@@ -10,7 +10,7 @@ $Expected = @(
     'alpha beta',
     'C:\Users\fshuu\Documents\tetris\1313\mainmodel copy 3.jld2',
     'embedded"quote',
-    'trailing\',
+    'path with space\',
     '',
     '日本語 path'
 )

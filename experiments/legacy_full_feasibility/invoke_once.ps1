@@ -32,6 +32,8 @@ $JuliaPhase = Join-Path $OutputDirectory 'julia_phase.json'
 $WeightsPath = Join-Path $OutputDirectory 'temporary_updated_weights.npz'
 $ReferencePath = Join-Path $OutputDirectory 'temporary_updated_reference.npz'
 $OpenVinoPhase = Join-Path $OutputDirectory 'openvino_phase.json'
+$AssessmentPath = Join-Path $OutputDirectory 'assessment.json'
+$FinalResultPath = Join-Path $OutputDirectory 'final_result.json'
 $SystemPython = 'C:\Program Files\Python310\python.exe'
 $OpenVinoPython = 'D:\tetris-paper-plus\python-env\Scripts\python.exe'
 $JuliaExe = (Get-Command julia -ErrorAction Stop).Source
@@ -149,6 +151,21 @@ if ($HeavyPython.Count -ne 0) {
     throw "a Python process above 2 GiB is active; heavy F execution refused"
 }
 
+$NativeArgvTestPath = Join-Path $Experiment 'test_native_arguments.ps1'
+$NativeArgvTestStarted = Get-Date
+$NativeArgvTestOutput = @(& $NativeArgvTestPath 2>&1)
+if (-not $?) {
+    throw "native argv boundary preflight failed: $($NativeArgvTestOutput -join [Environment]::NewLine)"
+}
+$NativeArgvTestRecord = [ordered]@{
+    path = $NativeArgvTestPath
+    sha256 = Get-Sha256 $NativeArgvTestPath
+    started_at = $NativeArgvTestStarted.ToString('o')
+    seconds = ((Get-Date) - $NativeArgvTestStarted).TotalSeconds
+    output = $NativeArgvTestOutput -join [Environment]::NewLine
+    passed = $true
+}
+
 $OperatingSystem = Get-CimInstance Win32_OperatingSystem
 $Processor = Get-CimInstance Win32_Processor | Select-Object -First 1
 $Computer = Get-CimInstance Win32_ComputerSystem
@@ -174,6 +191,7 @@ $Freeze = [ordered]@{
     dataset_sha256 = Get-Sha256 $Dataset
     harness_sha256 = $HarnessAggregate
     harness_files = $HarnessRecords
+    native_argv_boundary_test = $NativeArgvTestRecord
     output_directory = $OutputDirectory
     commands = $Commands
     constants = [ordered]@{
@@ -360,6 +378,12 @@ try {
             $ReferencePath, $JuliaPhase, $OpenVinoPhase
         )
     }
+    $FinalizerOk = Invoke-MonitoredPhase 'finalize' $SystemPython @(
+        (Join-Path $Experiment 'finalize_result.py'), $OutputDirectory
+    )
+    if (-not $FinalizerOk -and $OverallStopReason -eq 'completed') {
+        $OverallStopReason = 'finalizer failed'
+    }
 } catch {
     $OverallStopReason = "wrapper exception: $($_.Exception.Message)"
 }
@@ -377,11 +401,51 @@ $Monitor = [ordered]@{
     one_shot_retry_prohibited = $true
 }
 Write-JsonAtomic $MonitorPath $Monitor 12
-
-& $SystemPython (Join-Path $Experiment 'finalize_result.py') $OutputDirectory
-if ($LASTEXITCODE -ne 0) {
-    throw "F finalizer failed with exit code $LASTEXITCODE"
+$Assessment = if (Test-Path -LiteralPath $AssessmentPath -PathType Leaf) {
+    Get-Content -LiteralPath $AssessmentPath -Raw | ConvertFrom-Json
+} else {
+    [pscustomobject]@{
+        benchmark = 'F legacy full-model continuation feasibility'
+        failures = @('missing monitored phase assessment')
+        freeze = if (Test-Path $FreezePath) { Get-Content $FreezePath -Raw | ConvertFrom-Json } else { $null }
+        dataset_extraction = $null
+        julia_phase = $null
+        openvino_phase = $null
+        scope = 'throughput/plumbing gate only; not a learned-policy or score result'
+        temporary_outputs_promoted = $false
+        score_or_game_evaluation_run = $false
+        validation_or_test_data_used = $false
+    }
 }
+$FailureList = [System.Collections.Generic.List[string]]::new()
+foreach ($Failure in @($Assessment.failures)) {
+    if ($null -ne $Failure -and [string]$Failure -ne '') { $FailureList.Add([string]$Failure) }
+}
+if ($Monitor.stop_reason -ne 'completed') {
+    $FailureList.Add("one-shot monitor did not complete: $($Monitor.stop_reason)")
+}
+if ([int64]$Monitor.peak_working_set_bytes -gt $MaxWorkingSetBytes) {
+    $FailureList.Add('peak working set exceeded 8 GiB')
+}
+if ([double]$Monitor.wall_seconds -gt $HardWallSeconds) {
+    $FailureList.Add('hard wall exceeded 25 minutes')
+}
+$FinalResult = [ordered]@{
+    benchmark = $Assessment.benchmark
+    status = if ($FailureList.Count -eq 0) { 'F-feasible' } else { 'F-infeasible' }
+    success = $FailureList.Count -eq 0
+    failures = @($FailureList)
+    freeze = $Assessment.freeze
+    dataset_extraction = $Assessment.dataset_extraction
+    julia_phase = $Assessment.julia_phase
+    openvino_phase = $Assessment.openvino_phase
+    monitor = $Monitor
+    scope = $Assessment.scope
+    temporary_outputs_promoted = $false
+    score_or_game_evaluation_run = $false
+    validation_or_test_data_used = $false
+}
+Write-JsonAtomic $FinalResultPath $FinalResult 30
 if ($OverallStopReason -ne 'completed') {
     exit 2
 }

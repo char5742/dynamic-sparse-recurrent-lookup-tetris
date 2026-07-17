@@ -14,7 +14,7 @@ def main() -> None:
     parser.add_argument("output_directory", type=Path)
     args = parser.parse_args()
     root = args.output_directory
-    destination = root / "final_result.json"
+    destination = root / "assessment.json"
     if destination.exists():
         raise RuntimeError("refusing to overwrite final F result")
 
@@ -22,7 +22,6 @@ def main() -> None:
     extraction = read_optional(root / "subset.json")
     julia = read_optional(root / "julia_phase.json")
     openvino = read_optional(root / "openvino_phase.json")
-    monitor = read_optional(root / "monitor.json")
     failures: list[str] = []
 
     if not freeze:
@@ -33,8 +32,6 @@ def main() -> None:
         failures.append("Julia six-update/export phase incomplete")
     if not openvino or openvino.get("status") != "openvino_phase_complete":
         failures.append("OpenVINO CPU/NPU refresh/equivalence phase incomplete")
-    if not monitor or monitor.get("stop_reason") != "completed":
-        failures.append(f"one-shot monitor did not complete: {monitor and monitor.get('stop_reason')}")
 
     if julia:
         if julia.get("zero_update", {}).get("max_abs_error", float("inf")) > 1.0e-2:
@@ -57,22 +54,14 @@ def main() -> None:
             failures.append("NPU updated-weight equivalence failed")
         if openvino.get("t1000_seconds_before_peak_memory_gate", float("inf")) > 1800.0:
             failures.append("T1000 exceeded 1800 seconds")
-    if monitor:
-        if monitor.get("peak_working_set_bytes", 2**63) > 8 * 1024**3:
-            failures.append("peak working set exceeded 8 GiB")
-        if monitor.get("wall_seconds", float("inf")) > 25 * 60:
-            failures.append("hard wall exceeded 25 minutes")
-
     result = {
         "benchmark": "F legacy full-model continuation feasibility",
-        "status": "F-feasible" if not failures else "F-infeasible",
-        "success": not failures,
+        "status": "phase-assessment-complete",
         "failures": failures,
         "freeze": freeze,
         "dataset_extraction": extraction,
         "julia_phase": julia,
         "openvino_phase": openvino,
-        "monitor": monitor,
         "scope": "throughput/plumbing gate only; not a learned-policy or score result",
         "temporary_outputs_promoted": False,
         "score_or_game_evaluation_run": False,
