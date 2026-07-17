@@ -57,6 +57,7 @@ SOURCE_ROOTS = (
     "experiments",
 )
 SOURCE_SUFFIXES = (".jl", ".toml", ".md", ".json", ".py", ".ps1", ".so", ".dll")
+NON_SOURCE_DIRECTORY_NAMES = frozenset({"node_modules"})
 
 
 def sha256_file(path: Path) -> str:
@@ -182,6 +183,8 @@ def source_records(repository: Path) -> list[dict[str, Any]]:
                 for name in directory_names:
                     child = current / name
                     if name == ".git":
+                        continue
+                    if name.casefold() in NON_SOURCE_DIRECTORY_NAMES:
                         continue
                     if is_linked_directory(child):
                         child_relative = child.relative_to(repository).as_posix()

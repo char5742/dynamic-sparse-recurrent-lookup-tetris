@@ -93,6 +93,35 @@ class SourceFingerprintTests(unittest.TestCase):
             self.assertIn("standalone.pyc", result["repository_cache_artifacts"])
             self.assertTrue(any("__pycache__" in path for path in result["repository_cache_artifacts"]))
 
+    def test_node_modules_is_excluded_but_other_source_reparse_points_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r1-source-walk-") as temporary:
+            repository, cache = self.make_repository(Path(temporary))
+            dependency = repository / "tools/node_modules"
+            dependency.mkdir(parents=True)
+            (dependency / "ambient.py").write_text("raise RuntimeError\n", encoding="utf-8")
+            tracked_source = repository / "tools/source.py"
+            tracked_source.write_text("VALUE = 1\n", encoding="utf-8")
+
+            def node_modules_is_linked(path: Path) -> bool:
+                return path == dependency
+
+            with patch.dict(os.environ, {"PYTHONPYCACHEPREFIX": str(cache)}):
+                with patch.object(subject, "is_linked_directory", side_effect=node_modules_is_linked):
+                    records = subject.source_records(repository)
+            paths = {record["path"] for record in records}
+            self.assertIn("tools/source.py", paths)
+            self.assertNotIn("tools/node_modules/ambient.py", paths)
+
+            unexpected = repository / "tools/unexpected-link"
+            unexpected.mkdir()
+
+            def unexpected_is_linked(path: Path) -> bool:
+                return path == unexpected
+
+            with patch.object(subject, "is_linked_directory", side_effect=unexpected_is_linked):
+                with self.assertRaisesRegex(ValueError, "source directory is symlink/reparse"):
+                    subject.source_records(repository)
+
     def test_upstream_exact_clean_head_and_original_hashes(self) -> None:
         live = subject.validate_upstream_tetrisai_binding(LIVE_REPOSITORY)
         self.assertTrue(live["valid"], live["failures"])
