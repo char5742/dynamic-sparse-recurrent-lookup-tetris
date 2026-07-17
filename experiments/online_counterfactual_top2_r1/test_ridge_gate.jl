@@ -5,6 +5,8 @@ using SHA
 
 include(joinpath(@__DIR__, "ridge_gate.jl"))
 using .R1RidgeGate
+include(joinpath(@__DIR__, "collector.jl"))
+import .R1CounterfactualCollector
 
 function synthetic_training_data()
     episodes = repeat(73001:73012; inner=4)
@@ -27,6 +29,62 @@ function synthetic_training_data()
     advantage[1] = 99.0
     advantage[2] = -99.0
     return x, advantage, collect(episodes)
+end
+
+mutable struct SyntheticLiveState
+    label::String
+    applied::Vector{Int}
+end
+
+function synthetic_live_candidates()
+    metric(value) = (;
+        immediate_score=value,
+        cleared_lines=value + 1,
+        holes=value + 2,
+        covered_cells=value + 3,
+        aggregate_height=value + 4,
+        max_height=value + 5,
+        bumpiness=value + 6,
+        well_sum=value + 7,
+        row_transitions=value + 8,
+        column_transitions=value + 9,
+        ren=value + 10,
+        back_to_back=value + 11,
+        tspin=value + 12,
+    )
+    return [
+        (; id=index, action_digest="action-$(index)", node_identity="node-$(index)",
+           metrics=metric(Float64(index))) for index in 1:3
+    ]
+end
+
+function synthetic_live_current(state)
+    return (;
+        holes=1.0,
+        covered_cells=2.0,
+        aggregate_height=3.0,
+        max_height=4.0,
+        bumpiness=5.0,
+        well_sum=6.0,
+        row_transitions=7.0,
+        column_transitions=8.0,
+    )
+end
+
+function deployment_test_gate(lower_bound)
+    coefficients = zeros(Float64, COEFFICIENT_COUNT, ENSEMBLE_SIZE)
+    coefficients[1, :] .= lower_bound
+    return RidgeGate(
+        collect(FEATURE_NAMES),
+        zeros(FEATURE_COUNT),
+        ones(FEATURE_COUNT),
+        falses(FEATURE_COUNT),
+        coefficients,
+        RIDGE_LAMBDA,
+        UInt64(BOOTSTRAP_SEED),
+        LOWER_QUANTILE,
+        OVERRIDE_THRESHOLD,
+    )
 end
 
 @testset "R1 fixed feature contract" begin
@@ -273,6 +331,134 @@ end
         gate, fill("not numeric", FEATURE_COUNT); valid_action_count=4,
     ).fallback_reason ==
           :invalid_features
+end
+
+@testset "R1 live deployment decision binds and applies exact candidate" begin
+    candidates = synthetic_live_candidates()
+    q = [3.0, 1.0, 2.0]
+    state = SyntheticLiveState("root", Int[])
+    queue = zeros(Float64, 42)
+    queue[[1, 9, 17, 25, 33, 41]] .= 1.0
+    callbacks = (;
+        action_metrics=(root, candidate) -> candidate.metrics,
+        current_metrics=synthetic_live_current,
+        queue_onehot=root -> queue,
+        action_digest=candidate -> candidate.action_digest,
+        node_identity=candidate -> candidate.node_identity,
+        state_digest=root -> bytes2hex(sha256(
+            "$(root.label):$(join(root.applied, ','))",
+        )),
+        clone_state=deepcopy,
+        apply_selected! = (clone, candidate) -> begin
+            push!(clone.applied, candidate.id)
+            (; action_digest=candidate.action_digest, node_identity=candidate.node_identity)
+        end,
+    )
+
+    built = build_live_feature_vector(
+        state, candidates, q;
+        callbacks.action_metrics,
+        callbacks.current_metrics,
+        callbacks.queue_onehot,
+    )
+    @test length(built.features) == FEATURE_COUNT
+    @test (built.top1_index, built.top2_index) == (1, 3)
+    @test built.features[1:7] ≈ [
+        3.0, 2.0, 1.0, sqrt(3 / 2), 0.0, sqrt(3 / 2), 3.0,
+    ]
+    @test built.features[8:20] == fill(2.0, 13)
+    @test built.features[21:28] == collect(1.0:8.0)
+    @test built.features[29:end] == queue
+    collector_features = R1CounterfactualCollector.build_feature_vector(
+        q,
+        built.top1_index,
+        built.top2_index,
+        candidates[built.top1_index].metrics,
+        candidates[built.top2_index].metrics,
+        synthetic_live_current(state),
+        queue,
+    )
+    @test built.features == collector_features
+
+    fallback_clock_values = UInt64[1_000, 1_450]
+    timing_events = Symbol[]
+    fallback_callbacks = merge(callbacks, (;
+        clone_state=root -> begin
+            push!(timing_events, :clone)
+            deepcopy(root)
+        end,
+        apply_selected! = (clone, candidate) -> begin
+            push!(timing_events, :apply)
+            push!(clone.applied, candidate.id)
+            (; action_digest=candidate.action_digest, node_identity=candidate.node_identity)
+        end,
+    ))
+    fallback = deploy_ridge_decision(
+        state,
+        candidates,
+        q,
+        deployment_test_gate(OVERRIDE_THRESHOLD);
+        fallback_callbacks...,
+        clock_ns=() -> begin
+            value = popfirst!(fallback_clock_values)
+            push!(timing_events, value == 1_000 ? :clock_started : :clock_finished)
+            value
+        end,
+    )
+    @test !fallback.use_top2
+    @test fallback.fallback_reason == :lower_bound_not_above_threshold
+    @test fallback.selected_index == fallback.top1_index == 1
+    @test fallback.selected_action_digest == fallback.applied_action_digest == "action-1"
+    @test fallback.selected_node_identity == fallback.applied_node_identity == "node-1"
+    @test fallback.canonical_state_digest_before == fallback.canonical_state_digest_after
+    @test fallback.gate_incremental_elapsed_ns == 450
+    @test occursin("excludes_candidate_enumeration+old_q_evaluation", fallback.gate_incremental_scope)
+    @test timing_events == [:clock_started, :clock_finished, :clone, :apply]
+    @test isempty(state.applied)
+
+    override_clock_values = UInt64[2_000, 2_700]
+    override = deploy_ridge_decision(
+        state,
+        candidates,
+        q,
+        deployment_test_gate(nextfloat(OVERRIDE_THRESHOLD));
+        callbacks...,
+        clock_ns=() -> popfirst!(override_clock_values),
+    )
+    @test override.use_top2
+    @test override.fallback_reason == :none
+    @test override.selected_index == override.top2_index == 3
+    @test override.selected_action_digest == override.applied_action_digest == "action-3"
+    @test override.selected_node_identity == override.applied_node_identity == "node-3"
+    @test override.gate_incremental_elapsed_ns == 700
+    @test override.feature_vector == fallback.feature_vector
+    @test override.feature_vector_sha256 == fallback.feature_vector_sha256
+    @test override.selection_binding_sha256 != fallback.selection_binding_sha256
+    @test length(override.feature_vector_sha256) == 64
+    @test length(override.selection_binding_sha256) == 64
+    @test isempty(state.applied)
+
+    lying_callbacks = merge(callbacks, (;
+        apply_selected! = (clone, candidate) -> (;
+            action_digest="wrong-action",
+            node_identity=candidate.node_identity,
+        ),
+    ))
+    @test_throws ErrorException deploy_ridge_decision(
+        state,
+        candidates,
+        q,
+        deployment_test_gate(OVERRIDE_THRESHOLD);
+        lying_callbacks...,
+    )
+    aliasing_callbacks = merge(callbacks, (; clone_state=identity))
+    @test_throws ErrorException deploy_ridge_decision(
+        state,
+        candidates,
+        q,
+        deployment_test_gate(OVERRIDE_THRESHOLD);
+        aliasing_callbacks...,
+    )
 end
 
 @testset "invalid data fail closed" begin

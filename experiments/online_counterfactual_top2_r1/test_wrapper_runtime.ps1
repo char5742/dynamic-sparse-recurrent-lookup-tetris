@@ -14,6 +14,35 @@ $Julia = Resolve-R1ConcreteJulia
 if ($Julia.path -match '(?i)\\Microsoft\\WindowsApps\\' -or $Julia.version -cne '1.12.6') {
     throw 'concrete Julia resolver returned a launcher or wrong version'
 }
+$OriginalPythonPath = [Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process')
+$OriginalPythonHome = [Environment]::GetEnvironmentVariable('PYTHONHOME', 'Process')
+$OriginalPythonNoUserSite = [Environment]::GetEnvironmentVariable('PYTHONNOUSERSITE', 'Process')
+try {
+    [Environment]::SetEnvironmentVariable('PYTHONPATH', 'C:\ambient-pythonpath-poison', 'Process')
+    [Environment]::SetEnvironmentVariable('PYTHONHOME', 'C:\ambient-pythonhome-poison', 'Process')
+    [Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE', '0', 'Process')
+    $Python = Resolve-R1FrozenPython
+    if (-not $Python.pythonpath_cleared -or -not $Python.pythonhome_cleared -or
+        $Python.python_no_user_site -cne '1' -or
+        $Python.python_executable -cne 'D:\tetris-paper-plus\python-env\Scripts\python.exe' -or
+        $Python.python_base_prefix -cne 'C:\Users\fshuu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python' -or
+        $Python.venv_prefix -cne 'D:\tetris-paper-plus\python-env' -or
+        $Python.openvino_module_file -cne 'D:\tetris-paper-plus\python-env\Lib\site-packages\openvino\__init__.py' -or
+        $Python.openvino_package_tree_sha256 -cne 'c292b25245f36e937f21b105023737be80491e70de5f24b1704ad1ced8547e43' -or
+        $Python.openvino_loaded_native_sha256 -cne '929dd49859750bfa59c850234c8eeb872c84db05c1b60510e9a9db8b7d756a74' -or
+        @($Python.openvino_loaded_native_modules).Count -ne 5) {
+        throw 'frozen Python/OpenVINO origin proof is incomplete'
+    }
+    if ([Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process') -cne 'C:\ambient-pythonpath-poison' -or
+        [Environment]::GetEnvironmentVariable('PYTHONHOME', 'Process') -cne 'C:\ambient-pythonhome-poison' -or
+        [Environment]::GetEnvironmentVariable('PYTHONNOUSERSITE', 'Process') -cne '0') {
+        throw 'Python origin probe did not restore the parent import environment'
+    }
+} finally {
+    [Environment]::SetEnvironmentVariable('PYTHONPATH', $OriginalPythonPath, 'Process')
+    [Environment]::SetEnvironmentVariable('PYTHONHOME', $OriginalPythonHome, 'Process')
+    [Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE', $OriginalPythonNoUserSite, 'Process')
+}
 $PwshRecord = Resolve-R1ConcretePwsh (Get-Process -Id $PID).Path
 $WindowsPowerShellRejected = $false
 try {
@@ -89,6 +118,36 @@ try {
     )
     if (($Lifecycle -join "`n") -cne ($ExpectedLifecycle -join "`n")) {
         throw "wrapper lifecycle order mismatch: $($Lifecycle -join ',')"
+    }
+
+    $OldPhasePythonPath = [Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process')
+    $OldPhasePythonHome = [Environment]::GetEnvironmentVariable('PYTHONHOME', 'Process')
+    $OldPhaseNoUserSite = [Environment]::GetEnvironmentVariable('PYTHONNOUSERSITE', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('PYTHONPATH', 'C:\phase-path-poison', 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONHOME', 'C:\phase-home-poison', 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE', '0', 'Process')
+        $EnvironmentRoot = Join-Path $Root 'python-environment-isolation'
+        $EnvironmentRecord = Invoke-R1MonitoredPhase -Phase fit_ridge -Command @(
+            $Pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+            '[Console]::Out.Write((@{pythonpath=$env:PYTHONPATH;pythonhome=$env:PYTHONHOME;nousersite=$env:PYTHONNOUSERSITE}|ConvertTo-Json -Compress))'
+        ) -WorkingDirectory $Root -OutputDirectory $EnvironmentRoot `
+            -RunStarted ([DateTimeOffset]::UtcNow) -TotalHardWallSeconds 10 `
+            -MaxPrivateCommittedBytes ([int64](1GB)) -MaxWorkingSetResidentBytes ([int64](1GB))
+        $EnvironmentFacts = Get-Content -LiteralPath $EnvironmentRecord.stdout -Raw | ConvertFrom-Json
+        if ($EnvironmentRecord.exit_code -ne 0 -or $null -ne $EnvironmentFacts.pythonpath -or
+            $null -ne $EnvironmentFacts.pythonhome -or $EnvironmentFacts.nousersite -cne '1') {
+            throw 'monitored child inherited an ambient Python import environment'
+        }
+        if ([Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process') -cne 'C:\phase-path-poison' -or
+            [Environment]::GetEnvironmentVariable('PYTHONHOME', 'Process') -cne 'C:\phase-home-poison' -or
+            [Environment]::GetEnvironmentVariable('PYTHONNOUSERSITE', 'Process') -cne '0') {
+            throw 'monitored phase did not restore parent Python environment'
+        }
+    } finally {
+        [Environment]::SetEnvironmentVariable('PYTHONPATH', $OldPhasePythonPath, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONHOME', $OldPhasePythonHome, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE', $OldPhaseNoUserSite, 'Process')
     }
 
     $MemoryRoot = Join-Path $Root 'memory-stop'
@@ -329,6 +388,8 @@ try {
         during_finalizer_terminal_integrity_failure_authoritative=$true
         exact_pwsh_7_4_17_verified=$true
         windows_powershell_5_1_rejected=$true
+        frozen_python_openvino_origin_verified=$true
+        child_python_environment_isolated_and_restored=$true
         movefile_write_through_publication_verified=$true
         checkpoint_or_model_loaded=$false
         game_run=$false

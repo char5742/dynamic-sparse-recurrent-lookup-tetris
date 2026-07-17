@@ -227,7 +227,7 @@ $Commands = [ordered]@{
     collect_calibration=@(
         $Julia.path, '--startup-file=no', '--history-file=no', "--project=$Repository",
         (Join-Path $PSScriptRoot 'collect_online.jl'), 'calibration', $CalibrationTable, $CalibrationManifest,
-        (Join-Path $OutputDirectory 'collect_calibration.child_milestones.jsonl')
+        (Join-Path $OutputDirectory 'collect_calibration.child_milestones.jsonl'), $RidgeArtifact
     )
     calibration_gate=@(
         $Python.path, (Join-Path $PSScriptRoot 'calibration_gate.py'), $CalibrationTable,
@@ -256,6 +256,9 @@ function New-R1FrozenHandoff([string]$Path, [string]$Sha256) {
     return [ordered]@{ frozen_path=[IO.Path]::GetFullPath($Path); frozen_sha256=$Sha256 }
 }
 $PhaseEnvironment = [ordered]@{
+    collect_calibration=[ordered]@{
+        R1_EXPECTED_RIDGE_ARTIFACT_SHA256=New-R1ProducedHandoff 'fit_ridge' $RidgeArtifact
+    }
     fit_ridge=[ordered]@{
         R1_EXPECTED_TRAINING_TABLE_SHA256=New-R1ProducedHandoff 'collect_training' $TrainingTable
         R1_EXPECTED_TRAINING_MANIFEST_SHA256=New-R1ProducedHandoff 'collect_training' $TrainingManifest

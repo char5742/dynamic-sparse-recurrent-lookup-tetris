@@ -68,6 +68,22 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def read_json_byte_snapshot(path: Path) -> tuple[bytes, dict[str, Any], str]:
+    """Read, parse, and hash one immutable-in-memory byte snapshot.
+
+    In particular, do not parse with ``read_text`` and then reopen the path for
+    the reported digest.  A replace between those two operations could
+    otherwise make the audit describe bytes that it never validated.
+    """
+
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    document = json.loads(raw.decode("utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError("fingerprint JSON root must be an object")
+    return raw, document, digest
+
+
 def is_linked_directory(path: Path) -> bool:
     if path.is_symlink():
         return True
@@ -449,7 +465,7 @@ def validate_repository_binding(repository: Path, authorized_commit: str) -> dic
 
 
 def audit(repository: Path, fingerprint_path: Path, authorized_commit: str) -> dict[str, Any]:
-    document = json.loads(fingerprint_path.read_text(encoding="utf-8"))
+    snapshot_bytes, document, snapshot_sha256 = read_json_byte_snapshot(fingerprint_path)
     fingerprint = validate_fingerprint_document(repository, document)
     binding = validate_repository_binding(repository, authorized_commit)
     upstream = validate_upstream_tetrisai_binding(repository)
@@ -458,7 +474,9 @@ def audit(repository: Path, fingerprint_path: Path, authorized_commit: str) -> d
         "valid": not failures,
         "failures": failures,
         "fingerprint_path": str(fingerprint_path.resolve()),
-        "fingerprint_file_sha256": sha256_file(fingerprint_path),
+        "fingerprint_file_sha256": snapshot_sha256,
+        "fingerprint_snapshot_bytes": len(snapshot_bytes),
+        "fingerprint_snapshot_semantics": "one read; the same bytes are parsed and hashed",
         "fingerprint": fingerprint,
         "repository_binding": binding,
         "upstream_tetrisai_binding": upstream,

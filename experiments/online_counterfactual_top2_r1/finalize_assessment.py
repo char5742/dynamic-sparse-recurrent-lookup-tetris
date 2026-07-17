@@ -16,6 +16,7 @@ import json
 import math
 import os
 import statistics
+import struct
 import subprocess
 import sys
 import time
@@ -32,13 +33,66 @@ WEIGHT_DIGEST = "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375b
 TRAIN_EPISODES = tuple(range(73001, 73013))
 CALIBRATION_EPISODES = tuple(range(73101, 73107))
 SAMPLE_PIECES = tuple(range(10, 241, 10))
-PROJECTION_FORMULA = "2*setup_seconds + first32_collection_seconds/32*432"
+PROJECTION_FORMULA = (
+    "2*setup_seconds + (first32_collection_seconds-repeatability_probe_seconds)/32*432 "
+    "+ repeatability_probe_seconds"
+)
+DEPLOYMENT_SCHEMA = "r1-live-ridge-decision-v1"
+DEPLOYMENT_TIMING_SCOPE = (
+    "feature_build+ridge_eval+selection_binding;"
+    "excludes_candidate_enumeration+old_q_evaluation+artifact_load+clone_apply_verification"
+)
+DEPLOYMENT_FEATURE_ENCODING = (
+    "feature_schema_sha256 newline Float64-bitstring-per-feature newline joined"
+)
 QUANTILE_METHOD = "linear_type7_position_1_plus_n_minus_1_p"
 FEATURE_COUNT = 70
 COEFFICIENT_COUNT = 71
 ENSEMBLE_COUNT = 256
 NUMERIC_VALUE_COUNT = FEATURE_COUNT * 2 + COEFFICIENT_COUNT * ENSEMBLE_COUNT
 OPENVINO_FULL_VERSION = "2026.2.1-21919-ede283a88e3-releases/2026/2"
+EXPECTED_PYTHON_RUNTIME_ORIGIN = {
+    "python_runtime_origin_schema": "r1-python-runtime-origin-v1",
+    "python_bridge": "PythonCall",
+    "python_executable": r"D:\tetris-paper-plus\python-env\Scripts\python.exe",
+    "python_base_prefix": r"C:\Users\fshuu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python",
+    "python_prefix": r"D:\tetris-paper-plus\python-env",
+    "pythonpath_cleared": True,
+    "pythonhome_cleared": True,
+    "python_no_user_site": "1",
+    "openvino_module_file": r"D:\tetris-paper-plus\python-env\Lib\site-packages\openvino\__init__.py",
+    "openvino_package_root": r"D:\tetris-paper-plus\python-env\Lib\site-packages\openvino",
+    "openvino_package_file_count": 1102,
+    "openvino_package_bytes": 234324334,
+    "openvino_package_tree_sha256": "c292b25245f36e937f21b105023737be80491e70de5f24b1704ad1ced8547e43",
+    "openvino_package_tree_aggregate": "sorted relative-path NUL decimal-bytes NUL lowercase-sha256 newline",
+    "openvino_loaded_native_sha256": "929dd49859750bfa59c850234c8eeb872c84db05c1b60510e9a9db8b7d756a74",
+}
+EXPECTED_OPENVINO_NATIVE_MODULES = [
+    {"path": "_pyopenvino.cp312-win_amd64.pyd", "bytes": 3981304, "sha256": "602468f4ca37ba9859a6b22220e46267170abd0f744a72a839bb5e0874f2ad56"},
+    {"path": "frontend/tensorflow/py_tensorflow_frontend.cp312-win_amd64.pyd", "bytes": 477176, "sha256": "859f76d40fb77074bf94de2bed3317aeb835debb2e98bd4b78ce24f0b1077c28"},
+    {"path": "libs/openvino.dll", "bytes": 15888376, "sha256": "dc29dfd84048bed1b687426f770ee355d6c2933bbb3c6aa861f6dd1154e48908"},
+    {"path": "libs/tbb12.dll", "bytes": 225272, "sha256": "5cdc63525bc1b7f9916b329a1304955a360803b3d5780f5b23e62fd4027622be"},
+    {"path": "libs/tbbmalloc.dll", "bytes": 120824, "sha256": "11ac3ef8f213cc647b63f92dd115c2c005e489fd050fd41c3e69cf3cd4949921"},
+]
+COUNTERFACTUAL_GAMMA = 0.997
+COUNTERFACTUAL_HORIZON = 6
+COUNTERFACTUAL_SCORE_NORMALIZER = 600.0
+# Exact binary64 outputs of Julia 1.12.6's `Float64(0.997)^n` for n=0:6.
+# Python's `**` differs by one ulp at n=6, so spelling out the frozen Julia
+# arithmetic is necessary for an exact serialized cross-runtime check.
+COUNTERFACTUAL_GAMMA_POWERS = tuple(
+    float.fromhex(value)
+    for value in (
+        "0x1p+0",
+        "0x1.fe76c8b439581p-1",
+        "0x1.fceebf65dbfcfp-1",
+        "0x1.fb67e32cfa4ddp-1",
+        "0x1.f9e2332258c9p-1",
+        "0x1.f85dae5f6d82cp-1",
+        "0x1.f6da53fe5f9d3p-1",
+    )
+)
 ENGINE_DEPENDENCY_ENCODING = "sorted relative_path + NUL + lowercase sha256 + newline"
 UPSTREAM_TETRISAI_HEAD = "6fdfb1d30197246fd862b716438e998f0315c830"
 ENGINE_DEPENDENCY_PATHS = (
@@ -143,6 +197,27 @@ def _lowercase_digest(value: Any, label: str) -> str:
 
 def _normal(path: Any) -> str:
     return os.path.normcase(str(Path(str(path)).resolve()))
+
+
+def _validate_python_runtime_origin(value: Any, label: str) -> dict[str, Any]:
+    _require(isinstance(value, dict), f"{label} missing")
+    for key, expected in EXPECTED_PYTHON_RUNTIME_ORIGIN.items():
+        observed = value.get(key)
+        if key in {
+            "python_executable", "python_base_prefix", "python_prefix",
+            "openvino_module_file", "openvino_package_root",
+        }:
+            _require(_normal(observed) == _normal(expected), f"{label} {key} mismatch")
+        else:
+            _require(observed == expected, f"{label} {key} mismatch")
+    modules = value.get("openvino_loaded_native_modules")
+    _require(modules == EXPECTED_OPENVINO_NATIVE_MODULES, f"{label} native module list mismatch")
+    for index, module in enumerate(modules, 1):
+        _require(isinstance(module, dict), f"{label} native module {index} invalid")
+        _require(type(module.get("path")) is str and bool(module["path"]), f"{label} native module {index} path invalid")
+        _require(_integer(module.get("bytes"), f"{label} native module {index} bytes") > 0, f"{label} native module {index} bytes invalid")
+        _digest(module.get("sha256"), f"{label} native module {index} digest")
+    return value
 
 
 def _feature_digest(names: Sequence[str]) -> str:
@@ -502,6 +577,10 @@ def _validate_backend_evidence(value: Any, *, synthetic: bool, label: str) -> No
     for name, wanted in expected.items():
         _require(_required(value, name) == wanted, f"{label} backend {name} mismatch")
     _digest(_required(value, "evaluator_source_sha256"), f"{label} evaluator source")
+    _validate_python_runtime_origin(
+        _required(value, "python_runtime_origin"),
+        f"{label} Python/OpenVINO runtime origin",
+    )
 
 
 def _validate_immutable_evidence(value: Any, *, synthetic: bool, label: str) -> None:
@@ -512,6 +591,433 @@ def _validate_immutable_evidence(value: Any, *, synthetic: bool, label: str) -> 
     _require(_digest(_required(value, "old_checkpoint_sha256"), "checkpoint end") == CHECKPOINT_DIGEST, f"{label} checkpoint changed")
     _require(_digest(_required(value, "old_openvino_weight_npz_sha256"), "weights end") == WEIGHT_DIGEST, f"{label} weights changed")
     _require(_bool(_required(value, "unchanged"), f"{label}.unchanged") is True, f"{label} immutable inputs changed")
+
+
+_BRANCH_EVIDENCE_KEYS = {
+    "return_G6",
+    "terminal_within_horizon",
+    "terminal_step",
+    "bootstrap_q",
+    "score_deltas",
+    "pre_action_current_piece_tokens",
+    "placed_piece_tokens",
+    "post_action_rng_digests",
+    "final_rng_digest",
+    "selected_action_digests",
+    "candidate_counts",
+    "branch_start_state_digest",
+    "branch_start_future_stream_digest",
+    "start_score",
+    "final_score",
+    "pieces_played",
+    "exact_outcome_digest",
+    "decision_evidence",
+}
+_DECISION_EVIDENCE_KEYS = {
+    "rollout_piece",
+    "kind",
+    "candidate_count",
+    "candidate_order_digest",
+    "q_vector_digest",
+    "selected_index",
+    "selected_action_digest",
+    "selected_q",
+    "max_q",
+}
+
+
+def _exact_number_equal(left: Any, right: Any, label: str) -> float:
+    """Require equality of the parsed finite binary64 values, not tolerance."""
+    value = _number(left, label)
+    expected = _number(right, f"{label} recomputation")
+    _require(value == expected, f"{label} exact serialized value mismatch")
+    return value
+
+
+def _nonempty_string(value: Any, label: str) -> str:
+    _require(type(value) is str and bool(value), f"{label} is not a non-empty string")
+    return value
+
+
+def _validate_decision_evidence(
+    value: Any,
+    *,
+    label: str,
+    rollout_piece: int,
+    kind: str,
+) -> dict[str, Any]:
+    _require(isinstance(value, dict), f"{label} is not an object")
+    _require(set(value) == _DECISION_EVIDENCE_KEYS, f"{label} schema mismatch")
+    _require(
+        _integer(_required(value, "rollout_piece"), f"{label} rollout piece") == rollout_piece,
+        f"{label} rollout piece mismatch",
+    )
+    _require(_required(value, "kind") == kind, f"{label} kind mismatch")
+    candidate_count = _integer(_required(value, "candidate_count"), f"{label} candidate count")
+    _require(candidate_count >= 1, f"{label} candidate count is not positive")
+    selected_index = _integer(_required(value, "selected_index"), f"{label} selected index")
+    _require(1 <= selected_index <= candidate_count, f"{label} selected index is out of range")
+    return {
+        "rollout_piece": rollout_piece,
+        "kind": kind,
+        "candidate_count": candidate_count,
+        "candidate_order_digest": _lowercase_digest(
+            _required(value, "candidate_order_digest"), f"{label} candidate order"
+        ),
+        "q_vector_digest": _lowercase_digest(
+            _required(value, "q_vector_digest"), f"{label} Q vector"
+        ),
+        "selected_index": selected_index,
+        "selected_action_digest": _lowercase_digest(
+            _required(value, "selected_action_digest"), f"{label} selected action"
+        ),
+        "selected_q": _number(_required(value, "selected_q"), f"{label} selected Q"),
+        "max_q": _number(_required(value, "max_q"), f"{label} maximum Q"),
+    }
+
+
+def _validate_production_branch(
+    value: Any,
+    *,
+    label: str,
+    root_state_digest: str,
+    root_future_stream_digest: str,
+    root_candidate_count: int,
+    root_selected_index: int,
+    root_selected_action_digest: str,
+    root_selected_q: float,
+    root_max_q: float,
+) -> dict[str, Any]:
+    _require(isinstance(value, dict), f"{label} evidence missing")
+    _require(set(value) == _BRANCH_EVIDENCE_KEYS, f"{label} evidence schema mismatch")
+
+    terminal = _bool(_required(value, "terminal_within_horizon"), f"{label} terminal")
+    terminal_step = _integer(_required(value, "terminal_step"), f"{label} terminal step")
+    if terminal:
+        _require(
+            1 <= terminal_step <= COUNTERFACTUAL_HORIZON,
+            f"{label} terminal step outside the six-piece horizon",
+        )
+        applied_steps = terminal_step
+    else:
+        _require(terminal_step == 0, f"{label} surviving branch has a terminal step")
+        applied_steps = COUNTERFACTUAL_HORIZON
+
+    score_deltas_raw = _required(value, "score_deltas")
+    _require(isinstance(score_deltas_raw, list), f"{label} score deltas missing")
+    score_deltas = [_number(item, f"{label} score delta") for item in score_deltas_raw]
+    _require(len(score_deltas) == applied_steps, f"{label} score-delta horizon mismatch")
+    start_score = _number(_required(value, "start_score"), f"{label} start score")
+    final_score = _number(_required(value, "final_score"), f"{label} final score")
+    pieces_played = _integer(_required(value, "pieces_played"), f"{label} pieces played")
+    _require(pieces_played == applied_steps, f"{label} pieces-played horizon mismatch")
+    _exact_number_equal(
+        final_score - start_score,
+        math.fsum(score_deltas),
+        f"{label} score accounting",
+    )
+
+    candidate_counts_raw = _required(value, "candidate_counts")
+    _require(isinstance(candidate_counts_raw, list), f"{label} candidate counts missing")
+    candidate_counts = [
+        _integer(item, f"{label} candidate count") for item in candidate_counts_raw
+    ]
+    _require(
+        len(candidate_counts) == applied_steps and all(item >= 1 for item in candidate_counts),
+        f"{label} candidate-count horizon mismatch",
+    )
+    _require(candidate_counts[0] == root_candidate_count, f"{label} root candidate count mismatch")
+
+    selected_action_digests_raw = _required(value, "selected_action_digests")
+    _require(isinstance(selected_action_digests_raw, list), f"{label} selected action digests missing")
+    selected_action_digests = [
+        _lowercase_digest(item, f"{label} selected action")
+        for item in selected_action_digests_raw
+    ]
+    _require(
+        len(selected_action_digests) == applied_steps,
+        f"{label} selected-action horizon mismatch",
+    )
+    _require(
+        selected_action_digests[0] == root_selected_action_digest,
+        f"{label} root selected action digest mismatch",
+    )
+
+    for field in ("pre_action_current_piece_tokens", "placed_piece_tokens"):
+        raw = _required(value, field)
+        _require(isinstance(raw, list) and len(raw) == applied_steps, f"{label} {field} horizon mismatch")
+        for item in raw:
+            _nonempty_string(item, f"{label} {field} item")
+
+    rng_raw = _required(value, "post_action_rng_digests")
+    _require(isinstance(rng_raw, list), f"{label} post-action RNG digests missing")
+    rng_digests = [_lowercase_digest(item, f"{label} post-action RNG") for item in rng_raw]
+    _require(len(rng_digests) == applied_steps, f"{label} post-action RNG horizon mismatch")
+    _require(
+        _lowercase_digest(_required(value, "final_rng_digest"), f"{label} final RNG")
+        == rng_digests[-1],
+        f"{label} final RNG digest mismatch",
+    )
+
+    branch_future = _lowercase_digest(
+        _required(value, "branch_start_future_stream_digest"),
+        f"{label} branch-start future stream",
+    )
+    branch_state = _lowercase_digest(
+        _required(value, "branch_start_state_digest"), f"{label} branch-start state"
+    )
+    _require(branch_state == root_state_digest, f"{label} branch-start state mismatch")
+    exact_outcome_digest = _lowercase_digest(
+        _required(value, "exact_outcome_digest"), f"{label} exact outcome"
+    )
+    _require(
+        branch_future == root_future_stream_digest,
+        f"{label} branch-start future stream mismatch",
+    )
+
+    raw_decisions = _required(value, "decision_evidence")
+    expected_decisions = applied_steps + (0 if terminal else 1)
+    _require(
+        isinstance(raw_decisions, list) and len(raw_decisions) == expected_decisions,
+        f"{label} decision-evidence horizon mismatch",
+    )
+    decisions = [
+        _validate_decision_evidence(
+            raw,
+            label=f"{label} decision {step}",
+            rollout_piece=step,
+            kind="action",
+        )
+        for step, raw in enumerate(raw_decisions[:applied_steps], 1)
+    ]
+    for step, decision in enumerate(decisions, 1):
+        offset = step - 1
+        _require(
+            decision["candidate_count"] == candidate_counts[offset],
+            f"{label} decision {step} candidate count mismatch",
+        )
+        _require(
+            decision["selected_action_digest"] == selected_action_digests[offset],
+            f"{label} decision {step} selected action digest mismatch",
+        )
+        if step > 1:
+            _require(
+                decision["selected_q"] == decision["max_q"],
+                f"{label} decision {step} did not select the old-policy maximum Q",
+            )
+
+    first = decisions[0]
+    _require(first["selected_index"] == root_selected_index, f"{label} root selected index mismatch")
+    _require(first["selected_q"] == root_selected_q, f"{label} root selected Q mismatch")
+    _require(first["max_q"] == root_max_q, f"{label} root maximum Q mismatch")
+
+    bootstrap_q = _number(_required(value, "bootstrap_q"), f"{label} bootstrap Q")
+    if terminal:
+        _require(bootstrap_q == 0.0, f"{label} terminal branch has nonzero bootstrap Q")
+        bootstrap = None
+    else:
+        bootstrap = _validate_decision_evidence(
+            raw_decisions[-1],
+            label=f"{label} bootstrap decision",
+            rollout_piece=COUNTERFACTUAL_HORIZON + 1,
+            kind="bootstrap",
+        )
+        _require(
+            bootstrap["selected_q"] == bootstrap["max_q"] == bootstrap_q,
+            f"{label} bootstrap Q/selection mismatch",
+        )
+
+    recomputed_g6 = 0.0
+    for step, score_delta in enumerate(score_deltas, 1):
+        recomputed_g6 += (
+            COUNTERFACTUAL_GAMMA_POWERS[step - 1]
+            * score_delta
+            / COUNTERFACTUAL_SCORE_NORMALIZER
+        )
+    if not terminal:
+        recomputed_g6 += COUNTERFACTUAL_GAMMA_POWERS[COUNTERFACTUAL_HORIZON] * bootstrap_q
+    return_g6 = _exact_number_equal(
+        _required(value, "return_G6"), recomputed_g6, f"{label} return_G6"
+    )
+    return {
+        "return_G6": return_g6,
+        "terminal": terminal,
+        "terminal_step": terminal_step,
+        "branch_start_future_stream_digest": branch_future,
+        "exact_outcome_digest": exact_outcome_digest,
+        "root_decision": first,
+        "bootstrap_decision": bootstrap,
+    }
+
+
+def _validate_production_row_science(row: dict[str, Any], *, label: str) -> None:
+    """Independently reconstruct both six-piece returns and their advantage."""
+    root_future = _lowercase_digest(
+        _required(row, "root_future_stream_digest"), f"{label} root future stream"
+    )
+    root_state = _lowercase_digest(_required(row, "root_state_digest"), f"{label} root state")
+    valid_count = _integer(_required(row, "valid_action_count"), f"{label} valid action count")
+    top1_index = _integer(
+        _required(row, "canonical_top1_candidate_index"), f"{label} top1 index"
+    )
+    top2_index = _integer(
+        _required(row, "canonical_top2_candidate_index"), f"{label} top2 index"
+    )
+    top1_digest = _lowercase_digest(
+        _required(row, "canonical_top1_action_digest"), f"{label} top1 action"
+    )
+    top2_digest = _lowercase_digest(
+        _required(row, "canonical_top2_action_digest"), f"{label} top2 action"
+    )
+    q1 = _number(_required(row, "q_top1"), f"{label} q_top1")
+    q2 = _number(_required(row, "q_top2"), f"{label} q_top2")
+
+    top1 = _validate_production_branch(
+        _required(row, "top1_branch"),
+        label=f"{label} top1 branch",
+        root_state_digest=root_state,
+        root_future_stream_digest=root_future,
+        root_candidate_count=valid_count,
+        root_selected_index=top1_index,
+        root_selected_action_digest=top1_digest,
+        root_selected_q=q1,
+        root_max_q=q1,
+    )
+    top2 = _validate_production_branch(
+        _required(row, "top2_branch"),
+        label=f"{label} top2 branch",
+        root_state_digest=root_state,
+        root_future_stream_digest=root_future,
+        root_candidate_count=valid_count,
+        root_selected_index=top2_index,
+        root_selected_action_digest=top2_digest,
+        root_selected_q=q2,
+        root_max_q=q1,
+    )
+    _require(
+        top1["branch_start_future_stream_digest"]
+        == top2["branch_start_future_stream_digest"]
+        == root_future,
+        f"{label} branch-start future streams differ",
+    )
+    _require(
+        top1["root_decision"]["candidate_order_digest"]
+        == top2["root_decision"]["candidate_order_digest"],
+        f"{label} root candidate-order evidence differs",
+    )
+    _require(
+        top1["root_decision"]["q_vector_digest"]
+        == top2["root_decision"]["q_vector_digest"],
+        f"{label} root Q-vector evidence differs",
+    )
+    _require(
+        _bool(_required(row, "a1_terminal_within_horizon"), f"{label} a1 terminal")
+        is top1["terminal"],
+        f"{label} top1 terminal alias mismatch",
+    )
+    _require(
+        _bool(_required(row, "a2_terminal_within_horizon"), f"{label} a2 terminal")
+        is top2["terminal"],
+        f"{label} top2 terminal alias mismatch",
+    )
+    _exact_number_equal(_required(row, "g6_top1"), top1["return_G6"], f"{label} g6_top1")
+    _exact_number_equal(_required(row, "g6_top2"), top2["return_G6"], f"{label} g6_top2")
+    recomputed_advantage = top2["return_G6"] - top1["return_G6"]
+    advantage = _exact_number_equal(
+        _required(row, "advantage_unclipped_A6"),
+        recomputed_advantage,
+        f"{label} advantage_unclipped_A6",
+    )
+    _exact_number_equal(_required(row, "advantage"), advantage, f"{label} advantage alias")
+    _exact_number_equal(
+        _required(row, "clipped_target"),
+        max(-2.0, min(2.0, advantage)),
+        f"{label} clipped target",
+    )
+
+
+def _validate_repeatability_sentinels(
+    table: dict[str, Any],
+    metadata: dict[str, Any],
+    manifest: dict[str, Any],
+    rows: list[dict[str, Any]],
+    episode_evidence: list[dict[str, Any]],
+    *,
+    training: bool,
+    synthetic: bool,
+) -> float:
+    sentinels = table.get("repeatability_sentinels", []) if synthetic else _required(table, "repeatability_sentinels")
+    _require(isinstance(sentinels, list), "repeatability sentinel list missing")
+    expected_count = 0 if synthetic or not training else 1
+    _require(len(sentinels) == expected_count, "repeatability sentinel count mismatch")
+    episode_sentinels = [item.get("repeatability_sentinel") for item in episode_evidence]
+    _require(
+        sum(item is not None for item in episode_sentinels) == expected_count,
+        "per-episode repeatability sentinel count mismatch",
+    )
+    probe_seconds = _number(
+        manifest.get("repeatability_probe_seconds", 0.0) if synthetic else _required(manifest, "repeatability_probe_seconds"),
+        "repeatability duration",
+    )
+    _require(
+        _same_number(metadata.get("repeatability_probe_seconds", 0.0) if synthetic else _required(metadata, "repeatability_probe_seconds"), probe_seconds),
+        "repeatability duration differs between metadata and manifest",
+    )
+    if expected_count == 0:
+        _require(not sentinels and all(item is None for item in episode_sentinels), "forged repeatability sentinel")
+        _require(probe_seconds == 0.0, "unexpected repeatability duration")
+        return probe_seconds
+
+    sentinel = sentinels[0]
+    expected_keys = {
+        "schema", "seed", "episode_id", "piece_index", "root_state_digest",
+        "root_future_stream_digest", "repetitions_per_branch",
+        "added_branch_rollouts", "added_rollout_pieces",
+        "reference_root_candidate_order_digest", "repeated_root_candidate_order_digest",
+        "reference_root_q_vector_digest", "repeated_root_q_vector_digest",
+        "reference_top1_outcome_digest", "repeated_top1_outcome_digest",
+        "reference_top2_outcome_digest", "repeated_top2_outcome_digest",
+        "elapsed_seconds",
+    }
+    _require(isinstance(sentinel, dict) and set(sentinel) == expected_keys, "repeatability sentinel schema mismatch")
+    _require(_required(sentinel, "schema") == "r1-repeatability-sentinel-v1", "repeatability sentinel version mismatch")
+    seed = _integer(_required(sentinel, "seed"), "repeatability seed")
+    piece = _integer(_required(sentinel, "piece_index"), "repeatability piece")
+    _require(seed == TRAIN_EPISODES[0], "repeatability sentinel seed is not frozen")
+    _require(_integer(_required(sentinel, "episode_id"), "repeatability episode") == seed, "repeatability episode mismatch")
+    matched = [row for row in rows if row["episode_id"] == seed and row["piece_index"] == piece]
+    _require(len(matched) == 1, "repeatability sentinel does not identify one retained row")
+    row = matched[0]
+    _require(_required(sentinel, "root_state_digest") == _required(row, "root_state_digest"), "repeatability root mismatch")
+    _require(_required(sentinel, "root_future_stream_digest") == _required(row, "root_future_stream_digest"), "repeatability future mismatch")
+    for prefix, evidence_key in (
+        ("root_candidate_order", "candidate_order_digest"),
+        ("root_q_vector", "q_vector_digest"),
+    ):
+        reference = _digest(_required(sentinel, f"reference_{prefix}_digest"), f"repeatability {prefix}")
+        repeated = _digest(_required(sentinel, f"repeated_{prefix}_digest"), f"repeated {prefix}")
+        _require(reference == repeated, f"repeatability {prefix} mismatch")
+        for branch_name in ("top1_branch", "top2_branch"):
+            decision = _required(_required(row, branch_name), "decision_evidence")[0]
+            _require(reference == _digest(_required(decision, evidence_key), f"{branch_name} {prefix}"), f"repeatability {prefix} differs from retained row")
+    for branch in ("top1", "top2"):
+        reference = _digest(_required(sentinel, f"reference_{branch}_outcome_digest"), f"repeatability {branch}")
+        repeated = _digest(_required(sentinel, f"repeated_{branch}_outcome_digest"), f"repeated {branch}")
+        _require(reference == repeated, f"repeatability {branch} outcome mismatch")
+        row_digest = _digest(_required(_required(row, f"{branch}_branch"), "exact_outcome_digest"), f"row {branch} outcome")
+        _require(reference == row_digest, f"repeatability {branch} differs from retained row")
+    _require(_integer(_required(sentinel, "repetitions_per_branch"), "repeatability repetitions") == 2, "repeatability count mismatch")
+    _require(_integer(_required(sentinel, "added_branch_rollouts"), "repeatability rollouts") == 2, "repeatability rollout count mismatch")
+    expected_pieces = sum(
+        _integer(_required(_required(row, name), "pieces_played"), f"{name} pieces")
+        for name in ("top1_branch", "top2_branch")
+    )
+    _require(_integer(_required(sentinel, "added_rollout_pieces"), "repeatability pieces") == expected_pieces, "repeatability piece count mismatch")
+    _require(_same_number(_required(sentinel, "elapsed_seconds"), probe_seconds), "repeatability duration mismatch")
+    episode = next(item for item in episode_evidence if item["episode_id"] == seed)
+    _require(_required(episode, "repeatability_sentinel") == sentinel, "episode/table sentinel mismatch")
+    _require(probe_seconds >= 0.0, "negative repeatability duration")
+    return probe_seconds
 
 
 def validate_collection(
@@ -592,8 +1098,9 @@ def validate_collection(
         seen_roots.add(root_digest)
         _bool(_required(row, "a1_terminal_within_horizon"), f"{role} row {index} a1 terminal")
         _bool(_required(row, "a2_terminal_within_horizon"), f"{role} row {index} a2 terminal")
+        if not synthetic:
+            _validate_production_row_science(row, label=f"{role} row {index}")
         positives += advantage > 0.0
-    _require(seen_episodes == set(episodes), f"{role} table does not cover every exact episode")
     row_order_sha256 = hashlib.sha256(
         "\n".join(
             f"{_integer(_required(row, 'episode_id'), f'{role} row episode')},"
@@ -604,7 +1111,6 @@ def validate_collection(
     ).hexdigest()
     positive_fraction = positives / len(rows)
     _require(_same_number(_required(metadata, "positive_advantage_fraction"), positive_fraction), f"{role} metadata positive fraction mismatch")
-    _require(_integer(_required(metadata, "counterfactual_states_completed"), f"{role} metadata completed states") == total, f"{role} metadata completed-state mismatch")
 
     _require(_required(manifest, "schema_version") == "r1-collection-manifest-v1", f"{role} manifest schema mismatch")
     _require(_required(manifest, "source_role") == role, f"{role} manifest role mismatch")
@@ -629,6 +1135,16 @@ def validate_collection(
         identity = (episode, piece)
         _require(episode == seed and episode in episodes and piece in SAMPLE_PIECES, f"{role} exclusion {index} escaped role")
         _require(identity not in seen and identity not in excluded_identities, f"{role} exclusion identity duplicated/also eligible: {identity}")
+        code = str(_required(item, "code"))
+        detail = str(_required(item, "detail"))
+        if code == "canonical_trajectory_unavailable":
+            _require(
+                detail in (
+                    "reason=terminal;canonical trajectory unavailable before scheduled sample",
+                    "reason=no_canonical_action;canonical trajectory unavailable before scheduled sample",
+                ),
+                f"{role} unavailable-slot reason is not frozen",
+            )
         excluded_identities.add(identity)
     exact_schedule = {(episode, piece) for episode in episodes for piece in SAMPLE_PIECES}
     _require(seen | excluded_identities == exact_schedule, f"{role} eligible/excluded identities do not exactly cover the frozen schedule")
@@ -642,7 +1158,33 @@ def validate_collection(
         episode = _integer(_required(item, "episode_id"), f"{role} episode id")
         _require(_integer(_required(item, "rows"), f"{role} episode rows") == actual_rows_by_episode[episode], f"{role} per-episode row count mismatch for {episode}")
         _require(_integer(_required(item, "exclusions"), f"{role} episode exclusions") == actual_exclusions_by_episode[episode], f"{role} per-episode exclusion count mismatch for {episode}")
-    _require(_integer(_required(manifest, "counterfactual_states_completed"), f"{role} manifest completed states") == total, f"{role} manifest completed-state mismatch")
+    unavailable_count = sum(
+        str(_required(item, "code")) == "canonical_trajectory_unavailable"
+        for item in exclusions
+    )
+    attempted = len(rows) + len(exclusions) - unavailable_count
+    for container, label in ((metadata, "metadata"), (manifest, "manifest")):
+        _require(
+            _integer(_required(container, "counterfactual_states_completed"), f"{role} {label} completed states") == attempted,
+            f"{role} {label} completed-state mismatch",
+        )
+        _require(
+            _integer(_required(container, "counterfactual_states_attempted"), f"{role} {label} attempted states") == attempted,
+            f"{role} {label} attempted-state mismatch",
+        )
+        _require(
+            _integer(_required(container, "scheduled_slots_accounted"), f"{role} {label} accounted slots") == total,
+            f"{role} {label} schedule-accounting mismatch",
+        )
+    repeatability_probe_seconds = _validate_repeatability_sentinels(
+        table,
+        metadata,
+        manifest,
+        rows,
+        episode_evidence,
+        training=training,
+        synthetic=synthetic,
+    )
     _require(_same_number(_required(manifest, "positive_advantage_fraction"), positive_fraction), f"{role} manifest positive fraction mismatch")
     _require_scope_false(manifest, ("validation_seed_used", "sealed_test_seed_used"), f"{role} manifest")
     _require(_bool(_required(manifest, "real_model_or_game_loaded"), f"{role} real-model flag") is (not synthetic), f"{role} model/game mode mismatch")
@@ -684,7 +1226,17 @@ def validate_collection(
         _require(_integer(_required(manifest, "first32_projection_basis_states"), "training projection basis") == 432, "training projection basis mismatch")
         _require(_required(manifest, "first32_projection_formula") == PROJECTION_FORMULA, "training projection formula mismatch")
         _require(_number(_required(manifest, "first32_projection_limit_seconds"), "projection limit") == 3300.0, "training projection limit mismatch")
-        _require(_same_number(projected, 2.0 * setup + elapsed / 32.0 * 432.0, tolerance=1.0e-10), "training projection arithmetic mismatch")
+        _require(0.0 <= repeatability_probe_seconds <= elapsed, "training repeatability duration exceeds first32 elapsed")
+        _require(
+            _same_number(
+                projected,
+                2.0 * setup
+                + (elapsed - repeatability_probe_seconds) / 32.0 * 432.0
+                + repeatability_probe_seconds,
+                tolerance=1.0e-10,
+            ),
+            "training projection arithmetic mismatch",
+        )
         _require(0.0 <= projected <= 3300.0, "training projection exceeds preregistration")
         for key in (
             "first32_setup_seconds", "first32_elapsed_seconds", "first32_projected_seconds",
@@ -733,6 +1285,10 @@ def validate_ridge(
     _require(
         artifact_dependency_graph == training["engine_dependency_graph"],
         "ridge artifact engine dependency graph differs from training collection",
+    )
+    _require(
+        _required(artifact, "backend_binding") == training["backend_binding"],
+        "ridge artifact backend binding differs from training collection",
     )
     _require(_normal(_required(artifact, "source_table_path")) == _normal(training_table_path), "ridge training table path mismatch")
     _require(_digest(_required(artifact, "source_table_sha256"), "ridge source table") == training["table_sha256"], "ridge training table hash mismatch")
@@ -817,7 +1373,101 @@ def _lower_bound(features: Sequence[Any], ridge: dict[str, Any]) -> float:
     return _type7(predictions)
 
 
-def recompute_calibration(rows: list[dict[str, Any]], ridge: dict[str, Any], schedules: list[list[int]], measured_overhead: float) -> dict[str, Any]:
+def _float64_bitstring(value: Any, label: str) -> str:
+    number = _number(value, label)
+    return f"{struct.unpack('>Q', struct.pack('>d', number))[0]:064b}"
+
+
+def _deployment_evidence(row: dict[str, Any], row_index: int) -> dict[str, Any]:
+    value = _required(row, "deployment_decision")
+    _require(isinstance(value, dict), f"calibration row {row_index} lacks deployment evidence")
+    _require(_required(value, "deployment_decision_schema_version") == DEPLOYMENT_SCHEMA, "deployment schema mismatch")
+    feature_schema = _digest(_required(value, "production_feature_schema_digest"), "deployment feature schema")
+    _require(feature_schema == FEATURE_DIGEST, "deployment feature schema mismatch")
+    _require(_required(value, "production_feature_digest_encoding") == DEPLOYMENT_FEATURE_ENCODING, "deployment feature encoding mismatch")
+    live_features = list(_required(value, "production_feature_vector"))
+    row_features = list(_required(row, "features"))
+    _require(len(live_features) == FEATURE_COUNT and len(row_features) == FEATURE_COUNT, "deployment feature width mismatch")
+    _require(
+        all(
+            _float64_bitstring(left, "deployment feature")
+            == _float64_bitstring(right, "row feature")
+            for left, right in zip(live_features, row_features, strict=True)
+        ),
+        "deployment feature vector differs from collected row",
+    )
+    feature_payload = "\n".join(
+        [feature_schema, *(_float64_bitstring(item, "deployment feature") for item in live_features)]
+    ).encode("utf-8")
+    _require(
+        _digest(_required(value, "production_feature_vector_sha256"), "deployment feature digest")
+        == hashlib.sha256(feature_payload).hexdigest(),
+        "deployment feature digest mismatch",
+    )
+    decision = _bool(_required(value, "production_decision"), "deployment decision")
+    lower_bound = _number(_required(value, "production_gate_lower_bound"), "deployment lower bound")
+    _require(decision is (lower_bound > 0.05), "deployment threshold decision mismatch")
+    _require(
+        _required(value, "production_gate_fallback_reason")
+        == ("none" if decision else "lower_bound_not_above_threshold"),
+        "deployment fallback reason mismatch",
+    )
+    top1 = _integer(_required(value, "canonical_top1_candidate_index"), "deployment top1 index")
+    top2 = _integer(_required(value, "canonical_top2_candidate_index"), "deployment top2 index")
+    _require(top1 == _integer(_required(row, "canonical_top1_candidate_index"), "row top1 index"), "deployment top1 index mismatch")
+    _require(top2 == _integer(_required(row, "canonical_top2_candidate_index"), "row top2 index"), "deployment top2 index mismatch")
+    top1_action = str(_required(value, "canonical_top1_action_digest"))
+    top2_action = str(_required(value, "canonical_top2_action_digest"))
+    _require(top1_action == str(_required(row, "canonical_top1_action_digest")), "deployment top1 action mismatch")
+    _require(top2_action == str(_required(row, "canonical_top2_action_digest")), "deployment top2 action mismatch")
+    top1_node = str(_required(value, "canonical_top1_node_identity"))
+    top2_node = str(_required(value, "canonical_top2_node_identity"))
+    selected_index = _integer(_required(value, "production_selected_candidate_index"), "deployment selected index")
+    selected_action = str(_required(value, "production_selected_action_digest"))
+    selected_node = str(_required(value, "production_selected_node_identity"))
+    expected_index = top2 if decision else top1
+    expected_action = top2_action if decision else top1_action
+    expected_node = top2_node if decision else top1_node
+    selected_mismatch = selected_index != expected_index or selected_action != expected_action or selected_node != expected_node
+    applied_mismatch = (
+        str(_required(value, "production_applied_action_digest")) != selected_action
+        or str(_required(value, "production_applied_node_identity")) != selected_node
+    )
+    before = str(_required(value, "canonical_state_digest_before"))
+    state_mismatch = (
+        not before
+        or str(_required(value, "canonical_state_digest_after")) != before
+        or str(_required(value, "production_clone_state_digest_before")) != before
+        or not str(_required(value, "production_applied_clone_state_digest"))
+    )
+    started = _integer(_required(value, "production_gate_incremental_started_ns"), "deployment start ns")
+    finished = _integer(_required(value, "production_gate_incremental_finished_ns"), "deployment finish ns")
+    elapsed = _integer(_required(value, "production_gate_incremental_elapsed_ns"), "deployment elapsed ns")
+    _require(started >= 0 and finished >= started and elapsed == finished - started, "deployment timing mismatch")
+    _require(_required(value, "production_gate_incremental_scope") == DEPLOYMENT_TIMING_SCOPE, "deployment timing scope mismatch")
+    binding = "\n".join([DEPLOYMENT_SCHEMA, str(selected_index), selected_action, selected_node]).encode("utf-8")
+    _require(
+        _digest(_required(value, "production_selection_binding_sha256"), "deployment selection binding")
+        == hashlib.sha256(binding).hexdigest(),
+        "deployment selection binding mismatch",
+    )
+    return {
+        "lower_bound": lower_bound,
+        "decision": decision,
+        "selected_mismatch": selected_mismatch or applied_mismatch or state_mismatch,
+        "fallback_mismatch": (not decision) and (selected_mismatch or applied_mismatch or state_mismatch),
+        "elapsed_ms": elapsed / 1_000_000.0,
+    }
+
+
+def recompute_calibration(
+    rows: list[dict[str, Any]],
+    ridge: dict[str, Any],
+    schedules: list[list[int]],
+    measured_overhead: float,
+    *,
+    synthetic: bool = False,
+) -> dict[str, Any]:
     # Recreate the production vectorized NumPy path independently from the
     # calibration module, then compare it with the scalar reference below.
     import numpy as np
@@ -838,19 +1488,39 @@ def recompute_calibration(rows: list[dict[str, Any]], ridge: dict[str, Any], sch
             standardized[row_index, :] @ coefficients[1:, :]
             + coefficients[0, :]
         )
-    production_lower = np.quantile(predictions, 0.10, axis=1, method="linear")
-    _require(bool(np.all(np.isfinite(production_lower))), "non-finite independent production prediction")
+    python_lower = np.quantile(predictions, 0.10, axis=1, method="linear")
+    _require(bool(np.all(np.isfinite(python_lower))), "non-finite independent Python prediction")
     decisions: list[tuple[int, float, bool, bool, bool]] = []
     reference_lower: list[float] = []
     production_reference_mismatch_count = 0
+    selected_action_mismatch_count = 0
+    fallback_top1_mismatch_count = 0
+    live_overheads: list[float] = []
+    live_lower: list[float] = []
     for row_index, row in enumerate(rows):
         reference = _lower_bound(_required(row, "features"), ridge)
-        production = float(production_lower[row_index])
+        live = (
+            {
+                "lower_bound": float(python_lower[row_index]),
+                "decision": bool(float(python_lower[row_index]) > 0.05),
+                "selected_mismatch": False,
+                "fallback_mismatch": False,
+                "elapsed_ms": measured_overhead,
+            }
+            if synthetic and row.get("deployment_decision") is None
+            else _deployment_evidence(row, row_index + 1)
+        )
+        production = live["lower_bound"]
         tolerance = 1.0e-10 * max(1.0, abs(reference))
         _require(abs(production - reference) <= tolerance, f"independent production/reference numerical mismatch at row {row_index + 1}")
-        production_decision = production > 0.05
+        _require(abs(float(python_lower[row_index]) - reference) <= tolerance, f"independent Python/reference numerical mismatch at row {row_index + 1}")
+        production_decision = live["decision"]
         reference_decision = reference > 0.05
         production_reference_mismatch_count += production_decision != reference_decision
+        selected_action_mismatch_count += bool(live["selected_mismatch"])
+        fallback_top1_mismatch_count += bool(live["fallback_mismatch"])
+        live_overheads.append(float(live["elapsed_ms"]))
+        live_lower.append(production)
         reference_lower.append(reference)
         decisions.append(
             (
@@ -891,6 +1561,8 @@ def recompute_calibration(rows: list[dict[str, Any]], ridge: dict[str, Any], sch
         "lower_quantile": 0.10,
         "empty_override_replicate_count": empty,
     }
+    derived_overhead = statistics.median(live_overheads)
+    _require(_same_number(measured_overhead, derived_overhead, tolerance=1.0e-12), "reported overhead differs from live row evidence")
     checks = {
         "minimum_state_count": state_count >= 120,
         "exact_calibration_episodes": sorted({item[0] for item in decisions}) == list(CALIBRATION_EPISODES),
@@ -903,9 +1575,9 @@ def recompute_calibration(rows: list[dict[str, Any]], ridge: dict[str, Any], sch
         "mean_advantage_lower_bound": bootstrap["mean_advantage_lower90"] > 0.0,
         "no_top2_only_terminal": unsafe == 0,
         "production_reference_exact": production_reference_mismatch_count == 0,
-        "selected_action_matches_decision": True,
-        "fallback_top1_exact": True,
-        "overhead_within_budget": measured_overhead <= 0.10,
+        "selected_action_matches_decision": selected_action_mismatch_count == 0,
+        "fallback_top1_exact": fallback_top1_mismatch_count == 0,
+        "overhead_within_budget": derived_overhead <= 0.10,
         "artifact_finite": True,
         "feature_schema_exact": True,
         "coefficient_shape_exact": True,
@@ -924,14 +1596,14 @@ def recompute_calibration(rows: list[dict[str, Any]], ridge: dict[str, Any], sch
         "override_mean_unclipped_A6": mean_advantage,
         "unsafe_top2_terminal_count": unsafe,
         "production_reference_mismatch_count": production_reference_mismatch_count,
-        "selected_action_mismatch_count": 0,
-        "fallback_top1_mismatch_count": 0,
-        "median_decision_overhead_ms": measured_overhead,
+        "selected_action_mismatch_count": selected_action_mismatch_count,
+        "fallback_top1_mismatch_count": fallback_top1_mismatch_count,
+        "median_decision_overhead_ms": derived_overhead,
         "bootstrap": bootstrap,
         "checks": checks,
         "promoted": all(checks.values()),
         "production_reference_max_abs_error": float(
-            np.max(np.abs(production_lower - np.asarray(reference_lower, dtype=np.float64)))
+            np.max(np.abs(np.asarray(live_lower, dtype=np.float64) - np.asarray(reference_lower, dtype=np.float64)))
         ),
     }
 
@@ -1158,7 +1830,13 @@ def assess(args: argparse.Namespace, milestones: Milestones) -> dict[str, Any]:
     observed_assessment = documents["calibration_assessment"]
     measured_overhead = _number(_required(observed_assessment, "median_decision_overhead_ms"), "measured calibration overhead")
     milestones.write("independent_recompute_begin")
-    expected = recompute_calibration(calibration["rows"], ridge, freeze["calibration_schedules"], measured_overhead)
+    expected = recompute_calibration(
+        calibration["rows"],
+        ridge,
+        freeze["calibration_schedules"],
+        measured_overhead,
+        synthetic=args.synthetic,
+    )
     milestones.write("independent_recompute_complete", promoted=expected["promoted"], override_count=expected["override_count"])
     validate_calibration_assessment(
         observed_assessment, expected, synthetic=args.synthetic,

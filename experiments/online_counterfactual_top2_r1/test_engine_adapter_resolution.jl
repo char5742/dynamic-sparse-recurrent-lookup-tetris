@@ -15,6 +15,51 @@ using .R1ProductionEngineAdapter
     @test !isdefined(Main, :evaluate_openvino_episode)
 end
 
+@testset "PythonCall runtime origin contract is exact and fail closed" begin
+    good = (;
+        python_version="3.12.13",
+        numpy_version="2.4.6",
+        openvino_version="2026.2.1-21919-ede283a88e3-releases/2026/2",
+        python_executable=R1ProductionEngineAdapter._FROZEN_PYTHON_EXECUTABLE,
+        python_base_prefix=R1ProductionEngineAdapter._FROZEN_PYTHON_BASE_PREFIX,
+        python_prefix=R1ProductionEngineAdapter._FROZEN_PYTHON_PREFIX,
+        pythonpath_cleared=true,
+        pythonhome_cleared=true,
+        python_no_user_site="1",
+        openvino_module_file=R1ProductionEngineAdapter._FROZEN_OPENVINO_MODULE,
+        openvino_package_root=R1ProductionEngineAdapter._FROZEN_OPENVINO_ROOT,
+        openvino_package_file_count=
+            R1ProductionEngineAdapter._FROZEN_OPENVINO_PACKAGE_FILE_COUNT,
+        openvino_package_bytes=R1ProductionEngineAdapter._FROZEN_OPENVINO_PACKAGE_BYTES,
+        openvino_package_tree_sha256=
+            R1ProductionEngineAdapter._FROZEN_OPENVINO_PACKAGE_SHA256,
+        openvino_loaded_native_modules=
+            R1ProductionEngineAdapter._FROZEN_OPENVINO_NATIVE_MODULES,
+        openvino_loaded_native_sha256=
+            R1ProductionEngineAdapter._FROZEN_OPENVINO_NATIVE_SHA256,
+    )
+    proof = R1ProductionEngineAdapter._validate_python_runtime_origin_facts(good)
+    @test proof.python_runtime_origin_schema == "r1-python-runtime-origin-v1"
+    @test proof.python_bridge == "PythonCall"
+    @test proof.pythonpath_cleared
+    @test proof.pythonhome_cleared
+    @test length(proof.openvino_loaded_native_modules) == 5
+    @test_throws ErrorException R1ProductionEngineAdapter._validate_python_runtime_origin_facts(
+        merge(good, (; python_prefix=raw"C:\ambient-python")),
+    )
+    @test_throws ErrorException R1ProductionEngineAdapter._validate_python_runtime_origin_facts(
+        merge(good, (; pythonpath_cleared=false)),
+    )
+    @test_throws ErrorException R1ProductionEngineAdapter._validate_python_runtime_origin_facts(
+        merge(good, (; openvino_package_tree_sha256="0"^64)),
+    )
+    bad_native = collect(good.openvino_loaded_native_modules)
+    bad_native[1] = merge(bad_native[1], (; sha256="f"^64))
+    @test_throws ErrorException R1ProductionEngineAdapter._validate_python_runtime_origin_facts(
+        merge(good, (; openvino_loaded_native_modules=bad_native)),
+    )
+end
+
 abstract type FakeMino end
 for name in (:FI, :FO, :FS, :FZ, :FJ, :FL, :FT)
     @eval begin
@@ -178,6 +223,9 @@ end
     @test occursin("GameState(root)", source)
     @test occursin("node_replay_mismatch", source)
     @test occursin("future_oracle_mutated_state", source)
+    @test occursin("_python_runtime_origin_facts", source)
+    @test occursin("openvino_package_tree_sha256", source)
+    @test occursin("openvino_loaded_native_sha256", source)
 end
 
 @testset "vendored candidate generator is byte-identical and privately loaded" begin

@@ -49,7 +49,27 @@ EXPECTED_PYTHON_VERSION = "3.12.13"
 EXPECTED_BLAS_NAME = "scipy-openblas"
 EXPECTED_BLAS_VERSION = "0.3.31.188.0"
 EXPECTED_OPENVINO_FULL_VERSION = "2026.2.1-21919-ede283a88e3-releases/2026/2"
-PROJECTION_FORMULA = "2*setup_seconds + first32_collection_seconds/32*432"
+PROJECTION_FORMULA = (
+    "2*setup_seconds + (first32_collection_seconds-repeatability_probe_seconds)/32*432 "
+    "+ repeatability_probe_seconds"
+)
+EXPECTED_PYTHON_RUNTIME_ORIGIN = {
+    "python_runtime_origin_schema": "r1-python-runtime-origin-v1",
+    "python_bridge": "PythonCall",
+    "python_executable": r"D:\tetris-paper-plus\python-env\Scripts\python.exe",
+    "python_base_prefix": r"C:\Users\fshuu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python",
+    "python_prefix": r"D:\tetris-paper-plus\python-env",
+    "pythonpath_cleared": True,
+    "pythonhome_cleared": True,
+    "python_no_user_site": "1",
+    "openvino_module_file": r"D:\tetris-paper-plus\python-env\Lib\site-packages\openvino\__init__.py",
+    "openvino_package_root": r"D:\tetris-paper-plus\python-env\Lib\site-packages\openvino",
+    "openvino_package_file_count": 1102,
+    "openvino_package_bytes": 234324334,
+    "openvino_package_tree_sha256": "c292b25245f36e937f21b105023737be80491e70de5f24b1704ad1ced8547e43",
+    "openvino_package_tree_aggregate": "sorted relative-path NUL decimal-bytes NUL lowercase-sha256 newline",
+    "openvino_loaded_native_sha256": "929dd49859750bfa59c850234c8eeb872c84db05c1b60510e9a9db8b7d756a74",
+}
 ENGINE_DEPENDENCY_ENCODING = "sorted relative_path + NUL + lowercase sha256 + newline"
 UPSTREAM_TETRISAI_HEAD = "6fdfb1d30197246fd862b716438e998f0315c830"
 ENGINE_DEPENDENCY_PATHS = [
@@ -382,6 +402,31 @@ def _sha256_string(value: Any, label: str) -> str:
     return observed
 
 
+def _validate_python_runtime_origin(value: Any, label: str) -> dict[str, Any]:
+    _require(isinstance(value, dict), f"{label} missing")
+    for key, expected in EXPECTED_PYTHON_RUNTIME_ORIGIN.items():
+        observed = value.get(key)
+        if key in {
+            "python_executable", "python_base_prefix", "python_prefix",
+            "openvino_module_file", "openvino_package_root",
+        }:
+            _require(
+                os.path.normcase(os.path.abspath(str(observed)))
+                == os.path.normcase(os.path.abspath(str(expected))),
+                f"{label} {key} mismatch",
+            )
+        else:
+            _require(observed == expected, f"{label} {key} mismatch")
+    modules = value.get("openvino_loaded_native_modules")
+    _require(isinstance(modules, list) and len(modules) == 5, f"{label} native module list mismatch")
+    for index, module in enumerate(modules, 1):
+        _require(isinstance(module, dict), f"{label} native module {index} invalid")
+        _nonempty_string(module.get("path"), f"{label} native module {index} path")
+        _require(type(module.get("bytes")) is int and module["bytes"] > 0, f"{label} native module {index} bytes invalid")
+        _sha256_string(module.get("sha256"), f"{label} native module {index} digest")
+    return value
+
+
 def _synthetic_documents() -> tuple[dict[str, Any], dict[str, Any]]:
     names = _contract_feature_names()
     stable_digest = hashlib.sha256(b"r1-synthetic-stable-node-key-source").hexdigest()
@@ -451,6 +496,7 @@ def _synthetic_documents() -> tuple[dict[str, Any], dict[str, Any]]:
                 "canonical_action_digests": [],
                 "rows": 24,
                 "exclusions": 0,
+                "repeatability_sentinel": None,
             }
         )
     positive_fraction = sum(
@@ -467,10 +513,13 @@ def _synthetic_documents() -> tuple[dict[str, Any], dict[str, Any]]:
         "stable_node_key_source_sha256": stable_digest,
         "engine_dependency_graph": None,
         "counterfactual_states_completed": 288,
+        "counterfactual_states_attempted": 288,
+        "scheduled_slots_accounted": 288,
         "positive_advantage_fraction": positive_fraction,
         "first32_elapsed_seconds": 0.01,
         "first32_setup_seconds": 0.01,
         "first32_projected_seconds": 0.155,
+        "repeatability_probe_seconds": 0.0,
         "first32_projection_limit_seconds": 3300.0,
         "first32_projection_basis_states": 432,
         "first32_projection_formula": PROJECTION_FORMULA,
@@ -487,6 +536,7 @@ def _synthetic_documents() -> tuple[dict[str, Any], dict[str, Any]]:
         "synthetic": True,
         "validation_seed_used": False,
         "sealed_test_seed_used": False,
+        "repeatability_sentinels": [],
         "rows": rows,
     }
     # The table hash is filled only after publication by main().
@@ -505,10 +555,13 @@ def _synthetic_documents() -> tuple[dict[str, Any], dict[str, Any]]:
         "exclusion_count": 0,
         "role_seeds": TRAINING_IDS,
         "counterfactual_states_completed": 288,
+        "counterfactual_states_attempted": 288,
+        "scheduled_slots_accounted": 288,
         "positive_advantage_fraction": positive_fraction,
         "first32_elapsed_seconds": 0.01,
         "first32_setup_seconds": 0.01,
         "first32_projected_seconds": 0.155,
+        "repeatability_probe_seconds": 0.0,
         "first32_projection_limit_seconds": 3300.0,
         "first32_projection_basis_states": 432,
         "first32_projection_formula": PROJECTION_FORMULA,
@@ -592,6 +645,10 @@ def _load_training_table(
         _sha256_string(
             metadata_backend.get("evaluator_source_sha256"),
             "production evaluator source digest",
+        )
+        _validate_python_runtime_origin(
+            metadata_backend.get("python_runtime_origin"),
+            "production Python/OpenVINO runtime origin",
         )
     runtime_binding = _contract_document()["runtime_source_binding"]
     metadata_dependency_graph = _validate_engine_dependency_graph(
@@ -759,6 +816,7 @@ def _load_training_table(
         # Preserve the collector object unchanged; downstream assessment can
         # compare the identical runtime lineage without re-encoding it.
         "engine_dependency_graph": metadata_dependency_graph,
+        "backend_binding": metadata_backend,
     }
 
 
@@ -1159,6 +1217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "source_collection_manifest_path": str(manifest_path),
             "source_collection_manifest_sha256": table["source_manifest_sha256"],
             "engine_dependency_graph": table["engine_dependency_graph"],
+            "backend_binding": table["backend_binding"],
             "training_row_order_sha256": table["row_order_sha256"],
             "training_row_order_encoding": "episode_id,piece_index,root_state_digest newline joined",
             "design_freeze_path": str(freeze_path),

@@ -183,6 +183,8 @@ end
     @test row.top1_branch.bootstrap_q == 10.0
     @test row.top2_branch.bootstrap_q == 10.0
     @test row.top1_branch.future_stream_digest == row.top2_branch.future_stream_digest
+    @test row.top1_branch.branch_start_state_digest ==
+          row.top2_branch.branch_start_state_digest
     @test row.top1_branch.pre_action_current_piece_tokens ==
           row.top2_branch.pre_action_current_piece_tokens
     @test row.top1_branch.rng_digests == row.top2_branch.rng_digests
@@ -361,9 +363,221 @@ end
     @test all(==("synthetic-action-1"), episode.canonical_action_digests)
     @test [row.piece_index for row in episode.rows] == collect(10:10:240)
     @test episode.canonical_score == 60.0 * 240
+    @test length(episode.deployment_decisions) == length(episode.rows)
+    @test all(isnothing, episode.deployment_decisions)
     table = numeric_table(episode.rows)
     @test size(table.features) == (24, 70)
     @test all(table.advantage_unclipped .≈ 0.2)
+end
+
+@testset "training repeatability sentinel is exact and fail-closed" begin
+    tracked_base = make_adapter()
+    root_candidate_calls = Ref(0)
+    root_q_calls = Ref(0)
+    tracked = merge(tracked_base, (;
+        candidate_actions=state -> begin
+            state.piece_index == 9 && !state.branch_root_pending &&
+                (root_candidate_calls[] += 1)
+            tracked_base.candidate_actions(state)
+        end,
+        q_values=(state, actions) -> begin
+            state.piece_index == 9 && !state.branch_root_pending &&
+                (root_q_calls[] += 1)
+            tracked_base.q_values(state, actions)
+        end,
+    ))
+    retained_root_q_counts = Int[]
+    sentinel_events = Any[]
+    train = collect_role_episode(
+        tracked,
+        first(R1_TRAIN_SEEDS),
+        :train;
+        episode_id=first(R1_TRAIN_SEEDS),
+        on_sample_complete=event -> push!(sentinel_events, event),
+        on_row_retained=(state, actions, q, row) -> begin
+            push!(retained_root_q_counts, root_q_calls[])
+            (; piece_index=row.piece_index, root_digest=tracked.state_digest(state))
+        end,
+    )
+    sentinel = train.repeatability_sentinel
+    @test sentinel isa RepeatabilitySentinel
+    @test sentinel.schema == "r1-repeatability-sentinel-v1"
+    @test sentinel.seed == first(R1_TRAIN_SEEDS)
+    @test sentinel.episode_id == first(R1_TRAIN_SEEDS)
+    @test sentinel.piece_index == 10
+    @test sentinel.root_state_digest == train.rows[1].root_state_digest
+    @test sentinel.root_future_stream_digest == train.rows[1].root_future_stream_digest
+    @test sentinel.repetitions_per_branch == 2
+    @test sentinel.added_branch_rollouts == 2
+    @test sentinel.added_rollout_pieces == 12
+    @test root_candidate_calls[] == 2
+    @test root_q_calls[] == 2
+    @test sentinel.reference_root_candidate_order_digest ==
+          sentinel.repeated_root_candidate_order_digest
+    @test sentinel.reference_root_q_vector_digest == sentinel.repeated_root_q_vector_digest
+    @test sentinel.reference_top1_outcome_digest == sentinel.repeated_top1_outcome_digest
+    @test sentinel.reference_top2_outcome_digest == sentinel.repeated_top2_outcome_digest
+    @test length(sentinel.reference_top1_outcome_digest) == 64
+    @test length(sentinel.reference_top2_outcome_digest) == 64
+    @test sentinel.reference_top1_outcome_digest ==
+          branch_outcome_digest(train.rows[1].top1_branch)
+    @test sentinel.reference_top2_outcome_digest ==
+          branch_outcome_digest(train.rows[1].top2_branch)
+    @test isfinite(sentinel.elapsed_seconds)
+    @test sentinel.elapsed_seconds >= 0.0
+    @test retained_root_q_counts[1] == 2
+    @test sentinel_events[1].repeatability_sentinel_elapsed_seconds ==
+          sentinel.elapsed_seconds
+    @test all(
+        event.repeatability_sentinel_elapsed_seconds == 0.0 for event in sentinel_events[2:end]
+    )
+    @test length(train.deployment_decisions) == length(train.rows)
+    @test [decision.piece_index for decision in train.deployment_decisions] ==
+          [row.piece_index for row in train.rows]
+    @test [decision.root_digest for decision in train.deployment_decisions] ==
+          [row.root_state_digest for row in train.rows]
+
+    later_training_seed = collect_role_episode(
+        make_adapter(),
+        R1_TRAIN_SEEDS[2],
+        :train;
+        episode_id=R1_TRAIN_SEEDS[2],
+    )
+    @test isnothing(later_training_seed.repeatability_sentinel)
+
+    calibration = collect_role_episode(
+        make_adapter(),
+        first(R1_CALIBRATION_SEEDS),
+        :calibration;
+        episode_id=first(R1_CALIBRATION_SEEDS),
+    )
+    @test isnothing(calibration.repeatability_sentinel)
+
+    # The frozen sentinel belongs to the first *eligible* sampled state, not
+    # merely the first scheduled position.
+    ineligible_first_base = make_adapter()
+    ineligible_first = merge(ineligible_first_base, (;
+        candidate_actions=state -> state.piece_index == 9 ?
+            SyntheticAction[SyntheticAction(1)] :
+            ineligible_first_base.candidate_actions(state),
+    ))
+    shifted = collect_role_episode(
+        ineligible_first,
+        first(R1_TRAIN_SEEDS),
+        :train;
+        episode_id=first(R1_TRAIN_SEEDS),
+    )
+    @test shifted.exclusions[1].piece_index == 10
+    @test shifted.repeatability_sentinel.piece_index == 20
+
+    # The sentinel must rerun candidate/Q evaluation from the unchanged root.
+    # A changed fresh Q vector aborts before either repeated branch and before
+    # the first row callback can promote the sample.
+    nondeterministic_base = make_adapter()
+    mismatch_root_q_calls = Ref(0)
+    nondeterministic = merge(nondeterministic_base, (;
+        q_values=(state, actions) -> begin
+            if state.piece_index == 9 && !state.branch_root_pending
+                mismatch_root_q_calls[] += 1
+                mismatch_root_q_calls[] == 2 && return [10.0, 8.0, 1.0]
+            end
+            nondeterministic_base.q_values(state, actions)
+        end,
+    ))
+    promoted = Ref(false)
+    events = Any[]
+    observed = try
+        result = collect_role_episode(
+            nondeterministic,
+            first(R1_TRAIN_SEEDS),
+            :train;
+            episode_id=first(R1_TRAIN_SEEDS),
+            on_sample_complete=event -> push!(events, event),
+        )
+        promoted[] = !isempty(result.rows)
+        nothing
+    catch error
+        error
+    end
+    @test observed isa FatalCollectionInvariant
+    @test observed.code == :repeatability_sentinel_root_evidence
+    @test occursin("fresh root Q vector differs", observed.detail)
+    @test mismatch_root_q_calls[] == 2
+    @test !promoted[]
+    @test isempty(events)
+end
+
+@testset "retained-row callback is aligned and cannot mutate the root" begin
+    adapter = make_adapter()
+    episode = collect_episode(
+        adapter,
+        31;
+        episode_id=101,
+        on_row_retained=(state, actions, q, row) -> (;
+            piece_index=row.piece_index,
+            root_digest=adapter.state_digest(state),
+            action_count=length(actions),
+            q_count=length(q),
+        ),
+    )
+    @test length(episode.deployment_decisions) == length(episode.rows) == 24
+    @test [item.piece_index for item in episode.deployment_decisions] ==
+          [row.piece_index for row in episode.rows]
+    @test [item.root_digest for item in episode.deployment_decisions] ==
+          [row.root_state_digest for row in episode.rows]
+    @test all(item.action_count == item.q_count == 3 for item in episode.deployment_decisions)
+
+    mutation_events = Any[]
+    observed = try
+        collect_episode(
+            make_adapter(),
+            31;
+            episode_id=102,
+            on_sample_complete=event -> push!(mutation_events, event),
+            on_row_retained=(state, actions, q, row) -> begin
+                state.score += 1.0
+                nothing
+            end,
+        )
+        nothing
+    catch error
+        error
+    end
+    @test observed isa FatalCollectionInvariant
+    @test observed.code == :row_retained_callback_mutation
+    @test isempty(mutation_events)
+end
+
+@testset "early canonical termination fully accounts the frozen grid" begin
+    early_terminal_base = make_adapter()
+    early_terminal = merge(early_terminal_base, (;
+        apply_action=(state, action) -> begin
+            was_branch_root = state.branch_root_pending
+            early_terminal_base.apply_action(state, action)
+            if !was_branch_root && state.piece_index == 15
+                state.terminal = true
+            end
+            state
+        end,
+    ))
+    attempted_events = Any[]
+    episode = collect_episode(
+        early_terminal,
+        31;
+        episode_id=99,
+        on_sample_complete=event -> push!(attempted_events, event),
+    )
+    @test episode.canonical_terminal
+    @test episode.canonical_pieces == 15
+    @test length(episode.rows) == 1
+    @test episode.rows[1].piece_index == 10
+    @test length(episode.exclusions) == 23
+    @test [item.piece_index for item in episode.exclusions] == collect(20:10:240)
+    @test all(item.code == :canonical_trajectory_unavailable for item in episode.exclusions)
+    @test all(occursin("reason=terminal", item.detail) for item in episode.exclusions)
+    @test length(episode.rows) + length(episode.exclusions) == length(R1_SAMPLE_PIECES)
+    @test length(attempted_events) == 1
+    @test attempted_events[1].piece_index == 10
 end
 
 @testset "role seeds are fail-closed" begin

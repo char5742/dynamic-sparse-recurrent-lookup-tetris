@@ -66,11 +66,14 @@ try {
         $Julia.path, '--startup-file=no', '--history-file=no', "--project=$Repository",
         (Join-Path $PSScriptRoot 'collect_online.jl'), 'calibration',
         $CalibrationSmokeTable, $CalibrationSmokeManifest,
-        $CalibrationMilestones, '--synthetic'
+        $CalibrationMilestones, $FittedRidgeArtifact, '--synthetic'
     ) -WorkingDirectory $Repository -OutputDirectory $Root -RunStarted $RunStarted `
         -TotalHardWallSeconds 120 -MaxPrivateCommittedBytes ([int64](4GB)) `
         -MaxWorkingSetResidentBytes ([int64](2GB)) -RequireChildMilestones `
-        -RequiredPhaseArtifacts @($CalibrationSmokeTable,$CalibrationSmokeManifest)
+        -RequiredPhaseArtifacts @($CalibrationSmokeTable,$CalibrationSmokeManifest) `
+        -EnvironmentOverrides ([ordered]@{
+            R1_EXPECTED_RIDGE_ARTIFACT_SHA256=(Get-FileHash -LiteralPath $FittedRidgeArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
+        })
     if ($Calibration.exit_code -ne 0) { throw "calibration collection production argv failed: $($Calibration.stop_reason)" }
 
     $CalibrationTable = Join-Path $Root 'calibration_table.json'

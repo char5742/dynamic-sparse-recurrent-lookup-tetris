@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import statistics
+import struct
 import subprocess
 import sys
 import time
@@ -113,6 +114,23 @@ EXPECTED_QUANTILE_METHOD = "linear_type7_position_1_plus_n_minus_1_p"
 EXPECTED_PYTHON_VERSION = "3.12.13"
 EXPECTED_NUMPY_VERSION = "2.4.6"
 EXPECTED_OPENVINO_FULL_VERSION = "2026.2.1-21919-ede283a88e3-releases/2026/2"
+EXPECTED_PYTHON_RUNTIME_ORIGIN = {
+    "python_runtime_origin_schema": "r1-python-runtime-origin-v1",
+    "python_bridge": "PythonCall",
+    "python_executable": r"D:\tetris-paper-plus\python-env\Scripts\python.exe",
+    "python_base_prefix": r"C:\Users\fshuu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python",
+    "python_prefix": r"D:\tetris-paper-plus\python-env",
+    "pythonpath_cleared": True,
+    "pythonhome_cleared": True,
+    "python_no_user_site": "1",
+    "openvino_module_file": r"D:\tetris-paper-plus\python-env\Lib\site-packages\openvino\__init__.py",
+    "openvino_package_root": r"D:\tetris-paper-plus\python-env\Lib\site-packages\openvino",
+    "openvino_package_file_count": 1102,
+    "openvino_package_bytes": 234324334,
+    "openvino_package_tree_sha256": "c292b25245f36e937f21b105023737be80491e70de5f24b1704ad1ced8547e43",
+    "openvino_package_tree_aggregate": "sorted relative-path NUL decimal-bytes NUL lowercase-sha256 newline",
+    "openvino_loaded_native_sha256": "929dd49859750bfa59c850234c8eeb872c84db05c1b60510e9a9db8b7d756a74",
+}
 EXPECTED_HANDOFF_ENVIRONMENT = {
     "calibration_table": "R1_EXPECTED_CALIBRATION_TABLE_SHA256",
     "calibration_manifest": "R1_EXPECTED_CALIBRATION_MANIFEST_SHA256",
@@ -239,6 +257,27 @@ def _require_digest(value: Any, label: str) -> str:
 
 def _normal_path(path: str | Path) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _validate_python_runtime_origin(value: Any, label: str) -> dict[str, Any]:
+    _require(isinstance(value, dict), f"{label} missing")
+    for key, expected in EXPECTED_PYTHON_RUNTIME_ORIGIN.items():
+        observed = value.get(key)
+        if key in {
+            "python_executable", "python_base_prefix", "python_prefix",
+            "openvino_module_file", "openvino_package_root",
+        }:
+            _require(_normal_path(str(observed)) == _normal_path(expected), f"{label} {key} mismatch")
+        else:
+            _require(observed == expected, f"{label} {key} mismatch")
+    modules = value.get("openvino_loaded_native_modules")
+    _require(isinstance(modules, list) and len(modules) == 5, f"{label} native module list mismatch")
+    for index, module in enumerate(modules, 1):
+        _require(isinstance(module, dict), f"{label} native module {index} invalid")
+        _require(type(module.get("path")) is str and bool(module["path"]), f"{label} native module {index} path invalid")
+        _require(_exact_int(module.get("bytes"), f"{label} native module {index} bytes") > 0, f"{label} native module {index} bytes invalid")
+        _require_digest(module.get("sha256"), f"{label} native module {index} digest")
+    return value
 
 
 def sha256_file(path: str | Path) -> str:
@@ -806,6 +845,10 @@ def _validate_collection_table(
             _require_key(metadata_backend, "evaluator_source_sha256"),
             f"{role} evaluator source",
         )
+        _validate_python_runtime_origin(
+            _require_key(metadata_backend, "python_runtime_origin"),
+            f"{role} Python/OpenVINO runtime origin",
+        )
     metadata_graph = _require_key(metadata, "engine_dependency_graph")
     manifest_graph = _require_key(manifest, "engine_dependency_graph")
     _require(
@@ -888,7 +931,7 @@ def _validate_collection_table(
             is True,
             f"{role} production manifest did not load the real model/game",
         )
-    return rows, validated_graph
+    return rows, validated_graph, metadata_backend
 
 
 def _load_production_gate(
@@ -897,7 +940,10 @@ def _load_production_gate(
     freeze_snapshot: JsonByteSnapshot,
     freeze_details: dict[str, Any],
     synthetic: bool,
-) -> tuple[dict[str, Any], GateArtifactEvidence, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[
+    dict[str, Any], GateArtifactEvidence, np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray, dict[str, Any] | None, dict[str, Any] | None,
+]:
     artifact = artifact_snapshot.value
     artifact_path = artifact_snapshot.path
     freeze_path = freeze_snapshot.path
@@ -979,7 +1025,7 @@ def _load_production_gate(
     manifest_evidence = training_manifest_snapshot.evidence
     training_table = training_table_snapshot.value
     training_manifest = training_manifest_snapshot.value
-    training_rows, training_engine_graph = _validate_collection_table(
+    training_rows, training_engine_graph, training_backend_binding = _validate_collection_table(
         training_table,
         training_manifest,
         role="training",
@@ -1077,6 +1123,11 @@ def _load_production_gate(
         validated_artifact_graph == training_engine_graph,
         "ridge artifact engine dependency graph differs from training collection",
     )
+    artifact_backend_binding = _require_key(artifact, "backend_binding")
+    _require(
+        artifact_backend_binding == training_backend_binding,
+        "ridge artifact backend binding differs from training collection",
+    )
     return (
         provenance,
         evidence,
@@ -1085,6 +1136,7 @@ def _load_production_gate(
         constant,
         coefficients,
         training_engine_graph,
+        training_backend_binding,
     )
 
 
@@ -1212,6 +1264,108 @@ def scalar_lower_bound_reference(
     return _type7_quantile(predictions, ONE_SIDED_LOWER_QUANTILE)
 
 
+DEPLOYMENT_DECISION_SCHEMA_VERSION = "r1-live-ridge-decision-v1"
+DEPLOYMENT_TIMING_SCOPE = (
+    "feature_build+ridge_eval+selection_binding;"
+    "excludes_candidate_enumeration+old_q_evaluation+artifact_load+clone_apply_verification"
+)
+DEPLOYMENT_FEATURE_DIGEST_ENCODING = (
+    "feature_schema_sha256 newline Float64-bitstring-per-feature newline joined"
+)
+
+
+def _float64_bitstring(value: float) -> str:
+    return f"{struct.unpack('>Q', struct.pack('>d', float(value)))[0]:064b}"
+
+
+def _live_deployment_evidence(raw: dict[str, Any], row_number: int) -> dict[str, Any]:
+    evidence = _require_key(raw, "deployment_decision")
+    _require(isinstance(evidence, dict), f"calibration row {row_number} lacks live deployment evidence")
+    _require(
+        str(_require_key(evidence, "deployment_decision_schema_version"))
+        == DEPLOYMENT_DECISION_SCHEMA_VERSION,
+        f"calibration row {row_number} deployment schema mismatch",
+    )
+    feature_schema = str(_require_key(evidence, "production_feature_schema_digest"))
+    _require(feature_schema == EXPECTED_FEATURE_NAMES_SHA256, "deployment feature schema mismatch")
+    encoding = str(_require_key(evidence, "production_feature_digest_encoding"))
+    _require(encoding == DEPLOYMENT_FEATURE_DIGEST_ENCODING, "deployment feature encoding mismatch")
+    live_features = [float(value) for value in _require_key(evidence, "production_feature_vector")]
+    row_features = [float(value) for value in _require_key(raw, "features")]
+    _require(len(live_features) == EXPECTED_FEATURE_COUNT, "deployment feature width mismatch")
+    _require(
+        all(_float64_bitstring(left) == _float64_bitstring(right) for left, right in zip(live_features, row_features, strict=True)),
+        f"calibration row {row_number} live features differ from collection features",
+    )
+    feature_payload = "\n".join(
+        [feature_schema, *(_float64_bitstring(value) for value in live_features)]
+    ).encode("utf-8")
+    _require(
+        str(_require_key(evidence, "production_feature_vector_sha256"))
+        == hashlib.sha256(feature_payload).hexdigest(),
+        "deployment feature digest mismatch",
+    )
+
+    decision = _require_bool(_require_key(evidence, "production_decision"), "production decision")
+    lower_bound = float(_require_key(evidence, "production_gate_lower_bound"))
+    _require(math.isfinite(lower_bound), "non-finite deployment lower bound")
+    _require(decision == (lower_bound > 0.05), "deployment threshold decision mismatch")
+    fallback = str(_require_key(evidence, "production_gate_fallback_reason"))
+    _require(
+        fallback == ("none" if decision else "lower_bound_not_above_threshold"),
+        "deployment fallback reason mismatch",
+    )
+    top1_index = _exact_int(_require_key(evidence, "canonical_top1_candidate_index"), "deployment top1 index")
+    top2_index = _exact_int(_require_key(evidence, "canonical_top2_candidate_index"), "deployment top2 index")
+    _require(top1_index == _exact_int(_require_key(raw, "canonical_top1_candidate_index"), "row top1 index"), "deployment/row top1 index mismatch")
+    _require(top2_index == _exact_int(_require_key(raw, "canonical_top2_candidate_index"), "row top2 index"), "deployment/row top2 index mismatch")
+    top1_action = str(_require_key(evidence, "canonical_top1_action_digest"))
+    top2_action = str(_require_key(evidence, "canonical_top2_action_digest"))
+    _require(top1_action == str(_require_key(raw, "canonical_top1_action_digest")), "deployment/row top1 action mismatch")
+    _require(top2_action == str(_require_key(raw, "canonical_top2_action_digest")), "deployment/row top2 action mismatch")
+    top1_node = str(_require_key(evidence, "canonical_top1_node_identity"))
+    top2_node = str(_require_key(evidence, "canonical_top2_node_identity"))
+    selected_index = _exact_int(_require_key(evidence, "production_selected_candidate_index"), "deployment selected index")
+    selected_action = str(_require_key(evidence, "production_selected_action_digest"))
+    selected_node = str(_require_key(evidence, "production_selected_node_identity"))
+    expected_index = top2_index if decision else top1_index
+    expected_action = top2_action if decision else top1_action
+    expected_node = top2_node if decision else top1_node
+    _require(selected_index == expected_index, "deployment selected index mismatch")
+    _require(selected_action == expected_action, "deployment selected action mismatch")
+    _require(selected_node == expected_node, "deployment selected node mismatch")
+    _require(str(_require_key(evidence, "production_applied_action_digest")) == selected_action, "deployment applied action mismatch")
+    _require(str(_require_key(evidence, "production_applied_node_identity")) == selected_node, "deployment applied node mismatch")
+    canonical_before = str(_require_key(evidence, "canonical_state_digest_before"))
+    _require(canonical_before, "empty deployment canonical digest")
+    _require(str(_require_key(evidence, "canonical_state_digest_after")) == canonical_before, "deployment mutated canonical state")
+    _require(str(_require_key(evidence, "production_clone_state_digest_before")) == canonical_before, "deployment clone/root mismatch")
+    _require(str(_require_key(evidence, "production_applied_clone_state_digest")), "empty applied clone digest")
+    started = _exact_int(_require_key(evidence, "production_gate_incremental_started_ns"), "deployment start ns")
+    finished = _exact_int(_require_key(evidence, "production_gate_incremental_finished_ns"), "deployment finish ns")
+    elapsed = _exact_int(_require_key(evidence, "production_gate_incremental_elapsed_ns"), "deployment elapsed ns")
+    _require(started >= 0 and finished >= started and elapsed == finished - started, "deployment timing mismatch")
+    _require(
+        str(_require_key(evidence, "production_gate_incremental_scope")) == DEPLOYMENT_TIMING_SCOPE,
+        "deployment timing scope mismatch",
+    )
+    binding_payload = "\n".join(
+        [DEPLOYMENT_DECISION_SCHEMA_VERSION, str(selected_index), selected_action, selected_node]
+    ).encode("utf-8")
+    _require(
+        str(_require_key(evidence, "production_selection_binding_sha256"))
+        == hashlib.sha256(binding_payload).hexdigest(),
+        "deployment selection binding mismatch",
+    )
+    return {
+        "lower_bound": lower_bound,
+        "use_top2": decision,
+        "selected_candidate_index": selected_index,
+        "selected_action_digest": selected_action,
+        "elapsed_ms": elapsed / 1_000_000.0,
+    }
+
+
 def calibration_rows_from_table(
     raw_rows: Sequence[dict[str, Any]],
     means: np.ndarray,
@@ -1219,6 +1373,7 @@ def calibration_rows_from_table(
     constant: np.ndarray,
     coefficients: np.ndarray,
     production_selector: Any = production_select_action,
+    require_live_deployment: bool = False,
 ) -> tuple[list[CalibrationRow], dict[str, float]]:
     matrix_rows: list[list[float]] = []
     for row_number, row in enumerate(raw_rows, 1):
@@ -1241,9 +1396,9 @@ def calibration_rows_from_table(
         ],
         dtype=np.float64,
     )
-    # Warm the exact one-state deploy selector before collecting one independent
-    # latency observation per calibration state.  The batch path remains a
-    # separate numerical diagnostic and is not used for the online budget.
+    # Python one-state and batch paths are independent conformance references.
+    # Production decisions and timing come only from the live Julia collection
+    # evidence, which includes feature construction and candidate binding.
     first = raw_rows[0]
     production_selector(
         matrix_rows[0],
@@ -1260,9 +1415,10 @@ def calibration_rows_from_table(
     production_values: list[float] = []
     per_state_overhead_ms: list[float] = []
     selections: list[dict[str, Any]] = []
-    for features, raw in zip(matrix_rows, raw_rows, strict=True):
-        started = time.perf_counter_ns()
-        selection = production_selector(
+    python_selections: list[dict[str, Any]] = []
+    for row_number, (features, raw) in enumerate(zip(matrix_rows, raw_rows, strict=True), 1):
+        legacy_started = time.perf_counter_ns()
+        python_selection = production_selector(
             features,
             valid_action_count=_exact_int(_require_key(raw, "valid_action_count"), "calibration valid_action_count"),
             canonical_top1_candidate_index=_exact_int(_require_key(raw, "canonical_top1_candidate_index"), "calibration top1 index"),
@@ -1274,13 +1430,40 @@ def calibration_rows_from_table(
             constant=constant,
             coefficients=coefficients,
         )
-        per_state_overhead_ms.append((time.perf_counter_ns() - started) / 1_000_000.0)
+        legacy_elapsed_ms = (time.perf_counter_ns() - legacy_started) / 1_000_000.0
+        selection = (
+            _live_deployment_evidence(raw, row_number)
+            if require_live_deployment
+            else {
+                "lower_bound": float(python_selection["lower_bound"]),
+                "use_top2": bool(python_selection["use_top2"]),
+                "selected_candidate_index": _exact_int(
+                    python_selection["selected_candidate_index"],
+                    "synthetic selected index",
+                ),
+                "selected_action_digest": str(python_selection["selected_action_digest"]),
+                "elapsed_ms": legacy_elapsed_ms,
+            }
+        )
+        per_state_overhead_ms.append(float(selection["elapsed_ms"]))
         production_values.append(float(selection["lower_bound"]))
         selections.append(selection)
+        python_selections.append(python_selection)
     production = np.asarray(production_values, dtype=np.float64)
     difference = np.abs(production - reference)
     tolerance = 1.0e-10 * np.maximum(1.0, np.abs(reference))
     _require(bool(np.all(difference <= tolerance)), "production/scalar lower-bound numerical mismatch")
+    python_values = np.asarray(
+        [float(selection["lower_bound"]) for selection in python_selections], dtype=np.float64
+    )
+    _require(
+        bool(np.all(np.abs(python_values - production) <= tolerance)),
+        "live/Python one-state lower-bound mismatch",
+    )
+    _require(
+        all(bool(selection["use_top2"]) == bool(live["use_top2"]) for selection, live in zip(python_selections, selections, strict=True)),
+        "live/Python one-state decision mismatch",
+    )
 
     batch_started = time.perf_counter_ns()
     batch_values = production_lower_bounds(features_matrix, means, scales, constant, coefficients)
@@ -1558,7 +1741,7 @@ def run_calibration(
     calibration_manifest = input_snapshots["calibration_manifest"].value
     freeze = input_snapshots["design_freeze"].value
     freeze_details = validate_freeze(freeze)
-    raw_rows, calibration_engine_graph = _validate_collection_table(
+    raw_rows, calibration_engine_graph, calibration_backend_binding = _validate_collection_table(
         calibration_table,
         calibration_manifest,
         role="calibration",
@@ -1577,6 +1760,7 @@ def run_calibration(
         constant,
         coefficients,
         training_engine_graph,
+        training_backend_binding,
     ) = _load_production_gate(
         input_snapshots["ridge_artifact"],
         freeze_snapshot=input_snapshots["design_freeze"],
@@ -1586,6 +1770,10 @@ def run_calibration(
     _require(
         training_engine_graph == calibration_engine_graph,
         "training and calibration engine dependency graphs differ",
+    )
+    _require(
+        training_backend_binding == calibration_backend_binding,
+        "training and calibration backend bindings differ",
     )
     if milestones:
         milestones.write("input_load_complete", details={"rows": len(raw_rows)})
@@ -1597,6 +1785,7 @@ def run_calibration(
         constant,
         coefficients,
         production_selector=production_selector,
+        require_live_deployment=not synthetic,
     )
     forbidden = any(
         _exact_int(row["seed"], "calibration forbidden-seed check")

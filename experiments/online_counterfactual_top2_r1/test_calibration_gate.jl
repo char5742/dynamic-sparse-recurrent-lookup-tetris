@@ -98,6 +98,65 @@ function episode(seed, score; pieces=250, game_over=false, wall=1.0)
     )
 end
 
+function synthetic_deployment_decision(; use_top2::Bool)
+    top1_index = 1
+    top2_index = 3
+    selected_index = use_top2 ? top2_index : top1_index
+    top1_action = "action-1"
+    top2_action = "action-3"
+    selected_action = use_top2 ? top2_action : top1_action
+    top1_node = "node-1"
+    top2_node = "node-3"
+    selected_node = use_top2 ? top2_node : top1_node
+    binding = bytes2hex(sha256(join((
+        "r1-live-ridge-decision-v1",
+        string(selected_index),
+        selected_action,
+        selected_node,
+    ), '\n')))
+    feature_vector = zeros(Float64, FEATURE_COUNT)
+    feature_digest = bytes2hex(sha256(join((
+        FEATURE_SCHEMA_DIGEST,
+        (bitstring(value) for value in feature_vector)...,
+    ), '\n')))
+    return DeploymentDecision(
+        "r1-live-ridge-decision-v1",
+        FEATURE_SCHEMA_DIGEST,
+        feature_digest,
+        "feature_schema_sha256 newline Float64-bitstring-per-feature newline joined",
+        feature_vector,
+        top1_index,
+        top2_index,
+        selected_index,
+        top1_action,
+        top2_action,
+        selected_action,
+        top1_node,
+        top2_node,
+        selected_node,
+        binding,
+        selected_action,
+        selected_node,
+        use_top2,
+        use_top2 ? nextfloat(OVERRIDE_THRESHOLD) : OVERRIDE_THRESHOLD,
+        use_top2 ? :none : :lower_bound_not_above_threshold,
+        "root-digest",
+        "root-digest",
+        "root-digest",
+        "clone-digest",
+        UInt64(10_000),
+        UInt64(10_375),
+        UInt64(375),
+        "feature_build+ridge_eval+selection_binding;" *
+        "excludes_candidate_enumeration+old_q_evaluation+artifact_load+clone_apply_verification",
+    )
+end
+
+function decision_namedtuple(decision::DeploymentDecision)
+    names = fieldnames(DeploymentDecision)
+    return NamedTuple{names}(Tuple(getfield(decision, name) for name in names))
+end
+
 @testset "R1 exact calibration promotion gate" begin
     rows = passing_rows()
     result = gate_result(rows)
@@ -204,6 +263,50 @@ end
     @test all(row.production_decision == row.reference_decision for row in rows)
     # Equality at 0.05 is deliberately a fallback, not an override.
     @test !rows[3].production_decision
+end
+
+@testset "R1 live deployment producer fields are measured and self-consistent" begin
+    fallback = deployment_calibration_fields(synthetic_deployment_decision(use_top2=false))
+    @test !fallback.production_decision
+    @test fallback.production_selected_candidate_index == 1
+    @test fallback.production_selected_action_digest == "action-1"
+    @test fallback.production_selected_node_identity == "node-1"
+    @test length(fallback.production_feature_vector) == FEATURE_COUNT
+    @test fallback.production_gate_incremental_elapsed_ns == 375
+    @test fallback.production_gate_incremental_finished_ns -
+          fallback.production_gate_incremental_started_ns ==
+          fallback.production_gate_incremental_elapsed_ns
+
+    override_decision = synthetic_deployment_decision(use_top2=true)
+    override = deployment_calibration_fields(override_decision)
+    @test override.production_decision
+    @test override.production_selected_candidate_index == 3
+    @test override.production_selected_action_digest == "action-3"
+    @test override.production_selected_node_identity == "node-3"
+    @test override.production_applied_action_digest == override.production_selected_action_digest
+    @test override.canonical_state_digest_before == override.canonical_state_digest_after
+    @test override.production_clone_state_digest_before ==
+          override.canonical_state_digest_before
+
+    raw = decision_namedtuple(override_decision)
+    @test_throws ErrorException deployment_calibration_fields(merge(
+        raw, (; gate_incremental_elapsed_ns=UInt64(374)),
+    ))
+    @test_throws ErrorException deployment_calibration_fields(merge(
+        raw, (; applied_node_identity="node-1"),
+    ))
+    @test_throws ErrorException deployment_calibration_fields(merge(
+        raw, (; canonical_state_digest_after="mutated-root"),
+    ))
+    @test_throws ErrorException deployment_calibration_fields(merge(
+        raw, (; selection_binding_sha256=repeat("0", 64)),
+    ))
+    @test_throws ErrorException deployment_calibration_fields(merge(
+        raw, (; feature_vector=zeros(Float64, FEATURE_COUNT - 1)),
+    ))
+    @test_throws ErrorException deployment_calibration_fields(merge(
+        raw, (; lower_bound=OVERRIDE_THRESHOLD),
+    ))
 end
 
 @testset "R1 development screen is opt-in and sequential" begin

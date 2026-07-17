@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -16,7 +17,13 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def run_role(julia: Path, experiment_dir: Path, role: str, output: Path) -> None:
+def run_role(
+    julia: Path,
+    experiment_dir: Path,
+    role: str,
+    output: Path,
+    ridge_artifact: Path | None = None,
+) -> tuple[Path, Path]:
     table = output / "table.json"
     manifest = output / "manifest.json"
     milestones = output / "milestones.jsonl"
@@ -30,8 +37,11 @@ def run_role(julia: Path, experiment_dir: Path, role: str, output: Path) -> None
         str(table),
         str(manifest),
         str(milestones),
-        "--synthetic",
     ]
+    if role == "calibration":
+        assert ridge_artifact is not None
+        command.append(str(ridge_artifact))
+    command.append("--synthetic")
     subprocess.run(command, check=True)
     document = json.loads(table.read_text(encoding="utf-8"))
     evidence = json.loads(manifest.read_text(encoding="utf-8"))
@@ -43,6 +53,10 @@ def run_role(julia: Path, experiment_dir: Path, role: str, output: Path) -> None
     assert len(document["feature_names"]) == 70
     assert len(document["rows"]) == 48
     assert all(len(row["features"]) == 70 for row in document["rows"])
+    assert all(
+        (row["deployment_decision"] is not None) == (role == "calibration")
+        for row in document["rows"]
+    )
     assert not ({row["seed"] for row in document["rows"]} & FORBIDDEN)
     assert evidence["table_sha256"] == sha256(table)
     assert evidence["real_model_or_game_loaded"] is False
@@ -70,11 +84,19 @@ def run_role(julia: Path, experiment_dir: Path, role: str, output: Path) -> None
     assert first["top1_branch"]["decision_evidence"][0]["selected_index"] == 1
     assert first["top2_branch"]["decision_evidence"][0]["selected_index"] == 2
     assert first["top1_branch"]["decision_evidence"][-1]["kind"] == "bootstrap"
+    assert len(first["top1_branch"]["exact_outcome_digest"]) == 64
+    assert first["top1_branch"]["pieces_played"] == 6
+    if role == "calibration":
+        deployment = first["deployment_decision"]
+        assert deployment["deployment_decision_schema_version"] == "r1-live-ridge-decision-v1"
+        assert deployment["production_feature_vector"] == first["features"]
+        assert deployment["production_gate_incremental_elapsed_ns"] >= 0
 
     before = (sha256(table), sha256(manifest), sha256(milestones))
     collision = subprocess.run(command, check=False, capture_output=True, text=True)
     assert collision.returncode != 0
     assert before == (sha256(table), sha256(manifest), sha256(milestones))
+    return table, manifest
 
 
 def main() -> None:
@@ -84,10 +106,56 @@ def main() -> None:
     experiment_dir = Path(__file__).resolve().parent
     with tempfile.TemporaryDirectory(prefix="r1-collector-cli-") as temporary:
         root = Path(temporary)
-        for role in ("train", "calibration"):
-            output = root / role
-            output.mkdir()
-            run_role(args.julia.resolve(), experiment_dir, role, output)
+        train_output = root / "train"
+        train_output.mkdir()
+        run_role(
+            args.julia.resolve(), experiment_dir, "train", train_output
+        )
+
+        eligibility = root / "eligibility.json"
+        design = root / "design_freeze.json"
+        ridge = root / "ridge.json"
+        fit_training_table = root / "fit_training_table.json"
+        fit_training_manifest = root / "fit_training_manifest.json"
+        fit_milestones = root / "fit_milestones.jsonl"
+        subprocess.run(
+            [sys.executable, str(experiment_dir / "make_eligibility.py"), str(eligibility)],
+            check=True,
+        )
+        subprocess.run(
+            [
+                str(args.julia.resolve()),
+                f"--project={experiment_dir.parent.parent}",
+                "--startup-file=no",
+                "--history-file=no",
+                str(experiment_dir / "freeze_design.jl"),
+                str(eligibility),
+                str(design),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                str(experiment_dir / "fit_ridge.py"),
+                str(fit_training_table),
+                str(fit_training_manifest),
+                str(design),
+                str(ridge),
+                str(fit_milestones),
+                "--synthetic",
+            ],
+            check=True,
+        )
+        calibration_output = root / "calibration"
+        calibration_output.mkdir()
+        run_role(
+            args.julia.resolve(),
+            experiment_dir,
+            "calibration",
+            calibration_output,
+            ridge,
+        )
     print("R1 synthetic collector CLI tests passed")
 
 

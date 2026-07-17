@@ -24,6 +24,7 @@ export CALIBRATION_EPISODES,
        SourceHashEvidence,
        calibration_row,
        calibration_rows_from_gate,
+       deployment_calibration_fields,
        gate_artifact_evidence,
        source_hash_evidence,
        calibration_cluster_schedules,
@@ -51,6 +52,12 @@ const EXPECTED_COEFFICIENT_COUNT = 71
 const EXPECTED_ENSEMBLE_SIZE = 256
 const EXPECTED_FEATURE_NAMES_SHA256 =
     "7e89c16b57dcebac56e3ab4c5be161d5e5430c682e60f3b565dd23ab3b04ac44"
+const DEPLOYMENT_DECISION_SCHEMA_VERSION = "r1-live-ridge-decision-v1"
+const DEPLOYMENT_TIMING_SCOPE =
+    "feature_build+ridge_eval+selection_binding;" *
+    "excludes_candidate_enumeration+old_q_evaluation+artifact_load+clone_apply_verification"
+const DEPLOYMENT_FEATURE_DIGEST_ENCODING =
+    "feature_schema_sha256 newline Float64-bitstring-per-feature newline joined"
 
 function child_milestone(stage::AbstractString)
     path = get(ENV, "R1_CHILD_MILESTONE_PATH", "")
@@ -202,6 +209,133 @@ function source_hash_evidence(path::AbstractString, expected_sha256::AbstractStr
     occursin(r"^[0-9a-f]{64}$", expected) || error("invalid expected source SHA-256")
     actual = bytes2hex(open(sha256, source_path))
     return SourceHashEvidence(source_path, actual, expected, actual == expected)
+end
+
+"""Normalize and validate live deployment evidence for a calibration producer.
+
+Every boolean and timing value comes from the live gate result.  This helper
+does not manufacture a `*_verified=true` claim: it checks the measured
+identities/timestamps and returns the exact primitive fields that the producer
+must serialize and the finalizer must independently revalidate.
+"""
+function deployment_calibration_fields(decision)
+    schema_version = String(required_property(decision, :schema_version))
+    schema_version == DEPLOYMENT_DECISION_SCHEMA_VERSION ||
+        error("deployment decision schema mismatch")
+    feature_schema_digest = lowercase(String(required_property(
+        decision, :feature_schema_digest,
+    )))
+    feature_schema_digest == EXPECTED_FEATURE_NAMES_SHA256 ||
+        error("deployment feature schema mismatch")
+    feature_vector_sha256 = lowercase(String(required_property(
+        decision, :feature_vector_sha256,
+    )))
+    occursin(r"^[0-9a-f]{64}$", feature_vector_sha256) ||
+        error("invalid deployment feature digest")
+    feature_digest_encoding = String(required_property(decision, :feature_digest_encoding))
+    feature_digest_encoding == DEPLOYMENT_FEATURE_DIGEST_ENCODING ||
+        error("deployment feature digest encoding mismatch")
+    feature_vector = Float64.(required_property(decision, :feature_vector))
+    length(feature_vector) == EXPECTED_FEATURE_COUNT ||
+        error("deployment feature vector width mismatch")
+    all(isfinite, feature_vector) || error("non-finite deployment feature vector")
+    expected_feature_digest = bytes2hex(sha256(join((
+        feature_schema_digest,
+        (bitstring(value) for value in feature_vector)...,
+    ), '\n')))
+    feature_vector_sha256 == expected_feature_digest ||
+        error("deployment feature vector digest mismatch")
+    selection_binding_sha256 = lowercase(String(required_property(
+        decision, :selection_binding_sha256,
+    )))
+    occursin(r"^[0-9a-f]{64}$", selection_binding_sha256) ||
+        error("invalid deployment selection binding")
+
+    top1_index = Int(required_property(decision, :top1_index))
+    top2_index = Int(required_property(decision, :top2_index))
+    selected_index = Int(required_property(decision, :selected_index))
+    use_top2 = Bool(required_property(decision, :use_top2))
+    top1_action = String(required_property(decision, :top1_action_digest))
+    top2_action = String(required_property(decision, :top2_action_digest))
+    selected_action = String(required_property(decision, :selected_action_digest))
+    top1_node = String(required_property(decision, :top1_node_identity))
+    top2_node = String(required_property(decision, :top2_node_identity))
+    selected_node = String(required_property(decision, :selected_node_identity))
+    expected_index = use_top2 ? top2_index : top1_index
+    expected_action = use_top2 ? top2_action : top1_action
+    expected_node = use_top2 ? top2_node : top1_node
+    selected_index == expected_index || error("deployment selected index mismatch")
+    selected_action == expected_action || error("deployment selected action mismatch")
+    selected_node == expected_node || error("deployment selected node mismatch")
+    String(required_property(decision, :applied_action_digest)) == selected_action ||
+        error("deployment applied action mismatch")
+    String(required_property(decision, :applied_node_identity)) == selected_node ||
+        error("deployment applied node mismatch")
+    before = String(required_property(decision, :canonical_state_digest_before))
+    after = String(required_property(decision, :canonical_state_digest_after))
+    !isempty(before) && before == after || error("deployment canonical state changed")
+    clone_before = String(required_property(decision, :clone_state_digest_before))
+    clone_before == before || error("deployment clone did not match canonical root")
+
+    started_ns = UInt64(required_property(decision, :gate_incremental_started_ns))
+    finished_ns = UInt64(required_property(decision, :gate_incremental_finished_ns))
+    elapsed_ns = UInt64(required_property(decision, :gate_incremental_elapsed_ns))
+    finished_ns >= started_ns || error("deployment timing moved backwards")
+    elapsed_ns == finished_ns - started_ns || error("deployment elapsed timing mismatch")
+    timing_scope = String(required_property(decision, :gate_incremental_scope))
+    timing_scope == DEPLOYMENT_TIMING_SCOPE || error("deployment timing scope mismatch")
+
+    lower_bound = Float64(required_property(decision, :lower_bound))
+    isfinite(lower_bound) || error("non-finite deployment lower bound")
+    fallback_reason = String(required_property(decision, :fallback_reason))
+    use_top2 == (lower_bound > 0.05) || error("deployment threshold decision mismatch")
+    fallback_reason == (use_top2 ? "none" : "lower_bound_not_above_threshold") ||
+        error("deployment fallback reason mismatch")
+    expected_binding = bytes2hex(sha256(join((
+        DEPLOYMENT_DECISION_SCHEMA_VERSION,
+        string(selected_index),
+        selected_action,
+        selected_node,
+    ), '\n')))
+    selection_binding_sha256 == expected_binding ||
+        error("deployment selection binding digest mismatch")
+
+    return (;
+        deployment_decision_schema_version=schema_version,
+        production_feature_schema_digest=feature_schema_digest,
+        production_feature_vector_sha256=feature_vector_sha256,
+        production_feature_digest_encoding=feature_digest_encoding,
+        production_feature_vector=feature_vector,
+        production_selection_binding_sha256=selection_binding_sha256,
+        production_decision=use_top2,
+        production_gate_lower_bound=lower_bound,
+        production_gate_fallback_reason=fallback_reason,
+        production_selected_candidate_index=selected_index,
+        canonical_top1_candidate_index=top1_index,
+        canonical_top2_candidate_index=top2_index,
+        production_selected_action_digest=selected_action,
+        canonical_top1_action_digest=top1_action,
+        canonical_top2_action_digest=top2_action,
+        production_selected_node_identity=selected_node,
+        canonical_top1_node_identity=top1_node,
+        canonical_top2_node_identity=top2_node,
+        production_applied_action_digest=String(required_property(
+            decision, :applied_action_digest,
+        )),
+        production_applied_node_identity=String(required_property(
+            decision, :applied_node_identity,
+        )),
+        canonical_state_digest_before=before,
+        canonical_state_digest_after=after,
+        production_clone_state_digest_before=clone_before,
+        production_applied_clone_state_digest=String(required_property(
+            decision, :applied_clone_state_digest,
+        )),
+        production_gate_incremental_started_ns=started_ns,
+        production_gate_incremental_finished_ns=finished_ns,
+        production_gate_incremental_elapsed_ns=elapsed_ns,
+        production_gate_incremental_scope=timing_scope,
+    )
 end
 
 function calibration_cluster_schedules()

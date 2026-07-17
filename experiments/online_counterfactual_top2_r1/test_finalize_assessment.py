@@ -38,6 +38,142 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def digest_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def production_branch_fixture(
+    *,
+    name: str,
+    root_state: str,
+    root_future: str,
+    root_index: int,
+    root_action_digest: str,
+    root_q: float,
+    root_max_q: float,
+    score_deltas: list[float],
+    bootstrap_q: float,
+    terminal_step: int = 0,
+) -> dict[str, Any]:
+    terminal = terminal_step != 0
+    applied_steps = terminal_step if terminal else 6
+    self_actions = [root_action_digest] + [
+        digest_text(f"{name}-action-{step}") for step in range(2, applied_steps + 1)
+    ]
+    root_candidate_order = digest_text("common-root-candidate-order")
+    root_q_vector = digest_text("common-root-q-vector")
+    decisions: list[dict[str, Any]] = []
+    for step in range(1, applied_steps + 1):
+        is_root = step == 1
+        decisions.append(
+            {
+                "rollout_piece": step,
+                "kind": "action",
+                "candidate_count": 3 if is_root else 2,
+                "candidate_order_digest": (
+                    root_candidate_order if is_root else digest_text(f"{name}-order-{step}")
+                ),
+                "q_vector_digest": (
+                    root_q_vector if is_root else digest_text(f"{name}-q-vector-{step}")
+                ),
+                "selected_index": root_index if is_root else 1,
+                "selected_action_digest": self_actions[step - 1],
+                "selected_q": root_q if is_root else 1.0 + step / 10.0,
+                "max_q": root_max_q if is_root else 1.0 + step / 10.0,
+            }
+        )
+    if not terminal:
+        decisions.append(
+            {
+                "rollout_piece": 7,
+                "kind": "bootstrap",
+                "candidate_count": 2,
+                "candidate_order_digest": digest_text(f"{name}-bootstrap-order"),
+                "q_vector_digest": digest_text(f"{name}-bootstrap-q-vector"),
+                "selected_index": 1,
+                "selected_action_digest": digest_text(f"{name}-bootstrap-action"),
+                "selected_q": bootstrap_q,
+                "max_q": bootstrap_q,
+            }
+        )
+    result = 0.0
+    for step, delta in enumerate(score_deltas, 1):
+        result += finalizer.COUNTERFACTUAL_GAMMA_POWERS[step - 1] * delta / 600.0
+    if not terminal:
+        result += finalizer.COUNTERFACTUAL_GAMMA_POWERS[6] * bootstrap_q
+    rng_digests = [digest_text(f"{name}-rng-{step}") for step in range(1, applied_steps + 1)]
+    return {
+        "return_G6": result,
+        "terminal_within_horizon": terminal,
+        "terminal_step": terminal_step,
+        "bootstrap_q": bootstrap_q,
+        "score_deltas": score_deltas,
+        "pre_action_current_piece_tokens": [f"piece-{step}" for step in range(1, applied_steps + 1)],
+        "placed_piece_tokens": [f"placed-{step}" for step in range(1, applied_steps + 1)],
+        "post_action_rng_digests": rng_digests,
+        "final_rng_digest": rng_digests[-1],
+        "selected_action_digests": self_actions,
+        "candidate_counts": [3] + [2] * (applied_steps - 1),
+        "branch_start_state_digest": root_state,
+        "branch_start_future_stream_digest": root_future,
+        "start_score": 0.0,
+        "final_score": sum(score_deltas),
+        "pieces_played": applied_steps,
+        "exact_outcome_digest": digest_text(f"{name}-exact-outcome"),
+        "decision_evidence": decisions,
+    }
+
+
+def production_science_row() -> dict[str, Any]:
+    root_state = digest_text("root-state")
+    root_future = digest_text("root-future")
+    top1_action = digest_text("root-top1-action")
+    top2_action = digest_text("root-top2-action")
+    top1 = production_branch_fixture(
+        name="top1",
+        root_state=root_state,
+        root_future=root_future,
+        root_index=1,
+        root_action_digest=top1_action,
+        root_q=2.0,
+        root_max_q=2.0,
+        score_deltas=[60.0, 0.0, 30.0, 0.0, 0.0, 12.0],
+        bootstrap_q=0.25,
+    )
+    top2 = production_branch_fixture(
+        name="top2",
+        root_state=root_state,
+        root_future=root_future,
+        root_index=2,
+        root_action_digest=top2_action,
+        root_q=1.5,
+        root_max_q=2.0,
+        score_deltas=[120.0, 0.0, 0.0, 18.0, 0.0, 0.0],
+        bootstrap_q=0.30,
+    )
+    advantage = top2["return_G6"] - top1["return_G6"]
+    return {
+        "root_state_digest": root_state,
+        "root_future_stream_digest": root_future,
+        "valid_action_count": 3,
+        "canonical_top1_candidate_index": 1,
+        "canonical_top2_candidate_index": 2,
+        "canonical_top1_action_digest": top1_action,
+        "canonical_top2_action_digest": top2_action,
+        "q_top1": 2.0,
+        "q_top2": 1.5,
+        "g6_top1": top1["return_G6"],
+        "g6_top2": top2["return_G6"],
+        "a1_terminal_within_horizon": False,
+        "a2_terminal_within_horizon": False,
+        "advantage_unclipped_A6": advantage,
+        "advantage": advantage,
+        "clipped_target": max(-2.0, min(2.0, advantage)),
+        "top1_branch": top1,
+        "top2_branch": top2,
+    }
+
+
 def julia_executable() -> Path:
     if CONCRETE_JULIA.is_file():
         return CONCRETE_JULIA
@@ -109,6 +245,7 @@ def make_collection(role: str, table_path: Path) -> tuple[dict[str, Any], dict[s
                 "canonical_action_digests": [],
                 "rows": 20,
                 "exclusions": 4,
+                "repeatability_sentinel": None,
             }
         )
     positive_fraction = sum(row["advantage_unclipped_A6"] > 0.0 for row in rows) / len(rows)
@@ -125,12 +262,15 @@ def make_collection(role: str, table_path: Path) -> tuple[dict[str, Any], dict[s
         "engine_dependency_graph": None,
         "immutable_input_end_hashes": None,
         "counterfactual_states_completed": total,
+        "counterfactual_states_attempted": total,
+        "scheduled_slots_accounted": total,
+        "repeatability_probe_seconds": 0.0,
         "first32_elapsed_seconds": 0.01 if role == "training" else None,
         "first32_setup_seconds": 0.01 if role == "training" else None,
         "first32_projected_seconds": 0.155 if role == "training" else None,
         "first32_projection_limit_seconds": 3300.0,
         "first32_projection_basis_states": 432,
-        "first32_projection_formula": "2*setup_seconds + first32_collection_seconds/32*432",
+        "first32_projection_formula": finalizer.PROJECTION_FORMULA,
         "positive_advantage_fraction": positive_fraction,
         "validation_seed_used": False,
         "sealed_test_seed_used": False,
@@ -145,6 +285,7 @@ def make_collection(role: str, table_path: Path) -> tuple[dict[str, Any], dict[s
         "synthetic": True,
         "validation_seed_used": False,
         "sealed_test_seed_used": False,
+        "repeatability_sentinels": [],
         "rows": rows,
     }
     write_json(table_path, table)
@@ -165,12 +306,15 @@ def make_collection(role: str, table_path: Path) -> tuple[dict[str, Any], dict[s
         "exclusion_count": len(exclusions),
         "role_seeds": episodes,
         "counterfactual_states_completed": total,
+        "counterfactual_states_attempted": total,
+        "scheduled_slots_accounted": total,
+        "repeatability_probe_seconds": 0.0,
         "first32_elapsed_seconds": metadata["first32_elapsed_seconds"],
         "first32_setup_seconds": metadata["first32_setup_seconds"],
         "first32_projected_seconds": metadata["first32_projected_seconds"],
         "first32_projection_limit_seconds": 3300.0,
         "first32_projection_basis_states": 432,
-        "first32_projection_formula": "2*setup_seconds + first32_collection_seconds/32*432",
+        "first32_projection_formula": finalizer.PROJECTION_FORMULA,
         "positive_advantage_fraction": positive_fraction,
         "exclusions": exclusions,
         "episodes": episode_evidence,
@@ -227,6 +371,7 @@ def make_ridge(training_table: Path, training_manifest: Path, freeze: Path) -> d
         "source_collection_manifest_path": str(training_manifest.resolve()),
         "source_collection_manifest_sha256": sha256(training_manifest),
         "engine_dependency_graph": None,
+        "backend_binding": None,
         "training_row_order_sha256": row_order_sha256,
         "training_row_order_encoding": "episode_id,piece_index,root_state_digest newline joined",
         "design_freeze_path": str(freeze.resolve()),
@@ -453,6 +598,10 @@ class FinalizerTests(unittest.TestCase):
             "tail_device": "CPU",
             "complete_batch_size": 16,
             "evaluator_source_sha256": "a" * 64,
+            "python_runtime_origin": {
+                **finalizer.EXPECTED_PYTHON_RUNTIME_ORIGIN,
+                "openvino_loaded_native_modules": finalizer.EXPECTED_OPENVINO_NATIVE_MODULES,
+            },
         }
         finalizer._validate_backend_evidence(
             backend, synthetic=False, label="production-shaped fixture"
@@ -463,6 +612,88 @@ class FinalizerTests(unittest.TestCase):
             finalizer._validate_backend_evidence(
                 short, synthetic=False, label="short-version fixture"
             )
+
+    def test_production_row_science_is_independently_recomputed(self) -> None:
+        row = production_science_row()
+        finalizer._validate_production_row_science(row, label="production fixture")
+
+    def test_production_row_science_rejects_omission_and_tampering(self) -> None:
+        cases: list[tuple[str, Any, str]] = []
+
+        missing_branch = production_science_row()
+        del missing_branch["top1_branch"]
+        cases.append(("missing branch", missing_branch, "missing required property: top1_branch"))
+
+        changed_delta = production_science_row()
+        changed_delta["top1_branch"]["score_deltas"][2] += 1.0
+        cases.append(("changed score delta", changed_delta, "score accounting exact serialized value mismatch"))
+
+        changed_bootstrap = production_science_row()
+        changed_bootstrap["top2_branch"]["bootstrap_q"] += 0.25
+        cases.append(("changed bootstrap", changed_bootstrap, "bootstrap Q/selection mismatch"))
+
+        wrong_selected_action = production_science_row()
+        wrong_selected_action["top1_branch"]["decision_evidence"][3][
+            "selected_action_digest"
+        ] = digest_text("different-action")
+        cases.append(
+            (
+                "changed selected action",
+                wrong_selected_action,
+                "decision 4 selected action digest mismatch",
+            )
+        )
+
+        changed_future = production_science_row()
+        changed_future["top2_branch"]["branch_start_future_stream_digest"] = digest_text(
+            "different-future"
+        )
+        cases.append(
+            ("changed future stream", changed_future, "branch-start future stream mismatch")
+        )
+
+        changed_advantage = production_science_row()
+        changed_advantage["advantage_unclipped_A6"] += 0.01
+        changed_advantage["advantage"] = changed_advantage["advantage_unclipped_A6"]
+        changed_advantage["clipped_target"] = changed_advantage["advantage_unclipped_A6"]
+        cases.append(
+            (
+                "changed A6 aliases",
+                changed_advantage,
+                "advantage_unclipped_A6 exact serialized value mismatch",
+            )
+        )
+
+        for name, row, message in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
+                finalizer._validate_production_row_science(row, label="tampered fixture")
+
+    def test_terminal_branch_requires_zero_bootstrap_and_exact_terminal_horizon(self) -> None:
+        row = production_science_row()
+        terminal = production_branch_fixture(
+            name="terminal-top2",
+            root_state=row["root_state_digest"],
+            root_future=row["root_future_stream_digest"],
+            root_index=2,
+            root_action_digest=row["canonical_top2_action_digest"],
+            root_q=row["q_top2"],
+            root_max_q=row["q_top1"],
+            score_deltas=[120.0, 30.0, 0.0, 60.0],
+            bootstrap_q=0.0,
+            terminal_step=4,
+        )
+        row["top2_branch"] = terminal
+        row["g6_top2"] = terminal["return_G6"]
+        row["a2_terminal_within_horizon"] = True
+        advantage = row["g6_top2"] - row["g6_top1"]
+        row["advantage_unclipped_A6"] = advantage
+        row["advantage"] = advantage
+        row["clipped_target"] = max(-2.0, min(2.0, advantage))
+        finalizer._validate_production_row_science(row, label="terminal fixture")
+
+        row["top2_branch"]["bootstrap_q"] = 0.5
+        with self.assertRaisesRegex(ValueError, "terminal branch has nonzero bootstrap Q"):
+            finalizer._validate_production_row_science(row, label="tampered terminal fixture")
 
     def test_production_shaped_dependency_graph_binds_exact_live_closure(self) -> None:
         graph = finalizer._live_engine_dependency_graph(REPOSITORY)

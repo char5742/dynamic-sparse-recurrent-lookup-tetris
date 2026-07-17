@@ -149,6 +149,116 @@ function Resolve-R1ConcreteJulia([string]$Requested = '') {
     }
 }
 
+function Get-R1PythonOriginProbeScript {
+    return @'
+import ctypes
+import ctypes.wintypes
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+import numpy
+import openvino
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+module_file = pathlib.Path(openvino.__file__).resolve()
+package_root = module_file.parent
+package_records = []
+for path in sorted(
+    (candidate for candidate in package_root.rglob("*") if candidate.is_file()),
+    key=lambda candidate: candidate.relative_to(package_root).as_posix(),
+):
+    if path.is_symlink():
+        raise RuntimeError(f"OpenVINO package contains a symlink: {path}")
+    package_records.append({
+        "path": path.relative_to(package_root).as_posix(),
+        "bytes": path.stat().st_size,
+        "sha256": file_sha256(path),
+    })
+
+def record_aggregate(records):
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update(
+            f"{record['path']}\0{record['bytes']}\0{record['sha256']}\n".encode("utf-8")
+        )
+    return digest.hexdigest()
+
+psapi = ctypes.WinDLL("psapi", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+HMODULE = ctypes.wintypes.HMODULE
+kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
+psapi.EnumProcessModules.argtypes = [
+    ctypes.wintypes.HANDLE,
+    ctypes.POINTER(HMODULE),
+    ctypes.wintypes.DWORD,
+    ctypes.POINTER(ctypes.wintypes.DWORD),
+]
+psapi.EnumProcessModules.restype = ctypes.wintypes.BOOL
+psapi.GetModuleFileNameExW.argtypes = [
+    ctypes.wintypes.HANDLE,
+    HMODULE,
+    ctypes.wintypes.LPWSTR,
+    ctypes.wintypes.DWORD,
+]
+psapi.GetModuleFileNameExW.restype = ctypes.wintypes.DWORD
+modules = (HMODULE * 4096)()
+needed = ctypes.wintypes.DWORD()
+process = kernel32.GetCurrentProcess()
+if not psapi.EnumProcessModules(
+    process, modules, ctypes.sizeof(modules), ctypes.byref(needed)
+):
+    raise ctypes.WinError(ctypes.get_last_error())
+if needed.value > ctypes.sizeof(modules):
+    raise RuntimeError("loaded-module buffer was too small")
+native_by_path = {}
+for index in range(needed.value // ctypes.sizeof(HMODULE)):
+    buffer = ctypes.create_unicode_buffer(32768)
+    if not psapi.GetModuleFileNameExW(process, modules[index], buffer, len(buffer)):
+        continue
+    path = pathlib.Path(buffer.value).resolve()
+    try:
+        relative = path.relative_to(package_root).as_posix()
+    except ValueError:
+        continue
+    if path.is_file() and path.suffix.lower() in (".dll", ".pyd"):
+        native_by_path[relative] = {
+            "path": relative,
+            "bytes": path.stat().st_size,
+            "sha256": file_sha256(path),
+        }
+native_records = [native_by_path[path] for path in sorted(native_by_path)]
+
+facts = {
+    "python": sys.version.split()[0],
+    "numpy": numpy.__version__,
+    "openvino": openvino.__version__,
+    "executable": str(pathlib.Path(sys.executable).resolve()),
+    "base_prefix": str(pathlib.Path(sys.base_prefix).resolve()),
+    "prefix": str(pathlib.Path(sys.prefix).resolve()),
+    "pythonpath_cleared": os.environ.get("PYTHONPATH") is None,
+    "pythonhome_cleared": os.environ.get("PYTHONHOME") is None,
+    "python_no_user_site": os.environ.get("PYTHONNOUSERSITE"),
+    "openvino_module_file": str(module_file),
+    "openvino_package_root": str(package_root),
+    "openvino_package_file_count": len(package_records),
+    "openvino_package_bytes": sum(record["bytes"] for record in package_records),
+    "openvino_package_tree_sha256": record_aggregate(package_records),
+    "openvino_loaded_native_modules": native_records,
+    "openvino_loaded_native_sha256": record_aggregate(native_records),
+}
+print(json.dumps(facts, separators=(",", ":")))
+'@
+}
+
 function Resolve-R1FrozenPython([string]$Requested = '') {
     $VenvLauncher = 'D:\tetris-paper-plus\python-env\Scripts\python.exe'
     $VenvLauncherSize = [int64]262144
@@ -161,6 +271,21 @@ function Resolve-R1FrozenPython([string]$Requested = '') {
     $FrozenSize = [int64]91648
     $FrozenSha256 = '3c6a206b7d93cca823934a83732220dcffd413fd1036d9fb82eebb64599cf7f3'
     $ExpectedOpenVino = '2026.2.1-21919-ede283a88e3-releases/2026/2'
+    $ExpectedBasePrefix = 'C:\Users\fshuu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python'
+    $ExpectedPrefix = 'D:\tetris-paper-plus\python-env'
+    $ExpectedOpenVinoModule = 'D:\tetris-paper-plus\python-env\Lib\site-packages\openvino\__init__.py'
+    $ExpectedOpenVinoRoot = 'D:\tetris-paper-plus\python-env\Lib\site-packages\openvino'
+    $ExpectedPackageTreeSha256 = 'c292b25245f36e937f21b105023737be80491e70de5f24b1704ad1ced8547e43'
+    $ExpectedPackageFileCount = 1102
+    $ExpectedPackageBytes = [int64]234324334
+    $ExpectedNativeSha256 = '929dd49859750bfa59c850234c8eeb872c84db05c1b60510e9a9db8b7d756a74'
+    $ExpectedNative = @(
+        [ordered]@{ path='_pyopenvino.cp312-win_amd64.pyd'; bytes=[int64]3981304; sha256='602468f4ca37ba9859a6b22220e46267170abd0f744a72a839bb5e0874f2ad56' },
+        [ordered]@{ path='frontend/tensorflow/py_tensorflow_frontend.cp312-win_amd64.pyd'; bytes=[int64]477176; sha256='859f76d40fb77074bf94de2bed3317aeb835debb2e98bd4b78ce24f0b1077c28' },
+        [ordered]@{ path='libs/openvino.dll'; bytes=[int64]15888376; sha256='dc29dfd84048bed1b687426f770ee355d6c2933bbb3c6aa861f6dd1154e48908' },
+        [ordered]@{ path='libs/tbb12.dll'; bytes=[int64]225272; sha256='5cdc63525bc1b7f9916b329a1304955a360803b3d5780f5b23e62fd4027622be' },
+        [ordered]@{ path='libs/tbbmalloc.dll'; bytes=[int64]120824; sha256='11ac3ef8f213cc647b63f92dd115c2c005e489fd050fd41c3e69cf3cd4949921' }
+    )
     $Path = if ([string]::IsNullOrWhiteSpace($Requested)) { $FrozenPath } else { $Requested }
     $Path = [IO.Path]::GetFullPath($Path)
     if (-not $Path.Equals($FrozenPath, [StringComparison]::OrdinalIgnoreCase)) {
@@ -181,24 +306,64 @@ function Resolve-R1FrozenPython([string]$Requested = '') {
         throw 'frozen Python venv launcher binding changed'
     }
     $OldLauncher = [Environment]::GetEnvironmentVariable('__PYVENV_LAUNCHER__', 'Process')
+    $OldPythonPath = [Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process')
+    $OldPythonHome = [Environment]::GetEnvironmentVariable('PYTHONHOME', 'Process')
+    $OldPythonNoUserSite = [Environment]::GetEnvironmentVariable('PYTHONNOUSERSITE', 'Process')
     [Environment]::SetEnvironmentVariable('__PYVENV_LAUNCHER__', $VenvLauncher, 'Process')
+    [Environment]::SetEnvironmentVariable('PYTHONPATH', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('PYTHONHOME', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE', '1', 'Process')
     try {
-        $FactsText = @(& $Path -c 'import json,numpy,openvino,sys;print(json.dumps({"python":sys.version.split()[0],"numpy":numpy.__version__,"openvino":openvino.__version__,"executable":sys.executable,"prefix":sys.prefix}))' 2>&1) -join ''
+        $FactsText = @(& $Path -c (Get-R1PythonOriginProbeScript) 2>&1) -join ''
     } finally {
         [Environment]::SetEnvironmentVariable('__PYVENV_LAUNCHER__', $OldLauncher, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONPATH', $OldPythonPath, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONHOME', $OldPythonHome, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE', $OldPythonNoUserSite, 'Process')
     }
     if ($LASTEXITCODE -ne 0) { throw "frozen Python/OpenVINO probe failed: $FactsText" }
     $Facts = $FactsText | ConvertFrom-Json
     if ($Facts.python -cne '3.12.13' -or $Facts.numpy -cne '2.4.6' -or $Facts.openvino -cne $ExpectedOpenVino -or
         -not [IO.Path]::GetFullPath([string]$Facts.executable).Equals($VenvLauncher, [StringComparison]::OrdinalIgnoreCase) -or
-        -not [IO.Path]::GetFullPath([string]$Facts.prefix).Equals('D:\tetris-paper-plus\python-env', [StringComparison]::OrdinalIgnoreCase)) {
+        -not [IO.Path]::GetFullPath([string]$Facts.base_prefix).Equals($ExpectedBasePrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [IO.Path]::GetFullPath([string]$Facts.prefix).Equals($ExpectedPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [bool]$Facts.pythonpath_cleared -or -not [bool]$Facts.pythonhome_cleared -or
+        [string]$Facts.python_no_user_site -cne '1' -or
+        -not [IO.Path]::GetFullPath([string]$Facts.openvino_module_file).Equals($ExpectedOpenVinoModule, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [IO.Path]::GetFullPath([string]$Facts.openvino_package_root).Equals($ExpectedOpenVinoRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        [int]$Facts.openvino_package_file_count -ne $ExpectedPackageFileCount -or
+        [int64]$Facts.openvino_package_bytes -ne $ExpectedPackageBytes -or
+        [string]$Facts.openvino_package_tree_sha256 -cne $ExpectedPackageTreeSha256 -or
+        [string]$Facts.openvino_loaded_native_sha256 -cne $ExpectedNativeSha256) {
         throw 'frozen Python/OpenVINO versions changed'
+    }
+    $ObservedNative = @($Facts.openvino_loaded_native_modules)
+    if ($ObservedNative.Count -ne $ExpectedNative.Count) {
+        throw 'frozen OpenVINO loaded native-module set changed'
+    }
+    for ($Index = 0; $Index -lt $ExpectedNative.Count; $Index += 1) {
+        if ([string]$ObservedNative[$Index].path -cne [string]$ExpectedNative[$Index].path -or
+            [int64]$ObservedNative[$Index].bytes -ne [int64]$ExpectedNative[$Index].bytes -or
+            [string]$ObservedNative[$Index].sha256 -cne [string]$ExpectedNative[$Index].sha256) {
+            throw "frozen OpenVINO loaded native module changed at index $Index"
+        }
     }
     return [ordered]@{
         path=$Path; size_bytes=[int64]$Item.Length; sha256=$ObservedSha
         python_version=[string]$Facts.python; numpy_version=[string]$Facts.numpy; openvino_version=[string]$Facts.openvino
         venv_launcher_path=$VenvLauncher; venv_launcher_size_bytes=$VenvLauncherSize
-        venv_launcher_sha256=$VenvLauncherSha256; venv_prefix=[string]$Facts.prefix
+        venv_launcher_sha256=$VenvLauncherSha256; python_executable=[string]$Facts.executable
+        python_base_prefix=[string]$Facts.base_prefix; venv_prefix=[string]$Facts.prefix
+        pythonpath_cleared=[bool]$Facts.pythonpath_cleared; pythonhome_cleared=[bool]$Facts.pythonhome_cleared
+        python_no_user_site=[string]$Facts.python_no_user_site
+        openvino_module_file=[string]$Facts.openvino_module_file
+        openvino_package_root=[string]$Facts.openvino_package_root
+        openvino_package_file_count=[int]$Facts.openvino_package_file_count
+        openvino_package_bytes=[int64]$Facts.openvino_package_bytes
+        openvino_package_tree_sha256=[string]$Facts.openvino_package_tree_sha256
+        openvino_package_tree_aggregate='sorted relative-path NUL decimal-bytes NUL lowercase-sha256 newline'
+        openvino_loaded_native_modules=@($ObservedNative)
+        openvino_loaded_native_sha256=[string]$Facts.openvino_loaded_native_sha256
         reparse_point=$false
     }
 }
@@ -447,6 +612,9 @@ function Invoke-R1MonitoredPhase {
     $OldMilestoneEnvironment = [Environment]::GetEnvironmentVariable('R1_CHILD_MILESTONE_PATH', 'Process')
     $OldSentinelEnvironment = [Environment]::GetEnvironmentVariable('R1_PRE_RESUME_SENTINEL_PATH', 'Process')
     $OldPythonLauncherEnvironment = [Environment]::GetEnvironmentVariable('__PYVENV_LAUNCHER__', 'Process')
+    $OldPythonPathEnvironment = [Environment]::GetEnvironmentVariable('PYTHONPATH', 'Process')
+    $OldPythonHomeEnvironment = [Environment]::GetEnvironmentVariable('PYTHONHOME', 'Process')
+    $OldPythonNoUserSiteEnvironment = [Environment]::GetEnvironmentVariable('PYTHONNOUSERSITE', 'Process')
     $OldOverrideEnvironment = [ordered]@{}
     foreach ($Name in $script:R1ExpectedHandoffEnvironmentNames) {
         $OldOverrideEnvironment[$Name] = [Environment]::GetEnvironmentVariable($Name, 'Process')
@@ -471,6 +639,12 @@ function Invoke-R1MonitoredPhase {
             } else { $null }
             [Environment]::SetEnvironmentVariable($Name, $PhaseValue, 'Process')
         }
+        # Both direct Python phases and Julia/PythonCall phases inherit this
+        # closed import environment.  Ambient user/site injection is never a
+        # permitted part of the R1 runtime origin.
+        [Environment]::SetEnvironmentVariable('PYTHONPATH', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONHOME', $null, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE', '1', 'Process')
         if ([IO.Path]::GetFullPath($Command[0]).Equals(
                 'C:\Users\fshuu\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe',
                 [StringComparison]::OrdinalIgnoreCase)) {
@@ -494,6 +668,9 @@ function Invoke-R1MonitoredPhase {
             [Environment]::SetEnvironmentVariable('R1_CHILD_MILESTONE_PATH', $OldMilestoneEnvironment, 'Process')
             [Environment]::SetEnvironmentVariable('R1_PRE_RESUME_SENTINEL_PATH', $OldSentinelEnvironment, 'Process')
             [Environment]::SetEnvironmentVariable('__PYVENV_LAUNCHER__', $OldPythonLauncherEnvironment, 'Process')
+            [Environment]::SetEnvironmentVariable('PYTHONPATH', $OldPythonPathEnvironment, 'Process')
+            [Environment]::SetEnvironmentVariable('PYTHONHOME', $OldPythonHomeEnvironment, 'Process')
+            [Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE', $OldPythonNoUserSiteEnvironment, 'Process')
             foreach ($Name in @($OldOverrideEnvironment.Keys)) {
                 [Environment]::SetEnvironmentVariable($Name, $OldOverrideEnvironment[$Name], 'Process')
             }
@@ -609,6 +786,9 @@ function Invoke-R1MonitoredPhase {
         [Environment]::SetEnvironmentVariable('R1_CHILD_MILESTONE_PATH', $OldMilestoneEnvironment, 'Process')
         [Environment]::SetEnvironmentVariable('R1_PRE_RESUME_SENTINEL_PATH', $OldSentinelEnvironment, 'Process')
         [Environment]::SetEnvironmentVariable('__PYVENV_LAUNCHER__', $OldPythonLauncherEnvironment, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONPATH', $OldPythonPathEnvironment, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONHOME', $OldPythonHomeEnvironment, 'Process')
+        [Environment]::SetEnvironmentVariable('PYTHONNOUSERSITE', $OldPythonNoUserSiteEnvironment, 'Process')
         foreach ($Name in @($OldOverrideEnvironment.Keys)) {
             [Environment]::SetEnvironmentVariable($Name, $OldOverrideEnvironment[$Name], 'Process')
         }

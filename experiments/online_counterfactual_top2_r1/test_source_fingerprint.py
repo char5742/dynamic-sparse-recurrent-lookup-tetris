@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import shutil
 import tempfile
@@ -31,6 +32,19 @@ def populate_runtime_closure(repository: Path) -> None:
 
 
 class SourceFingerprintTests(unittest.TestCase):
+    def test_json_snapshot_is_parsed_and_hashed_from_the_same_bytes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r1-snapshot-") as temporary:
+            path = Path(temporary) / "fingerprint.json"
+            first = b'{"generation":"A"}\n'
+            second = b'{"generation":"B"}\n'
+            path.write_bytes(first)
+            raw, document, digest = subject.read_json_byte_snapshot(path)
+            path.write_bytes(second)
+            self.assertEqual(raw, first)
+            self.assertEqual(document, {"generation": "A"})
+            self.assertEqual(digest, hashlib.sha256(first).hexdigest())
+            self.assertNotEqual(digest, hashlib.sha256(path.read_bytes()).hexdigest())
+
     def make_repository(self, parent: Path) -> tuple[Path, Path]:
         repository = parent / "repository"
         repository.mkdir()

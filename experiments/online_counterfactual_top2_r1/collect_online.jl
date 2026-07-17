@@ -20,15 +20,21 @@ function _append_milestone(path::AbstractString, event::AbstractString; detail::
 end
 
 function _parse_early_args(args)
-    (length(args) == 4 || (length(args) == 5 && args[5] == "--synthetic")) || error(
-        "usage: collect_online.jl <train|calibration> <table.json> " *
-        "<manifest.json> <milestones.jsonl> [--synthetic]"
+    synthetic = !isempty(args) && args[end] == "--synthetic"
+    core_args = synthetic ? args[1:(end - 1)] : args
+    length(core_args) in (4, 5) || error(
+        "usage: collect_online.jl train <table.json> <manifest.json> " *
+        "<milestones.jsonl> [--synthetic] | calibration <table.json> " *
+        "<manifest.json> <milestones.jsonl> <ridge.json> [--synthetic]"
     )
-    role = Symbol(args[1])
+    role = Symbol(core_args[1])
     role in (:train, :calibration) || error("role must be train or calibration")
-    table_path = abspath(args[2])
-    manifest_path = abspath(args[3])
-    milestone_path = abspath(args[4])
+    role === :train && length(core_args) != 4 && error("train collection does not accept a ridge artifact")
+    role === :calibration && length(core_args) != 5 && error("calibration collection requires a ridge artifact")
+    table_path = abspath(core_args[2])
+    manifest_path = abspath(core_args[3])
+    milestone_path = abspath(core_args[4])
+    ridge_artifact_path = role === :calibration ? abspath(core_args[5]) : nothing
     length(unique((table_path, manifest_path, milestone_path))) == 3 || error(
         "table, manifest, and milestone paths must be distinct"
     )
@@ -41,7 +47,8 @@ function _parse_early_args(args)
         table_path,
         manifest_path,
         milestone_path,
-        synthetic=length(args) == 5,
+        ridge_artifact_path,
+        synthetic,
     )
 end
 
@@ -88,13 +95,18 @@ function _branch_payload(branch)
         final_rng_digest=(isempty(branch.rng_digests) ? "" : branch.rng_digests[end]),
         selected_action_digests=copy(branch.selected_action_digests),
         candidate_counts=copy(branch.candidate_counts),
+        branch_start_state_digest=branch.branch_start_state_digest,
         branch_start_future_stream_digest=branch.future_stream_digest,
+        start_score=branch.start_score,
+        final_score=branch.final_score,
+        pieces_played=branch.pieces_played,
+        exact_outcome_digest=R1CounterfactualCollector.branch_outcome_digest(branch),
         decision_evidence=evidence,
     )
 end
 
-function _row_payload(row)
-    return (;
+function _row_payload(row, deployment_decision=nothing)
+    base = (;
         episode_id=row.episode_id,
         seed=row.seed,
         piece_index=row.piece_index,
@@ -118,6 +130,31 @@ function _row_payload(row)
         valid_action_count=row.valid_action_count,
         top1_branch=_branch_payload(row.top1_branch),
         top2_branch=_branch_payload(row.top2_branch),
+    )
+    return merge(base, (; deployment_decision))
+end
+
+function _sentinel_payload(sentinel)
+    isnothing(sentinel) && return nothing
+    return (;
+        schema=sentinel.schema,
+        seed=sentinel.seed,
+        episode_id=sentinel.episode_id,
+        piece_index=sentinel.piece_index,
+        root_state_digest=sentinel.root_state_digest,
+        root_future_stream_digest=sentinel.root_future_stream_digest,
+        repetitions_per_branch=sentinel.repetitions_per_branch,
+        added_branch_rollouts=sentinel.added_branch_rollouts,
+        added_rollout_pieces=sentinel.added_rollout_pieces,
+        reference_root_candidate_order_digest=sentinel.reference_root_candidate_order_digest,
+        repeated_root_candidate_order_digest=sentinel.repeated_root_candidate_order_digest,
+        reference_root_q_vector_digest=sentinel.reference_root_q_vector_digest,
+        repeated_root_q_vector_digest=sentinel.repeated_root_q_vector_digest,
+        reference_top1_outcome_digest=sentinel.reference_top1_outcome_digest,
+        repeated_top1_outcome_digest=sentinel.repeated_top1_outcome_digest,
+        reference_top2_outcome_digest=sentinel.reference_top2_outcome_digest,
+        repeated_top2_outcome_digest=sentinel.repeated_top2_outcome_digest,
+        elapsed_seconds=sentinel.elapsed_seconds,
     )
 end
 
@@ -256,6 +293,8 @@ function main(args=ARGS)
     experiment_dir = @__DIR__
     include(joinpath(experiment_dir, "collector.jl"))
     include(joinpath(experiment_dir, "contract.jl"))
+    include(joinpath(experiment_dir, "ridge_gate.jl"))
+    include(joinpath(experiment_dir, "calibration_gate.jl"))
     @eval using JSON3
     @eval using SHA
     return Base.invokelatest(_collect_after_imports, parsed, experiment_dir)
@@ -279,6 +318,30 @@ function _collect_after_imports(parsed, experiment_dir)
     adapter = parsed.synthetic ? _synthetic_adapter(R1) :
               _load_production_adapter(experiment_dir)
     R1.validate_adapter_contract(adapter.contract)
+    ridge_gate = if parsed.role === :calibration
+        isfile(parsed.ridge_artifact_path) || error(
+            "missing completed ridge artifact: $(parsed.ridge_artifact_path)"
+        )
+        observed_ridge_sha = bytes2hex(open(SHA.sha256, parsed.ridge_artifact_path))
+        expected_ridge_sha = get(ENV, "R1_EXPECTED_RIDGE_ARTIFACT_SHA256", "")
+        if !parsed.synthetic
+            occursin(r"^[0-9a-f]{64}$", expected_ridge_sha) || error(
+                "missing exact R1_EXPECTED_RIDGE_ARTIFACT_SHA256 for calibration collection"
+            )
+            observed_ridge_sha == expected_ridge_sha || error(
+                "completed ridge artifact differs from producer handoff"
+            )
+        elseif !isempty(expected_ridge_sha)
+            observed_ridge_sha == expected_ridge_sha || error(
+                "synthetic ridge artifact differs from producer handoff"
+            )
+        end
+        artifact_document = JSON3.read(read(parsed.ridge_artifact_path, String))
+        parsed.synthetic ? R1RidgeGate.gate_from_payload(artifact_document) :
+            R1RidgeGate.gate_from_production_artifact(artifact_document)
+    else
+        nothing
+    end
     _append_milestone(parsed.milestone_path, "collection_begin")
 
     role_seeds = if parsed.synthetic
@@ -293,6 +356,7 @@ function _collect_after_imports(parsed, experiment_dir)
     first32_setup_seconds = Ref{Union{Nothing,Float64}}(nothing)
     first32_elapsed_seconds = Ref{Union{Nothing,Float64}}(nothing)
     first32_projected_seconds = Ref{Union{Nothing,Float64}}(nothing)
+    repeatability_probe_seconds = Ref(0.0)
     collection_started = time()
     # The preregistered first-32 gate projects the complete online collection
     # workload: 12 training + 6 calibration episodes, each sampled 24 times.
@@ -301,6 +365,11 @@ function _collect_after_imports(parsed, experiment_dir)
         length(role_seeds) * length(R1.R1_SAMPLE_PIECES) : (12 + 6) * 24
     function on_sample_complete(event)
         sample_count[] += 1
+        probe_seconds = Float64(event.repeatability_sentinel_elapsed_seconds)
+        isfinite(probe_seconds) && probe_seconds >= 0.0 || error(
+            "invalid repeatability sentinel duration"
+        )
+        repeatability_probe_seconds[] += probe_seconds
         _append_milestone(
             parsed.milestone_path,
             "counterfactual_state_complete";
@@ -312,14 +381,19 @@ function _collect_after_imports(parsed, experiment_dir)
             # Training and calibration are separate collector processes, so
             # account for the observed one-time import/OpenVINO setup twice,
             # while extrapolating only steady collection across all 432 states.
-            projected = 2 * setup_elapsed + elapsed / 32 * expected_sample_states
+            repeatability_probe_seconds[] <= elapsed || error(
+                "repeatability sentinel duration exceeds first-32 elapsed time"
+            )
+            projected = 2 * setup_elapsed +
+                        (elapsed - repeatability_probe_seconds[]) / 32 * expected_sample_states +
+                        repeatability_probe_seconds[]
             first32_setup_seconds[] = setup_elapsed
             first32_elapsed_seconds[] = elapsed
             first32_projected_seconds[] = projected
             _append_milestone(
                 parsed.milestone_path,
                 "first32_projection";
-                detail="formula=2*setup+first32_collection/32*basis;setup_seconds=$setup_elapsed;first32_collection_seconds=$elapsed;basis_states=$expected_sample_states;projected_seconds=$projected;limit_seconds=3300",
+                detail="formula=2*setup+(first32_collection-repeatability_probe)/32*basis+repeatability_probe;setup_seconds=$setup_elapsed;first32_collection_seconds=$elapsed;repeatability_probe_seconds=$(repeatability_probe_seconds[]);basis_states=$expected_sample_states;projected_seconds=$projected;limit_seconds=3300",
             )
             projected <= 3300.0 || error(
                 "R1 first-32 projection $projected exceeds the frozen 3300 s limit"
@@ -327,13 +401,50 @@ function _collect_after_imports(parsed, experiment_dir)
         end
         return nothing
     end
+    deployment_callback = if parsed.role === :calibration
+        (state, actions, q, row) -> begin
+            decision = R1RidgeGate.deploy_ridge_decision(
+                state,
+                actions,
+                q,
+                ridge_gate;
+                action_metrics=adapter.action_metrics,
+                current_metrics=adapter.current_metrics,
+                queue_onehot=adapter.queue_onehot,
+                action_digest=adapter.action_digest,
+                node_identity=adapter.action_digest,
+                state_digest=adapter.state_digest,
+                clone_state=(parsed.synthetic ? deepcopy : adapter.clone_state),
+                apply_selected! = (clone, node) -> begin
+                    adapter.apply_action(clone, node)
+                    identity = String(adapter.action_digest(node))
+                    (; action_digest=identity, node_identity=identity)
+                end,
+                verify_source_files=false,
+            )
+            return R1CalibrationGate.deployment_calibration_fields(decision)
+        end
+    else
+        (state, actions, q, row) -> nothing
+    end
     for (episode_index, seed) in pairs(role_seeds)
         episode_id = parsed.synthetic ? episode_index : seed
         collection = if parsed.synthetic
-            R1.collect_episode(adapter, seed; episode_id, on_sample_complete)
+            R1.collect_episode(
+                adapter,
+                seed;
+                episode_id,
+                on_sample_complete,
+                on_row_retained=deployment_callback,
+            )
         else
             R1.collect_role_episode(
-                adapter, seed, parsed.role; episode_id, on_sample_complete
+                adapter,
+                seed,
+                parsed.role;
+                episode_id,
+                on_sample_complete,
+                on_row_retained=deployment_callback,
             )
         end
         push!(collections, collection)
@@ -349,6 +460,21 @@ function _collect_after_imports(parsed, experiment_dir)
         vcat,
         (collection.exclusions for collection in collections);
         init=R1.ExcludedState[],
+    )
+    row_payloads = Any[]
+    for collection in collections
+        length(collection.rows) == length(collection.deployment_decisions) || error(
+            "deployment decision/row cardinality mismatch"
+        )
+        append!(row_payloads, [
+            _row_payload(row, deployment) for
+            (row, deployment) in zip(collection.rows, collection.deployment_decisions)
+        ])
+    end
+    scheduled_slots_accounted = length(rows) + length(exclusions)
+    counterfactual_states_attempted = length(rows) + count(
+        item -> item.code != :canonical_trajectory_unavailable,
+        exclusions,
     )
     all(length(row.features) == 70 for row in rows) || error("non-canonical feature width")
     positive_fraction = isempty(rows) ? NaN :
@@ -377,6 +503,7 @@ function _collect_after_imports(parsed, experiment_dir)
         tail_device=String(adapter.openvino_tail_device),
         complete_batch_size=Int(adapter.openvino_batch_size),
         evaluator_source_sha256=String(adapter.evaluator_source_sha256),
+        python_runtime_origin=adapter.python_runtime_origin,
     )
     engine_dependency_graph = parsed.synthetic ? nothing : adapter.engine_dependency_graph
     immutable_input_end_hashes = if parsed.synthetic
@@ -418,12 +545,15 @@ function _collect_after_imports(parsed, experiment_dir)
             engine_dependency_graph,
             immutable_input_end_hashes,
             counterfactual_states_completed=sample_count[],
+            counterfactual_states_attempted,
+            scheduled_slots_accounted,
+            repeatability_probe_seconds=repeatability_probe_seconds[],
             first32_elapsed_seconds=first32_elapsed_seconds[],
             first32_setup_seconds=first32_setup_seconds[],
             first32_projected_seconds=first32_projected_seconds[],
             first32_projection_limit_seconds=3300.0,
             first32_projection_basis_states=expected_sample_states,
-            first32_projection_formula="2*setup_seconds + first32_collection_seconds/32*$expected_sample_states",
+            first32_projection_formula="2*setup_seconds + (first32_collection_seconds-repeatability_probe_seconds)/32*$expected_sample_states + repeatability_probe_seconds",
             positive_advantage_fraction=positive_fraction,
             validation_seed_used=false,
             sealed_test_seed_used=false,
@@ -434,7 +564,11 @@ function _collect_after_imports(parsed, experiment_dir)
         synthetic=parsed.synthetic,
         validation_seed_used=false,
         sealed_test_seed_used=false,
-        rows=[_row_payload(row) for row in rows],
+        repeatability_sentinels=[
+            _sentinel_payload(collection.repeatability_sentinel) for collection in collections
+            if !isnothing(collection.repeatability_sentinel)
+        ],
+        rows=row_payloads,
     )
     _atomic_json_create(parsed.table_path, table, JSON3)
     table_sha256 = bytes2hex(open(SHA.sha256, parsed.table_path))
@@ -456,12 +590,15 @@ function _collect_after_imports(parsed, experiment_dir)
         exclusion_count=length(exclusions),
         role_seeds,
         counterfactual_states_completed=sample_count[],
+        counterfactual_states_attempted,
+        scheduled_slots_accounted,
+        repeatability_probe_seconds=repeatability_probe_seconds[],
         first32_elapsed_seconds=first32_elapsed_seconds[],
         first32_setup_seconds=first32_setup_seconds[],
         first32_projected_seconds=first32_projected_seconds[],
         first32_projection_limit_seconds=3300.0,
         first32_projection_basis_states=expected_sample_states,
-        first32_projection_formula="2*setup_seconds + first32_collection_seconds/32*$expected_sample_states",
+        first32_projection_formula="2*setup_seconds + (first32_collection_seconds-repeatability_probe_seconds)/32*$expected_sample_states + repeatability_probe_seconds",
         positive_advantage_fraction=positive_fraction,
         exclusions=[(;
             seed=item.seed,
@@ -480,6 +617,7 @@ function _collect_after_imports(parsed, experiment_dir)
             canonical_action_digests=item.canonical_action_digests,
             rows=length(item.rows),
             exclusions=length(item.exclusions),
+            repeatability_sentinel=_sentinel_payload(item.repeatability_sentinel),
         ) for item in collections],
         real_model_or_game_loaded=!parsed.synthetic,
         validation_seed_used=false,

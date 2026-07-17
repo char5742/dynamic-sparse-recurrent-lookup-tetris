@@ -28,7 +28,10 @@ export FEATURE_NAMES,
        decide_top2,
        gate_payload,
        gate_from_payload,
-       gate_from_production_artifact
+       gate_from_production_artifact,
+       DeploymentDecision,
+       build_live_feature_vector,
+       deploy_ridge_decision
 
 # This order is part of the R1 preregistration.  It must not be inferred from a
 # Dict or an input table.  HOLD plus NEXT1:NEXT5 is exactly six 7-way slots.
@@ -99,6 +102,36 @@ const TARGET_MIN = -2.0
 const TARGET_MAX = 2.0
 const TRAINING_ROW_ORDER_ENCODING =
     "episode_id,piece_index,root_state_digest newline joined"
+const DEPLOYMENT_DECISION_SCHEMA_VERSION = "r1-live-ridge-decision-v1"
+const DEPLOYMENT_TIMING_SCOPE =
+    "feature_build+ridge_eval+selection_binding;" *
+    "excludes_candidate_enumeration+old_q_evaluation+artifact_load+clone_apply_verification"
+
+const _ACTION_METRIC_PROPERTIES = (
+    :immediate_score,
+    :cleared_lines,
+    :holes,
+    :covered_cells,
+    :aggregate_height,
+    :max_height,
+    :bumpiness,
+    :well_sum,
+    :row_transitions,
+    :column_transitions,
+    :ren,
+    :back_to_back,
+    :tspin,
+)
+const _CURRENT_METRIC_PROPERTIES = (
+    :holes,
+    :covered_cells,
+    :aggregate_height,
+    :max_height,
+    :bumpiness,
+    :well_sum,
+    :row_transitions,
+    :column_transitions,
+)
 
 @assert FEATURE_COUNT == 70
 @assert COEFFICIENT_COUNT < 100
@@ -120,6 +153,45 @@ struct RidgeGate
     bootstrap_seed::UInt64
     lower_quantile::Float64
     override_threshold::Float64
+end
+
+"""Auditable result of the incremental live gate path.
+
+Candidate enumeration, old-Q evaluation, and artifact loading happen before
+`deploy_ridge_decision` starts its clock.  Clone/application verification is a
+shared action-execution cost and occurs after the clock stops.  The measured
+interval contains only feature extraction, ridge evaluation, and selection
+index/action/node binding.
+"""
+struct DeploymentDecision
+    schema_version::String
+    feature_schema_digest::String
+    feature_vector_sha256::String
+    feature_digest_encoding::String
+    feature_vector::Vector{Float64}
+    top1_index::Int
+    top2_index::Int
+    selected_index::Int
+    top1_action_digest::String
+    top2_action_digest::String
+    selected_action_digest::String
+    top1_node_identity::String
+    top2_node_identity::String
+    selected_node_identity::String
+    selection_binding_sha256::String
+    applied_action_digest::String
+    applied_node_identity::String
+    use_top2::Bool
+    lower_bound::Float64
+    fallback_reason::Symbol
+    canonical_state_digest_before::String
+    canonical_state_digest_after::String
+    clone_state_digest_before::String
+    applied_clone_state_digest::String
+    gate_incremental_started_ns::UInt64
+    gate_incremental_finished_ns::UInt64
+    gate_incremental_elapsed_ns::UInt64
+    gate_incremental_scope::String
 end
 
 function _schema_strings(names)
@@ -423,6 +495,234 @@ function decide_top2(
         use_top2,
         lower_bound=lower,
         fallback_reason=use_top2 ? :none : :lower_bound_not_above_threshold,
+    )
+end
+
+function _live_stable_top_two(q::Vector{Float64})
+    length(q) >= 2 || error("live R1 gate requires at least two candidates")
+    all(isfinite, q) || error("live R1 gate received non-finite old-Q")
+    top1 = 0
+    top2 = 0
+    @inbounds for index in eachindex(q)
+        if top1 == 0 || q[index] > q[top1]
+            top2 = top1
+            top1 = index
+        elseif top2 == 0 || q[index] > q[top2]
+            top2 = index
+        end
+    end
+    top2 != 0 || error("live R1 top-2 selection failed")
+    return top1, top2
+end
+
+function _live_metric_values(metrics, properties, label::AbstractString)
+    values = Vector{Float64}(undef, length(properties))
+    for (index, property) in pairs(properties)
+        hasproperty(metrics, property) || error("$(label) is missing metric $(property)")
+        value = Float64(getproperty(metrics, property))
+        isfinite(value) || error("$(label) metric $(property) is non-finite")
+        values[index] = value
+    end
+    return values
+end
+
+function _live_queue_values(queue_onehot)
+    queue = Float64.(collect(queue_onehot))
+    length(queue) == 42 || error("live HOLD/NEXT one-hot width is not 42")
+    all(isfinite, queue) || error("live HOLD/NEXT one-hot is non-finite")
+    all(value -> value == 0.0 || value == 1.0, queue) ||
+        error("live HOLD/NEXT one-hot contains a non-binary value")
+    for slot in 1:6
+        slot_sum = sum(@view queue[((slot - 1) * 7 + 1):(slot * 7)])
+        (slot_sum == 0.0 || slot_sum == 1.0) ||
+            error("live HOLD/NEXT slot $(slot) is not zero-or-one-hot")
+    end
+    return queue
+end
+
+"""Construct the exact frozen 70-feature deployment vector.
+
+This is deliberately equivalent to `collector.jl/build_feature_vector`: ties
+preserve candidate order, Q z-scores use the complete candidate population,
+action deltas are top-2 minus top-1, and queue slots use canonical
+I,O,S,Z,J,L,T order.  Callbacks isolate production engine types from this
+analytic gate and make the same path testable without loading a model or game.
+"""
+function build_live_feature_vector(
+    state,
+    candidates,
+    old_q_values;
+    action_metrics::Function,
+    current_metrics::Function,
+    queue_onehot::Function,
+)
+    candidate_vector = collect(candidates)
+    q = Float64.(collect(old_q_values))
+    length(q) == length(candidate_vector) || error("live candidate/old-Q length mismatch")
+    top1, top2 = _live_stable_top_two(q)
+    q_mean = mean(q)
+    q_scale = sqrt(sum(value -> abs2(value - q_mean), q) / length(q))
+    z1, z2 = q_scale == 0.0 ? (0.0, 0.0) :
+        ((q[top1] - q_mean) / q_scale, (q[top2] - q_mean) / q_scale)
+    action1 = _live_metric_values(
+        action_metrics(state, candidate_vector[top1]),
+        _ACTION_METRIC_PROPERTIES,
+        "live top1",
+    )
+    action2 = _live_metric_values(
+        action_metrics(state, candidate_vector[top2]),
+        _ACTION_METRIC_PROPERTIES,
+        "live top2",
+    )
+    current = _live_metric_values(
+        current_metrics(state),
+        _CURRENT_METRIC_PROPERTIES,
+        "live current",
+    )
+    queue = _live_queue_values(queue_onehot(state))
+    features = vcat(
+        Float64[q[top1], q[top2], q[top1] - q[top2], z1, z2, z1 - z2, length(q)],
+        action2 .- action1,
+        current,
+        queue,
+    )
+    length(features) == FEATURE_COUNT || error("internal live R1 feature width error")
+    all(isfinite, features) || error("live R1 feature vector is non-finite")
+    return (; features, top1_index=top1, top2_index=top2, candidates=candidate_vector)
+end
+
+function _live_required_property(value, key::Symbol)
+    if hasproperty(value, key)
+        return getproperty(value, key)
+    elseif value isa AbstractDict
+        return haskey(value, key) ? value[key] : value[String(key)]
+    end
+    error("live apply callback did not return $(key)")
+end
+
+function _nonempty_live_identity(callback::Function, candidate, label::AbstractString)
+    value = String(callback(candidate))
+    isempty(value) && error("empty $(label)")
+    return value
+end
+
+function _feature_vector_digest(features::Vector{Float64})
+    payload = join((FEATURE_SCHEMA_DIGEST, (bitstring(value) for value in features)...), '\n')
+    return bytes2hex(sha256(codeunits(payload)))
+end
+
+function _selection_binding_digest(index::Int, action_digest::String, node_identity::String)
+    payload = join((
+        DEPLOYMENT_DECISION_SCHEMA_VERSION,
+        string(index),
+        action_digest,
+        node_identity,
+    ), '\n')
+    return bytes2hex(sha256(codeunits(payload)))
+end
+
+"""Execute the minimal auditable live deployment decision on an injected clone.
+
+`old_q_values` and `candidates` are precomputed shared baseline inputs. Artifact
+validation/loading is also outside the reported interval. `apply_selected!`
+must return the action digest and node identity it actually applied; both are
+checked against the bound selected candidate before the result is returned.
+The canonical state digest must remain byte-for-byte unchanged.
+"""
+function deploy_ridge_decision(
+    state,
+    candidates,
+    old_q_values,
+    frozen_ridge_artifact;
+    action_metrics::Function,
+    current_metrics::Function,
+    queue_onehot::Function,
+    action_digest::Function,
+    node_identity::Function,
+    state_digest::Function,
+    clone_state::Function,
+    apply_selected!::Function,
+    verify_source_files::Bool=true,
+    clock_ns::Function=time_ns,
+)
+    gate = frozen_ridge_artifact isa RidgeGate ?
+        _validate_gate(frozen_ridge_artifact) :
+        gate_from_production_artifact(
+            frozen_ridge_artifact; verify_source_files=verify_source_files,
+        )
+
+    started_ns = UInt64(clock_ns())
+    canonical_before = String(state_digest(state))
+    isempty(canonical_before) && error("empty canonical state digest")
+    built = build_live_feature_vector(
+        state,
+        candidates,
+        old_q_values;
+        action_metrics,
+        current_metrics,
+        queue_onehot,
+    )
+    top1 = built.top1_index
+    top2 = built.top2_index
+    candidate_vector = built.candidates
+    top1_action = _nonempty_live_identity(action_digest, candidate_vector[top1], "top1 action digest")
+    top2_action = _nonempty_live_identity(action_digest, candidate_vector[top2], "top2 action digest")
+    top1_node = _nonempty_live_identity(node_identity, candidate_vector[top1], "top1 node identity")
+    top2_node = _nonempty_live_identity(node_identity, candidate_vector[top2], "top2 node identity")
+    top1_action != top2_action || error("top1/top2 action digests are identical")
+    top1_node != top2_node || error("top1/top2 node identities are identical")
+
+    decision = decide_top2(gate, built.features; valid_action_count=length(candidate_vector))
+    selected = decision.use_top2 ? top2 : top1
+    selected_action = decision.use_top2 ? top2_action : top1_action
+    selected_node = decision.use_top2 ? top2_node : top1_node
+    selection_binding = _selection_binding_digest(selected, selected_action, selected_node)
+    finished_ns = UInt64(clock_ns())
+    finished_ns >= started_ns || error("live gate clock moved backwards")
+
+    clone = clone_state(state)
+    clone === state && error("clone callback returned the canonical state object")
+    clone_before = String(state_digest(clone))
+    clone_before == canonical_before || error("clone digest differs from canonical root")
+    application = apply_selected!(clone, candidate_vector[selected])
+    applied_action = String(_live_required_property(application, :action_digest))
+    applied_node = String(_live_required_property(application, :node_identity))
+    applied_action == selected_action || error("applied action digest differs from selected action")
+    applied_node == selected_node || error("applied node identity differs from selected node")
+    canonical_after = String(state_digest(state))
+    canonical_after == canonical_before || error("live gate mutated the canonical state")
+    clone_after = String(state_digest(clone))
+    isempty(clone_after) && error("empty applied clone state digest")
+
+    return DeploymentDecision(
+        DEPLOYMENT_DECISION_SCHEMA_VERSION,
+        FEATURE_SCHEMA_DIGEST,
+        _feature_vector_digest(built.features),
+        "feature_schema_sha256 newline Float64-bitstring-per-feature newline joined",
+        built.features,
+        top1,
+        top2,
+        selected,
+        top1_action,
+        top2_action,
+        selected_action,
+        top1_node,
+        top2_node,
+        selected_node,
+        selection_binding,
+        applied_action,
+        applied_node,
+        decision.use_top2,
+        decision.lower_bound,
+        decision.fallback_reason,
+        canonical_before,
+        canonical_after,
+        clone_before,
+        clone_after,
+        started_ns,
+        finished_ns,
+        finished_ns - started_ns,
+        DEPLOYMENT_TIMING_SCOPE,
     )
 end
 
