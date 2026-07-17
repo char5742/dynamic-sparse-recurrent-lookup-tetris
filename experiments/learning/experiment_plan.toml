@@ -1,0 +1,44 @@
+[scope]
+owner = "subagent-c-learning"
+development_seed_start = 5742
+development_seed_stop = 5757
+held_out_test_seeds_visible_to_training = false
+legacy_checkpoint_read_only = "C:/Users/fshuu/Documents/tetris/1313/mainmodel copy 3.jld2"
+dataset_root = "D:/tetris-paper-plus/datasets/learning"
+
+[[experiment]]
+id = "C00_replay_numeric"
+hypothesis = "A Fenwick-tree PER with normalized importance weights samples according to priority and produces finite n-step Double-DQN targets."
+mechanism = "Correct proportional sampling and beta correction remove the bias present in uniform or unweighted prioritized replay."
+change = "Infrastructure only; no model or environment change."
+success = "All deterministic replay, n-step, masking, and update tests pass."
+time_limit_minutes = 10
+stop = "Any non-finite target, out-of-range sample, or priority/update inconsistency."
+
+[[experiment]]
+id = "C01_teacher_listwise_smoke"
+hypothesis = "A compact end-to-end CNN can learn the old 1313 policy ordering from complete candidate sets."
+mechanism = "Listwise, per-state standardized Q distillation preserves action ranking without fitting cross-state Q scale."
+change = "Train all student layers; teacher and game rules remain fixed."
+success = "Held-out DEVELOPMENT states improve top-1 agreement over random and training loss is finite/decreasing."
+time_limit_minutes = 30
+stop = "No finite update by step 5, loss divergence, or top-1 agreement no better than random after the smoke budget."
+
+[[experiment]]
+id = "C02_offline_nstep_smoke"
+hypothesis = "Teacher initialization plus n-step Double DQN can fit consistent Bellman targets without destroying policy ordering immediately."
+mechanism = "3-step returns, online argmax/target evaluation, target-network synchronization, and corrected PER."
+change = "Add one TD objective after listwise initialization; no environment/test-seed evaluation."
+success = "100 finite updates, bounded TD loss, non-zero priority dispersion, and no catastrophic development top-1 collapse."
+time_limit_minutes = 30
+stop = "NaN/Inf, exploding loss above 100 for 5 updates, or top-1 agreement drops by more than 20 percentage points."
+
+[[experiment]]
+id = "C13_dagger_round1"
+hypothesis = "The compact student's game failure is dominated by covariate shift despite useful teacher-trajectory ranking, so old-teacher labels on student-visited states will reduce compounding error."
+mechanism = "Roll out C11b only on training seeds 5742-5747, label every complete candidate set with the unchanged 1313 OpenVINO teacher, and mix those rows with the original 1500 training states while preserving seeds 5748-5749 as validation."
+change = "Dataset distribution only; keep the 165051-parameter model, standardized listwise loss, learning rate 1e-3, rules, NEXT=5, and fixed search budget unchanged."
+success = "Finite full-candidate dataset; original validation top-1 at least 0.45; then complete the 50-piece fixed-budget smoke on the next unused development seed."
+time_limit_minutes = 20
+stop = "Any non-finite teacher/student value, candidate overflow, original-validation collapse, use of a validation/test seed for rollout, or another game-over before 50 pieces."
+execution_hold = "Do not start teacher generation until the main agent reports D0 complete."

@@ -1,0 +1,28 @@
+[thesis]
+repository = "char5742/thesis"
+commit = "36c83d1"
+
+[Tetris]
+repository = "char5742/Tetris"
+commit = "50447e2"
+
+[TetrisAI]
+repository = "char5742/TetrisAI"
+commit = "6fdfb1d"
+
+[TetrisAICore]
+repository = "char5742/TetrisAICore"
+commit = "3cc0792"
+
+[TetrisAILearner]
+repository = "char5742/TetrisAILearner"
+commit = "3879ce5"
+
+[TetrisAIActor]
+repository = "char5742/TetrisAIActor"
+commit = "4f32297"
+
+[TetrisAIServer]
+repository = "char5742/TetrisAIServer"
+commit = "236cd5e"
+

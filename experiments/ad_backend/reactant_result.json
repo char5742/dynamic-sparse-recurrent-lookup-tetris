@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-07-17T23:15:30",
+  "versions": {
+    "julia": "1.12.6",
+    "lux": "1.31.4",
+    "zygote": "0.7.11",
+    "enzyme": "0.13.186",
+    "reactant": "0.2.274",
+    "optimisers": "0.4.7"
+  },
+  "threads": 1,
+  "batch": 16,
+  "status": "rejected_compile_inclusive_time_to_100",
+  "completed_updates": 5,
+  "first_full_update_seconds": 65.340312,
+  "subsequent_launch_seconds": [0.164337, 0.000237, 0.000273, 0.000248],
+  "subsequent_timing_valid_for_throughput": false,
+  "timing_limit": "loss host synchronization occurred after the timed region",
+  "losses": [0.31175932, 0.27252254, 0.24093223, 0.21491337, 0.19014841],
+  "zygote_reference_initial_loss": 0.3117593,
+  "zygote_reference_fifth_loss": 0.19014841318130493,
+  "gradient_comparison": null,
+  "gradient_limit": "returned gradient buffers had been donated by the compiled optimizer update and could not be copied to host",
+  "zygote_compile_inclusive_100_seconds": 17.456339,
+  "decision": "reject: Reactant's first full update alone was 3.74x slower than Zygote's first-plus-99-median estimate; even zero-cost remaining updates cannot pass the registered time-to-100 gate",
+  "extra_retry_authorized": false,
+  "held_out_test_seeds_used": false
+}

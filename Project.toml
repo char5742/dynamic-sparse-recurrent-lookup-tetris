@@ -1,0 +1,33 @@
+name = "TetrisPaperPlus"
+uuid = "9e9b8ea9-f8b2-4f83-9c7d-3b976e9fd5d1"
+version = "0.1.0"
+authors = ["char5742"]
+
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+NPZ = "15e1cf62-19b3-5cfa-8e77-841668bca605"
+Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+Tetris = "7b9bd417-ef73-4d3d-bf88-d74753caa289"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[sources]
+Tetris = {path = "vendor/Tetris"}
+
+[compat]
+JLD2 = "0.6.5"
+JSON3 = "1.14.3"
+Lux = "1.31.4"
+NPZ = "0.4.3"
+Optimisers = "0.4.7"
+PythonCall = "0.9.35"
+Tetris = "1"
+Zygote = "0.7.11"
+julia = "1.12"

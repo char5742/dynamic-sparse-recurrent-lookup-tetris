@@ -1,0 +1,63 @@
+{
+    "generated_at": "2026-07-17T22:55:20",
+    "versions": {
+        "optimisers": "0.4.7",
+        "julia": "1.12.6",
+        "lux": "1.31.4",
+        "zygote": "0.7.11",
+        "enzyme": "0.13.186"
+    },
+    "threads": 1,
+    "blas_threads": 10,
+    "contamination": "concurrent teacher-dataset generator PID 6544; correctness probe only",
+    "numerical_gate_preceded_timing": true,
+    "results": [
+        {
+            "batch": 16,
+            "parameter_count": 133125,
+            "zygote_loss": 0.3117593,
+            "enzyme_loss": 0.31175932,
+            "enzyme_vs_zygote": {
+                "cosine": 0.9999999999999662,
+                "maximum_absolute_error": 7.078051567077637e-8,
+                "relative_l2": 1.6625053398789143e-7
+            },
+            "runs": [
+                {
+                    "backend": "zygote",
+                    "completed_steps": 5,
+                    "requested_steps": 5,
+                    "first_update_seconds": 1.3562875,
+                    "steady_median_seconds": 0.06595505,
+                    "steady_updates_per_second": 15.16184128432925,
+                    "measured_total_seconds": 1.6323425999999999,
+                    "projected_compile_inclusive_100_seconds": 7.88583745,
+                    "steady_median_allocated_bytes": 34927074,
+                    "initial_loss": 0.3117592930793762,
+                    "final_loss": 0.19014841318130493,
+                    "finite": true,
+                    "exit_reason": "completed",
+                    "peak_working_set_bytes": 1615134720,
+                    "current_working_set_bytes": 1615134720
+                },
+                {
+                    "backend": "enzyme",
+                    "completed_steps": 5,
+                    "requested_steps": 5,
+                    "first_update_seconds": 0.4666503,
+                    "steady_median_seconds": 0.48074629999999996,
+                    "steady_updates_per_second": 2.080099212412035,
+                    "measured_total_seconds": 2.3769361,
+                    "projected_compile_inclusive_100_seconds": 48.060534,
+                    "steady_median_allocated_bytes": 189107441,
+                    "initial_loss": 0.3117593228816986,
+                    "final_loss": 0.19014841318130493,
+                    "finite": true,
+                    "exit_reason": "completed",
+                    "peak_working_set_bytes": 1689542656,
+                    "current_working_set_bytes": 1579175936
+                }
+            ]
+        }
+    ]
+}

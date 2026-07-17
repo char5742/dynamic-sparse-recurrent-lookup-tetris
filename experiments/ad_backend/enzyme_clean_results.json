@@ -1,0 +1,42 @@
+{
+    "generated_at": "2026-07-17T23:11:50",
+    "versions": {
+        "optimisers": "0.4.7",
+        "julia": "1.12.6",
+        "lux": "1.31.4",
+        "zygote": "0.7.11",
+        "enzyme": "0.13.186"
+    },
+    "threads": 1,
+    "blas_threads": 10,
+    "contamination": "none; coordinated quiet window; no other Julia process at launch",
+    "numerical_gate_preceded_timing": false,
+    "results": [
+        {
+            "batch": 16,
+            "parameter_count": 133125,
+            "zygote_loss": null,
+            "enzyme_loss": null,
+            "enzyme_vs_zygote": null,
+            "runs": [
+                {
+                    "backend": "enzyme",
+                    "completed_steps": 10,
+                    "requested_steps": 10,
+                    "first_update_seconds": 19.5290317,
+                    "steady_median_seconds": 0.3433325,
+                    "steady_updates_per_second": 2.9126284287097786,
+                    "measured_total_seconds": 23.304277600000002,
+                    "projected_compile_inclusive_100_seconds": 53.518949199999994,
+                    "steady_median_allocated_bytes": 189107577,
+                    "initial_loss": 0.3117593228816986,
+                    "final_loss": 0.0786300003528595,
+                    "finite": true,
+                    "exit_reason": "completed",
+                    "peak_working_set_bytes": 1720578048,
+                    "current_working_set_bytes": 1617686528
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,120 @@
+{
+    "generated_at": "2026-07-17T23:10:25",
+    "versions": {
+        "optimisers": "0.4.7",
+        "julia": "1.12.6",
+        "lux": "1.31.4",
+        "zygote": "0.7.11",
+        "enzyme": "0.13.186"
+    },
+    "threads": 1,
+    "blas_threads": 10,
+    "contamination": "none; coordinated quiet window; no other Julia process at launch",
+    "numerical_gate_preceded_timing": false,
+    "results": [
+        {
+            "batch": 16,
+            "parameter_count": 133125,
+            "zygote_loss": null,
+            "enzyme_loss": null,
+            "enzyme_vs_zygote": null,
+            "runs": [
+                {
+                    "backend": "zygote",
+                    "completed_steps": 100,
+                    "requested_steps": 100,
+                    "first_update_seconds": 10.6860755,
+                    "steady_median_seconds": 0.0683865,
+                    "steady_updates_per_second": 14.622769113787077,
+                    "measured_total_seconds": 19.053974900000004,
+                    "projected_compile_inclusive_100_seconds": 17.456339,
+                    "steady_median_allocated_bytes": 34926338,
+                    "initial_loss": 0.3117592930793762,
+                    "final_loss": 5.423170296126045e-5,
+                    "finite": true,
+                    "exit_reason": "completed",
+                    "peak_working_set_bytes": 1480593408,
+                    "current_working_set_bytes": 1338003456
+                }
+            ]
+        },
+        {
+            "batch": 32,
+            "parameter_count": 133125,
+            "zygote_loss": null,
+            "enzyme_loss": null,
+            "enzyme_vs_zygote": null,
+            "runs": [
+                {
+                    "backend": "zygote",
+                    "completed_steps": 100,
+                    "requested_steps": 100,
+                    "first_update_seconds": 0.3866411,
+                    "steady_median_seconds": 0.1228858,
+                    "steady_updates_per_second": 8.1376367326412,
+                    "measured_total_seconds": 15.0078156,
+                    "projected_compile_inclusive_100_seconds": 12.552335300000001,
+                    "steady_median_allocated_bytes": 64559282,
+                    "initial_loss": 0.4800091087818146,
+                    "final_loss": 0.00024908327031880617,
+                    "finite": true,
+                    "exit_reason": "completed",
+                    "peak_working_set_bytes": 1650216960,
+                    "current_working_set_bytes": 1376878592
+                }
+            ]
+        },
+        {
+            "batch": 64,
+            "parameter_count": 133125,
+            "zygote_loss": null,
+            "enzyme_loss": null,
+            "enzyme_vs_zygote": null,
+            "runs": [
+                {
+                    "backend": "zygote",
+                    "completed_steps": 100,
+                    "requested_steps": 100,
+                    "first_update_seconds": 0.231414,
+                    "steady_median_seconds": 0.2500953,
+                    "steady_updates_per_second": 3.99847578103227,
+                    "measured_total_seconds": 29.673731600000004,
+                    "projected_compile_inclusive_100_seconds": 24.990848700000004,
+                    "steady_median_allocated_bytes": 123824402,
+                    "initial_loss": 0.4619191884994507,
+                    "final_loss": 3.537320299074054e-5,
+                    "finite": true,
+                    "exit_reason": "completed",
+                    "peak_working_set_bytes": 1716924416,
+                    "current_working_set_bytes": 1409990656
+                }
+            ]
+        },
+        {
+            "batch": 128,
+            "parameter_count": 133125,
+            "zygote_loss": null,
+            "enzyme_loss": null,
+            "enzyme_vs_zygote": null,
+            "runs": [
+                {
+                    "backend": "zygote",
+                    "completed_steps": 100,
+                    "requested_steps": 100,
+                    "first_update_seconds": 0.4975221,
+                    "steady_median_seconds": 0.4964115,
+                    "steady_updates_per_second": 2.0144577633676897,
+                    "measured_total_seconds": 56.4146948,
+                    "projected_compile_inclusive_100_seconds": 49.6422606,
+                    "steady_median_allocated_bytes": 242355866,
+                    "initial_loss": 0.3840359151363373,
+                    "final_loss": 3.979119719588198e-5,
+                    "finite": true,
+                    "exit_reason": "completed",
+                    "peak_working_set_bytes": 1854689280,
+                    "current_working_set_bytes": 1563578368
+                }
+            ]
+        }
+    ]
+}

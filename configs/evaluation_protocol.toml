@@ -1,0 +1,64 @@
+protocol_version = "1.1.0"
+frozen_on = "2026-07-17"
+
+[environment]
+board_rows = 24
+visible_rows = 20
+board_columns = 10
+episode_piece_limit = 250
+hold_enabled = true
+rng = "Random.Xoshiro"
+candidate_order = "stable_node_key"
+default_next_count = 5
+engine_source = "vendor/Tetris historical 2024-01-12 behavior plus isolated RNG copy fix"
+
+[baseline_policy_semantics]
+candidate_chunk_size = 16
+tail_chunk = "same FP32 graph; OpenVINO accelerator path uses dynamic CPU for a chunk shorter than 16"
+tie_break = "first maximum in stable candidate order"
+canonical_reference = "Lux FP32 CPU, candidate chunks of 16, actual-size tail"
+canonical_operational_backend = "OpenVINO 2026.2.1: NPU for complete 16-candidate chunks and dynamic CPU for the short tail"
+operational_equivalence_evidence = "artifacts/baseline_conformance/seed5742.json; 16/16 real-state argmax and trajectory agreement"
+baseline_checkpoint_sha256 = "7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1"
+layernorm_note = "Historical LayerNorm includes candidate batch dimensions, so chunk size and boundaries are part of the policy."
+
+[scoring]
+source = "vendor/Tetris/src/game.jl:add_score!"
+notes = "Line clear, T-spin, B2B, REN, and 1000-point perfect-clear bonus; no drop-distance points."
+
+[seed_sets]
+development = [5742, 5743, 5744, 5745, 5746, 5747, 5748, 5749, 5750, 5751, 5752, 5753, 5754, 5755, 5756, 5757]
+validation = [8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008]
+test = [91001, 91002, 91003, 91004, 91005, 91006, 91007, 91008, 91009, 91010, 91011, 91012, 91013, 91014, 91015, 91016, 91017, 91018, 91019, 91020, 91021, 91022, 91023, 91024, 91025, 91026, 91027, 91028, 91029, 91030, 91031, 91032]
+test_policy = "Do not execute test seeds until architecture, checkpoint, NEXT count, and inference budget are frozen."
+
+[model_only_budget]
+candidate_generation = "identical stable candidate set"
+network_calls_per_decision = 1
+lookahead_expansions = 0
+selection = "argmax candidate value"
+
+[network_call_accounting]
+logical_model_pass = "One complete scoring of the candidate set by the declared model architecture."
+physical_backend_request = "One actual compiled-backend invocation for a candidate chunk or model component."
+required = ["logical_model_passes", "physical_backend_requests", "candidate_evaluations"]
+
+[system_budget]
+report_separately = true
+required_metrics = ["network_calls", "candidate_evaluations", "generation_seconds", "inference_seconds", "wall_seconds"]
+
+[g2_success]
+paired_test_episodes = 32
+required_metrics = ["mean", "median", "maximum", "p10", "p25", "p75", "p90", "completion_rate", "paired_difference", "inference_time"]
+confidence_interval = "paired bootstrap 95%, fixed bootstrap seed"
+primary_statistic = "mean"
+primary_statistic_description = "paired mean score difference (candidate - baseline)"
+primary_rule = "paired mean-difference bootstrap 95% confidence-interval lower bound above zero"
+secondary_statistics = ["paired median difference", "win/tie/loss count", "completion-rate difference"]
+
+[historical_records]
+user_reported = 16900
+training_log_max = 17500
+workbook_max = 18300
+workbook_max_condition = "性能変化large256_15, NEXT=4; execution seed is not stored in the workbook"
+g1_target = 18400

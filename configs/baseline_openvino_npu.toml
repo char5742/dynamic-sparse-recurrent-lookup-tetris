@@ -1,0 +1,21 @@
+config_version = "1.0.0"
+role = "baseline"
+checkpoint = "C:/Users/fshuu/Documents/tetris/1313/mainmodel copy 3.jld2"
+checkpoint_sha256 = "7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1"
+
+[runtime]
+backend = "OpenVINO 2026.2.1 NPU with dynamic CPU tail"
+dtype = "Float32 input/output; NPU internal precision selected by OpenVINO"
+inference_batch_size = 16
+tail_backend = "OpenVINO CPU dynamic actual-size tail"
+tie_break = "first maximum in stable candidate order"
+
+[budget]
+episode_piece_limit = 250
+next_count = 5
+hold_enabled = true
+candidate_order = "stable_node_key"
+lookahead_expansions = 0
+logical_network_calls_per_decision = 1
+candidate_generation = "identical stable candidate set"
+selection = "argmax candidate value"
