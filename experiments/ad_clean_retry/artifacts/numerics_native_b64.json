@@ -1,0 +1,71 @@
+{
+    "status": "completed",
+    "generated_at": "2026-07-18T06:18:35",
+    "batch_size": 64,
+    "versions": {
+        "julia": "1.12.6",
+        "julia_commit": "15346901f0",
+        "lux": "1.31.4",
+        "zygote": "0.7.11",
+        "enzyme": "0.13.187",
+        "optimisers": "0.4.7"
+    },
+    "julia_threads": 20,
+    "blas_threads": 20,
+    "workload": {
+        "model": "Lux.Chain(Dense(256=>256,tanh),Dense(256=>64))",
+        "loss": "sum(abs2,prediction-target)/length(target)",
+        "optimizer": "Optimisers.AdamW(lr=1e-3,beta=(0.9,0.999),weight_decay=1e-4)",
+        "parameter_count": 82240,
+        "batch_size": 64,
+        "input_shape": [
+            256,
+            64
+        ],
+        "target_shape": [
+            64,
+            64
+        ],
+        "parameter_sha256": "b6258f932cc8d6dca9468faac5a6ff9740895a4544a5f07a78d06bf86353d038",
+        "batch_sha256": "4ff500145850d4eeac645703b18551d664c70bd72f5259f3104c9c6dba2df947",
+        "dtype": "Float32"
+    },
+    "enzyme_static": {
+        "status": "completed",
+        "error": null,
+        "zygote_loss": 0.9911922812461853,
+        "enzyme_loss": 0.9911918640136719,
+        "loss_absolute_error": 4.172325134277344e-7,
+        "gradient_vs_zygote": {
+            "elements": 82240,
+            "cosine": 0.9999999999999892,
+            "maximum_absolute_error": 0,
+            "relative_l2": 0
+        },
+        "one_update_parameters_vs_zygote": {
+            "elements": 82240,
+            "cosine": 0.9999999999999742,
+            "maximum_absolute_error": 0,
+            "relative_l2": 0
+        }
+    },
+    "enzyme_runtime": {
+        "status": "completed",
+        "error": null,
+        "zygote_loss": 0.9911922812461853,
+        "enzyme_loss": 0.9911918640136719,
+        "loss_absolute_error": 4.172325134277344e-7,
+        "gradient_vs_zygote": {
+            "elements": 82240,
+            "cosine": 0.9999999999999892,
+            "maximum_absolute_error": 0,
+            "relative_l2": 0
+        },
+        "one_update_parameters_vs_zygote": {
+            "elements": 82240,
+            "cosine": 0.9999999999999742,
+            "maximum_absolute_error": 0,
+            "relative_l2": 0
+        }
+    }
+}

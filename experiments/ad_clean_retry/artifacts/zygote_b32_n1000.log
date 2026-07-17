@@ -1,0 +1,10 @@
+zygote batch=32 step=1 seconds=9.278761600 bytes=1893662167 loss=0.909625173
+zygote batch=32 step=2 seconds=0.002147000 bytes=540742 loss=0.781253517
+zygote batch=32 step=3 seconds=0.001313200 bytes=540646 loss=0.665564358
+zygote batch=32 step=10 seconds=0.000976700 bytes=540710 loss=0.181386530
+zygote batch=32 step=16 seconds=0.001929800 bytes=540742 loss=0.052172024
+zygote batch=32 step=64 seconds=0.000985400 bytes=540630 loss=0.000321413
+zygote batch=32 step=100 seconds=0.001012700 bytes=540630 loss=0.000009749
+zygote batch=32 step=500 seconds=0.000885800 bytes=540630 loss=0.000000000
+zygote batch=32 step=1000 seconds=0.000964800 bytes=540614 loss=0.000000000
+wrote C:\Users\fshuu\Documents\tetris\experiments\ad_clean_retry\artifacts\zygote_b32_n1000.json steady=909.772 step/s peak=0.818 GiB

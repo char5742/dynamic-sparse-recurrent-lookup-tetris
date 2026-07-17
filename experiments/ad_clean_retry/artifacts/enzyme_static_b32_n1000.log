@@ -1,0 +1,10 @@
+enzyme_static batch=32 step=1 seconds=33.625482600 bytes=5986874428 loss=0.909625292
+enzyme_static batch=32 step=2 seconds=0.000933400 bytes=271606 loss=0.781253219
+enzyme_static batch=32 step=3 seconds=0.000815200 bytes=271574 loss=0.665564239
+enzyme_static batch=32 step=10 seconds=0.000823500 bytes=271638 loss=0.181386590
+enzyme_static batch=32 step=16 seconds=0.000772100 bytes=271590 loss=0.052172001
+enzyme_static batch=32 step=64 seconds=0.000922800 bytes=271750 loss=0.000321413
+enzyme_static batch=32 step=100 seconds=0.000933500 bytes=271654 loss=0.000009749
+enzyme_static batch=32 step=500 seconds=0.001109100 bytes=271670 loss=0.000000000
+enzyme_static batch=32 step=1000 seconds=0.000869100 bytes=271670 loss=0.000000000
+wrote C:\Users\fshuu\Documents\tetris\experiments\ad_clean_retry\artifacts\enzyme_static_b32_n1000.json steady=1094.113 step/s peak=1.030 GiB

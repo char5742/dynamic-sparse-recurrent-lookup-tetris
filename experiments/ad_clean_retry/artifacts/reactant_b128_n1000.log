@@ -1,0 +1,12 @@
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+reactant batch=128 step=1 seconds=37.060469800 bytes=6275406677 loss=0.970375538
+reactant batch=128 step=2 seconds=0.057189700 bytes=3311378 loss=0.897114038
+reactant batch=128 step=3 seconds=0.001019800 bytes=13520 loss=0.828422546
+reactant batch=128 step=10 seconds=0.000703700 bytes=13520 loss=0.466881156
+reactant batch=128 step=16 seconds=0.000650900 bytes=13520 loss=0.287801206
+reactant batch=128 step=64 seconds=0.000721000 bytes=13520 loss=0.007109794
+reactant batch=128 step=100 seconds=0.000696700 bytes=13520 loss=0.000203464
+reactant batch=128 step=500 seconds=0.000643900 bytes=13520 loss=0.000000000
+reactant batch=128 step=1000 seconds=0.000588900 bytes=13568 loss=0.000000000
+wrote C:\Users\fshuu\Documents\tetris\experiments\ad_clean_retry\artifacts\reactant_b128_n1000.json steady=1574.802 step/s peak=1.250 GiB
+I0000 00:00:1784323085.589527   35544 cpp_gen_intrinsics.cc:79] Empty bitcode string provided for eigen. Optimizations relying on this IR will be disabled.

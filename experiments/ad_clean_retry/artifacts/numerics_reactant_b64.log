@@ -1,0 +1,51 @@
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+{
+    "status": "completed",
+    "generated_at": "2026-07-18T06:20:11",
+    "batch_size": 64,
+    "versions": {
+        "julia": "1.12.6",
+        "julia_commit": "15346901f0",
+        "lux": "1.31.4",
+        "zygote": "0.7.11",
+        "enzyme": "0.13.187",
+        "optimisers": "0.4.7",
+        "reactant": "0.2.274"
+    },
+    "julia_threads": 20,
+    "blas_threads": 20,
+    "workload": {
+        "model": "Lux.Chain(Dense(256=>256,tanh),Dense(256=>64))",
+        "loss": "sum(abs2,prediction-target)/length(target)",
+        "optimizer": "Optimisers.AdamW(lr=1e-3,beta=(0.9,0.999),weight_decay=1e-4)",
+        "parameter_count": 82240,
+        "batch_size": 64,
+        "input_shape": [
+            256,
+            64
+        ],
+        "target_shape": [
+            64,
+            64
+        ],
+        "parameter_sha256": "b6258f932cc8d6dca9468faac5a6ff9740895a4544a5f07a78d06bf86353d038",
+        "batch_sha256": "4ff500145850d4eeac645703b18551d664c70bd72f5259f3104c9c6dba2df947",
+        "dtype": "Float32"
+    },
+    "zygote_loss": 0.9911922812461853,
+    "reactant_loss": 0.9911922812461853,
+    "loss_absolute_error": 0,
+    "gradient_vs_zygote": {
+        "elements": 82240,
+        "cosine": 0.9999999999998895,
+        "maximum_absolute_error": 6.05359673500061e-9,
+        "relative_l2": 4.4390943179421267e-7
+    },
+    "one_update_parameters_vs_zygote": {
+        "elements": 82240,
+        "cosine": 0.9999999999999697,
+        "maximum_absolute_error": 1.8998980522155762e-6,
+        "relative_l2": 1.0033115680689053e-7
+    }
+}nothing
+I0000 00:00:1784323209.209800   40532 cpp_gen_intrinsics.cc:79] Empty bitcode string provided for eigen. Optimizations relying on this IR will be disabled.

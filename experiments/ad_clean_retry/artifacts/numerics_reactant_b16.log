@@ -1,0 +1,87 @@
+Precompiling packages...
+   1787.5 ms  ✓ Enzyme → EnzymeBFloat16sExt
+  62036.6 ms  ✓ Reactant
+   3235.2 ms  ✓ Reactant → ReactantSparseArraysExt
+   5188.1 ms  ✓ Reactant → ReactantDatesExt
+  4 dependencies successfully precompiled in 70 seconds. 91 already precompiled.
+Precompiling packages...
+   4233.2 ms  ✓ Reactant → ReactantStatisticsExt
+   5544.4 ms  ✓ Optimisers → OptimisersReactantExt
+  2 dependencies successfully precompiled in 9 seconds. 104 already precompiled.
+Precompiling packages...
+   4246.7 ms  ✓ Reactant → ReactantStaticExt
+   4377.7 ms  ✓ LuxCore → ReactantExt
+   4432.4 ms  ✓ Reactant → ReactantArrayInterfaceExt
+   4379.3 ms  ✓ MLDataDevices → ReactantExt
+   4495.7 ms  ✓ Reactant → ReactantStaticArraysExt
+   4520.2 ms  ✓ Reactant → ReactantLogExpFunctionsExt
+   4508.6 ms  ✓ Reactant → ReactantSpecialFunctionsExt
+   4521.0 ms  ✓ WeightInitializers → ReactantExt
+   4793.5 ms  ✓ LuxLib → ReactantExt
+   5126.4 ms  ✓ Reactant → ReactantKernelAbstractionsExt
+   7190.9 ms  ✓ Lux → ReactantExt
+  11 dependencies successfully precompiled in 12 seconds. 176 already precompiled.
+Precompiling packages...
+   3369.7 ms  ✓ Reactant → ReactantStructArraysExt
+  1 dependency successfully precompiled in 6 seconds. 99 already precompiled.
+Precompiling packages...
+   3410.4 ms  ✓ Reactant → ReactantAbstractFFTsExt
+  1 dependency successfully precompiled in 6 seconds. 96 already precompiled.
+Precompiling packages...
+   3589.9 ms  ✓ Reactant → ReactantFillArraysExt
+   4373.1 ms  ✓ Reactant → ReactantZygoteExt
+  2 dependencies successfully precompiled in 8 seconds. 138 already precompiled.
+Precompiling packages...
+   3757.7 ms  ✓ Reactant → ReactantNNlibExt
+  1 dependency successfully precompiled in 7 seconds. 120 already precompiled.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+{
+    "status": "completed",
+    "generated_at": "2026-07-18T06:09:15",
+    "batch_size": 16,
+    "versions": {
+        "julia": "1.12.6",
+        "julia_commit": "15346901f0",
+        "lux": "1.31.4",
+        "zygote": "0.7.11",
+        "enzyme": "0.13.187",
+        "optimisers": "0.4.7",
+        "reactant": "0.2.274"
+    },
+    "julia_threads": 20,
+    "blas_threads": 20,
+    "workload": {
+        "model": "Lux.Chain(Dense(256=>256,tanh),Dense(256=>64))",
+        "loss": "sum(abs2,prediction-target)/length(target)",
+        "optimizer": "Optimisers.AdamW(lr=1e-3,beta=(0.9,0.999),weight_decay=1e-4)",
+        "parameter_count": 82240,
+        "batch_size": 16,
+        "input_shape": [
+            256,
+            16
+        ],
+        "target_shape": [
+            64,
+            16
+        ],
+        "parameter_sha256": "b6258f932cc8d6dca9468faac5a6ff9740895a4544a5f07a78d06bf86353d038",
+        "batch_sha256": "a9842b9cc4088d35bed08eadee5b39cdd66cdcdb32555784df59139f593ec2e2",
+        "dtype": "Float32"
+    },
+    "zygote_loss": 0.9977676868438721,
+    "reactant_loss": 0.9977676272392273,
+    "loss_absolute_error": 5.960464477539063e-8,
+    "gradient_vs_zygote": {
+        "elements": 82240,
+        "cosine": 0.9999999999998762,
+        "maximum_absolute_error": 1.0608346201479435e-8,
+        "relative_l2": 4.7081598946778695e-7
+    },
+    "one_update_parameters_vs_zygote": {
+        "elements": 82240,
+        "cosine": 0.999999999999972,
+        "maximum_absolute_error": 2.3692846298217773e-6,
+        "relative_l2": 8.789185615309734e-8
+    }
+}nothing
+I0000 00:00:1784322553.363101   31772 cpp_gen_intrinsics.cc:79] Empty bitcode string provided for eigen. Optimizations relying on this IR will be disabled.

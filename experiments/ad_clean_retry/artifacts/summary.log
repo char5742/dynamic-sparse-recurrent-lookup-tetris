@@ -1,0 +1,564 @@
+{
+    "generated_at": "2026-07-18T06:21:49",
+    "all_twelve_runs_completed_1000_updates": true,
+    "rows": [
+        {
+            "batch": 16,
+            "backend": "reactant",
+            "first_update_compile_inclusive_seconds": 39.2040515,
+            "steady_updates_per_second": 3436.8364996202126,
+            "steady_median_seconds": 0.00028465,
+            "steady_p10_seconds": 0.0002475,
+            "steady_p90_seconds": 0.00034240999999999997,
+            "steady_median_allocated_bytes": 13520,
+            "peak_working_set_bytes": 1346297856,
+            "full_loop_wall_seconds": 40.0051711,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9977676272392273,
+                "final_loss": 2.000322650574926e-13,
+                "minimum_loss": 1.3534384387964976e-13,
+                "maximum_loss": 0.9977676272392273,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 16,
+            "backend": "zygote",
+            "first_update_compile_inclusive_seconds": 9.7060223,
+            "steady_updates_per_second": 1064.255558074652,
+            "steady_median_seconds": 0.0007564500000000001,
+            "steady_p10_seconds": 0.00063959,
+            "steady_p90_seconds": 0.0009607099999999999,
+            "steady_median_allocated_bytes": 458774,
+            "peak_working_set_bytes": 851599360,
+            "full_loop_wall_seconds": 11.0323942,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9977676868438721,
+                "final_loss": 1.809711370559866e-13,
+                "minimum_loss": 1.1090093958183306e-13,
+                "maximum_loss": 0.9977676868438721,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 16,
+            "backend": "enzyme_static",
+            "first_update_compile_inclusive_seconds": 35.8228561,
+            "steady_updates_per_second": 1818.9451404308327,
+            "steady_median_seconds": 0.00052985,
+            "steady_p10_seconds": 0.00044114,
+            "steady_p90_seconds": 0.00060312,
+            "steady_median_allocated_bytes": 173350,
+            "peak_working_set_bytes": 1097383936,
+            "full_loop_wall_seconds": 36.7343069,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9977675080299377,
+                "final_loss": 1.809711370559866e-13,
+                "minimum_loss": 1.1090094635809664e-13,
+                "maximum_loss": 0.9977675080299377,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 32,
+            "backend": "reactant",
+            "first_update_compile_inclusive_seconds": 38.1142826,
+            "steady_updates_per_second": 3084.1207966003644,
+            "steady_median_seconds": 0.0003165,
+            "steady_p10_seconds": 0.00028459,
+            "steady_p90_seconds": 0.00037580999999999997,
+            "steady_median_allocated_bytes": 13520,
+            "peak_working_set_bytes": 1365626880,
+            "full_loop_wall_seconds": 38.8721656,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9096250534057617,
+                "final_loss": 1.6998865693968607e-13,
+                "minimum_loss": 1.2938048798549068e-13,
+                "maximum_loss": 0.9096250534057617,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 32,
+            "backend": "zygote",
+            "first_update_compile_inclusive_seconds": 9.2787616,
+            "steady_updates_per_second": 909.7719431478919,
+            "steady_median_seconds": 0.00097205,
+            "steady_p10_seconds": 0.00085908,
+            "steady_p90_seconds": 0.00132652,
+            "steady_median_allocated_bytes": 540694,
+            "peak_working_set_bytes": 878809088,
+            "full_loop_wall_seconds": 10.7503221,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9096251726150513,
+                "final_loss": 1.468436375100246e-13,
+                "minimum_loss": 1.1511023254376362e-13,
+                "maximum_loss": 0.9096251726150513,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 32,
+            "backend": "enzyme_static",
+            "first_update_compile_inclusive_seconds": 33.6254826,
+            "steady_updates_per_second": 1094.112942958256,
+            "steady_median_seconds": 0.0007667,
+            "steady_p10_seconds": 0.00061049,
+            "steady_p90_seconds": 0.00092949,
+            "steady_median_allocated_bytes": 271654,
+            "peak_working_set_bytes": 1106460672,
+            "full_loop_wall_seconds": 34.8924957,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9096252918243408,
+                "final_loss": 1.468436375100246e-13,
+                "minimum_loss": 1.1511023254376362e-13,
+                "maximum_loss": 0.9096252918243408,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 64,
+            "backend": "reactant",
+            "first_update_compile_inclusive_seconds": 39.5355665,
+            "steady_updates_per_second": 2057.643532587358,
+            "steady_median_seconds": 0.00048695,
+            "steady_p10_seconds": 0.0004252,
+            "steady_p90_seconds": 0.0005454300000000001,
+            "steady_median_allocated_bytes": 13520,
+            "peak_working_set_bytes": 1335123968,
+            "full_loop_wall_seconds": 40.415903,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9911922812461853,
+                "final_loss": 9.308892090324761e-14,
+                "minimum_loss": 9.273223871729061e-14,
+                "maximum_loss": 0.9911922812461853,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 64,
+            "backend": "zygote",
+            "first_update_compile_inclusive_seconds": 9.315482,
+            "steady_updates_per_second": 713.7447410890953,
+            "steady_median_seconds": 0.00126845,
+            "steady_p10_seconds": 0.00110337,
+            "steady_p90_seconds": 0.00151863,
+            "steady_median_allocated_bytes": 704534,
+            "peak_working_set_bytes": 851488768,
+            "full_loop_wall_seconds": 11.0694631,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9911922812461853,
+                "final_loss": 1.3585874504389028e-13,
+                "minimum_loss": 1.285310697934569e-13,
+                "maximum_loss": 0.9911922812461853,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 64,
+            "backend": "enzyme_static",
+            "first_update_compile_inclusive_seconds": 32.7781972,
+            "steady_updates_per_second": 822.8189127669827,
+            "steady_median_seconds": 0.0010964,
+            "steady_p10_seconds": 0.0009415,
+            "steady_p90_seconds": 0.0012779299999999998,
+            "steady_median_allocated_bytes": 468262,
+            "peak_working_set_bytes": 1110892544,
+            "full_loop_wall_seconds": 34.3395221,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9911918640136719,
+                "final_loss": 1.3585873149136313e-13,
+                "minimum_loss": 1.2853105624092975e-13,
+                "maximum_loss": 0.9911918640136719,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 128,
+            "backend": "reactant",
+            "first_update_compile_inclusive_seconds": 37.0604698,
+            "steady_updates_per_second": 1574.8021475847306,
+            "steady_median_seconds": 0.0006422,
+            "steady_p10_seconds": 0.00054428,
+            "steady_p90_seconds": 0.0007168,
+            "steady_median_allocated_bytes": 13520,
+            "peak_working_set_bytes": 1342509056,
+            "full_loop_wall_seconds": 38.1431609,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9703755378723145,
+                "final_loss": 2.0408564974701976e-13,
+                "minimum_loss": 2.0055008001507169e-13,
+                "maximum_loss": 0.9703755378723145,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 128,
+            "backend": "zygote",
+            "first_update_compile_inclusive_seconds": 9.2195031,
+            "steady_updates_per_second": 564.3600473446772,
+            "steady_median_seconds": 0.0015544,
+            "steady_p10_seconds": 0.0013153,
+            "steady_p90_seconds": 0.0019716,
+            "steady_median_allocated_bytes": 1032230,
+            "peak_working_set_bytes": 889647104,
+            "full_loop_wall_seconds": 11.3297734,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9703754782676697,
+                "final_loss": 1.8556708361767982e-13,
+                "minimum_loss": 1.8031962641801291e-13,
+                "maximum_loss": 0.9703754782676697,
+                "final_parameters_finite": true
+            }
+        },
+        {
+            "batch": 128,
+            "backend": "enzyme_static",
+            "first_update_compile_inclusive_seconds": 29.3135076,
+            "steady_updates_per_second": 610.9188979245233,
+            "steady_median_seconds": 0.0014540999999999998,
+            "steady_p10_seconds": 0.0012645,
+            "steady_p90_seconds": 0.00169519,
+            "steady_median_allocated_bytes": 861478,
+            "peak_working_set_bytes": 1103110144,
+            "full_loop_wall_seconds": 31.3152049,
+            "completed_steps": 1000,
+            "stability": {
+                "all_losses_finite": true,
+                "initial_loss": 0.9703754186630249,
+                "final_loss": 1.8556707006515266e-13,
+                "minimum_loss": 1.8031961286548576e-13,
+                "maximum_loss": 0.9703754186630249,
+                "final_parameters_finite": true
+            }
+        }
+    ],
+    "speedups": {
+        "32": {
+            "enzyme_over_zygote": 1.2026233070812538,
+            "reactant_over_zygote": 3.3899933052771796,
+            "reactant_over_enzyme": 2.8188322023332772
+        },
+        "64": {
+            "enzyme_over_zygote": 1.152819580164545,
+            "reactant_over_zygote": 2.8828843340374353,
+            "reactant_over_enzyme": 2.5007246438561994
+        },
+        "16": {
+            "enzyme_over_zygote": 1.7091243983930813,
+            "reactant_over_zygote": 3.229333850826021,
+            "reactant_over_enzyme": 1.8894668251545885
+        },
+        "128": {
+            "enzyme_over_zygote": 1.0824984879757278,
+            "reactant_over_zygote": 2.790421035284477,
+            "reactant_over_enzyme": 2.577759753274634
+        }
+    },
+    "trajectory_checks": {
+        "32": {
+            "zygote_vs_enzyme": {
+                "maximum_absolute_error": 2.980232238769531e-7,
+                "update": 2
+            },
+            "zygote_vs_reactant": {
+                "maximum_absolute_error": 1.1920928955078125e-7,
+                "update": 1
+            }
+        },
+        "64": {
+            "zygote_vs_enzyme": {
+                "maximum_absolute_error": 4.172325134277344e-7,
+                "update": 1
+            },
+            "zygote_vs_reactant": {
+                "maximum_absolute_error": 5.960464477539063e-8,
+                "update": 5
+            }
+        },
+        "16": {
+            "zygote_vs_enzyme": {
+                "maximum_absolute_error": 1.7881393432617188e-7,
+                "update": 1
+            },
+            "zygote_vs_reactant": {
+                "maximum_absolute_error": 2.384185791015625e-7,
+                "update": 2
+            }
+        },
+        "128": {
+            "zygote_vs_enzyme": {
+                "maximum_absolute_error": 2.980232238769531e-7,
+                "update": 3
+            },
+            "zygote_vs_reactant": {
+                "maximum_absolute_error": 5.960464477539063e-8,
+                "update": 1
+            }
+        }
+    },
+    "numerics": {
+        "native_b64": {
+            "status": "completed",
+            "generated_at": "2026-07-18T06:18:35",
+            "batch_size": 64,
+            "versions": {
+                "julia": "1.12.6",
+                "julia_commit": "15346901f0",
+                "lux": "1.31.4",
+                "zygote": "0.7.11",
+                "enzyme": "0.13.187",
+                "optimisers": "0.4.7"
+            },
+            "julia_threads": 20,
+            "blas_threads": 20,
+            "workload": {
+                "model": "Lux.Chain(Dense(256=>256,tanh),Dense(256=>64))",
+                "loss": "sum(abs2,prediction-target)/length(target)",
+                "optimizer": "Optimisers.AdamW(lr=1e-3,beta=(0.9,0.999),weight_decay=1e-4)",
+                "parameter_count": 82240,
+                "batch_size": 64,
+                "input_shape": [
+                    256,
+                    64
+                ],
+                "target_shape": [
+                    64,
+                    64
+                ],
+                "parameter_sha256": "b6258f932cc8d6dca9468faac5a6ff9740895a4544a5f07a78d06bf86353d038",
+                "batch_sha256": "4ff500145850d4eeac645703b18551d664c70bd72f5259f3104c9c6dba2df947",
+                "dtype": "Float32"
+            },
+            "enzyme_static": {
+                "status": "completed",
+                "error": null,
+                "zygote_loss": 0.9911922812461853,
+                "enzyme_loss": 0.9911918640136719,
+                "loss_absolute_error": 4.172325134277344e-7,
+                "gradient_vs_zygote": {
+                    "elements": 82240,
+                    "cosine": 0.9999999999999892,
+                    "maximum_absolute_error": 0,
+                    "relative_l2": 0
+                },
+                "one_update_parameters_vs_zygote": {
+                    "elements": 82240,
+                    "cosine": 0.9999999999999742,
+                    "maximum_absolute_error": 0,
+                    "relative_l2": 0
+                }
+            },
+            "enzyme_runtime": {
+                "status": "completed",
+                "error": null,
+                "zygote_loss": 0.9911922812461853,
+                "enzyme_loss": 0.9911918640136719,
+                "loss_absolute_error": 4.172325134277344e-7,
+                "gradient_vs_zygote": {
+                    "elements": 82240,
+                    "cosine": 0.9999999999999892,
+                    "maximum_absolute_error": 0,
+                    "relative_l2": 0
+                },
+                "one_update_parameters_vs_zygote": {
+                    "elements": 82240,
+                    "cosine": 0.9999999999999742,
+                    "maximum_absolute_error": 0,
+                    "relative_l2": 0
+                }
+            }
+        },
+        "native_b16": {
+            "status": "completed",
+            "generated_at": "2026-07-18T06:05:33",
+            "batch_size": 16,
+            "versions": {
+                "julia": "1.12.6",
+                "julia_commit": "15346901f0",
+                "lux": "1.31.4",
+                "zygote": "0.7.11",
+                "enzyme": "0.13.187",
+                "optimisers": "0.4.7"
+            },
+            "julia_threads": 20,
+            "blas_threads": 20,
+            "workload": {
+                "model": "Lux.Chain(Dense(256=>256,tanh),Dense(256=>64))",
+                "loss": "sum(abs2,prediction-target)/length(target)",
+                "optimizer": "Optimisers.AdamW(lr=1e-3,beta=(0.9,0.999),weight_decay=1e-4)",
+                "parameter_count": 82240,
+                "batch_size": 16,
+                "input_shape": [
+                    256,
+                    16
+                ],
+                "target_shape": [
+                    64,
+                    16
+                ],
+                "parameter_sha256": "b6258f932cc8d6dca9468faac5a6ff9740895a4544a5f07a78d06bf86353d038",
+                "batch_sha256": "a9842b9cc4088d35bed08eadee5b39cdd66cdcdb32555784df59139f593ec2e2",
+                "dtype": "Float32"
+            },
+            "enzyme_static": {
+                "status": "completed",
+                "error": null,
+                "zygote_loss": 0.9977676868438721,
+                "enzyme_loss": 0.9977675080299377,
+                "loss_absolute_error": 1.7881393432617188e-7,
+                "gradient_vs_zygote": {
+                    "elements": 82240,
+                    "cosine": 0.9999999999999865,
+                    "maximum_absolute_error": 0,
+                    "relative_l2": 0
+                },
+                "one_update_parameters_vs_zygote": {
+                    "elements": 82240,
+                    "cosine": 0.9999999999999752,
+                    "maximum_absolute_error": 0,
+                    "relative_l2": 0
+                }
+            },
+            "enzyme_runtime": {
+                "status": "completed",
+                "error": null,
+                "zygote_loss": 0.9977676868438721,
+                "enzyme_loss": 0.9977675080299377,
+                "loss_absolute_error": 1.7881393432617188e-7,
+                "gradient_vs_zygote": {
+                    "elements": 82240,
+                    "cosine": 0.9999999999999865,
+                    "maximum_absolute_error": 0,
+                    "relative_l2": 0
+                },
+                "one_update_parameters_vs_zygote": {
+                    "elements": 82240,
+                    "cosine": 0.9999999999999752,
+                    "maximum_absolute_error": 0,
+                    "relative_l2": 0
+                }
+            }
+        },
+        "reactant_b64": {
+            "status": "completed",
+            "generated_at": "2026-07-18T06:20:11",
+            "batch_size": 64,
+            "versions": {
+                "julia": "1.12.6",
+                "julia_commit": "15346901f0",
+                "lux": "1.31.4",
+                "zygote": "0.7.11",
+                "enzyme": "0.13.187",
+                "optimisers": "0.4.7",
+                "reactant": "0.2.274"
+            },
+            "julia_threads": 20,
+            "blas_threads": 20,
+            "workload": {
+                "model": "Lux.Chain(Dense(256=>256,tanh),Dense(256=>64))",
+                "loss": "sum(abs2,prediction-target)/length(target)",
+                "optimizer": "Optimisers.AdamW(lr=1e-3,beta=(0.9,0.999),weight_decay=1e-4)",
+                "parameter_count": 82240,
+                "batch_size": 64,
+                "input_shape": [
+                    256,
+                    64
+                ],
+                "target_shape": [
+                    64,
+                    64
+                ],
+                "parameter_sha256": "b6258f932cc8d6dca9468faac5a6ff9740895a4544a5f07a78d06bf86353d038",
+                "batch_sha256": "4ff500145850d4eeac645703b18551d664c70bd72f5259f3104c9c6dba2df947",
+                "dtype": "Float32"
+            },
+            "zygote_loss": 0.9911922812461853,
+            "reactant_loss": 0.9911922812461853,
+            "loss_absolute_error": 0,
+            "gradient_vs_zygote": {
+                "elements": 82240,
+                "cosine": 0.9999999999998895,
+                "maximum_absolute_error": 6.05359673500061e-9,
+                "relative_l2": 4.4390943179421267e-7
+            },
+            "one_update_parameters_vs_zygote": {
+                "elements": 82240,
+                "cosine": 0.9999999999999697,
+                "maximum_absolute_error": 1.8998980522155762e-6,
+                "relative_l2": 1.0033115680689053e-7
+            }
+        },
+        "reactant_b16": {
+            "status": "completed",
+            "generated_at": "2026-07-18T06:09:15",
+            "batch_size": 16,
+            "versions": {
+                "julia": "1.12.6",
+                "julia_commit": "15346901f0",
+                "lux": "1.31.4",
+                "zygote": "0.7.11",
+                "enzyme": "0.13.187",
+                "optimisers": "0.4.7",
+                "reactant": "0.2.274"
+            },
+            "julia_threads": 20,
+            "blas_threads": 20,
+            "workload": {
+                "model": "Lux.Chain(Dense(256=>256,tanh),Dense(256=>64))",
+                "loss": "sum(abs2,prediction-target)/length(target)",
+                "optimizer": "Optimisers.AdamW(lr=1e-3,beta=(0.9,0.999),weight_decay=1e-4)",
+                "parameter_count": 82240,
+                "batch_size": 16,
+                "input_shape": [
+                    256,
+                    16
+                ],
+                "target_shape": [
+                    64,
+                    16
+                ],
+                "parameter_sha256": "b6258f932cc8d6dca9468faac5a6ff9740895a4544a5f07a78d06bf86353d038",
+                "batch_sha256": "a9842b9cc4088d35bed08eadee5b39cdd66cdcdb32555784df59139f593ec2e2",
+                "dtype": "Float32"
+            },
+            "zygote_loss": 0.9977676868438721,
+            "reactant_loss": 0.9977676272392273,
+            "loss_absolute_error": 5.960464477539063e-8,
+            "gradient_vs_zygote": {
+                "elements": 82240,
+                "cosine": 0.9999999999998762,
+                "maximum_absolute_error": 1.0608346201479435e-8,
+                "relative_l2": 4.7081598946778695e-7
+            },
+            "one_update_parameters_vs_zygote": {
+                "elements": 82240,
+                "cosine": 0.999999999999972,
+                "maximum_absolute_error": 2.3692846298217773e-6,
+                "relative_l2": 8.789185615309734e-8
+            }
+        }
+    }
+}nothing
