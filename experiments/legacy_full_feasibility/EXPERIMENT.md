@@ -40,3 +40,8 @@ At the start gate the wrapper atomically creates the canonical marker
 `D:\tetris-paper-plus\runs\legacy_full_feasibility_F.started.json`.  This
 global guard is independent of the chosen output directory, so a failed or
 stopped F execution cannot be retried by selecting a fresh directory.
+
+Every child process is launched through the Windows command-line quoting rules
+in `native_arguments.ps1`; `test_native_arguments.ps1` verifies the actual
+`Start-Process` boundary using spaces, an embedded quote, a trailing
+backslash, an empty argument, and Unicode before a freeze is accepted.

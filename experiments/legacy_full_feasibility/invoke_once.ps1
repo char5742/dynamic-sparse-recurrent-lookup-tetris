@@ -20,6 +20,7 @@ $MaxWorkingSetBytes = [int64](8 * 1024 * 1024 * 1024)
 $Checkpoint = Join-Path $Repository '1313\mainmodel copy 3.jld2'
 $Dataset = 'D:\tetris-paper-plus\datasets\learning\teacher_dev_5742_5749_2000.jld2'
 $Experiment = Join-Path $Repository 'experiments\legacy_full_feasibility'
+. (Join-Path $Experiment 'native_arguments.ps1')
 $Manifest = Join-Path $Repository 'Manifest.toml'
 $FreezePath = Join-Path $OutputDirectory 'freeze.json'
 $MonitorPath = Join-Path $OutputDirectory 'monitor.json'
@@ -117,7 +118,9 @@ $HarnessFiles = @(
     'verify_openvino.py',
     'finalize_result.py',
     'invoke_once.ps1',
+    'native_arguments.ps1',
     'test_contract.jl',
+    'test_native_arguments.ps1',
     'EXPERIMENT.md'
 )
 $HarnessRecords = @()
@@ -269,13 +272,15 @@ function Invoke-MonitoredPhase(
     $Stdout = Join-Path $OutputDirectory "$Name.stdout.log"
     $Stderr = Join-Path $OutputDirectory "$Name.stderr.log"
     $PhaseStarted = Get-Date
-    $Process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -NoNewWindow -PassThru -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
+    $NativeArgumentString = Join-NativeArguments $ArgumentList
+    $Process = Start-Process -FilePath $FilePath -ArgumentList $NativeArgumentString -NoNewWindow -PassThru -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
     Write-JsonAtomic (Join-Path $OutputDirectory "$Name.started.json") ([ordered]@{
         phase = $Name
         pid = $Process.Id
         started_at = $PhaseStarted.ToString('o')
         executable = $FilePath
         arguments = $ArgumentList
+        native_argument_string = $NativeArgumentString
     })
     $StopReason = 'completed'
     while (-not $Process.HasExited) {
