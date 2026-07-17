@@ -1,4 +1,5 @@
 include(joinpath(ROOT, "scripts", "evaluation_artifact_helpers.jl"))
+include(joinpath(ROOT, "scripts", "lookahead_artifact_helpers.jl"))
 
 @testset "evaluation artifact accounting and names" begin
     mktempdir() do directory
@@ -46,4 +47,40 @@ include(joinpath(ROOT, "scripts", "evaluation_artifact_helpers.jl"))
     @test compact_50 == "compact_eval_seed5751-5752_next5_steps50.json"
     @test baseline_50 != baseline_250
     @test compact_50 != compact_250
+end
+
+@testset "S1 lookahead artifact accounting" begin
+    accounting = lookahead_evaluation_accounting(33, [0, 17, 16], 16)
+    @test accounting == (;
+        root_candidate_evaluations=33,
+        successor_candidate_evaluations=33,
+        lookahead_expansions=3,
+        logical_model_passes=3,
+        physical_backend_requests=6,
+    )
+    @test lookahead_evaluation_accounting(0, Int[], 16) == (;
+        root_candidate_evaluations=0,
+        successor_candidate_evaluations=0,
+        lookahead_expansions=0,
+        logical_model_passes=0,
+        physical_backend_requests=0,
+    )
+    @test_throws ArgumentError lookahead_evaluation_accounting(-1, Int[], 16)
+    @test_throws ArgumentError lookahead_evaluation_accounting(1, [-1], 16)
+    @test_throws ArgumentError lookahead_evaluation_accounting(0, [1], 16)
+    @test_throws ArgumentError lookahead_evaluation_accounting(1, Int[], 0)
+
+    constants = validate_s1_search_constants(2, 0.5f0, 0.997f0, Inf32)
+    @test constants == (;
+        top_k=2, blend=0.5f0, gamma=0.997f0, q_margin_threshold="Inf"
+    )
+    @test_throws ErrorException validate_s1_search_constants(3, 0.5f0, 0.997f0, Inf32)
+    @test_throws ErrorException validate_s1_search_constants(2, 0.6f0, 0.997f0, Inf32)
+    @test_throws ErrorException validate_s1_search_constants(2, 0.5f0, 0.9f0, Inf32)
+    @test_throws ErrorException validate_s1_search_constants(2, 0.5f0, 0.997f0, 1.0f0)
+
+    short_name = lookahead_result_filename(5755, 5, 50; device="NPU")
+    frozen_name = lookahead_result_filename(5755, 5, 100; device="NPU")
+    @test frozen_name == "openvino_lookahead_npu_k2_b0.5_g0.997_minf_seed5755_next5_steps100.json"
+    @test short_name != frozen_name
 end
