@@ -42,6 +42,7 @@ $RequiredFiles = @(
     'native_arguments.ps1', 'result_composition.ps1', 'invoke_once.ps1',
     'test_contract.jl', 'test_export_gate_contract.jl',
     'test_export_gate_static.py', 'test_source_fingerprint.py',
+    'test_freeze_order_production.py',
     'test_native_arguments.ps1', 'test_finalization.py',
     'test_result_composition.ps1', 'test_static.py', 'EXPERIMENT.md'
 )
@@ -133,7 +134,7 @@ function Test-Q1HarnessPreflight {
         & $JuliaExe --startup-file=no --history-file=no "--project=$Repository" $Path --self-check | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "fresh Julia startup self-check failed: $Name" }
     }
-    foreach ($Test in @('test_source_fingerprint.py', 'test_export_gate_static.py', 'test_finalization.py', 'test_static.py')) {
+    foreach ($Test in @('test_source_fingerprint.py', 'test_export_gate_static.py', 'test_freeze_order_production.py', 'test_finalization.py', 'test_static.py')) {
         & $SystemPython (Join-Path $Experiment $Test) | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Python synthetic test failed: $Test" }
     }
@@ -146,6 +147,8 @@ function Test-Q1HarnessPreflight {
         python_files = $PythonFiles.Count
         julia_files = $JuliaFiles.Count
         fresh_julia_entrypoints = $JuliaEntrypoints.Count
+        freeze_order_production_branch_executed = $true
+        freeze_order_production_branch_used_synthetic_eligibility = $true
         malformed_julia_fixture_rejected = $true
         checkpoint_or_dataset_opened = $false
         model_or_openvino_loaded = $false

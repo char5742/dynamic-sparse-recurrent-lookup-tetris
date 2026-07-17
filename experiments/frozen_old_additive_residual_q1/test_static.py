@@ -51,6 +51,8 @@ def test_q1_scope_and_fresh_export_are_explicit() -> None:
     assert "expected_parent_commit" not in wrapper
     assert "authorized_base_commit" in wrapper
     assert "actual_parent_commit" in wrapper
+    assert "test_freeze_order_production.py" in wrapper
+    assert "freeze_order_production_branch_executed = $true" in wrapper
 
 
 def test_no_forbidden_seed_or_prior_marker_escape() -> None:
