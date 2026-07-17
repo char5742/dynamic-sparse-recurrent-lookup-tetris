@@ -41,6 +41,8 @@ def test_q1_scope_and_fresh_export_are_explicit() -> None:
     assert '"earlier_checkpoint_rollback": False' in offline
     assert "require_hash(old_checkpoint_path" in trainer
     assert "jldopen(old_checkpoint_path" not in trainer
+    assert "Optimisers.ClipNorm" not in trainer
+    assert 'clip_mode="single_global_tree_l2"' in trainer
 
 
 def test_no_forbidden_seed_or_prior_marker_escape() -> None:

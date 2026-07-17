@@ -45,6 +45,17 @@ function main(args=ARGS)
         combined = stored .+ correction
         @test reinterpret(UInt32, combined) == reinterpret(UInt32, stored)
         @test argmax(combined) == argmax(stored)
+
+        witness = global_clip_synthetic_witness()
+        @test witness.statistics.clip_mode == "single_global_tree_l2"
+        @test witness.statistics.global_gradient_norm_before == 13.0
+        @test witness.statistics.global_gradient_scale == 1 / 13
+        @test isapprox(witness.statistics.global_gradient_norm_after, 1.0; atol=1.0e-6, rtol=0)
+        @test isapprox(witness.first_norm, 5 / 13; atol=1.0e-6, rtol=0)
+        @test isapprox(witness.second_norm, 12 / 13; atol=1.0e-6, rtol=0)
+        @test witness.statistics.all_leaves_same_scale
+        @test witness.empty_named_tuple_preserved
+        @test witness.nothing_preserved
     end
     println("Q1 Julia synthetic contract checks passed")
 end

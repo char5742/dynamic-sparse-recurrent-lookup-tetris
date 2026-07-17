@@ -283,6 +283,7 @@ def assess(root: Path) -> dict[str, Any]:
             "updates": 2000,
             "rng": "Xoshiro(0x5131_2026)",
             "n_step": 3,
+            "clip_mode": "single_global_tree_l2",
             "initializer_exposed_to_offline_rows": True,
             "offline_role": "reused_development_guard",
             "offline_is_held_out_generalization": False,
@@ -301,6 +302,12 @@ def assess(root: Path) -> dict[str, Any]:
         require(zero.get("top1_agreement") == 1, "update-0 top-1 identity failed")
         require(integer_nonnegative(zero.get("valid_outputs")) and zero.get("valid_outputs") > 0, "update-0 witness count invalid")
         require(training.get("gradient_elements_every_update") is True, "gradient coverage incomplete")
+        require(training.get("clip_mode") == "single_global_tree_l2", "training clip mode mismatch")
+        clip_tolerance = training.get("global_gradient_norm_tolerance")
+        require(finite(clip_tolerance) and clip_tolerance == 1.0e-6, "training global gradient tolerance mismatch")
+        require(training.get("global_gradient_norms_finite_every_update") is True, "non-finite global gradient norm recorded")
+        require(training.get("global_gradient_post_norm_within_limit_every_update") is True, "global gradient post-norm limit failed")
+        require(training.get("global_gradient_uniform_scale_every_update") is True, "global gradient uniform-scale gate failed")
         paths = training.get("gradient_paths")
         require(isinstance(paths, list) and len(paths) == training.get("parameter_array_count") and len(set(paths)) == len(paths), "gradient path inventory mismatch")
         require(finite_nonnegative(training.get("wall_seconds")) and training["wall_seconds"] <= 720, "training wall gate failed")
@@ -317,6 +324,20 @@ def assess(root: Path) -> dict[str, Any]:
             require(all(entry.get("gradient_elements") == 165051 for entry in updates), "update gradient accounting mismatch")
             require(all(entry.get("parameter_elements") == 165051 for entry in updates), "update parameter accounting mismatch")
             require(all(entry.get("parameter_array_count") == training.get("parameter_array_count") for entry in updates), "update parameter-array accounting mismatch")
+            for entry in updates:
+                before_norm = entry.get("global_gradient_norm_before")
+                after_norm = entry.get("global_gradient_norm_after")
+                scale = entry.get("global_gradient_scale")
+                require(entry.get("clip_mode") == "single_global_tree_l2", "update clip mode mismatch")
+                require(finite_nonnegative(before_norm), "update global pre-norm invalid")
+                require(finite_nonnegative(after_norm) and after_norm <= 1.0 + 1.0e-6, "update global post-norm invalid")
+                require(finite(scale) and 0 < scale <= 1, "update global scale invalid")
+                if finite_nonnegative(before_norm) and finite(scale):
+                    expected_scale = 1.0 if before_norm <= 1.0 else 1.0 / before_norm
+                    require(math.isclose(scale, expected_scale, rel_tol=1.0e-12, abs_tol=1.0e-15), "update global scale is inconsistent with pre-norm")
+                    require(abs(after_norm - before_norm * scale) <= 1.0e-6 * max(1.0, before_norm * scale), "update global post-norm is inconsistent with shared scale")
+                require(entry.get("all_gradient_leaves_same_scale") is True, "update did not apply one scale to all leaves")
+                require(finite_nonnegative(entry.get("maximum_leaf_scale_error")) and entry["maximum_leaf_scale_error"] <= 1.0e-6, "update leaf scale error exceeded tolerance")
             require(all(finite(entry.get("loss")) and finite_nonnegative(entry.get("seconds")) for entry in updates), "update loss/time ledger invalid")
             require(all(entry["seconds"] <= 1 for entry in updates[5:25]), "warm update individual limit failed")
         for role in ("base_role_diagnostics", "dagger_role_diagnostics"):

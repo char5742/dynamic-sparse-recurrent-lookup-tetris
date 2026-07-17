@@ -93,7 +93,7 @@ end
 
 function gradient_validation(parameters, gradient)
     ps_arrays = array_leaves(parameters)
-    grad_arrays = array_leaves(gradient)
+    grad_arrays = gradient_arrays(gradient)
     keys(ps_arrays) == keys(grad_arrays) || return (valid=false, reason="gradient path mismatch")
     elements = sum(length, values(grad_arrays); init=0)
     finite = all(array -> all(isfinite, array), values(grad_arrays))
@@ -113,8 +113,18 @@ function update_once(model, parameters, state, optimizer_state, batch)
     gradient = only(differentiated.grad)
     validation = gradient_validation(parameters, gradient)
     validation.valid || error("invalid gradient: $validation")
-    next_optimizer_state, next_parameters = Optimisers.update(optimizer_state, parameters, gradient)
-    return Float64(differentiated.val), validation, next_optimizer_state, next_parameters
+    clipped_gradient, clip_statistics = clip_global_tree_l2(
+        gradient; limit=Float64(GRADIENT_CLIP), tolerance=1.0e-6
+    )
+    next_optimizer_state, next_parameters = Optimisers.update(
+        optimizer_state, parameters, clipped_gradient
+    )
+    return (
+        Float64(differentiated.val),
+        merge(validation, clip_statistics),
+        next_optimizer_state,
+        next_parameters,
+    )
 end
 
 function zero_policy_gate(model, parameters, state, data)
@@ -219,6 +229,14 @@ function self_check()
     all(reinterpret(UInt32, value) == 0 for value in output) || error("synthetic zero-head output mismatch")
     flat_index(1, 1) == 1 || error("fixed74 flat index origin mismatch")
     flat_index(74, 4) == 296 || error("fixed74 flat index terminal mismatch")
+    witness = global_clip_synthetic_witness()
+    witness.statistics.global_gradient_norm_before == 13.0 || error("global clip witness pre-norm mismatch")
+    witness.statistics.global_gradient_scale == 1 / 13 || error("global clip witness scale mismatch")
+    isapprox(witness.statistics.global_gradient_norm_after, 1.0; atol=1.0e-6, rtol=0) || error("global clip witness post-norm mismatch")
+    isapprox(witness.first_norm, 5 / 13; atol=1.0e-6, rtol=0) || error("first leaf clip norm mismatch")
+    isapprox(witness.second_norm, 12 / 13; atol=1.0e-6, rtol=0) || error("second leaf clip norm mismatch")
+    witness.empty_named_tuple_preserved || error("empty NamedTuple was not preserved")
+    witness.nothing_preserved || error("Nothing gradient leaf was not preserved")
     return true
 end
 
@@ -262,10 +280,7 @@ function main(args=ARGS)
         )
         metadata = (; experiment=EXPERIMENT_ID, source_initializer_sha256=INITIALIZER_SHA256, old_checkpoint_sha256=OLD_CHECKPOINT_SHA256, order_sha256=input_hashes_before["order"])
         save_snapshot(joinpath(output_directory, "correction_update0.jld2"), parameters, state, 0, metadata)
-        optimizer = Optimisers.OptimiserChain(
-            Optimisers.ClipNorm(GRADIENT_CLIP),
-            Optimisers.AdamW(LEARNING_RATE, (0.9, 0.999), WEIGHT_DECAY),
-        )
+        optimizer = Optimisers.AdamW(LEARNING_RATE, (0.9, 0.999), WEIGHT_DECAY)
         optimizer_state = Optimisers.setup(optimizer, parameters)
         update_records = Any[]
         reference_paths = nothing
@@ -289,6 +304,12 @@ function main(args=ARGS)
                 allocated_bytes=timing.bytes,
                 gradient_elements=validation.gradient_elements,
                 gradient_array_count=validation.gradient_array_count,
+                clip_mode=validation.clip_mode,
+                global_gradient_norm_before=validation.global_gradient_norm_before,
+                global_gradient_norm_after=validation.global_gradient_norm_after,
+                global_gradient_scale=validation.global_gradient_scale,
+                all_gradient_leaves_same_scale=validation.all_leaves_same_scale,
+                maximum_leaf_scale_error=validation.maximum_leaf_scale_error,
                 parameter_elements=Lux.parameterlength(parameters),
                 parameter_array_count=length(array_leaves(parameters)),
             )
@@ -341,6 +362,21 @@ function main(args=ARGS)
             wall_seconds=time() - started, update_count=length(update_records), zero_gate,
             parameter_count=Lux.parameterlength(parameters), parameter_array_count,
             gradient_paths=reference_paths, gradient_elements_every_update=all(entry.gradient_elements == PARAMETER_COUNT for entry in update_records),
+            clip_mode="single_global_tree_l2",
+            global_gradient_norm_tolerance=1.0e-6,
+            global_gradient_norms_finite_every_update=all(
+                isfinite(entry.global_gradient_norm_before) &&
+                isfinite(entry.global_gradient_norm_after) &&
+                isfinite(entry.global_gradient_scale) for entry in update_records
+            ),
+            global_gradient_post_norm_within_limit_every_update=all(
+                entry.global_gradient_norm_after <= 1.0 + 1.0e-6 for entry in update_records
+            ),
+            global_gradient_uniform_scale_every_update=all(
+                entry.clip_mode == "single_global_tree_l2" &&
+                entry.all_gradient_leaves_same_scale &&
+                entry.maximum_leaf_scale_error <= 1.0e-6 for entry in update_records
+            ),
             first_update_seconds=update_records[1].seconds, warm_update_seconds=warm,
             warm_median_seconds=median(warm), update_records,
             projected_total_seconds,

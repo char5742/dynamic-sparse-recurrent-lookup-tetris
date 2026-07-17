@@ -151,6 +151,12 @@ def build_complete_fixture(root: Path) -> None:
             "allocated_bytes": 10,
             "gradient_elements": 165051,
             "gradient_array_count": 1,
+            "clip_mode": "single_global_tree_l2",
+            "global_gradient_norm_before": 2.0,
+            "global_gradient_norm_after": 1.0,
+            "global_gradient_scale": 0.5,
+            "all_gradient_leaves_same_scale": True,
+            "maximum_leaf_scale_error": 0.0,
             "parameter_elements": 165051,
             "parameter_array_count": 1,
         }
@@ -171,6 +177,7 @@ def build_complete_fixture(root: Path) -> None:
         "updates": 2000,
         "rng": "Xoshiro(0x5131_2026)",
         "n_step": 3,
+        "clip_mode": "single_global_tree_l2",
         "initializer_exposed_to_offline_rows": True,
         "offline_role": "reused_development_guard",
         "offline_is_held_out_generalization": False,
@@ -203,6 +210,11 @@ def build_complete_fixture(root: Path) -> None:
         "parameter_array_count": 1,
         "gradient_paths": ["head.weight"],
         "gradient_elements_every_update": True,
+        "clip_mode": "single_global_tree_l2",
+        "global_gradient_norm_tolerance": 1.0e-6,
+        "global_gradient_norms_finite_every_update": True,
+        "global_gradient_post_norm_within_limit_every_update": True,
+        "global_gradient_uniform_scale_every_update": True,
         "first_update_seconds": 0.1,
         "warm_update_seconds": [0.01] * 20,
         "warm_median_seconds": 0.01,
@@ -399,6 +411,25 @@ def test_complete_and_fail_closed_mutations() -> None:
         mutated_training["zero_gate"]["bitwise_zero"] = False
         write_json(training_path, mutated_training)
         assert not finalizer.assess(root)["success"]
+        write_json(training_path, training)
+
+        clip_mutations = (
+            (("clip_mode",), "per_leaf", "training clip mode mismatch"),
+            (("update_records", 0, "global_gradient_scale"), 0.6, "scale is inconsistent"),
+            (("update_records", 0, "global_gradient_norm_after"), 1.2, "post-norm invalid"),
+            (("update_records", 0, "all_gradient_leaves_same_scale"), False, "one scale to all leaves"),
+        )
+        for path_parts, value, needle in clip_mutations:
+            mutated_training = copy.deepcopy(training)
+            destination = mutated_training
+            for part in path_parts[:-1]:
+                destination = destination[part]
+            destination[path_parts[-1]] = value
+            write_json(training_path, mutated_training)
+            rejected = finalizer.assess(root)
+            assert not rejected["success"]
+            assert any(needle in failure for failure in rejected["failures"])
+        write_json(training_path, training)
 
 
 def test_incomplete_stub_rejected() -> None:

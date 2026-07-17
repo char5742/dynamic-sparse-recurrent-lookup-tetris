@@ -28,7 +28,9 @@ stored old scores exactly, and top-1 agreement must be 1.0.
   the selected action follow compact behavior, so DAgger-role diagnostics
   explicitly disclose the resulting off-policy bias;
 - selected Huber plus unit-weight all-valid-action zero-residual Huber anchor;
-- ClipNorm(1), AdamW(3e-4,(.9,.999),1e-4), exactly 2,000 Zygote updates;
+- one explicit Float64 L2 norm over every correction-gradient array leaf,
+  followed by one shared `min(1,1/norm)` scale and then
+  AdamW(3e-4,(.9,.999),1e-4), for exactly 2,000 Zygote updates;
 - Julia 1.12.6, Lux 1.31.4, Zygote 0.7.11;
 - first complete update <=60s, updates 6:25 individually <=1s and median
   <=.25s, projected and hard wall <=12 minutes, process tree <=4 GiB.
