@@ -8,8 +8,11 @@ using Random
 using Statistics
 using Zygote
 
+const REPOSITORY_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+
 include(joinpath(@__DIR__, "compact_model.jl"))
 include(joinpath(@__DIR__, "replay.jl"))
+include(joinpath(@__DIR__, "provenance.jl"))
 
 function load_teacher_dataset(path)
     return jldopen(path, "r") do file
@@ -218,6 +221,27 @@ end
 
 json_number(value::Real) = isfinite(value) ? value : nothing
 
+validation_key(metrics) = (
+    metrics.top1_agreement,
+    metrics.mean_reciprocal_rank,
+    -metrics.mean_listwise_cross_entropy,
+)
+
+function load_initial_checkpoint(path, model_config)
+    return jldopen(path, "r") do file
+        config = file["model_config"]
+        observed = (
+            channels=Int(config.channels),
+            blocks=Int(config.blocks),
+            spatial_channels=Int(config.spatial_channels),
+        )
+        observed == model_config || error(
+            "initial checkpoint model config $observed != requested $model_config"
+        )
+        return (parameters=file["ps"], state=file["st"])
+    end
+end
+
 function double_dqn_targets(
     dataset,
     transition_data,
@@ -268,6 +292,8 @@ function main()
         raw"D:\tetris-paper-plus\checkpoints\learning",
     )
     mkpath(checkpoint_root)
+    provenance = learning_provenance(REPOSITORY_ROOT)
+    dataset_fingerprint = require_file_fingerprint(dataset_path)
     dataset = load_teacher_dataset(dataset_path)
     unique_episodes = sort(unique(dataset.episode_ids))
     length(unique_episodes) >= 2 || error("at least two development episodes are required")
@@ -300,19 +326,72 @@ function main()
     n_step = parse(Int, get(ENV, "RL_NSTEP", "3"))
     target_interval = parse(Int, get(ENV, "RL_TARGET_INTERVAL", "20"))
     anchor_interval = parse(Int, get(ENV, "RL_ANCHOR_INTERVAL", "5"))
+    validation_interval = parse(
+        Int, get(ENV, "DISTILL_VALIDATION_INTERVAL", "250")
+    )
+    early_stop_patience = parse(
+        Int, get(ENV, "DISTILL_EARLY_STOP_PATIENCE", "4")
+    )
+    validation_interval > 0 || error("validation interval must be positive")
+    early_stop_patience > 0 || error("early-stop patience must be positive")
+    initial_checkpoint_path = get(ENV, "DISTILL_INIT_CHECKPOINT", "")
+    initial_checkpoint_fingerprint = isempty(initial_checkpoint_path) ? nothing :
+                                     require_file_fingerprint(initial_checkpoint_path)
 
-    model = CompactCandidateQ(; channels, blocks, spatial_channels)
+    model_config = (; channels, blocks, spatial_channels)
+    model = CompactCandidateQ(; model_config...)
     parameters, state = Lux.setup(rng, model)
+    if !isempty(initial_checkpoint_path)
+        initial = load_initial_checkpoint(initial_checkpoint_path, model_config)
+        parameters = initial.parameters
+        state = initial.state
+    end
     train_state = Lux.Training.TrainState(
         model, parameters, state, Optimisers.AdamW(learning_rate, (0.9, 0.999), 1.0f-4)
     )
     parameter_count = Lux.parameterlength(parameters)
+    experiment_tag = get(
+        ENV,
+        "LEARNING_EXPERIMENT_TAG",
+        "compact_q_listwise_$(parameter_count)p_$(distill_steps)steps",
+    )
+    checkpoint_path = joinpath(checkpoint_root, "$(experiment_tag).jld2")
+    best_checkpoint_path = joinpath(checkpoint_root, "$(experiment_tag)_best.jld2")
+    complete_config = (;
+        learning_seed=parse(UInt64, get(ENV, "LEARNING_SEED", "517812839")),
+        model_config,
+        state_batch,
+        distill_steps,
+        td_steps,
+        td_batch,
+        learning_rate,
+        distill_temperature,
+        discount,
+        n_step,
+        target_interval,
+        anchor_interval,
+        validation_interval,
+        early_stop_patience,
+        validation_episode_count,
+        initial_checkpoint_path=isempty(initial_checkpoint_path) ? nothing : abspath(initial_checkpoint_path),
+        dataset_path=abspath(dataset_path),
+        checkpoint_path=abspath(checkpoint_path),
+        backend="Lux+Zygote",
+    )
     initial_metrics = policy_metrics(
         dataset, development_rows, model, train_state.parameters, train_state.states
     )
     started = time()
     distill_losses = Float64[]
-    @info "Starting end-to-end listwise distillation" parameter_count initial_metrics
+    best_parameters = deepcopy(train_state.parameters)
+    best_state = deepcopy(train_state.states)
+    best_metrics = initial_metrics
+    best_update = 0
+    validations_without_improvement = 0
+    validation_history = Any[(update=0, metrics=initial_metrics, improved=true)]
+    actual_distill_steps = 0
+    distill_stop_reason = "configured update budget completed"
+    @info "Starting end-to-end listwise distillation" parameter_count initial_metrics complete_config
 
     for update in 1:distill_steps
         rows = rand(rng, training_rows, state_batch)
@@ -330,14 +409,59 @@ function main()
         )
         isfinite(loss) || error("non-finite distillation loss at update $update")
         push!(distill_losses, Float64(loss))
+        actual_distill_steps = update
         if update == 1 || update % 10 == 0
             @info "Distillation update" update loss=Float64(loss) statistics elapsed=time()-started
         end
+        if update % validation_interval == 0 || update == distill_steps
+            metrics = policy_metrics(
+                dataset,
+                development_rows,
+                model,
+                train_state.parameters,
+                train_state.states,
+            )
+            improved = validation_key(metrics) > validation_key(best_metrics)
+            push!(validation_history, (; update, metrics, improved))
+            if improved
+                best_parameters = deepcopy(train_state.parameters)
+                best_state = deepcopy(train_state.states)
+                best_metrics = metrics
+                best_update = update
+                validations_without_improvement = 0
+                jldsave(
+                    best_checkpoint_path;
+                    ps=best_parameters,
+                    st=best_state,
+                    model_config,
+                    parameter_count,
+                    update=best_update,
+                    metrics=best_metrics,
+                    provenance,
+                    dataset_fingerprint,
+                    initial_checkpoint_fingerprint,
+                    complete_config,
+                )
+            else
+                validations_without_improvement += 1
+            end
+            @info "Periodic offline validation" update metrics improved best_update validations_without_improvement
+            if validations_without_improvement >= early_stop_patience
+                distill_stop_reason = "early stop after $(early_stop_patience) validations without improvement"
+                break
+            end
+        end
     end
 
-    after_distillation_metrics = policy_metrics(
-        dataset, development_rows, model, train_state.parameters, train_state.states
+    # Always continue/save from the best offline snapshot, including update 0
+    # for warm-start runs where DAgger fine-tuning regresses.
+    train_state = Lux.Training.TrainState(
+        model,
+        best_parameters,
+        best_state,
+        Optimisers.AdamW(learning_rate, (0.9, 0.999), 1.0f-4),
     )
+    after_distillation_metrics = best_metrics
     @info "Completed offline distillation validation" after_distillation_metrics elapsed=time()-started
     target_parameters = deepcopy(train_state.parameters)
     target_state = deepcopy(train_state.states)
@@ -412,25 +536,39 @@ function main()
     final_metrics = policy_metrics(
         dataset, development_rows, model, train_state.parameters, train_state.states
     )
-    experiment_tag = get(
-        ENV,
-        "LEARNING_EXPERIMENT_TAG",
-        "compact_q_listwise_$(parameter_count)p_$(distill_steps)steps",
+    jldsave(
+        best_checkpoint_path;
+        ps=best_parameters,
+        st=best_state,
+        model_config,
+        parameter_count,
+        update=best_update,
+        metrics=best_metrics,
+        validation_history,
+        provenance,
+        dataset_fingerprint,
+        initial_checkpoint_fingerprint,
+        complete_config,
+        completion_reason=distill_stop_reason,
     )
-    checkpoint_path = joinpath(checkpoint_root, "$(experiment_tag).jld2")
     jldsave(
         checkpoint_path;
         ps=train_state.parameters,
         st=train_state.states,
         target_ps=target_parameters,
         target_st=target_state,
-        model_config=(; channels, blocks, spatial_channels),
+        model_config,
         optimizer="AdamW",
         learning_rate,
         distill_temperature,
         discount,
         n_step,
         distill_steps,
+        actual_distill_steps,
+        best_update,
+        best_checkpoint_path,
+        validation_history,
+        distill_stop_reason,
         td_steps,
         parameter_count,
         effective_max_actions=size(dataset.placements, 4),
@@ -440,6 +578,10 @@ function main()
         final_metrics,
         julia_version=string(VERSION),
         lux_version=string(Base.pkgversion(Lux)),
+        provenance,
+        dataset_fingerprint,
+        initial_checkpoint_fingerprint,
+        complete_config,
     )
     summary = (;
         experiment_id="C01_C02_smoke_$(Dates.format(now(), "yyyymmdd_HHMMSS"))",
@@ -448,13 +590,18 @@ function main()
         checkpoint_path,
         julia_version=string(VERSION),
         lux_version=string(Base.pkgversion(Lux)),
-        model_config=(; channels, blocks, spatial_channels),
+        model_config,
         parameter_count,
         effective_max_actions=size(dataset.placements, 4),
         backend="Lux+Zygote",
         learning_rate,
         distill_temperature,
         distill_steps,
+        actual_distill_steps,
+        best_update,
+        best_checkpoint_path,
+        validation_history,
+        distill_stop_reason,
         td_steps,
         n_step,
         discount,
@@ -463,6 +610,10 @@ function main()
         training_episode_ids=sort(unique(dataset.episode_ids[training_rows])),
         development_episode_ids=development_episodes,
         held_out_test_seeds_used=false,
+        provenance,
+        dataset_fingerprint,
+        initial_checkpoint_fingerprint,
+        complete_config,
         initial_metrics,
         after_distillation_metrics,
         final_metrics,
@@ -471,7 +622,7 @@ function main()
         td_loss_first=isempty(td_losses) ? nothing : json_number(first(td_losses)),
         td_loss_last=isempty(td_losses) ? nothing : json_number(last(td_losses)),
         wall_seconds=time() - started,
-        completion_reason="configured smoke budgets completed",
+        completion_reason=distill_stop_reason,
     )
     summary_path = replace(checkpoint_path, r"\.jld2$" => ".json")
     open(summary_path, "w") do io
@@ -481,4 +632,6 @@ function main()
     @info "Completed learning smoke experiment" summary
 end
 
-main()
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end

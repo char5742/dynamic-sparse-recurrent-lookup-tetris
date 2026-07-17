@@ -9,6 +9,7 @@ const EXPERIMENT_DIR = @__DIR__
 const REPOSITORY_ROOT = normpath(joinpath(EXPERIMENT_DIR, "..", ".."))
 include(joinpath(REPOSITORY_ROOT, "scripts", "evaluate_openvino_checkpoint.jl"))
 include(joinpath(EXPERIMENT_DIR, "compact_model.jl"))
+include(joinpath(EXPERIMENT_DIR, "provenance.jl"))
 
 using Dates
 using JLD2
@@ -106,6 +107,13 @@ function main()
         "TEACHER_DATASET_PATH",
         joinpath(dataset_root, "teacher_dev_smoke.jld2"),
     )
+    provenance = learning_provenance(REPOSITORY_ROOT)
+    teacher_checkpoint_path = joinpath(
+        REPOSITORY_ROOT, "1313", "mainmodel copy 3.jld2"
+    )
+    teacher_checkpoint = require_file_fingerprint(teacher_checkpoint_path)
+    rollout_checkpoint = rollout_policy == "compact" ?
+                         require_file_fingerprint(rollout_checkpoint_path) : nothing
 
     sys = pyimport("sys")
     sys.path.insert(0, joinpath(REPOSITORY_ROOT, "tools"))
@@ -162,8 +170,9 @@ function main()
     metadata = (;
         format_version=1,
         generated_at=string(now()),
-        source_checkpoint=joinpath(REPOSITORY_ROOT, "1313", "mainmodel copy 3.jld2"),
-        source_checkpoint_bytes=filesize(joinpath(REPOSITORY_ROOT, "1313", "mainmodel copy 3.jld2")),
+        provenance,
+        teacher_checkpoint,
+        rollout_checkpoint,
         julia_version=string(VERSION),
         lux_version=string(Base.pkgversion(Lux)),
         openvino_version=pyconvert(String, pyimport("openvino").__version__),
@@ -182,6 +191,17 @@ function main()
         inference_seconds,
         wall_seconds=time() - started,
         held_out_test_seeds_used=false,
+        complete_config=(;
+            seed_first,
+            episodes,
+            max_steps,
+            max_actions,
+            next_count,
+            device,
+            teacher_batch,
+            rollout_policy,
+            output_path=abspath(output_path),
+        ),
     )
     jldsave(
         output_path;

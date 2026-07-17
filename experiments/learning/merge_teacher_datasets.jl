@@ -2,6 +2,10 @@ using Dates
 using JLD2
 using JSON3
 
+const EXPERIMENT_DIR = @__DIR__
+const REPOSITORY_ROOT = normpath(joinpath(EXPERIMENT_DIR, "..", ".."))
+include(joinpath(EXPERIMENT_DIR, "provenance.jl"))
+
 function read_dataset(path)
     return jldopen(path, "r") do file
         (; (Symbol(key) => file[key] for key in (
@@ -43,6 +47,9 @@ function main()
     )
     base = read_dataset(base_path)
     dagger = read_dataset(dagger_path)
+    provenance = learning_provenance(REPOSITORY_ROOT)
+    base_dataset = require_file_fingerprint(base_path)
+    dagger_dataset = require_file_fingerprint(dagger_path)
     base_episode_ids = Int.(base.episode_ids)
     base_training_rows = findall(<=(6), base_episode_ids)
     base_validation_rows = findall(>=(7), base_episode_ids)
@@ -103,6 +110,16 @@ function main()
         training_episode_ids=sort(unique(merged[:episode_ids][1:(length(base_training_rows) + length(dagger.episode_ids))])),
         validation_episode_ids=sort(unique(merged[:episode_ids][(end - length(base_validation_rows) + 1):end])),
         held_out_test_seeds_used=false,
+        provenance,
+        base_dataset,
+        dagger_dataset,
+        complete_config=(;
+            base_path=abspath(base_path),
+            dagger_path=abspath(dagger_path),
+            output_path=abspath(output_path),
+            base_training_episode_ids=collect(1:6),
+            preserved_validation_episode_ids=collect(7:8),
+        ),
     )
     mkpath(dirname(output_path))
     jldsave(output_path; (name => value for (name, value) in merged)..., metadata)
