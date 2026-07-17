@@ -1,4 +1,5 @@
 include(joinpath(@__DIR__, "evaluate_legacy_checkpoint.jl"))
+include(joinpath(@__DIR__, "evaluation_artifact_helpers.jl"))
 include(joinpath(ROOT, "experiments", "learning", "compact_model.jl"))
 
 using Dates
@@ -65,6 +66,9 @@ function evaluate_compact_episode(
             @info "Compact checkpoint episode" seed steps score=state.score candidate_count network_calls generation_seconds inference_seconds wall_seconds=time()-started
         end
     end
+    compute_accounting = evaluation_compute_accounting(
+        candidate_count, network_calls, network_calls
+    )
     return (;
         seed,
         score=state.score,
@@ -72,6 +76,7 @@ function evaluate_compact_episode(
         game_over=state.game_over_flag,
         candidate_count,
         network_calls,
+        compute_accounting...,
         lookahead_expansions=0,
         generation_seconds,
         inference_seconds,
@@ -108,12 +113,24 @@ function main()
         checkpoint_path,
         julia_version=string(VERSION),
         lux_version=string(Base.pkgversion(Lux)),
+        backend="Lux native",
+        device="CPU",
         model_config=checkpoint.config,
         parameter_count=checkpoint.parameter_count,
         next_count,
         max_steps,
         network_calls_per_decision=1,
         lookahead_expansions=0,
+        search_budget=(;
+            episode_piece_limit=max_steps,
+            next_count,
+            hold_enabled=true,
+            candidate_order="stable_node_key",
+            lookahead_expansions=0,
+            logical_network_calls_per_decision=1,
+            selection="argmax_candidate_value",
+            inference_batch_size="all_candidates_in_one_forward",
+        ),
         compile_seconds,
         episodes,
         mean_score=mean(scores),
@@ -126,7 +143,12 @@ function main()
     )
     mkpath(output_root)
     seed_tag = join(seeds, "-")
-    output_path = joinpath(output_root, "compact_eval_seed$(seed_tag)_next$(next_count).json")
+    output_path = joinpath(
+        output_root,
+        evaluation_result_filename(
+            "compact_eval", seed_tag, next_count, max_steps
+        ),
+    )
     open(output_path, "w") do io
         JSON3.pretty(io, result)
     end

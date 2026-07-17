@@ -32,3 +32,4 @@ include(joinpath(ROOT, "upstream", "TetrisAI", "src", "core", "analyzer.jl"))
 end
 
 include(joinpath(@__DIR__, "conformance_tests.jl"))
+include(joinpath(@__DIR__, "evaluation_artifact_tests.jl"))
