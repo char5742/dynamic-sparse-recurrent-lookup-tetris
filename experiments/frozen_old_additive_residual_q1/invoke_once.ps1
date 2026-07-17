@@ -4,7 +4,8 @@ param(
     [string]$OutputDirectory,
     [string]$SourceFingerprint,
     [string]$StartGate,
-    [string]$AuthorizedCommit,
+    [Alias('AuthorizedCommit')]
+    [string]$AuthorizedHardeningCommit,
     [switch]$ValidateOnly
 )
 
@@ -164,16 +165,16 @@ if ($ValidateOnly) {
     exit 0
 }
 
-foreach ($Name in @('OutputDirectory', 'SourceFingerprint', 'StartGate', 'AuthorizedCommit')) {
+foreach ($Name in @('OutputDirectory', 'SourceFingerprint', 'StartGate', 'AuthorizedHardeningCommit')) {
     if ([string]::IsNullOrWhiteSpace([string](Get-Variable -Name $Name -ValueOnly))) {
         throw "-$Name is required"
     }
 }
-if ($AuthorizedCommit -notmatch '^[0-9a-fA-F]{40}$') {
-    throw '-AuthorizedCommit must be full 40-hex'
+if ($AuthorizedHardeningCommit -notmatch '^[0-9a-fA-F]{40}$') {
+    throw '-AuthorizedHardeningCommit must be full 40-hex'
 }
-$AuthorizedCommit = $AuthorizedCommit.ToLowerInvariant()
-$RequiredStartText = "START $ExperimentId $AuthorizedCommit"
+$AuthorizedHardeningCommit = $AuthorizedHardeningCommit.ToLowerInvariant()
+$RequiredStartText = "START $ExperimentId $AuthorizedHardeningCommit"
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $SourceFingerprint = [IO.Path]::GetFullPath($SourceFingerprint)
 $StartGate = [IO.Path]::GetFullPath($StartGate)
@@ -206,7 +207,7 @@ $JuliaVersion = (& $JuliaExe --version).Trim()
 if ($JuliaVersion -ne 'julia version 1.12.6') { throw "Julia version mismatch: $JuliaVersion" }
 
 $AuditText = @(& $SystemPython (Join-Path $Experiment 'validate_source_fingerprint.py') `
-    $Repository $SourceFingerprint $AuthorizedCommit 2>&1) -join [Environment]::NewLine
+    $Repository $SourceFingerprint $AuthorizedHardeningCommit 2>&1) -join [Environment]::NewLine
 try { $SourceAudit = $AuditText | ConvertFrom-Json } catch { throw "malformed source audit: $AuditText" }
 if ($LASTEXITCODE -ne 0 -or -not [bool]$SourceAudit.valid) {
     throw "source binding rejected: $($SourceAudit.failures -join '; ')"
@@ -253,9 +254,10 @@ $Freeze = [ordered]@{
     experiment=$ExperimentId
     scientific_role='one-shot frozen-old additive residual offline safety probe'
     frozen_at=$FreezeCreated.ToString('o')
-    source_commit=$AuthorizedCommit
-    authorized_hardening_commit=$AuthorizedCommit
-    expected_parent_commit='8d784985f300598d2a05ed4402902ae86dfb4908'
+    source_commit=$AuthorizedHardeningCommit
+    authorized_hardening_commit=$AuthorizedHardeningCommit
+    authorized_base_commit='8d784985f300598d2a05ed4402902ae86dfb4908'
+    actual_parent_commit=$SourceAudit.repository_binding.parent
     repository_clean=$true
     source_fingerprint_path=$SourceFingerprint
     source_fingerprint_sha256=Get-Sha256 $SourceFingerprint
@@ -297,7 +299,10 @@ $Freeze = [ordered]@{
 Write-Q1JsonDurableAtomic $FreezePath $Freeze
 Write-Q1JsonDurableAtomic $ReadyPath ([ordered]@{
     status='frozen_waiting_for_explicit_start_gate'; experiment=$ExperimentId
-    wrapper_pid=$PID; source_commit=$AuthorizedCommit; freeze_path=$FreezePath
+    wrapper_pid=$PID; source_commit=$AuthorizedHardeningCommit
+    authorized_hardening_commit=$AuthorizedHardeningCommit
+    authorized_base_commit='8d784985f300598d2a05ed4402902ae86dfb4908'
+    actual_parent_commit=$SourceAudit.repository_binding.parent; freeze_path=$FreezePath
     freeze_sha256=Get-Sha256 $FreezePath; required_start_gate_contents=$RequiredStartText
     offline_rows_loaded=$false; one_shot_marker_created=$false
 })
@@ -319,14 +324,18 @@ foreach ($Record in $InputRecords) {
     if ((Get-Sha256 $Record.path) -ne $Record.expected) { throw "immutable input changed at gate: $($Record.label)" }
 }
 $GateAuditText = @(& $SystemPython (Join-Path $Experiment 'validate_source_fingerprint.py') `
-    $Repository $SourceFingerprint $AuthorizedCommit 2>&1) -join [Environment]::NewLine
+    $Repository $SourceFingerprint $AuthorizedHardeningCommit 2>&1) -join [Environment]::NewLine
 try { $GateAudit = $GateAuditText | ConvertFrom-Json } catch { throw 'malformed gate source audit' }
 if ($LASTEXITCODE -ne 0 -or -not [bool]$GateAudit.valid) { throw 'source binding changed at gate' }
 if (Test-Path -LiteralPath $GlobalStartedPath) { throw 'global Q1 marker appeared concurrently' }
 
 $Marker = [ordered]@{
     experiment=$ExperimentId; started_at=[DateTimeOffset]::UtcNow.ToString('o')
-    source_commit=$AuthorizedCommit; output_directory=$OutputDirectory
+    source_commit=$AuthorizedHardeningCommit
+    authorized_hardening_commit=$AuthorizedHardeningCommit
+    authorized_base_commit='8d784985f300598d2a05ed4402902ae86dfb4908'
+    actual_parent_commit=$GateAudit.repository_binding.parent
+    output_directory=$OutputDirectory
     freeze_sha256=Get-Sha256 $FreezePath; order_freeze_sha256=Get-Sha256 $OrderPath
     retry_prohibited=$true; rescue_prohibited=$true
 }
@@ -434,7 +443,10 @@ $Monitor = [ordered]@{
 $Provisional = New-Q1FinalResult $Assessment $Monitor
 $Wrapper = [ordered]@{
     experiment=$ExperimentId; status=if ($Provisional.success) { 'wrapper-complete' } else { 'wrapper-failed' }
-    success=[bool]$Provisional.success; source_commit=$AuthorizedCommit
+    success=[bool]$Provisional.success; source_commit=$AuthorizedHardeningCommit
+    authorized_hardening_commit=$AuthorizedHardeningCommit
+    authorized_base_commit='8d784985f300598d2a05ed4402902ae86dfb4908'
+    actual_parent_commit=$GateAudit.repository_binding.parent
     global_one_shot_marker=$GlobalStartedPath; retry_prohibited=$true
     final_result_is_authoritative_terminal_artifact=$true
 }

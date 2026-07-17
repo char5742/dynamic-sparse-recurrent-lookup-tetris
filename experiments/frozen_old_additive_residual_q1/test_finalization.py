@@ -67,11 +67,13 @@ def build_complete_fixture(root: Path) -> None:
     }
     write_json(root / "order_freeze.json", order)
     source_commit = "a" * 40
+    actual_parent = "b" * 40
     freeze = {
         "experiment": finalizer.EXPERIMENT_ID,
         "source_commit": source_commit,
         "authorized_hardening_commit": source_commit,
-        "expected_parent_commit": finalizer.EXPECTED_PARENT_COMMIT,
+        "authorized_base_commit": finalizer.AUTHORIZED_BASE_COMMIT,
+        "actual_parent_commit": actual_parent,
         "repository_clean": True,
         "output_directory": str(root),
         "source_fingerprint": {"source_sha256": "b" * 64},
@@ -81,8 +83,13 @@ def build_complete_fixture(root: Path) -> None:
             "repository_binding": {
                 "head": source_commit,
                 "authorized_commit": source_commit,
-                "parent": finalizer.EXPECTED_PARENT_COMMIT,
+                "parent": actual_parent,
+                "authorized_base_commit": finalizer.AUTHORIZED_BASE_COMMIT,
+                "base_is_ancestor": True,
                 "repository_clean": True,
+                "changed_paths": [
+                    "experiments/frozen_old_additive_residual_q1/train_q1.jl"
+                ],
             },
             "fingerprint": {"source_sha256": "b" * 64, "manifest_sha256": "c" * 64},
         },
@@ -366,6 +373,26 @@ def test_complete_and_fail_closed_mutations() -> None:
         assert result["promotion"] == "Q1-offline-promoted"
         assert result["game_strength_evidence"] is False
         assert result["model_beat_claim"] is False
+
+        freeze_path = root / "freeze.json"
+        pristine_freeze = json.loads(freeze_path.read_text())
+        provenance_mutations = (
+            (("authorized_base_commit",), "c" * 40, "authorized base mismatch"),
+            (("source_fingerprint_audit", "repository_binding", "base_is_ancestor"), False, "base ancestry failed"),
+            (("source_fingerprint_audit", "repository_binding", "parent"), "d" * 40, "actual parent mismatch"),
+            (("source_fingerprint_audit", "repository_binding", "changed_paths"), ["scripts/source_fingerprint.jl"], "escaped Q1 namespace"),
+        )
+        for path_parts, value, needle in provenance_mutations:
+            mutated_freeze = copy.deepcopy(pristine_freeze)
+            destination = mutated_freeze
+            for part in path_parts[:-1]:
+                destination = destination[part]
+            destination[path_parts[-1]] = value
+            write_json(freeze_path, mutated_freeze)
+            rejected = finalizer.assess(root)
+            assert not rejected["success"]
+            assert any(needle in failure for failure in rejected["failures"])
+        write_json(freeze_path, pristine_freeze)
 
         path = root / "offline_gate.json"
         pristine = json.loads(path.read_text())

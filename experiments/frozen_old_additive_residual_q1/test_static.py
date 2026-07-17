@@ -43,6 +43,14 @@ def test_q1_scope_and_fresh_export_are_explicit() -> None:
     assert "jldopen(old_checkpoint_path" not in trainer
     assert "Optimisers.ClipNorm" not in trainer
     assert 'clip_mode="single_global_tree_l2"' in trainer
+    provenance = (ROOT / "validate_source_fingerprint.py").read_text(encoding="utf-8")
+    wrapper = (ROOT / "invoke_once.ps1").read_text(encoding="utf-8")
+    assert "AUTHORIZED_BASE_COMMIT" in provenance
+    assert "merge-base" in provenance and "--is-ancestor" in provenance
+    assert "EXPECTED_PARENT_COMMIT" not in provenance
+    assert "expected_parent_commit" not in wrapper
+    assert "authorized_base_commit" in wrapper
+    assert "actual_parent_commit" in wrapper
 
 
 def test_no_forbidden_seed_or_prior_marker_escape() -> None:

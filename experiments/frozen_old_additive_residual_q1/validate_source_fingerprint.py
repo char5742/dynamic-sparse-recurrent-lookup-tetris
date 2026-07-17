@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-EXPECTED_PARENT_COMMIT = "8d784985f300598d2a05ed4402902ae86dfb4908"
+AUTHORIZED_BASE_COMMIT = "8d784985f300598d2a05ed4402902ae86dfb4908"
 EXPERIMENT_PREFIX = "experiments/frozen_old_additive_residual_q1/"
 SOURCE_ROOTS = (
     "Project.toml",
@@ -184,6 +184,20 @@ def git(repository: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def git_is_ancestor(repository: Path, ancestor: str, descendant: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(repository), "merge-base", "--is-ancestor", ancestor, descendant],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(
+            f"git merge-base --is-ancestor failed ({result.returncode}): {result.stderr.strip()}"
+        )
+    return result.returncode == 0
+
+
 def validate_changed_paths(changed: list[str]) -> list[str]:
     failures: list[str] = []
     if not changed:
@@ -201,29 +215,29 @@ def validate_repository_binding(repository: Path, authorized_commit: str) -> dic
     parent = parents[1] if len(parents) == 2 else None
     if head != authorized_commit:
         failures.append("explicitly authorized Q1 commit is not live HEAD")
-    if parent != EXPECTED_PARENT_COMMIT:
-        failures.append("live HEAD is not the single-child Q1 commit of the audited base")
+    if parent is None:
+        failures.append("live Q1 HEAD does not have exactly one parent")
+    base_is_ancestor = git_is_ancestor(repository, AUTHORIZED_BASE_COMMIT, head)
+    if not base_is_ancestor:
+        failures.append("authorized Q1 base commit is not an ancestor of live HEAD")
     status = git(repository, "status", "--porcelain=v1", "--untracked-files=all")
     if status:
         failures.append("repository is not clean, including untracked files")
-    changed = (
-        [
-            line
-            for line in git(
-                repository, "diff", "--name-only", f"{EXPECTED_PARENT_COMMIT}..HEAD"
-            ).splitlines()
-            if line
-        ]
-        if parent == EXPECTED_PARENT_COMMIT
-        else []
-    )
+    changed = [
+        line
+        for line in git(
+            repository, "diff", "--name-only", f"{AUTHORIZED_BASE_COMMIT}..HEAD"
+        ).splitlines()
+        if line
+    ] if base_is_ancestor else []
     failures.extend(validate_changed_paths(changed))
     return {
         "valid": not failures,
         "failures": failures,
         "head": head,
         "parent": parent,
-        "expected_parent": EXPECTED_PARENT_COMMIT,
+        "authorized_base_commit": AUTHORIZED_BASE_COMMIT,
+        "base_is_ancestor": base_is_ancestor,
         "authorized_commit": authorized_commit,
         "changed_paths": changed,
         "repository_clean": not status,

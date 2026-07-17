@@ -9,7 +9,8 @@ from typing import Any
 
 
 EXPERIMENT_ID = "frozen_old_additive_residual_Q1"
-EXPECTED_PARENT_COMMIT = "8d784985f300598d2a05ed4402902ae86dfb4908"
+AUTHORIZED_BASE_COMMIT = "8d784985f300598d2a05ed4402902ae86dfb4908"
+Q1_SOURCE_PREFIX = "experiments/frozen_old_additive_residual_q1/"
 OLD_CHECKPOINT_SHA256 = "7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1"
 OLD_OPENVINO_SHA256 = "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba"
 INITIALIZER_SHA256 = "1273b55b7616f912a3120718f77770af39c489f7fbe51052f4810d8a03291270"
@@ -152,7 +153,9 @@ def assess(root: Path) -> dict[str, Any]:
         require(freeze.get("experiment") == EXPERIMENT_ID, "freeze experiment mismatch")
         require(isinstance(source_commit, str) and len(source_commit) == 40, "freeze source commit is not full")
         require(freeze.get("authorized_hardening_commit") == source_commit, "freeze authorization mismatch")
-        require(freeze.get("expected_parent_commit") == EXPECTED_PARENT_COMMIT, "freeze expected parent mismatch")
+        require(freeze.get("authorized_base_commit") == AUTHORIZED_BASE_COMMIT, "freeze authorized base mismatch")
+        actual_parent = freeze.get("actual_parent_commit")
+        require(isinstance(actual_parent, str) and len(actual_parent) == 40, "freeze actual parent commit is not full")
         require(freeze.get("repository_clean") is True, "freeze repository was not clean")
         require(path_is(root, freeze.get("output_directory"), "."), "freeze output directory mismatch")
         audit = freeze.get("source_fingerprint_audit")
@@ -162,8 +165,17 @@ def assess(root: Path) -> dict[str, Any]:
             fingerprint = audit.get("fingerprint", {})
             require(binding.get("head") == source_commit, "source audit HEAD mismatch")
             require(binding.get("authorized_commit") == source_commit, "source audit authorization mismatch")
-            require(binding.get("parent") == EXPECTED_PARENT_COMMIT, "source audit parent mismatch")
+            require(binding.get("parent") == actual_parent, "source audit actual parent mismatch")
+            require(binding.get("authorized_base_commit") == AUTHORIZED_BASE_COMMIT, "source audit authorized base mismatch")
+            require(binding.get("base_is_ancestor") is True, "source audit base ancestry failed")
             require(binding.get("repository_clean") is True, "source audit repository not clean")
+            changed_paths = binding.get("changed_paths")
+            require(
+                isinstance(changed_paths, list)
+                and len(changed_paths) > 0
+                and all(isinstance(path, str) and path.startswith(Q1_SOURCE_PREFIX) for path in changed_paths),
+                "source audit base-to-HEAD paths escaped Q1 namespace",
+            )
             require(
                 fingerprint.get("source_sha256") == freeze.get("source_fingerprint", {}).get("source_sha256"),
                 "source fingerprint aggregate mismatch",
