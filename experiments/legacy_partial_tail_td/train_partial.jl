@@ -491,6 +491,13 @@ function main(args=ARGS)
             generated_at=string(now()),
             wall_seconds=time() - started,
             constants=expected_constants(),
+            source_checkpoint_sha256=CHECKPOINT_SHA256,
+            training_subset_sha256=hex_sha256(training_path),
+            training_subset_path=training_path,
+            row_freeze_sha256=hex_sha256(row_freeze_path),
+            row_freeze_path,
+            freeze_sha256=hex_sha256(freeze_path),
+            freeze_path,
             source_rows=subset.rows,
             update_count=length(update_records),
             step0=(;

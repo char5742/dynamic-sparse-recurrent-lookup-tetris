@@ -228,6 +228,7 @@ def extract_training(dataset: Path, row_freeze: Path, output_npz: Path, output_j
             "status": "training_extraction_complete",
             "dataset_sha256": DATASET_SHA256,
             "row_freeze_sha256": sha256_file(row_freeze),
+            "row_freeze_path": str(row_freeze.resolve()),
             "row_count": 300,
             "source_rows": rows,
             "episodes": sorted(set(int(value) for value in arrays["episode_ids"])),
@@ -237,6 +238,7 @@ def extract_training(dataset: Path, row_freeze: Path, output_npz: Path, output_j
             "offline_rows_loaded": False,
             "validation_or_test_seed_loaded": False,
             "npz_sha256": sha256_file(output_npz),
+            "npz_path": str(output_npz.resolve()),
         },
     )
 
@@ -264,6 +266,7 @@ def extract_offline(dataset: Path, output_npz: Path, output_json: Path) -> None:
             "training_rows_loaded": False,
             "validation_or_test_seed_loaded": False,
             "npz_sha256": sha256_file(output_npz),
+            "npz_path": str(output_npz.resolve()),
         },
     )
 

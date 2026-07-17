@@ -4,6 +4,7 @@ param(
     [string]$OutputDirectory,
     [string]$SourceFingerprint,
     [string]$StartGate,
+    [string]$AuthorizedHardeningCommit,
     [switch]$ValidateOnly
 )
 
@@ -15,12 +16,13 @@ $ExpectedCheckpointHash = '7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924
 $ExpectedDatasetHash = 'e0d79e38daebb667bd8c248f5f64b8e5241a4ed56a29d31ffb4ee41bd0c26b8d'
 $ExpectedBaselineWeightsHash = '2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba'
 $ExpectedAuthorizationHash = 'a079330917571824fdbb0dd92d37db92dc1df9701012206bb27bc672d24ca906'
+$ExpectedParentCommit = 'c9ab1a94342752dc135725beabf4a6b10d73f92d'
 $HardWallSeconds = 35 * 60
 $FirstUpdateSeconds = 180.0
 $WarmUpdateSeconds = 15.0
 $MaxWorkingSetBytes = [int64](8GB)
 $StartGateTimeoutSeconds = 600.0
-$RequiredStartText = "START $ExperimentId"
+$RequiredStartText = $null
 $GlobalStartedPath = 'D:\tetris-paper-plus\runs\legacy_partial_tail_td_P1.started.json'
 $OutputRoot = [System.IO.Path]::GetFullPath('D:\tetris-paper-plus\runs')
 $SystemPython = 'C:\Program Files\Python310\python.exe'
@@ -32,6 +34,7 @@ if ([string]::IsNullOrWhiteSpace($Repository)) {
 $Repository = [System.IO.Path]::GetFullPath($Repository)
 $Experiment = Join-Path $Repository 'experiments\legacy_partial_tail_td'
 . (Join-Path $Experiment 'native_arguments.ps1')
+. (Join-Path $Experiment 'result_composition.ps1')
 
 $RequiredHarnessFiles = @(
     'contract.jl',
@@ -44,11 +47,15 @@ $RequiredHarnessFiles = @(
     'offline_gate.jl',
     'evaluate_development.jl',
     'finalize_result.py',
+    'validate_source_fingerprint.py',
+    'result_composition.ps1',
     'invoke_once.ps1',
     'native_arguments.ps1',
     'test_wrapper.ps1',
     'test_contract.jl',
     'test_static.py',
+    'test_finalization.py',
+    'test_result_composition.ps1',
     'EXPERIMENT.md'
 )
 
@@ -178,12 +185,20 @@ if ($ValidateOnly) {
     exit 0
 }
 
-foreach ($InputName in @('OutputDirectory', 'SourceFingerprint', 'StartGate')) {
+foreach ($InputName in @(
+    'OutputDirectory', 'SourceFingerprint', 'StartGate', 'AuthorizedHardeningCommit'
+)) {
     $InputValue = Get-Variable -Name $InputName -ValueOnly
     if ([string]::IsNullOrWhiteSpace([string]$InputValue)) {
         throw "-$InputName is required unless -ValidateOnly is used"
     }
 }
+
+if ($AuthorizedHardeningCommit -notmatch '^[0-9a-fA-F]{40}$') {
+    throw '-AuthorizedHardeningCommit must be the full 40-hex commit reviewed after hardening'
+}
+$AuthorizedHardeningCommit = $AuthorizedHardeningCommit.ToLowerInvariant()
+$RequiredStartText = "START $ExperimentId $AuthorizedHardeningCommit"
 
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $SourceFingerprint = [System.IO.Path]::GetFullPath($SourceFingerprint)
@@ -266,6 +281,19 @@ if ($GitStatus.Length -ne 0) {
 }
 $Commit = (& git -C $Repository rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'git rev-parse HEAD failed' }
+$SourceAuditOutput = @(& $SystemPython (
+    Join-Path $Experiment 'validate_source_fingerprint.py'
+) $Repository $SourceFingerprint $AuthorizedHardeningCommit $ExpectedParentCommit 2>&1)
+$SourceAuditExit = $LASTEXITCODE
+$SourceAuditText = $SourceAuditOutput -join [Environment]::NewLine
+try {
+    $SourceFingerprintAudit = $SourceAuditText | ConvertFrom-Json
+} catch {
+    throw "source fingerprint validator returned malformed output: $SourceAuditText"
+}
+if ($SourceAuditExit -ne 0 -or -not [bool]$SourceFingerprintAudit.valid) {
+    throw "source fingerprint/repository binding audit rejected: $($SourceFingerprintAudit.failures -join '; ')"
+}
 $Harness = Get-HarnessRecords
 $SourceFingerprintHash = Get-Sha256 $SourceFingerprint
 $SourceFingerprintValue = Get-Content -LiteralPath $SourceFingerprint -Raw | ConvertFrom-Json
@@ -288,6 +316,7 @@ $OfflineNpz = Join-Path $OutputDirectory 'offline.npz'
 $OfflineExtractionPath = Join-Path $OutputDirectory 'offline_extraction.json'
 $OfflineGatePath = Join-Path $OutputDirectory 'offline_gate.json'
 $DevelopmentPath = Join-Path $OutputDirectory 'development.json'
+$AssessmentPath = Join-Path $OutputDirectory 'assessment.json'
 $FinalResultPath = Join-Path $OutputDirectory 'final_result.json'
 
 $Commands = [ordered]@{
@@ -299,7 +328,7 @@ $Commands = [ordered]@{
     extract_offline = @($SystemPython, (Join-Path $Experiment 'extract_dataset.py'), 'offline', $Dataset, $OfflineNpz, $OfflineExtractionPath)
     offline_gate = @($JuliaExe, '--startup-file=no', "--project=$Repository", '--threads=20', (Join-Path $Experiment 'offline_gate.jl'), $OfflineNpz, $CandidateWeights, $OfflineGatePath)
     evaluate_development = @($JuliaExe, '--startup-file=no', "--project=$Repository", '--threads=20', (Join-Path $Experiment 'evaluate_development.jl'), $Repository, $CandidateWeights, $BaselineWeights, $DevelopmentPath)
-    finalize = @($SystemPython, (Join-Path $Experiment 'finalize_result.py'), $OutputDirectory)
+    finalize_assessment = @($SystemPython, (Join-Path $Experiment 'finalize_result.py'), $OutputDirectory)
 }
 
 $ProcessesBefore = @(
@@ -328,10 +357,13 @@ $Freeze = [ordered]@{
     scientific_role = 'one-shot conservative partial-tail anchored TD development pilot'
     frozen_at = $FreezeCreated.ToString('o')
     source_commit = $Commit
+    authorized_hardening_commit = $AuthorizedHardeningCommit
+    expected_parent_commit = $ExpectedParentCommit
     repository_clean = $true
     source_fingerprint_path = $SourceFingerprint
     source_fingerprint_sha256 = $SourceFingerprintHash
     source_fingerprint = $SourceFingerprintValue
+    source_fingerprint_audit = $SourceFingerprintAudit
     authorization_report = $AuthorizationReport
     authorization_report_sha256 = $ExpectedAuthorizationHash
     manifest_path = $Manifest
@@ -413,6 +445,8 @@ Write-JsonAtomic $ReadyPath ([ordered]@{
     experiment = $ExperimentId
     wrapper_pid = $PID
     source_commit = $Commit
+    authorized_hardening_commit = $AuthorizedHardeningCommit
+    expected_parent_commit = $ExpectedParentCommit
     freeze_path = $FreezePath
     freeze_sha256 = Get-Sha256 $FreezePath
     start_gate = $StartGate
@@ -456,6 +490,21 @@ if ($HarnessAtGate.aggregate_sha256 -ne $Harness.aggregate_sha256) {
 if ((Get-Sha256 $SourceFingerprint) -ne $SourceFingerprintHash) {
     throw 'source fingerprint changed between freeze and explicit start gate'
 }
+$GateSourceAuditOutput = @(& $SystemPython (
+    Join-Path $Experiment 'validate_source_fingerprint.py'
+) $Repository $SourceFingerprint $AuthorizedHardeningCommit $ExpectedParentCommit 2>&1)
+$GateSourceAuditExit = $LASTEXITCODE
+try {
+    $GateSourceFingerprintAudit = ($GateSourceAuditOutput -join [Environment]::NewLine) |
+        ConvertFrom-Json
+} catch {
+    throw 'source fingerprint validator output became malformed at start gate'
+}
+if ($GateSourceAuditExit -ne 0 -or -not [bool]$GateSourceFingerprintAudit.valid -or
+    [string]$GateSourceFingerprintAudit.fingerprint.source_sha256 -cne
+        [string]$SourceFingerprintAudit.fingerprint.source_sha256) {
+    throw 'source fingerprint/live tree binding changed before start gate'
+}
 
 $OneShotStarted = [DateTimeOffset]::UtcNow
 Write-JsonCreateNew $GlobalStartedPath ([ordered]@{
@@ -463,6 +512,8 @@ Write-JsonCreateNew $GlobalStartedPath ([ordered]@{
     started_at = $OneShotStarted.ToString('o')
     wrapper_pid = $PID
     source_commit = $Commit
+    authorized_hardening_commit = $AuthorizedHardeningCommit
+    expected_parent_commit = $ExpectedParentCommit
     harness_sha256 = $Harness.aggregate_sha256
     freeze_sha256 = Get-Sha256 $FreezePath
     start_gate_path = $StartGate
@@ -475,6 +526,8 @@ Write-JsonCreateNew (Join-Path $OutputDirectory 'started.json') ([ordered]@{
     started_at = $OneShotStarted.ToString('o')
     wrapper_pid = $PID
     source_commit = $Commit
+    authorized_hardening_commit = $AuthorizedHardeningCommit
+    expected_parent_commit = $ExpectedParentCommit
     global_marker = $GlobalStartedPath
     one_shot = $true
 })
@@ -561,7 +614,8 @@ function Get-TrainingStageStopReason {
     $StartedUnix = [double]$StageState.stage_started_unix
     $NowUnix = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
     $Elapsed = $NowUnix - $StartedUnix
-    if (-not [double]::IsFinite($StartedUnix) -or $Elapsed -lt -2.0) {
+    if ([double]::IsNaN($StartedUnix) -or [double]::IsInfinity($StartedUnix) -or
+        $Elapsed -lt -2.0) {
         return "training monitor contract failure: invalid stage_started_unix for $Stage"
     }
     if ($Stage -eq 'first_update_running' -and $Elapsed -ge $FirstUpdateSeconds) {
@@ -576,9 +630,9 @@ function Get-TrainingStageStopReason {
     return $null
 }
 
-function Write-MonitorSnapshot([bool]$Complete = $false) {
+function New-MonitorSnapshot([bool]$Complete = $false) {
     $Now = [DateTimeOffset]::UtcNow
-    Write-JsonAtomic $MonitorPath ([ordered]@{
+    return [ordered]@{
         experiment = $ExperimentId
         started_at = $script:RunStarted.ToString('o')
         hard_deadline = $script:Deadline.ToString('o')
@@ -596,7 +650,11 @@ function Write-MonitorSnapshot([bool]$Complete = $false) {
         stop_reason = if ($script:Failures.Count -eq 0) { 'completed' } else { [string]$script:Failures[0] }
         whole_tree_enforcement = 'Windows Job Object with KILL_ON_JOB_CLOSE; every sample sums all assigned process working sets'
         one_shot_retry_prohibited = $true
-    }) 32
+    }
+}
+
+function Write-MonitorSnapshot([bool]$Complete = $false) {
+    Write-JsonAtomic $MonitorPath (New-MonitorSnapshot $Complete) 32
 }
 
 function Invoke-MonitoredPhase(
@@ -844,37 +902,39 @@ if (-not $PipelineOk) {
     Add-Skipped $Remaining 'a prior required phase or gate failed; no rescue or later data role is permitted'
 }
 
-# Give the finalizer the completed pre-finalizer phase ledger.  It is the only
-# phase allowed after a gate failure, and it never trains, exports, or evaluates.
+# The monitored finalizer writes only assessment.json.  It cannot observe or
+# claim a completed monitor; final_result.json is composed in-process only
+# after the finalizer phase is recorded and monitor.complete=true is durable.
 Write-MonitorSnapshot
-$FinalizerOk = $false
+$AssessmentOk = $false
 if ([DateTimeOffset]::UtcNow -lt $script:Deadline) {
-    $FinalizerOk = Invoke-MonitoredPhase 'finalize' $SystemPython @(
+    $AssessmentOk = Invoke-MonitoredPhase 'finalize_assessment' $SystemPython @(
         (Join-Path $Experiment 'finalize_result.py'), $OutputDirectory
     )
 } else {
-    $Reason = 'hard 35-minute wall exhausted; finalizer was not launched'
+    $Reason = 'hard 35-minute wall exhausted; assessment finalizer was not launched'
     Add-Failure $Reason
-    Add-Skipped @('finalize') $Reason
+    Add-Skipped @('finalize_assessment') $Reason
 }
 
-if ($FinalizerOk) {
+$Assessment = $null
+if ($AssessmentOk) {
     try {
-        if (-not (Test-Path -LiteralPath $FinalResultPath -PathType Leaf)) {
-            throw 'finalizer did not create final_result.json'
+        if (-not (Test-Path -LiteralPath $AssessmentPath -PathType Leaf)) {
+            throw 'finalizer did not create assessment.json'
         }
-        $FinalResult = Get-Content -LiteralPath $FinalResultPath -Raw | ConvertFrom-Json
-        if (-not ($FinalResult.PSObject.Properties.Name -contains 'success') -or
-            $FinalResult.success -isnot [bool]) {
-            throw 'final_result.json lacks a Boolean success field'
+        $Assessment = Get-Content -LiteralPath $AssessmentPath -Raw | ConvertFrom-Json
+        if (-not ($Assessment.PSObject.Properties.Name -contains 'success') -or
+            $Assessment.success -isnot [bool]) {
+            throw 'assessment.json lacks a Boolean success field'
         }
-        if (-not [bool]$FinalResult.success) {
-            $FinalFailures = @($FinalResult.failures) -join '; '
-            Add-Failure "P1 finalizer rejected the fixed candidate: $FinalFailures"
+        if (-not [bool]$Assessment.success) {
+            $AssessmentFailures = @($Assessment.failures) -join '; '
+            Add-Failure "P1 artifact assessment rejected: $AssessmentFailures"
         }
     } catch {
-        Add-Failure "invalid finalizer result: $($_.Exception.Message)"
-        $FinalizerOk = $false
+        Add-Failure "invalid assessment result: $($_.Exception.Message)"
+        $AssessmentOk = $false
     }
 }
 
@@ -886,23 +946,35 @@ if ($script:PeakTreeWorkingSet -gt $MaxWorkingSetBytes -and
     -not (@($script:Failures) -match 'working set exceeded')) {
     Add-Failure 'process-tree peak working set exceeded 8 GiB'
 }
-Write-MonitorSnapshot $true
-
-$WrapperSuccess = $PipelineOk -and $FinalizerOk -and $script:Failures.Count -eq 0
-Write-JsonAtomic $WrapperResultPath ([ordered]@{
+$CompletedMonitor = New-MonitorSnapshot $true
+$FinalResultPreview = New-P1FinalResult $Assessment $CompletedMonitor
+$WrapperSuccess = $PipelineOk -and $AssessmentOk -and
+                  [bool]$FinalResultPreview.success -and $script:Failures.Count -eq 0
+$WrapperResult = [ordered]@{
     experiment = $ExperimentId
     status = if ($WrapperSuccess) { 'wrapper-complete' } else { 'wrapper-failed' }
     success = $WrapperSuccess
     failures = @($script:Failures)
     source_commit = $Commit
+    authorized_hardening_commit = $AuthorizedHardeningCommit
+    expected_parent_commit = $ExpectedParentCommit
     freeze_path = $FreezePath
     monitor_path = $MonitorPath
+    monitor_complete = [bool]$CompletedMonitor.complete
+    assessment_path = $AssessmentPath
+    assessment_present = Test-Path -LiteralPath $AssessmentPath -PathType Leaf
     final_result_path = $FinalResultPath
-    final_result_present = Test-Path -LiteralPath $FinalResultPath -PathType Leaf
+    final_result_is_authoritative_terminal_artifact = $true
     global_one_shot_marker = $GlobalStartedPath
     retry_prohibited = $true
     output_directory = $OutputDirectory
-}) 16
+}
+
+# All values are complete before publication. The completed monitor is flushed
+# and atomically renamed first, the non-authoritative wrapper ledger second,
+# and final_result.json is the final fallible filesystem operation.
+$FinalResult = Write-P1TerminalArtifacts $MonitorPath $WrapperResultPath `
+    $FinalResultPath $Assessment $CompletedMonitor $WrapperResult
 
 if (-not $WrapperSuccess) { exit 2 }
 exit 0

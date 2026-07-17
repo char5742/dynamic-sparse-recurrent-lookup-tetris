@@ -126,6 +126,7 @@ def main() -> None:
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "openvino_version": ov.__version__,
         "weights_path": str(args.weights.resolve()),
+        "training_phase_sha256": sha256_file(args.output_directory / "training_phase.json"),
         "weights_sha256": sha256_file(args.weights),
         "reference_path": str(args.reference.resolve()),
         "reference_sha256": sha256_file(args.reference),

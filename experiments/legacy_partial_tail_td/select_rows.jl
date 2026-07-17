@@ -27,6 +27,10 @@ function main(args=ARGS)
     shuffle!(rng, shuffled)
     selected = shuffled[1:UPDATE_COUNT]
     selected[1] == STEP0_WITNESS_ROW || error("Xoshiro witness row changed")
+    ordered_rows_sha256 = bytes2hex(sha256(join(selected, ",")))
+    ordered_rows_sha256 ==
+    "7f8a24abc5000ad1cc13ee4c4d7b5227caf57923686fd17aea83ef664550efae" ||
+        error("exact frozen row-order digest changed")
     result = (;
         status="training_row_freeze_complete",
         dataset_sha256=DATASET_SHA256,
@@ -36,9 +40,11 @@ function main(args=ARGS)
         sampling="without replacement; first 300 after shuffle!",
         eligible_count=length(eligible),
         ordered_rows=selected,
+        ordered_rows_sha256,
         row_count=length(selected),
         seeds=collect(TRAIN_SEEDS),
         role="fixed update order; one row per update; no selection or retry",
+        validation_or_test_seed_loaded=false,
     )
     atomic_write_json(output_path, result)
     println(JSON3.write((; status=result.status, output=output_path)))

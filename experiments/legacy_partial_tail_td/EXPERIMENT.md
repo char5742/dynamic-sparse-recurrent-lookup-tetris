@@ -56,6 +56,8 @@ list is shuffled once with Julia `Xoshiro(0x1313_2026)`; the first 300 rows,
 without replacement and preserving shuffled order, are written to
 `row_freeze.json` before any target extraction or learning.  Every row is then
 consumed exactly once and no environment rollout is generated.
+The comma-separated ordered-row digest is fixed as
+`7f8a24abc5000ad1cc13ee4c4d7b5227caf57923686fd17aea83ef664550efae`.
 
 The frozen target uses stored score-delta `/600` rewards, `n=3`, and
 `gamma=0.997`.  A terminal truncates rewards and removes bootstrap; otherwise
@@ -122,6 +124,32 @@ six, the measured projection `one-shot elapsed through update 7 +
 seconds.  Any contract, hash, gradient, finite, frozen-state, time, memory,
 export, offline, accounting, or game gate failure stops the one shot without a
 changed row, seed, update count, hyperparameter, or backend.
+
+The audited implementation base is commit
+`c9ab1a94342752dc135725beabf4a6b10d73f92d`.  A runnable hardening revision
+must be its single direct child, may change only this experiment directory,
+and must be passed back to the wrapper as the full
+`-AuthorizedHardeningCommit`.  The explicit start-gate text includes that full
+commit.  Before the marker and again at the gate, the supplied source
+fingerprint is recomputed against the live repository: repository root,
+Manifest hash, exact source file path set, every byte count and SHA-256, file
+count, aggregate source SHA-256, clean tree, parent, authorized HEAD, and the
+hardening diff scope must all match.  The separate harness aggregate covers
+all files here, including PowerShell files outside the source-fingerprint
+suffix set.
+
+Finalization is deliberately two-stage.  The monitored finalizer writes only
+`assessment.json` after strictly reconciling every artifact, role, hash link,
+provenance field, seed/config order, and nonnegative accounting value.  The
+wrapper then records that finalizer phase and computes the completed monitor
+and result before terminal publication.  It durably flushes and atomically
+renames `monitor.json` with `complete=true`, durably publishes the
+non-authoritative `wrapper_result.json`, and publishes `final_result.json`
+atomically as the final fallible filesystem operation.  A pass requires the
+exact ordered phase ledger, no skipped phase or failure, a passing assessment,
+and exact nonnegative top-level and per-phase working-set/private-byte
+accounting.  An incomplete/pre-finalizer monitor or any pre-final publication
+failure cannot leave a passing final result.
 
 `-ValidateOnly` and the files named `test_*` perform syntax, contract, and
 synthetic checks only.  They do not read the real checkpoint/dataset, learn a
