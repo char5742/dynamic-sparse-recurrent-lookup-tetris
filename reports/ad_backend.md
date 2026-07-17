@@ -139,3 +139,110 @@ Reject standalone Enzyme on steady speed and allocation.  Reject Reactant on
 compile-inclusive time-to-100, without using its invalid asynchronous launch
 timings as evidence.  No held-out game test seed was used in this backend
 screen.
+
+## 2026-07-18 independent retry and revised long-run decision
+
+The earlier Reactant result correctly rejected its asynchronous timings, but
+it did not test the optimized persistent Lux path.  A clean independent retry
+therefore separated three questions: Native Enzyme, a synchronized fixed-shape
+proxy, and the actual C13 fixed74 ListNet update.  Raw scripts, manifests, logs,
+and machine-readable results are under `D:\tetris-paper-plus\ad_retry`.
+
+### Native Enzyme remains rejected
+
+The retry used `ReverseWithPrimal`, a preallocated/reused parameter-gradient
+shadow, `Const` model/state/data/target parameters, and no runtime activity.
+It also tested Lux's official cached Training API, which already retains and
+zeroes its gradient shadow in place.  Numerical agreement remained excellent:
+gradient cosine `0.999999999999966`, maximum absolute gradient error
+`7.08e-8`, and one-step parameter maximum error `3.89e-7`.
+
+| 100-update Lux Training API metric | Zygote | Native Enzyme |
+|---|---:|---:|
+| first update | 15.610 s | 19.508 s |
+| steady median | 66.004 ms | 351.065 ms |
+| measured loop wall | 23.768 s | 58.508 s |
+| steady allocation/update | 33.34 MB | 186.97 MB |
+| peak working set | 1.697 GB | 1.962 GB |
+
+Native Enzyme was 5.32x slower at steady state and allocated 5.61x more.  The
+low-level explicitly preallocated path gave the same conclusion (5.18x slower,
+5.61x more allocation).  Native Enzyme is therefore rejected; CPU use alone
+does not explain away the result.
+
+Evidence: `D:\tetris-paper-plus\ad_retry\native_enzyme\RESULT.md` and
+`summary.json` in the same directory.
+
+### Persistent Reactant wins the long proxy run
+
+The corrected path used `single_train_step!`,
+`return_gradients=Val(false)`, `sync=true`, and retained the returned
+`TrainState`.  Lux cached one compiled function containing forward, TD loss,
+EnzymeMLIR backward, and Adam update.  An additional barrier over loss and all
+parameter arrays followed each timed call; its median was 8 microseconds.  One
+compiled thunk served all 1,000 updates with no recompilation.
+
+| compile-inclusive proxy updates | Zygote | Reactant + EnzymeMLIR |
+|---:|---:|---:|
+| 100 | 22.049 s | 67.391 s |
+| 500 | 50.085 s | 69.290 s |
+| 1,000 | 84.417 s | **71.526 s** |
+
+Reactant paid 66.724 seconds for its first update but reached a 4.580 ms steady
+median versus Zygote's 56.015 ms (12.23x faster).  Steady allocation was
+28.7 KB versus 33.286 MB (about 1,161x lower).  Five-step loss maximum error
+was `4.47e-8`; parameter cosine was `0.999999999999864`, relative L2
+`4.44e-7`, and maximum error `5.26e-6`.  Interpolation between the registered
+cumulative windows places break-even near update 799; it is not an exact
+per-update observed crossing.
+
+Thus the earlier short-horizon rejection remains correct at 100/500 updates,
+but the claim that Zygote is the faster long fixed-shape backend is overturned.
+
+Evidence: `D:\tetris-paper-plus\ad_retry\reactant_enzyme\RESULT.md` and
+`summary.json` in the same directory.
+
+### Actual C13 fixed74 ListNet screen
+
+The real screen used the tracked 165,051-parameter `CompactCandidateQ`, action
+width 74, state batch 4 (296 padded candidates), temperature 1, the C11b warm
+checkpoint, the tracked standardized masked ListNet loss, and AdamW at 1e-3.
+Both backends consumed the same four fixed aggregate-C13 rows and initial
+parameters.  This run used 20 Julia threads and 10 BLAS threads.
+
+| compile-inclusive actual-loss updates | Zygote | Reactant + EnzymeMLIR |
+|---:|---:|---:|
+| 100 | **29.264 s** | 68.726 s |
+| 500 | **55.906 s** | 80.626 s |
+| 1,000 | **88.970 s** | 95.850 s |
+
+Reactant did not recover its compile cost within 1,000 updates.  Its steady
+median nevertheless improved from 60.238 ms to 30.128 ms (1.999x), and steady
+allocation fell from 48.347 MB to 37.9 KB (about 1,276x).  The last-500 measured
+rates project cumulative break-even near update 1,193; this is an extrapolation,
+not a measured crossing.  Five-step loss maximum error was `9.54e-7`, parameter
+cosine `0.999999998381`, relative L2 `5.69e-5`, and maximum error `1.67e-3`.
+The update-1,000 loss differed by only `2.86e-6`.  One thunk served all 1,000
+finite updates with no recompilation.
+
+This screen deliberately repeats one fixed batch.  It excludes per-update row
+sampling, `candidate_batch` construction, changing-batch host/device transfer,
+validation, checkpoint export, and the rest of the actual training pipeline.
+Those costs can reduce or erase the 2x update-only gain.  It also establishes
+compatibility only for this compact model/loss; future FiLM, SE, distributional,
+or replay objectives require their own lowering smoke.
+
+Evidence: `D:\tetris-paper-plus\ad_retry\reactant_real_listwise\RESULT.md`,
+`summary.json`, and `INTEGRATION_PROPOSAL.md` in the same directory.
+
+### Revised backend policy
+
+- Keep Native Julia + Zygote for short or dynamic experiments and runs below
+  roughly 1,200 optimizer updates.
+- Keep Native Enzyme rejected.
+- Promote Reactant + EnzymeMLIR to a persistent **changing-batch, transfer- and
+  checkpoint-inclusive** integration screen for runs of at least 1,200 updates.
+- Do not claim production adoption until that complete pipeline is at least
+  1.15x faster with matching changing-batch numerical trajectories.
+
+No game, validation seed, or held-out test seed was used in any retry.
