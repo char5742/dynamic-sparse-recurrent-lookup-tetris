@@ -15,7 +15,7 @@ class ContractTests(unittest.TestCase):
         value = contract.load_contract()
         self.assertEqual(
             value["authorized_implementation_parent_commit"],
-            "ca0af2af8aa041147658fa4f494d1f26a5dc86a7",
+            "ddd0f6f83c0e2931cd4cd415531b30b3c80cd2bd",
         )
         self.assertEqual(len(value["feature_schema"]["names"]), 70)
         self.assertEqual(value["feature_schema"]["coefficient_count"], 71)
@@ -29,7 +29,20 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(value["feature_schema"]["piece_ids"], ["I", "O", "S", "Z", "J", "L", "T"])
         self.assertEqual(value["canonical_policy"]["candidate_order"], "stable_node_key")
         self.assertEqual(value["openvino_backend"]["complete_chunk"]["device"], "NPU")
+        self.assertEqual(
+            value["openvino_backend"]["full_build"],
+            "2026.2.1-21919-ede283a88e3-releases/2026/2",
+        )
         self.assertEqual(value["openvino_backend"]["tail_chunk"]["batch_semantics"], "actual candidate count")
+        self.assertEqual(value["fit"]["quantile_method"], "linear_type7_position_1_plus_n_minus_1_p")
+        self.assertEqual(
+            value["runtime_source_binding"]["upstream_tetrisai"]["head"],
+            "6fdfb1d30197246fd862b716438e998f0315c830",
+        )
+        self.assertEqual(
+            value["runtime_source_binding"]["runtime_closure_sha256"],
+            "fa908de68b6deb1581818bdb45c813b06d8886bc4fe33fd010830f7eef03a0e4",
+        )
         self.assertEqual(value["analytic_runtime"]["python_version"], "3.12.13")
         self.assertEqual(value["analytic_runtime"]["numpy_version"], "2.4.6")
         self.assertEqual(value["analytic_runtime"]["blas_threads"], 1)
@@ -50,6 +63,18 @@ class ContractTests(unittest.TestCase):
             contract.validate_contract(changed)
         changed = copy.deepcopy(value)
         changed["openvino_backend"]["tail_chunk"]["padding"] = True
+        with self.assertRaises(ValueError):
+            contract.validate_contract(changed)
+        changed = copy.deepcopy(value)
+        changed["runtime_source_binding"]["vendored_tetrisai"]["analyzer"]["sha256"] = "0" * 64
+        with self.assertRaises(ValueError):
+            contract.validate_contract(changed)
+        changed = copy.deepcopy(value)
+        changed["runtime_source_binding"]["vendored_tetrisai"]["node"]["original_relative_path"] = "upstream/other/node.jl"
+        with self.assertRaises(ValueError):
+            contract.validate_contract(changed)
+        changed = copy.deepcopy(value)
+        changed["fit"]["quantile_method"] = "nearest"
         with self.assertRaises(ValueError):
             contract.validate_contract(changed)
 

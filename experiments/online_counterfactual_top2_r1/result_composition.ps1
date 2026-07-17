@@ -36,7 +36,8 @@ function New-R1FinalResult($Assessment, $Monitor) {
         foreach ($Field in @(
             'complete','ended_at','wall_seconds','stop_reason','failures',
             'phases','skipped_phases','producer_completion_ledger','assessment_snapshot_sha256','optional_development_enabled',
-            'development_seed_used','validation_seed_used','sealed_test_seed_used','game_run'
+            'development_seed_used','validation_seed_used','sealed_test_seed_used','game_run',
+            'finalizer_disposition','authoritative_failure_assessment'
         )) {
             if (-not (Test-R1Property $Monitor $Field)) { $Failures.Add("monitor lacks $Field") }
         }
@@ -52,6 +53,18 @@ function New-R1FinalResult($Assessment, $Monitor) {
         }
         if ((Get-R1Property $Monitor 'stop_reason') -cne 'completed') {
             $Failures.Add("monitor stop reason: $(Get-R1Property $Monitor 'stop_reason')")
+        }
+        $AuthoritativeFailure = Get-R1Property $Monitor 'authoritative_failure_assessment'
+        if ($null -ne $AuthoritativeFailure) {
+            $Failures.Add("wrapper authoritative failure: $(Get-R1Property $AuthoritativeFailure 'failure_stage')")
+            if ((Get-R1Property $AuthoritativeFailure 'authority') -cne 'wrapper-fail-closed' -or
+                (Get-R1Property $AuthoritativeFailure 'status') -cne 'assessment-fail' -or
+                (Get-R1Property $AuthoritativeFailure 'success') -isnot [bool] -or
+                (Get-R1Property $AuthoritativeFailure 'success')) {
+                $Failures.Add('wrapper authoritative failure assessment is malformed')
+            }
+        } elseif ((Get-R1Property $Monitor 'finalizer_disposition') -cne 'launched_completed') {
+            $Failures.Add("finalizer disposition is not successful: $(Get-R1Property $Monitor 'finalizer_disposition')")
         }
         foreach ($Failure in @((Get-R1Property $Monitor 'failures'))) {
             if (-not [string]::IsNullOrWhiteSpace([string]$Failure)) { $Failures.Add("monitor: $Failure") }
@@ -278,9 +291,13 @@ function Write-R1TerminalArtifacts(
     $Assessment,
     $Monitor,
     $Wrapper,
-    [string]$FailurePoint = ''
+    [string]$FailurePoint = '',
+    [string]$FailurePath = ''
 ) {
-    foreach ($Path in @($MonitorPath,$WrapperPath,$FinalPath)) {
+    if ([string]::IsNullOrWhiteSpace($FailurePath)) {
+        $FailurePath = Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($FinalPath))) 'terminal_failure.json'
+    }
+    foreach ($Path in @($MonitorPath,$WrapperPath,$FinalPath,$FailurePath)) {
         if ([IO.File]::Exists($Path)) { throw "terminal artifact exists: $Path" }
     }
     $Final = New-R1FinalResult $Assessment $Monitor
@@ -312,8 +329,83 @@ function Write-R1TerminalArtifacts(
         Write-R1JsonDurableAtomic $FinalPath $Final
         if ($FailurePoint -ceq 'after_final') { throw 'injected after_final failure' }
     } catch {
-        if ([IO.File]::Exists($FinalPath)) { [IO.File]::Delete($FinalPath) }
+        $PublicationFailure = New-R1TerminalFailureRecord `
+            -Reason $_.Exception.Message -Monitor $Monitor -FinalPath $FinalPath
+        if ([IO.File]::Exists($FinalPath)) {
+            if (-not [IO.File]::Exists($FailurePath)) {
+                Write-R1JsonDurableAtomic $FailurePath $PublicationFailure
+            }
+        } elseif (-not [IO.File]::Exists($FinalPath)) {
+            Write-R1JsonDurableAtomic $FinalPath $PublicationFailure
+        }
         throw
     }
     return $Final
+}
+
+function New-R1TerminalFailureRecord {
+    param(
+        [Parameter(Mandatory)][string]$Reason,
+        $Monitor,
+        [string]$FinalPath = ''
+    )
+    return [ordered]@{
+        experiment='R1 online counterfactual top-2 safety gate'
+        status='R1-calibration-rejected'
+        success=$false
+        authoritative_terminal_failure=$true
+        authority='append-only terminal failure veto'
+        failures=@($Reason)
+        monitor=$Monitor
+        supersedes_final_result=([IO.File]::Exists($FinalPath))
+        calibration_candidate_only=$false
+        game_system_candidate=$false
+        model_improvement_claim=$false
+        game_strength_evidence=$false
+        development_authorized=$false
+        validation_seed_used=$false
+        sealed_test_seed_used=$false
+        sealed_test_authorized=$false
+        game_run=$false
+        retry_prohibited=$true
+        rescue_prohibited=$true
+    }
+}
+
+function Write-R1TerminalFailureVeto {
+    param(
+        [Parameter(Mandatory)][string]$FinalPath,
+        [Parameter(Mandatory)][string]$FailurePath,
+        [Parameter(Mandatory)][string]$Reason,
+        $Monitor
+    )
+    $Failure = New-R1TerminalFailureRecord -Reason $Reason -Monitor $Monitor -FinalPath $FinalPath
+    if ([IO.File]::Exists($FailurePath)) {
+        return (Read-R1AuthoritativeTerminalResult -FinalPath $FinalPath -FailurePath $FailurePath)
+    }
+    if ([IO.File]::Exists($FinalPath)) {
+        Write-R1JsonDurableAtomic $FailurePath $Failure
+    } else {
+        Write-R1JsonDurableAtomic $FinalPath $Failure
+    }
+    return $Failure
+}
+
+function Read-R1AuthoritativeTerminalResult {
+    param(
+        [Parameter(Mandatory)][string]$FinalPath,
+        [Parameter(Mandatory)][string]$FailurePath
+    )
+    if ([IO.File]::Exists($FailurePath)) {
+        $Veto = Get-Content -LiteralPath $FailurePath -Raw | ConvertFrom-Json
+        if ((Get-R1Property $Veto 'authoritative_terminal_failure') -isnot [bool] -or
+            -not (Get-R1Property $Veto 'authoritative_terminal_failure') -or
+            (Get-R1Property $Veto 'success') -isnot [bool] -or
+            (Get-R1Property $Veto 'success')) {
+            throw 'terminal failure veto exists but is malformed'
+        }
+        return $Veto
+    }
+    if (-not [IO.File]::Exists($FinalPath)) { throw 'no terminal result exists' }
+    return (Get-Content -LiteralPath $FinalPath -Raw | ConvertFrom-Json)
 }

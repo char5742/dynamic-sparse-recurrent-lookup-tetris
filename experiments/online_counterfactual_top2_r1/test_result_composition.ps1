@@ -4,6 +4,11 @@ param()
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'result_composition.ps1')
+$OriginalPycachePrefix = [Environment]::GetEnvironmentVariable('PYTHONPYCACHEPREFIX', 'Process')
+$env:PYTHONPYCACHEPREFIX = Join-Path 'D:\tetris-paper-plus\python-pycache' (
+    "r1_test_result_${PID}_$([guid]::NewGuid().ToString('N'))"
+)
+[IO.Directory]::CreateDirectory($env:PYTHONPYCACHEPREFIX) | Out-Null
 
 $ProductRoot = Join-Path ([IO.Path]::GetTempPath()) ('r1-result-products-' + [guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($ProductRoot) | Out-Null
@@ -85,6 +90,8 @@ $Monitor = [ordered]@{
     skipped_phases=@()
     producer_completion_ledger=$SyntheticLedger
     assessment_snapshot_sha256=$FinalizerProduct.sha256
+    finalizer_disposition='launched_completed'
+    authoritative_failure_assessment=$null
     optional_development_enabled=$false; development_seed_used=$false
     validation_seed_used=$false; sealed_test_seed_used=$false; game_run=$false
 }
@@ -120,6 +127,14 @@ $NegativeCases += ,@($Assessment,$Bad,'assessment snapshot unbound')
 $BadAssessment = $Assessment | ConvertTo-Json -Depth 10 | ConvertFrom-Json
 $BadAssessment.development_authorized = $true
 $NegativeCases += ,@($BadAssessment,$Monitor,'development authorized')
+$Bad = $Monitor | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+$Bad.stop_reason = 'failed'
+$Bad.finalizer_disposition = 'terminal_integrity_failure'
+$Bad.authoritative_failure_assessment = [ordered]@{
+    status='assessment-fail'; success=$false; authority='wrapper-fail-closed'
+    failure_stage='after_finalize_assessment'; failures=@('synthetic boundary failure')
+}
+$NegativeCases += ,@($Assessment,$Bad,'authoritative wrapper failure overrides passing assessment')
 foreach ($Case in $NegativeCases) {
     if ((New-R1FinalResult $Case[0] $Case[1]).success) {
         throw "negative terminal case passed: $($Case[2])"
@@ -149,12 +164,47 @@ try {
                 (Join-Path $CaseRoot 'final_result.json') `
                 $Assessment $Monitor ([ordered]@{ status='wrapper-complete'; success=$true }) $Point)
         } catch { $Failed = $true }
-        if (-not $Failed -or [IO.File]::Exists((Join-Path $CaseRoot 'final_result.json'))) {
-            throw "terminal failure injection did not fail closed: $Point"
+        $CaseFinalPath = Join-Path $CaseRoot 'final_result.json'
+        $CaseFailurePath = Join-Path $CaseRoot 'terminal_failure.json'
+        if (-not $Failed -or -not [IO.File]::Exists($CaseFinalPath)) {
+            throw "terminal failure injection did not retain a terminal record: $Point"
+        }
+        $CaseFinal = Get-Content -LiteralPath $CaseFinalPath -Raw | ConvertFrom-Json
+        if ($Point -ceq 'after_final') {
+            if (-not [IO.File]::Exists($CaseFailurePath)) {
+                throw 'post-success publication failure lacks the higher-authority veto'
+            }
+            $CaseVeto = Get-Content -LiteralPath $CaseFailurePath -Raw | ConvertFrom-Json
+            if (-not $CaseVeto.authoritative_terminal_failure -or $CaseVeto.success -or
+                -not $CaseVeto.supersedes_final_result) {
+                throw 'post-success terminal failure veto is not authoritative'
+            }
+        } elseif (-not $CaseFinal.authoritative_terminal_failure -or $CaseFinal.success) {
+            throw "publication failure did not leave an authoritative rejection: $Point"
+        }
+        $AuthoritativeCase = Read-R1AuthoritativeTerminalResult `
+            -FinalPath $CaseFinalPath -FailurePath $CaseFailurePath
+        if ($AuthoritativeCase.success -or -not $AuthoritativeCase.authoritative_terminal_failure) {
+            throw "terminal authority reader did not prefer failure: $Point"
         }
     }
+
+    $DurablePath = Join-Path $Root 'durable-no-replace.json'
+    Write-R1JsonDurableAtomic $DurablePath ([ordered]@{ generation=1 })
+    $FirstDurableSha = (Get-FileHash -LiteralPath $DurablePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $OverwriteRejected = $false
+    try { Write-R1JsonDurableAtomic $DurablePath ([ordered]@{ generation=2 }) }
+    catch { $OverwriteRejected = $true }
+    if (-not $OverwriteRejected -or
+        (Get-FileHash -LiteralPath $DurablePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $FirstDurableSha) {
+        throw 'MoveFileEx write-through publication overwrote an existing artifact'
+    }
 } finally {
+    [Environment]::SetEnvironmentVariable('PYTHONPYCACHEPREFIX', $OriginalPycachePrefix, 'Process')
     if ([IO.Directory]::Exists($Root)) { Remove-Item -LiteralPath $Root -Recurse -Force }
+}
+if ([Environment]::GetEnvironmentVariable('PYTHONPYCACHEPREFIX', 'Process') -cne $OriginalPycachePrefix) {
+    throw 'result-composition test did not restore PYTHONPYCACHEPREFIX'
 }
 
 [ordered]@{
@@ -162,6 +212,8 @@ try {
     positive_cases=2
     negative_cases=$NegativeCases.Count
     terminal_failure_injections=6
+    append_only_terminal_failure_veto_verified=$true
+    movefile_write_through_no_replace_verified=$true
     game_run=$false
     seed_loaded=$false
     marker_read_or_written=$false

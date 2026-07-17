@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import contract
+import finalize_assessment as finalizer
 import make_eligibility
 
 
@@ -121,6 +122,7 @@ def make_collection(role: str, table_path: Path) -> tuple[dict[str, Any], dict[s
         "synthetic": True,
         "stable_node_key_source_sha256": STABLE_DIGEST,
         "backend_binding": None,
+        "engine_dependency_graph": None,
         "immutable_input_end_hashes": None,
         "counterfactual_states_completed": total,
         "first32_elapsed_seconds": 0.01 if role == "training" else None,
@@ -156,6 +158,7 @@ def make_collection(role: str, table_path: Path) -> tuple[dict[str, Any], dict[s
         "feature_schema_digest": FEATURE_DIGEST,
         "stable_node_key_source_sha256": STABLE_DIGEST,
         "backend_binding": None,
+        "engine_dependency_graph": None,
         "immutable_input_end_hashes": None,
         "episode_count": len(episodes),
         "row_count": len(rows),
@@ -223,6 +226,7 @@ def make_ridge(training_table: Path, training_manifest: Path, freeze: Path) -> d
         "source_table_synthetic": True,
         "source_collection_manifest_path": str(training_manifest.resolve()),
         "source_collection_manifest_sha256": sha256(training_manifest),
+        "engine_dependency_graph": None,
         "training_row_order_sha256": row_order_sha256,
         "training_row_order_encoding": "episode_id,piece_index,root_state_digest newline joined",
         "design_freeze_path": str(freeze.resolve()),
@@ -438,6 +442,46 @@ class FinalizerTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "assessment-fail")
         self.assertTrue(any("training-seed field mismatch" in reason for reason in result["reasons"]))
+
+    def test_production_shaped_backend_requires_exact_openvino_build(self) -> None:
+        backend = {
+            "old_openvino_weight_npz_sha256": "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba",
+            "old_checkpoint_sha256": "7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1",
+            "openvino_version": "2026.2.1",
+            "openvino_full_build": "2026.2.1-21919-ede283a88e3-releases/2026/2",
+            "complete_device": "NPU",
+            "tail_device": "CPU",
+            "complete_batch_size": 16,
+            "evaluator_source_sha256": "a" * 64,
+        }
+        finalizer._validate_backend_evidence(
+            backend, synthetic=False, label="production-shaped fixture"
+        )
+        short = dict(backend)
+        short["openvino_full_build"] = "2026.2.1"
+        with self.assertRaisesRegex(ValueError, "openvino_full_build mismatch"):
+            finalizer._validate_backend_evidence(
+                short, synthetic=False, label="short-version fixture"
+            )
+
+    def test_production_shaped_dependency_graph_binds_exact_live_closure(self) -> None:
+        graph = finalizer._live_engine_dependency_graph(REPOSITORY)
+        self.assertEqual(
+            finalizer._validate_engine_dependency_graph(
+                graph, synthetic=False, label="production-shaped fixture"
+            ),
+            graph,
+        )
+        changed = json.loads(json.dumps(graph))
+        changed["records"][-1]["sha256"] = "0" * 64
+        changed["graph_sha256"] = finalizer._dependency_digest(changed["records"])
+        changed["runtime_closure_sha256"] = finalizer._dependency_digest(
+            changed["records"][1:]
+        )
+        with self.assertRaisesRegex(ValueError, "frozen runtime dependency mismatch"):
+            finalizer._validate_engine_dependency_graph(
+                changed, synthetic=False, label="tampered production fixture"
+            )
 
     def test_missing_input_fails_closed_with_durable_output(self) -> None:
         missing = self.directory / "missing_training.json"

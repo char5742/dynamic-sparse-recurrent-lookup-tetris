@@ -296,6 +296,61 @@ end
     )
 end
 
+@testset "fatal adapter invariants are never downgraded to exclusions" begin
+    function assert_fatal_aborts(adapter, expected_code)
+        promoted = Ref(false)
+        events = Any[]
+        observed = try
+            collect_episode(
+                adapter,
+                43;
+                episode_id=1,
+                on_sample_complete=event -> push!(events, event),
+            )
+            promoted[] = true
+            nothing
+        catch error
+            error
+        end
+        @test observed isa FatalCollectionInvariant
+        @test observed.code == expected_code
+        @test !promoted[]
+        @test isempty(events)
+    end
+
+    actions_fatal = merge(make_adapter(), (;
+        candidate_actions=state -> throw(FatalCollectionInvariant(
+            :injected_actions_fatal, "candidate generator invariant failed",
+        )),
+    ))
+    assert_fatal_aborts(actions_fatal, :injected_actions_fatal)
+
+    q_fatal = merge(make_adapter(), (;
+        q_values=(state, actions) -> throw(FatalCollectionInvariant(
+            :injected_q_fatal, "Q evaluator invariant failed",
+        )),
+    ))
+    assert_fatal_aborts(q_fatal, :injected_q_fatal)
+
+    clone_fatal = merge(make_adapter(), (;
+        clone_state=state -> throw(FatalCollectionInvariant(
+            :injected_clone_fatal, "clone invariant failed",
+        )),
+    ))
+    assert_fatal_aborts(clone_fatal, :injected_clone_fatal)
+
+    apply_base = make_adapter()
+    apply_fatal = merge(apply_base, (;
+        apply_action=(state, action) -> begin
+            state.branch_root_pending && throw(FatalCollectionInvariant(
+                :injected_apply_fatal, "branch replay invariant failed",
+            ))
+            apply_base.apply_action(state, action)
+        end,
+    ))
+    assert_fatal_aborts(apply_fatal, :injected_apply_fatal)
+end
+
 @testset "episode sampling never writes branches to canonical trajectory" begin
     adapter = make_adapter()
     episode = collect_episode(adapter, 31; episode_id=7)

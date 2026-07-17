@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import calibration_gate as gate
 import contract
@@ -82,6 +83,7 @@ def collection_table(role: str) -> dict[str, Any]:
             "sample_pieces": list(gate.SAMPLE_PIECES),
             "synthetic": True,
             "stable_node_key_source_sha256": stable_digest,
+            "engine_dependency_graph": None,
             "counterfactual_states_completed": len(episodes) * len(gate.SAMPLE_PIECES),
             "validation_seed_used": False,
             "sealed_test_seed_used": False,
@@ -135,6 +137,7 @@ def collection_manifest(table_path: Path, table: dict[str, Any]) -> dict[str, An
         "feature_names": table["feature_names"],
         "feature_schema_digest": gate.EXPECTED_FEATURE_NAMES_SHA256,
         "stable_node_key_source_sha256": table["metadata"]["stable_node_key_source_sha256"],
+        "engine_dependency_graph": table["metadata"]["engine_dependency_graph"],
         "episode_count": len(episodes),
         "row_count": len(table["rows"]),
         "exclusion_count": len(exclusions),
@@ -196,6 +199,7 @@ def ridge_artifact(
         "training_bootstrap_schedule_sha256": gate.EXPECTED_TRAINING_SCHEDULE_SHA256,
         "training_bootstrap_schedule_source_anchor_sha256": gate.EXPECTED_TRAINING_SCHEDULE_SHA256,
         "training_bootstrap_schedule_consumed": True,
+        "engine_dependency_graph": None,
         "training_stats": {
             "row_count": 240,
             "episode_count": 12,
@@ -407,6 +411,38 @@ class PythonCalibrationGateTests(unittest.TestCase):
         self.assertEqual(stages[:3], ["script_enter", "imports_begin", "imports_end"])
         self.assertEqual(stages[-1], "phase_failed")
 
+    def test_single_byte_snapshot_rejects_replacement_during_json_decode(self) -> None:
+        source = self.directory / "snapshot_race.json"
+        bytes_a = b'{"version":"A","payload":1}'
+        bytes_b = b'{"version":"B","payload":2}'
+        self.assertEqual(len(bytes_a), len(bytes_b))
+        source.write_bytes(bytes_a)
+        expected = hashlib.sha256(bytes_a).hexdigest()
+        original_loads = gate.json.loads
+        parsed_payloads: list[bytes] = []
+
+        def replace_after_snapshot(payload: Any, *args: Any, **kwargs: Any) -> Any:
+            self.assertIsInstance(payload, bytes)
+            parsed_payloads.append(payload)
+            try:
+                source.write_bytes(bytes_b)
+            except OSError as error:
+                # A platform-level read lock is also a fail-closed outcome.
+                raise gate.CalibrationError("replacement blocked during snapshot") from error
+            return original_loads(payload, *args, **kwargs)
+
+        with mock.patch.object(gate.json, "loads", side_effect=replace_after_snapshot):
+            with self.assertRaisesRegex(
+                gate.CalibrationError,
+                "replacement blocked|changed or was replaced",
+            ):
+                gate.load_json_byte_snapshot(source, expected)
+
+        # The decoder was given the exact immutable bytes that were hashed;
+        # bytes B were never consumed as JSON under bytes A's digest.
+        self.assertEqual(parsed_payloads, [bytes_a])
+        self.assertEqual(source.read_bytes(), bytes_b)
+
     def test_run_path_detects_wrong_production_fallback_mapping(self) -> None:
         expected = {
             "calibration_table": sha256(self.calibration_table),
@@ -504,6 +540,7 @@ class PythonCalibrationGateTests(unittest.TestCase):
                 maximum_rows=144,
                 synthetic=True,
                 table_path=self.calibration_table,
+                table_actual_sha256=sha256(self.calibration_table),
             )
 
         artifact = json.loads(self.artifact.read_text(encoding="utf-8"))
@@ -548,6 +585,7 @@ class PythonCalibrationGateTests(unittest.TestCase):
                     maximum_rows=144,
                     synthetic=True,
                     table_path=self.calibration_table,
+                    table_actual_sha256=sha256(self.calibration_table),
                 )
 
         training = json.loads(self.training_table.read_text(encoding="utf-8"))
@@ -565,6 +603,50 @@ class PythonCalibrationGateTests(unittest.TestCase):
                 maximum_rows=288,
                 synthetic=True,
                 table_path=self.training_table,
+                table_actual_sha256=sha256(self.training_table),
+            )
+
+    def test_engine_dependency_graph_tamper_and_ridge_propagation_are_rejected(self) -> None:
+        table = json.loads(self.calibration_table.read_text(encoding="utf-8"))
+        manifest = json.loads(self.calibration_manifest.read_text(encoding="utf-8"))
+        table["metadata"]["engine_dependency_graph"] = {}
+        with self.assertRaisesRegex(
+            gate.CalibrationError,
+            "engine dependency graph differs between table and manifest",
+        ):
+            gate._validate_collection_table(
+                table,
+                manifest,
+                role="calibration",
+                expected_episodes=gate.CALIBRATION_EPISODES,
+                minimum_rows=120,
+                maximum_rows=144,
+                synthetic=True,
+                table_path=self.calibration_table,
+                table_actual_sha256=sha256(self.calibration_table),
+            )
+
+        tampered_artifact = self.directory / "ridge_graph_tampered.json"
+        artifact = json.loads(self.artifact.read_text(encoding="utf-8"))
+        artifact["engine_dependency_graph"] = {}
+        write_json(tampered_artifact, artifact)
+        expected = {
+            "calibration_table": sha256(self.calibration_table),
+            "calibration_manifest": sha256(self.calibration_manifest),
+            "ridge_artifact": sha256(tampered_artifact),
+            "design_freeze": sha256(self.freeze),
+        }
+        with self.assertRaisesRegex(
+            gate.CalibrationError,
+            "ridge artifact synthetic engine dependency graph must be null",
+        ):
+            gate.run_calibration(
+                self.calibration_table,
+                self.calibration_manifest,
+                tampered_artifact,
+                self.freeze,
+                synthetic=True,
+                expected_handoff_sha256=expected,
             )
 
     def _deterministic_rows_and_evidence(self) -> tuple[list[gate.CalibrationRow], gate.GateArtifactEvidence]:
@@ -662,6 +744,7 @@ class PythonCalibrationGateTests(unittest.TestCase):
                 str(self.calibration_table), sha256(self.calibration_table), sha256(self.calibration_table), True
             ),
             bootstrap_schedules=freeze["calibration_bootstrap_schedules"],
+            engine_dependency_graph=None,
         )
 
     def assert_cross_language_equal(self, python: dict[str, Any], julia: dict[str, Any]) -> None:

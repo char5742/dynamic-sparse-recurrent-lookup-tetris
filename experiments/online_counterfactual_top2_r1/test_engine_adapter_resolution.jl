@@ -1,5 +1,6 @@
 using Test
 using Random
+using SHA
 
 include(joinpath(@__DIR__, "collector.jl"))
 include(joinpath(@__DIR__, "engine_adapter.jl"))
@@ -170,8 +171,55 @@ end
     @test occursin("LegacyOpenVINOInference(\"NPU\", 16)", source)
     @test occursin("legacy_1313_weights.npz", source)
     @test occursin("2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba", source)
-    @test occursin("stable_node_key_fn=Main.stable_node_key", source)
+    @test occursin("stable_node_key_fn=getfield(engine, :stable_node_key)", source)
+    @test !occursin("stable_node_key_fn=Main.stable_node_key", source)
+    @test occursin("_load_frozen_evaluator", source)
+    @test occursin("unexpected recursive include in frozen legacy evaluator", source)
     @test occursin("GameState(root)", source)
     @test occursin("node_replay_mismatch", source)
     @test occursin("future_oracle_mutated_state", source)
+end
+
+@testset "vendored candidate generator is byte-identical and privately loaded" begin
+    repository = normpath(joinpath(@__DIR__, "..", ".."))
+    original_node = joinpath(
+        repository, "upstream", "TetrisAI", "src", "core", "components", "node.jl",
+    )
+    original_analyzer = joinpath(
+        repository, "upstream", "TetrisAI", "src", "core", "analyzer.jl",
+    )
+    vendored_node = joinpath(
+        @__DIR__, "vendor", "TetrisAI", "src", "core", "components", "node.jl",
+    )
+    vendored_analyzer = joinpath(
+        @__DIR__, "vendor", "TetrisAI", "src", "core", "analyzer.jl",
+    )
+    @test read(vendored_node) == read(original_node)
+    @test read(vendored_analyzer) == read(original_analyzer)
+    @test bytes2hex(open(SHA.sha256, vendored_node)) ==
+          "e98d2052f9248f5c08c1eb58adaace1bd01533f287e682bf35a2fefa1325fe82"
+    @test bytes2hex(open(SHA.sha256, vendored_analyzer)) ==
+          "24152e2549dcc6c3c25d928454268e8baaa4d45fea31044603917cfbabbe02bc"
+
+    evaluator = joinpath(repository, "scripts", "evaluate_openvino_checkpoint.jl")
+    private_module = R1ProductionEngineAdapter._load_frozen_evaluator(repository, evaluator)
+    @test private_module !== Main
+    @test isdefined(private_module, :stable_node_list)
+    @test isdefined(private_module, :stable_node_key)
+    @test isdefined(private_module, :legacy_candidate_batch)
+    @test isdefined(private_module, :openvino_scores)
+    @test !isdefined(Main, :stable_node_list)
+    @test !isdefined(Main, :evaluate_openvino_episode)
+
+    graph = R1ProductionEngineAdapter._engine_dependency_graph(repository)
+    @test graph.schema_version == "r1-engine-dependency-graph-v1"
+    @test graph.upstream_tetrisai.head ==
+          "6fdfb1d30197246fd862b716438e998f0315c830"
+    @test graph.upstream_tetrisai.clean
+    @test length(graph.records) == 7
+    @test issorted(getproperty.(graph.records, :path))
+    @test graph.node_source_sha256 ==
+          "e98d2052f9248f5c08c1eb58adaace1bd01533f287e682bf35a2fefa1325fe82"
+    @test graph.analyzer_source_sha256 ==
+          "24152e2549dcc6c3c25d928454268e8baaa4d45fea31044603917cfbabbe02bc"
 end

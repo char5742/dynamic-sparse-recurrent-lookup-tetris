@@ -4,16 +4,35 @@ param()
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'wrapper_runtime.ps1')
+$OriginalPycachePrefix = [Environment]::GetEnvironmentVariable('PYTHONPYCACHEPREFIX', 'Process')
+$env:PYTHONPYCACHEPREFIX = Join-Path 'D:\tetris-paper-plus\python-pycache' (
+    "r1_test_wrapper_${PID}_$([guid]::NewGuid().ToString('N'))"
+)
+[IO.Directory]::CreateDirectory($env:PYTHONPYCACHEPREFIX) | Out-Null
 
 $Julia = Resolve-R1ConcreteJulia
 if ($Julia.path -match '(?i)\\Microsoft\\WindowsApps\\' -or $Julia.version -cne '1.12.6') {
     throw 'concrete Julia resolver returned a launcher or wrong version'
 }
+$PwshRecord = Resolve-R1ConcretePwsh (Get-Process -Id $PID).Path
+$WindowsPowerShellRejected = $false
+try {
+    [void](Resolve-R1ConcretePwsh "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
+} catch { $WindowsPowerShellRejected = $true }
+if (-not $WindowsPowerShellRejected -or $PwshRecord.version -cne '7.4.17') {
+    throw 'exact pwsh 7.4.17 enforcement or Windows PowerShell 5.1 rejection failed'
+}
+
+$Durability = Get-R1DurablePublicationEvidence
+if ($Durability.publication_flag -cne 'MOVEFILE_WRITE_THROUGH (0x00000008)' -or
+    $Durability.overwrite_allowed) {
+    throw 'Windows durable atomic publication evidence is incomplete'
+}
 
 $Root = Join-Path ([IO.Path]::GetTempPath()) ('r1-wrapper-' + [guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($Root) | Out-Null
 try {
-    $Pwsh = (Get-Process -Id $PID).Path
+    $Pwsh = $PwshRecord.path
     $SuccessRoot = Join-Path $Root 'success'
     $RunStarted = [DateTimeOffset]::UtcNow
     $Command = @(
@@ -226,6 +245,70 @@ try {
         throw 'strict finalizer was not invoked after a wrapper-side postprocess failure'
     }
 
+    function New-R1SyntheticPipelinePlan([string]$PlanRoot) {
+        [IO.Directory]::CreateDirectory($PlanRoot) | Out-Null
+        $PlanCommands = [ordered]@{}
+        $PlanArtifacts = [ordered]@{}
+        foreach ($PhaseName in $script:R1ExpectedPhaseOrder) {
+            $Product = Join-Path $PlanRoot "$PhaseName.product.json"
+            $ChildMilestone = Join-Path $PlanRoot "$PhaseName.child_milestones.jsonl"
+            $PlanCommands[$PhaseName] = @(
+                $Pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-File',
+                $SyntheticChild, $PhaseName, $Product, $ChildMilestone
+            )
+            $PlanArtifacts[$PhaseName] = @($Product)
+        }
+        return [ordered]@{ commands=$PlanCommands; artifacts=$PlanArtifacts }
+    }
+
+    $FinalizerBoundaryRoot = Join-Path $Root 'finalizer-boundary-authoritative-failure'
+    $FinalizerBoundaryPlan = New-R1SyntheticPipelinePlan $FinalizerBoundaryRoot
+    $FinalizerBoundaryCheck = {
+        param([string]$Boundary)
+        if ($Boundary -ceq 'finalize_assessment') { throw 'synthetic finalizer boundary failure' }
+    }
+    $FinalizerBoundaryResult = Invoke-R1PhasePipeline `
+        -Commands $FinalizerBoundaryPlan.commands -PhaseArtifacts $FinalizerBoundaryPlan.artifacts `
+        -WorkingDirectory $Root -OutputDirectory $FinalizerBoundaryRoot `
+        -BoundaryIntegrityCheck $FinalizerBoundaryCheck -TotalHardWallSeconds 30
+    if ($FinalizerBoundaryResult.finalizer_disposition -cne 'blocked_by_boundary_integrity_failure' -or
+        $FinalizerBoundaryResult.authoritative_failure_assessment.status -cne 'assessment-fail' -or
+        $FinalizerBoundaryResult.authoritative_failure_assessment.success -or
+        @($FinalizerBoundaryResult.phases | Where-Object phase -ceq 'finalize_assessment').Count -ne 0) {
+        throw 'finalizer boundary failure did not produce authoritative fail assessment semantics'
+    }
+
+    $FinalizerInvokeRoot = Join-Path $Root 'finalizer-invocation-authoritative-failure'
+    $FinalizerInvokePlan = New-R1SyntheticPipelinePlan $FinalizerInvokeRoot
+    $FinalizerInvokePlan.commands.finalize_assessment = @(
+        (Join-Path $FinalizerInvokeRoot 'missing-finalizer.exe'),
+        (Join-Path $FinalizerInvokeRoot 'missing-finalizer.child_milestones.jsonl')
+    )
+    $FinalizerInvokeResult = Invoke-R1PhasePipeline `
+        -Commands $FinalizerInvokePlan.commands -PhaseArtifacts $FinalizerInvokePlan.artifacts `
+        -WorkingDirectory $Root -OutputDirectory $FinalizerInvokeRoot -TotalHardWallSeconds 30
+    if ($FinalizerInvokeResult.finalizer_disposition -cne 'invocation_failure' -or
+        $FinalizerInvokeResult.authoritative_failure_assessment.status -cne 'assessment-fail' -or
+        $FinalizerInvokeResult.authoritative_failure_assessment.success) {
+        throw 'finalizer invocation failure did not become authoritative failure'
+    }
+
+    $TerminalBoundaryRoot = Join-Path $Root 'terminal-boundary-authoritative-failure'
+    $TerminalBoundaryPlan = New-R1SyntheticPipelinePlan $TerminalBoundaryRoot
+    $TerminalBoundaryCheck = {
+        param([string]$Boundary)
+        if ($Boundary -ceq 'terminal') { throw 'synthetic during-finalizer/terminal integrity failure' }
+    }
+    $TerminalBoundaryResult = Invoke-R1PhasePipeline `
+        -Commands $TerminalBoundaryPlan.commands -PhaseArtifacts $TerminalBoundaryPlan.artifacts `
+        -WorkingDirectory $Root -OutputDirectory $TerminalBoundaryRoot `
+        -BoundaryIntegrityCheck $TerminalBoundaryCheck -TotalHardWallSeconds 30
+    if ($TerminalBoundaryResult.finalizer_disposition -cne 'terminal_integrity_failure' -or
+        $TerminalBoundaryResult.authoritative_failure_assessment.failure_stage -cne 'after_finalize_assessment' -or
+        $TerminalBoundaryResult.authoritative_failure_assessment.success) {
+        throw 'during-finalizer/terminal integrity failure did not override the completed assessment'
+    }
+
     [ordered]@{
         status='r1_wrapper_runtime_synthetic_checks_passed'
         concrete_julia=$Julia
@@ -241,13 +324,23 @@ try {
         stale_handoff_environment_isolated_and_restored=$true
         finalizer_after_wrapper_prelaunch_failure_verified=$true
         finalizer_after_wrapper_postprocess_failure_verified=$true
+        finalizer_boundary_failure_authoritative=$true
+        finalizer_invocation_failure_authoritative=$true
+        during_finalizer_terminal_integrity_failure_authoritative=$true
+        exact_pwsh_7_4_17_verified=$true
+        windows_powershell_5_1_rejected=$true
+        movefile_write_through_publication_verified=$true
         checkpoint_or_model_loaded=$false
         game_run=$false
         seed_loaded=$false
         marker_read_or_written=$false
     } | ConvertTo-Json -Depth 8
 } finally {
+    [Environment]::SetEnvironmentVariable('PYTHONPYCACHEPREFIX', $OriginalPycachePrefix, 'Process')
     if ([IO.Directory]::Exists($Root)) {
         Remove-Item -LiteralPath $Root -Recurse -Force
     }
+}
+if ([Environment]::GetEnvironmentVariable('PYTHONPYCACHEPREFIX', 'Process') -cne $OriginalPycachePrefix) {
+    throw 'wrapper test did not restore PYTHONPYCACHEPREFIX'
 }

@@ -362,6 +362,7 @@ function _adapter_q(adapter, state, actions)
     raw = try
         adapter.q_values(state, actions)
     catch error
+        error isa FatalCollectionInvariant && rethrow()
         throw(ExcludableCollectionError(:q_evaluation_failure, sprint(showerror, error)))
     end
     q = Float64.(collect(raw))
@@ -380,6 +381,7 @@ function _adapter_actions(adapter, state)
     actions = try
         collect(adapter.candidate_actions(state))
     catch error
+        error isa FatalCollectionInvariant && rethrow()
         throw(ExcludableCollectionError(:branch_construction_failure, sprint(showerror, error)))
     end
     return actions
@@ -429,6 +431,7 @@ function _apply_branch_action!(adapter, state, action)
     try
         adapter.apply_action(state, action)
     catch error
+        error isa FatalCollectionInvariant && rethrow()
         throw(ExcludableCollectionError(:branch_apply_failure, sprint(showerror, error)))
     end
     return state
@@ -466,6 +469,7 @@ function rollout_branch(
     state = try
         adapter.clone_state(root_state)
     catch error
+        error isa FatalCollectionInvariant && rethrow()
         throw(ExcludableCollectionError(:branch_clone_failure, sprint(showerror, error)))
     end
     state === root_state && throw(FatalCollectionInvariant(

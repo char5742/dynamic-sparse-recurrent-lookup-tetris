@@ -4,10 +4,16 @@ param()
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'wrapper_runtime.ps1')
+$OriginalPycachePrefix = [Environment]::GetEnvironmentVariable('PYTHONPYCACHEPREFIX', 'Process')
+$env:PYTHONPYCACHEPREFIX = Join-Path 'D:\tetris-paper-plus\python-pycache' (
+    "r1_test_argv_${PID}_$([guid]::NewGuid().ToString('N'))"
+)
+[IO.Directory]::CreateDirectory($env:PYTHONPYCACHEPREFIX) | Out-Null
 
 $Repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $Julia = Resolve-R1ConcreteJulia
 $Python = Resolve-R1FrozenPython
+$Pwsh = Resolve-R1ConcretePwsh (Get-Process -Id $PID).Path
 $Manifest = Assert-R1FrozenManifest $Repository
 $Root = Join-Path ([IO.Path]::GetTempPath()) ('r1-production-argv-' + [guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($Root) | Out-Null
@@ -126,7 +132,7 @@ try {
 
     [ordered]@{
         status='r1_all_five_production_argv_synthetic_checks_passed'
-        concrete_julia=$Julia; frozen_python=$Python; manifest=$Manifest
+        concrete_julia=$Julia; frozen_python=$Python; frozen_pwsh=$Pwsh; manifest=$Manifest
         phases=@($Train.phase,$Fit.phase,$Calibration.phase,$CalibrationGate.phase,$Finalize.phase)
         python_fit_succeeded_under_1gib=$true
         python_fit_peak_private_committed_bytes=$Fit.peak_process_tree_private_committed_bytes
@@ -139,5 +145,9 @@ try {
         marker_read_or_written=$false
     } | ConvertTo-Json -Depth 10
 } finally {
+    [Environment]::SetEnvironmentVariable('PYTHONPYCACHEPREFIX', $OriginalPycachePrefix, 'Process')
     if ([IO.Directory]::Exists($Root)) { Remove-Item -LiteralPath $Root -Recurse -Force }
+}
+if ([Environment]::GetEnvironmentVariable('PYTHONPYCACHEPREFIX', 'Process') -cne $OriginalPycachePrefix) {
+    throw 'production-argv test did not restore PYTHONPYCACHEPREFIX'
 }

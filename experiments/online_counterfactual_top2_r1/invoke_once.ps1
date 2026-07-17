@@ -11,6 +11,13 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'wrapper_runtime.ps1')
 . (Join-Path $PSScriptRoot 'result_composition.ps1')
 
+$R1OriginalPycachePrefix = [Environment]::GetEnvironmentVariable('PYTHONPYCACHEPREFIX', 'Process')
+$R1PycachePrefix = Join-Path 'D:\tetris-paper-plus\python-pycache' (
+    "online_counterfactual_top2_r1_${PID}_$([guid]::NewGuid().ToString('N'))"
+)
+[IO.Directory]::CreateDirectory($R1PycachePrefix) | Out-Null
+$env:PYTHONPYCACHEPREFIX = $R1PycachePrefix
+
 function Get-R1ImmutableFileRecord([string]$Path) {
     $Full = [IO.Path]::GetFullPath($Path)
     if (-not [IO.File]::Exists($Full)) { throw "missing immutable R1 input: $Full" }
@@ -45,7 +52,8 @@ function Invoke-R1ValidateOnly {
     $Julia = Resolve-R1ConcreteJulia
     $Python = Resolve-R1FrozenPython
     $Manifest = Assert-R1FrozenManifest $Repository
-    $Pwsh = (Get-Process -Id $PID).Path
+    $PwshRecord = Resolve-R1ConcretePwsh (Get-Process -Id $PID).Path
+    $Pwsh = $PwshRecord.path
     Invoke-R1ExternalChecked @(
         $Python.venv_launcher_path, (Join-Path $PSScriptRoot 'syntax_preflight.py'),
         $PSScriptRoot, '--julia', $Julia.path,
@@ -78,6 +86,7 @@ function Invoke-R1ValidateOnly {
         status='R1-validate-only-pass'
         julia=$Julia
         python=$Python
+        pwsh=$PwshRecord
         manifest=$Manifest
         strict_syntax=$true
         all_five_production_argv_synthetic=$true
@@ -89,6 +98,7 @@ function Invoke-R1ValidateOnly {
     } | ConvertTo-Json -Depth 10
 }
 
+try {
 if ($ValidateOnly) {
     if (-not [string]::IsNullOrWhiteSpace($AuthorizedCommit) -or
         -not [string]::IsNullOrWhiteSpace($OutputDirectory)) {
@@ -105,6 +115,7 @@ if ($AuthorizedCommit -notmatch '^[0-9a-f]{40}$') {
 $Repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $Julia = Resolve-R1ConcreteJulia
 $Python = Resolve-R1FrozenPython
+$Pwsh = Resolve-R1ConcretePwsh (Get-Process -Id $PID).Path
 $Manifest = Assert-R1FrozenManifest $Repository
 $RunRoot = 'D:\tetris-paper-plus\runs'
 $GlobalMarker = Join-Path $RunRoot 'online_counterfactual_top2_R1.started.json'
@@ -171,9 +182,33 @@ $ImmutableRecords = @(
     Get-R1ImmutableFileRecord $Julia.path
     Get-R1ImmutableFileRecord $Python.path
     Get-R1ImmutableFileRecord $Python.venv_launcher_path
+    Get-R1ImmutableFileRecord $Pwsh.path
     Get-R1ImmutableFileRecord $Manifest.path
     Get-R1ImmutableFileRecord (Join-Path $PSScriptRoot 'contract.json')
 )
+$RuntimeSourceRecordMap = [ordered]@{}
+$AuditedSourceEntries = @($SourceAudit.fingerprint.files) + `
+    @($SourceAudit.fingerprint.runtime_closure.files)
+foreach ($AuditedSource in $AuditedSourceEntries) {
+    $AuditedPath = [IO.Path]::GetFullPath((Join-Path $Repository ([string]$AuditedSource.path)))
+    $CapturedSource = Get-R1ImmutableFileRecord $AuditedPath
+    if ([int64]$CapturedSource.bytes -ne [int64]$AuditedSource.bytes -or
+        [string]$CapturedSource.sha256 -cne [string]$AuditedSource.sha256) {
+        throw "source-audit file changed before immutable closure capture: $AuditedPath"
+    }
+    $RuntimeSourceRecordMap[$AuditedPath.ToLowerInvariant()] = $CapturedSource
+}
+foreach ($UpstreamRelative in @(
+    'upstream\TetrisAI\src\core\components\node.jl',
+    'upstream\TetrisAI\src\core\analyzer.jl'
+)) {
+    $UpstreamPath = [IO.Path]::GetFullPath((Join-Path $Repository $UpstreamRelative))
+    $RuntimeSourceRecordMap[$UpstreamPath.ToLowerInvariant()] = Get-R1ImmutableFileRecord $UpstreamPath
+}
+$RuntimeSourceRecords = @($RuntimeSourceRecordMap.Values)
+if ($RuntimeSourceRecords.Count -lt @($SourceAudit.fingerprint.files).Count) {
+    throw 'immutable runtime/source closure lost audited source entries'
+}
 if ($ImmutableRecords[0].sha256 -cne '7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1' -or
     $ImmutableRecords[1].sha256 -cne '2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba') {
     throw 'canonical checkpoint/OpenVINO weight digest differs from the frozen contract'
@@ -258,6 +293,14 @@ $FreezeDocument = [ordered]@{
     eligibility_sha256=(Get-FileHash -LiteralPath $Eligibility -Algorithm SHA256).Hash.ToLowerInvariant()
     design_freeze_sha256=$DesignFreezeSha
     immutable_files=$ImmutableRecords
+    runtime_source_files=$RuntimeSourceRecords
+    fit=[ordered]@{
+        quantile_method='linear_type7_position_1_plus_n_minus_1_p'
+    }
+    openvino=[ordered]@{
+        exact_full_build=$Python.openvino_version
+    }
+    python_pycache_prefix=$R1PycachePrefix
     commands=$Commands
     phase_artifacts=$PhaseArtifacts
     phase_environment_bindings=$PhaseEnvironment
@@ -291,6 +334,7 @@ $LastAudit = [DateTimeOffset]::MinValue
 while ($true) {
     if ([IO.File]::Exists($GlobalMarker)) { throw 'R1 marker appeared before this wrapper atomically consumed it' }
     Assert-R1ImmutableFileRecords $ImmutableRecords
+    Assert-R1ImmutableFileRecords $RuntimeSourceRecords
     if (([DateTimeOffset]::UtcNow - $LastAudit).TotalSeconds -ge 30) {
         $AuditText = @(& $Python.venv_launcher_path `
             (Join-Path $PSScriptRoot 'validate_source_fingerprint.py') `
@@ -326,6 +370,7 @@ while ($true) {
     Start-Sleep -Seconds 2
 }
 Assert-R1ImmutableFileRecords $ImmutableRecords
+Assert-R1ImmutableFileRecords $RuntimeSourceRecords
 $AuditText = @(& $Python.venv_launcher_path `
     (Join-Path $PSScriptRoot 'validate_source_fingerprint.py') `
     $Repository $SourceFingerprint $AuthorizedCommit 2>&1) -join "`n"
@@ -337,30 +382,43 @@ if ([int64]$GateRecord.bytes -ne [int64]$GateSnapshotBytes.LongLength -or
 }
 $GateRecord['creation_time_utc'] = (Get-Item -LiteralPath $StartGatePath -Force).CreationTimeUtc.ToString('o')
 $GateRecord['nonce'] = $StartGateNonce
+$EligibilityRecord = Get-R1ImmutableFileRecord $Eligibility
+$DesignFreezeRecord = Get-R1ImmutableFileRecord $DesignFreeze
+$SourceFingerprintRecord = Get-R1ImmutableFileRecord $SourceFingerprint
+$FreezePlanRecord = Get-R1ImmutableFileRecord $FreezePlan
+$ReadyRecord = Get-R1ImmutableFileRecord $ReadyPath
+$PreMarkerPersistentRecords = @(
+    $EligibilityRecord
+    $DesignFreezeRecord
+    $SourceFingerprintRecord
+    $FreezePlanRecord
+    $ReadyRecord
+    $GateRecord
+)
+Assert-R1ImmutableFileRecords $PreMarkerPersistentRecords
+$TerminalFailurePath = Join-Path $OutputDirectory 'terminal_failure.json'
+$Monitor = $null
+$Assessment = $null
+try {
 Write-R1JsonDurableAtomic $GlobalMarker ([ordered]@{
     experiment='online_counterfactual_top2_R1'
     started_at=[DateTimeOffset]::UtcNow.ToString('o')
     authorized_commit=$AuthorizedCommit
     output_directory=$OutputDirectory
-    freeze_sha256=(Get-FileHash -LiteralPath $FreezePlan -Algorithm SHA256).Hash.ToLowerInvariant()
-    ready_sha256=(Get-FileHash -LiteralPath $ReadyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    freeze_sha256=[string]$FreezePlanRecord.sha256
+    ready_sha256=[string]$ReadyRecord.sha256
     start_gate=$GateRecord
     retry_prohibited=$true
     rescue_prohibited=$true
 })
-$PersistentRunRecords = @(
-    Get-R1ImmutableFileRecord $Eligibility
-    Get-R1ImmutableFileRecord $DesignFreeze
-    Get-R1ImmutableFileRecord $SourceFingerprint
-    Get-R1ImmutableFileRecord $FreezePlan
-    Get-R1ImmutableFileRecord $ReadyPath
-    Get-R1ImmutableFileRecord $StartGatePath
-    Get-R1ImmutableFileRecord $GlobalMarker
-)
+$MarkerRecord = Get-R1ImmutableFileRecord $GlobalMarker
+$PersistentRunRecords = @($PreMarkerPersistentRecords) + @($MarkerRecord)
+Assert-R1ImmutableFileRecords $PersistentRunRecords
 
 $BoundaryIntegrityCheck = {
     param([string]$Boundary)
     Assert-R1ImmutableFileRecords $ImmutableRecords
+    Assert-R1ImmutableFileRecords $RuntimeSourceRecords
     Assert-R1ImmutableFileRecords $PersistentRunRecords
     $BoundaryAuditText = @(& $Python.venv_launcher_path `
         (Join-Path $PSScriptRoot 'validate_source_fingerprint.py') `
@@ -369,44 +427,105 @@ $BoundaryIntegrityCheck = {
         throw "source/HEAD/fingerprint audit failed at $Boundary boundary: $BoundaryAuditText"
     }
 }
-$Monitor = Invoke-R1PhasePipeline -Commands $Commands -WorkingDirectory $Repository `
-    -OutputDirectory $OutputDirectory -PhaseArtifacts $PhaseArtifacts `
-    -PhaseEnvironment $PhaseEnvironment -BoundaryIntegrityCheck $BoundaryIntegrityCheck `
-    -TotalHardWallSeconds 3900
-Assert-R1ImmutableFileRecords $ImmutableRecords
-Assert-R1ImmutableFileRecords $PersistentRunRecords
-$Assessment = $null
-$AssessmentSnapshotSha = $null
-if ([IO.File]::Exists($AssessmentPath)) {
-    $FinalizerPhase = @($Monitor.phases | Where-Object { $_.phase -ceq 'finalize_assessment' })
-    if ($FinalizerPhase.Count -ne 1 -or @($FinalizerPhase[0].phase_products).Count -ne 1) {
-        throw 'assessment exists without one finalizer phase-product binding'
+    $Monitor = Invoke-R1PhasePipeline -Commands $Commands -WorkingDirectory $Repository `
+        -OutputDirectory $OutputDirectory -PhaseArtifacts $PhaseArtifacts `
+        -PhaseEnvironment $PhaseEnvironment -BoundaryIntegrityCheck $BoundaryIntegrityCheck `
+        -TotalHardWallSeconds 3900
+    & $BoundaryIntegrityCheck 'after_pipeline'
+
+    $AssessmentSnapshotSha = $null
+    if ($null -ne $Monitor.authoritative_failure_assessment) {
+        $Assessment = $Monitor.authoritative_failure_assessment
+    } elseif ([IO.File]::Exists($AssessmentPath)) {
+        $FinalizerPhase = @($Monitor.phases | Where-Object { $_.phase -ceq 'finalize_assessment' })
+        if ($FinalizerPhase.Count -ne 1 -or @($FinalizerPhase[0].phase_products).Count -ne 1) {
+            throw 'assessment exists without one finalizer phase-product binding'
+        }
+        $AssessmentBytes = [IO.File]::ReadAllBytes($AssessmentPath)
+        $AssessmentSnapshotSha = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($AssessmentBytes)
+        ).ToLowerInvariant()
+        if ($AssessmentSnapshotSha -cne [string]$FinalizerPhase[0].phase_products[0].sha256) {
+            throw 'assessment changed after finalizer producer completion'
+        }
+        $Assessment = [Text.Encoding]::UTF8.GetString($AssessmentBytes) | ConvertFrom-Json
+    } else {
+        throw 'finalizer produced neither an assessment nor an authoritative wrapper failure assessment'
     }
-    $AssessmentBytes = [IO.File]::ReadAllBytes($AssessmentPath)
-    $AssessmentSnapshotSha = [Convert]::ToHexString(
-        [Security.Cryptography.SHA256]::HashData($AssessmentBytes)
-    ).ToLowerInvariant()
-    if ($AssessmentSnapshotSha -cne [string]$FinalizerPhase[0].phase_products[0].sha256) {
-        throw 'assessment changed after finalizer producer completion'
+    $Monitor['assessment_snapshot_sha256'] = $AssessmentSnapshotSha
+    & $BoundaryIntegrityCheck 'after_assessment_parse'
+
+    $MarkerCaptured = @($PersistentRunRecords | Where-Object {
+        ([string]$_.path).Equals([IO.Path]::GetFullPath($GlobalMarker), [StringComparison]::OrdinalIgnoreCase)
+    })
+    $FreezeCaptured = @($PersistentRunRecords | Where-Object {
+        ([string]$_.path).Equals([IO.Path]::GetFullPath($FreezePlan), [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($MarkerCaptured.Count -ne 1 -or $FreezeCaptured.Count -ne 1) {
+        throw 'captured marker/freeze immutable records are missing or ambiguous'
     }
-    $Assessment = [Text.Encoding]::UTF8.GetString($AssessmentBytes) | ConvertFrom-Json
+    $Wrapper = [ordered]@{
+        experiment='online_counterfactual_top2_R1'
+        authorized_commit=$AuthorizedCommit
+        global_marker=$GlobalMarker
+        global_marker_sha256=[string]$MarkerCaptured[0].sha256
+        freeze_path=$FreezePlan
+        freeze_sha256=[string]$FreezeCaptured[0].sha256
+        persistent_run_records=$PersistentRunRecords
+        runtime_source_records=$RuntimeSourceRecords
+        durable_publication=(Get-R1DurablePublicationEvidence)
+        output_directory=$OutputDirectory
+        retry_prohibited=$true
+        rescue_prohibited=$true
+        optional_development_enabled=$false
+        validation_seed_used=$false
+        sealed_test_seed_used=$false
+        game_run=$false
+    }
+    & $BoundaryIntegrityCheck 'before_composition'
+    $Final = Write-R1TerminalArtifacts -MonitorPath $MonitorPath -WrapperPath $WrapperPath `
+        -FinalPath $FinalPath -FailurePath $TerminalFailurePath `
+        -Assessment $Assessment -Monitor $Monitor -Wrapper $Wrapper
+    & $BoundaryIntegrityCheck 'after_terminal_publication'
+    $Final | ConvertTo-Json -Depth 32
+} catch {
+    if (-not [IO.File]::Exists($GlobalMarker)) { throw }
+    $PostMarkerFailure = "post-marker authoritative failure: $($_.Exception.Message)"
+    if ($null -eq $Monitor) {
+        $Monitor = [ordered]@{
+            complete=$true
+            ended_at=[DateTimeOffset]::UtcNow.ToString('o')
+            wall_seconds=0.0
+            stop_reason='failed'
+            failures=@($PostMarkerFailure)
+            phases=@()
+            skipped_phases=@($script:R1ExpectedPhaseOrder | ForEach-Object {
+                [ordered]@{ phase=$_; reason=$PostMarkerFailure }
+            })
+            producer_completion_ledger=@()
+            assessment_snapshot_sha256=$null
+            finalizer_disposition='outer_post_marker_failure'
+            authoritative_failure_assessment=(New-R1AuthoritativeFailureAssessment `
+                $PostMarkerFailure 'outer_post_marker')
+            optional_development_enabled=$false
+            development_seed_used=$false
+            validation_seed_used=$false
+            sealed_test_seed_used=$false
+            game_run=$false
+        }
+    } else {
+        $Monitor['stop_reason'] = 'failed'
+        $Monitor['failures'] = @($Monitor.failures) + @($PostMarkerFailure)
+        $Monitor['authoritative_failure_assessment'] = New-R1AuthoritativeFailureAssessment `
+            $PostMarkerFailure 'outer_post_marker'
+    }
+    $Failure = Write-R1TerminalFailureVeto -FinalPath $FinalPath `
+        -FailurePath $TerminalFailurePath -Reason $PostMarkerFailure -Monitor $Monitor
+    $Failure | ConvertTo-Json -Depth 32
+    throw
 }
-$Monitor['assessment_snapshot_sha256'] = $AssessmentSnapshotSha
-$Wrapper = [ordered]@{
-    experiment='online_counterfactual_top2_R1'
-    authorized_commit=$AuthorizedCommit
-    global_marker=$GlobalMarker
-    global_marker_sha256=(Get-FileHash -LiteralPath $GlobalMarker -Algorithm SHA256).Hash.ToLowerInvariant()
-    freeze_path=$FreezePlan
-    freeze_sha256=(Get-FileHash -LiteralPath $FreezePlan -Algorithm SHA256).Hash.ToLowerInvariant()
-    output_directory=$OutputDirectory
-    retry_prohibited=$true
-    rescue_prohibited=$true
-    optional_development_enabled=$false
-    validation_seed_used=$false
-    sealed_test_seed_used=$false
-    game_run=$false
+} finally {
+    [Environment]::SetEnvironmentVariable(
+        'PYTHONPYCACHEPREFIX', $R1OriginalPycachePrefix, 'Process'
+    )
 }
-$Final = Write-R1TerminalArtifacts -MonitorPath $MonitorPath -WrapperPath $WrapperPath `
-    -FinalPath $FinalPath -Assessment $Assessment -Monitor $Monitor -Wrapper $Wrapper
-$Final | ConvertTo-Json -Depth 32

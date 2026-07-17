@@ -26,6 +26,15 @@ class SyntaxPreflightTests(unittest.TestCase):
             with self.assertRaises(SyntaxError):
                 syntax_preflight.python_syntax([path])
 
+    def test_recursive_source_discovery_includes_vendored_leaf(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r1-nested-syntax-") as temporary:
+            root = Path(temporary)
+            nested = root / "vendor" / "TetrisAI" / "src" / "core"
+            nested.mkdir(parents=True)
+            leaf = nested / "analyzer.jl"
+            leaf.write_text("function broken(\n", encoding="utf-8")
+            self.assertEqual(syntax_preflight.recursive_sources(root, ".jl"), [leaf])
+
 
 if __name__ == "__main__":
     unittest.main()

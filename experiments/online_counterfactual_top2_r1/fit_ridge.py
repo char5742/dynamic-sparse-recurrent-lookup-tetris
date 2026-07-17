@@ -48,7 +48,22 @@ EXPECTED_NUMPY_VERSION = "2.4.6"
 EXPECTED_PYTHON_VERSION = "3.12.13"
 EXPECTED_BLAS_NAME = "scipy-openblas"
 EXPECTED_BLAS_VERSION = "0.3.31.188.0"
+EXPECTED_OPENVINO_FULL_VERSION = "2026.2.1-21919-ede283a88e3-releases/2026/2"
 PROJECTION_FORMULA = "2*setup_seconds + first32_collection_seconds/32*432"
+ENGINE_DEPENDENCY_ENCODING = "sorted relative_path + NUL + lowercase sha256 + newline"
+UPSTREAM_TETRISAI_HEAD = "6fdfb1d30197246fd862b716438e998f0315c830"
+ENGINE_DEPENDENCY_PATHS = [
+    "experiments/online_counterfactual_top2_r1/engine_adapter.jl",
+    "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/analyzer.jl",
+    "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/components/node.jl",
+    "vendor/Tetris/lib/curses.jl",
+    "vendor/Tetris/lib/game.so",
+    "vendor/Tetris/lib/key_input.jl",
+    "vendor/Tetris/lib/pdcurses.dll",
+]
+NODE_SOURCE_DIGEST = "e98d2052f9248f5c08c1eb58adaace1bd01533f287e682bf35a2fefa1325fe82"
+ANALYZER_SOURCE_DIGEST = "24152e2549dcc6c3c25d928454268e8baaa4d45fea31044603917cfbabbe02bc"
+RUNTIME_CLOSURE_DIGEST = "fa908de68b6deb1581818bdb45c813b06d8886bc4fe33fd010830f7eef03a0e4"
 ALLOWED_EXCLUSION_CODES = {
     "candidate_count_lt2",
     "nonfinite_q",
@@ -206,6 +221,101 @@ def schedule_digest(schedules: Sequence[Sequence[int]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _dependency_digest(records: Sequence[dict[str, Any]]) -> str:
+    payload = b"".join(
+        str(record["path"]).encode("utf-8")
+        + b"\0"
+        + str(record["sha256"]).lower().encode("ascii")
+        + b"\n"
+        for record in sorted(records, key=lambda record: str(record["path"]))
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _contract_document() -> dict[str, Any]:
+    document = json.loads(Path(__file__).with_name("contract.json").read_text(encoding="utf-8"))
+    binding = document.get("runtime_source_binding")
+    _require(isinstance(binding, dict), "contract runtime-source binding missing")
+    _require(
+        binding.get("dependency_graph_digest_encoding") == ENGINE_DEPENDENCY_ENCODING,
+        "contract dependency-graph encoding changed",
+    )
+    _require(
+        binding.get("runtime_closure_sha256") == RUNTIME_CLOSURE_DIGEST,
+        "contract runtime closure changed",
+    )
+    upstream = binding.get("upstream_tetrisai")
+    _require(
+        isinstance(upstream, dict)
+        and upstream.get("head") == UPSTREAM_TETRISAI_HEAD
+        and upstream.get("clean_required") is True,
+        "contract upstream TetrisAI binding changed",
+    )
+    return document
+
+
+def _expected_engine_dependency_graph(runtime_binding: dict[str, Any]) -> dict[str, Any]:
+    repository = Path(__file__).resolve().parents[2]
+    records: list[dict[str, Any]] = []
+    for relative_path in ENGINE_DEPENDENCY_PATHS:
+        path = repository.joinpath(*relative_path.split("/"))
+        _require(path.is_file(), f"missing live engine dependency: {relative_path}")
+        records.append(
+            {
+                "path": relative_path,
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    _require(records[1]["sha256"] == ANALYZER_SOURCE_DIGEST, "live analyzer digest changed")
+    _require(records[2]["sha256"] == NODE_SOURCE_DIGEST, "live Node digest changed")
+    runtime_records = [
+        record
+        for record in records
+        if record["path"] != "experiments/online_counterfactual_top2_r1/engine_adapter.jl"
+    ]
+    runtime_digest = _dependency_digest(runtime_records)
+    _require(runtime_digest == RUNTIME_CLOSURE_DIGEST, "live runtime closure changed")
+    _require(
+        runtime_digest == runtime_binding.get("runtime_closure_sha256"),
+        "design runtime closure differs from live dependencies",
+    )
+    return {
+        "schema_version": "r1-engine-dependency-graph-v1",
+        "encoding": ENGINE_DEPENDENCY_ENCODING,
+        "upstream_tetrisai": {"head": UPSTREAM_TETRISAI_HEAD, "clean": True},
+        "records": records,
+        "graph_sha256": _dependency_digest(records),
+        "runtime_closure_sha256": runtime_digest,
+        "node_source_sha256": NODE_SOURCE_DIGEST,
+        "analyzer_source_sha256": ANALYZER_SOURCE_DIGEST,
+    }
+
+
+def _validate_engine_dependency_graph(
+    value: Any,
+    *,
+    synthetic: bool,
+    runtime_binding: dict[str, Any],
+    label: str,
+) -> dict[str, Any] | None:
+    if synthetic:
+        _require(value is None, f"{label} synthetic engine dependency graph must be null")
+        return None
+    _require(isinstance(value, dict), f"{label} engine dependency graph missing")
+    expected = _expected_engine_dependency_graph(runtime_binding)
+    _require(set(value) == set(expected), f"{label} engine dependency graph schema mismatch")
+    records = value.get("records")
+    _require(isinstance(records, list) and len(records) == 7, f"{label} dependency record count mismatch")
+    _require(
+        all(isinstance(record, dict) and set(record) == {"path", "bytes", "sha256"}
+            for record in records),
+        f"{label} dependency record schema mismatch",
+    )
+    _require(value == expected, f"{label} engine dependency graph differs from live frozen closure")
+    return value
+
+
 def row_order_digest(rows: Sequence[dict[str, Any]]) -> str:
     payload = "\n".join(
         f"{_exact_int(row['episode_id'], 'row-order episode_id')},"
@@ -355,6 +465,7 @@ def _synthetic_documents() -> tuple[dict[str, Any], dict[str, Any]]:
         "sample_pieces": SAMPLE_PIECES,
         "synthetic": True,
         "stable_node_key_source_sha256": stable_digest,
+        "engine_dependency_graph": None,
         "counterfactual_states_completed": 288,
         "positive_advantage_fraction": positive_fraction,
         "first32_elapsed_seconds": 0.01,
@@ -388,6 +499,7 @@ def _synthetic_documents() -> tuple[dict[str, Any], dict[str, Any]]:
         "feature_names": names,
         "feature_schema_digest": FEATURE_SCHEMA_DIGEST,
         "stable_node_key_source_sha256": stable_digest,
+        "engine_dependency_graph": None,
         "episode_count": 12,
         "row_count": 288,
         "exclusion_count": 0,
@@ -456,6 +568,48 @@ def _load_training_table(
         "stable-order source digest",
     )
     _require(metadata.get("stable_node_key_source_sha256") == stable_digest, "stable-order evidence mismatch")
+    metadata_backend = metadata.get("backend_binding")
+    manifest_backend = manifest.get("backend_binding")
+    _require(metadata_backend == manifest_backend, "training backend binding differs between table and manifest")
+    if synthetic:
+        _require(metadata_backend is None, "synthetic training backend binding must be null/absent")
+    else:
+        _require(isinstance(metadata_backend, dict), "production training backend binding missing")
+        expected_backend = {
+            "old_openvino_weight_npz_sha256": "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba",
+            "old_checkpoint_sha256": "7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1",
+            "openvino_version": "2026.2.1",
+            "openvino_full_build": EXPECTED_OPENVINO_FULL_VERSION,
+            "complete_device": "NPU",
+            "tail_device": "CPU",
+            "complete_batch_size": 16,
+        }
+        for backend_key, expected_value in expected_backend.items():
+            _require(
+                metadata_backend.get(backend_key) == expected_value,
+                f"production training backend {backend_key} mismatch",
+            )
+        _sha256_string(
+            metadata_backend.get("evaluator_source_sha256"),
+            "production evaluator source digest",
+        )
+    runtime_binding = _contract_document()["runtime_source_binding"]
+    metadata_dependency_graph = _validate_engine_dependency_graph(
+        metadata.get("engine_dependency_graph"),
+        synthetic=synthetic,
+        runtime_binding=runtime_binding,
+        label="training metadata",
+    )
+    manifest_dependency_graph = _validate_engine_dependency_graph(
+        manifest.get("engine_dependency_graph"),
+        synthetic=synthetic,
+        runtime_binding=runtime_binding,
+        label="training manifest",
+    )
+    _require(
+        metadata_dependency_graph == manifest_dependency_graph,
+        "training engine dependency graph differs between table and manifest",
+    )
     _require(manifest.get("validation_seed_used") is False, "manifest validation contamination")
     _require(manifest.get("sealed_test_seed_used") is False, "manifest sealed contamination")
     _require(manifest.get("real_model_or_game_loaded") is (not synthetic), "manifest model/game role mismatch")
@@ -602,6 +756,9 @@ def _load_training_table(
         "source_table_sha256": actual_table_sha,
         "source_manifest_sha256": actual_manifest_sha,
         "row_order_sha256": row_order_digest(rows),
+        # Preserve the collector object unchanged; downstream assessment can
+        # compare the identical runtime lineage without re-encoding it.
+        "engine_dependency_graph": metadata_dependency_graph,
     }
 
 
@@ -613,6 +770,8 @@ def _load_design_freeze(
         _require(freeze_sha256 == expected_sha256, "design freeze differs from frozen SHA handoff")
     contract_path = Path(__file__).with_name("contract.json").resolve()
     contract, contract_sha256 = _json_snapshot(contract_path)
+    runtime_binding = contract.get("runtime_source_binding")
+    _require(isinstance(runtime_binding, dict), "contract runtime-source binding missing")
     _require(freeze.get("status") == "r1_design_frozen", "design freeze status mismatch")
     _require(freeze.get("experiment") == "online_counterfactual_top2_R1", "design freeze experiment mismatch")
     _require(Path(str(freeze.get("contract_path", ""))).resolve() == contract_path, "design freeze contract path mismatch")
@@ -653,6 +812,10 @@ def _load_design_freeze(
         "sealed_test_seed_loaded",
     ):
         _require(freeze.get(field) is False, f"forbidden pre-freeze activity: {field}")
+    _require(
+        freeze.get("runtime_source_binding") == runtime_binding,
+        "design freeze runtime-source binding differs from contract",
+    )
     schedules = freeze.get("training_bootstrap_schedules")
     _require(isinstance(schedules, list) and len(schedules) == ENSEMBLE_SIZE, "bootstrap schedule count mismatch")
     _require(all(isinstance(schedule, list) and len(schedule) == 12 for schedule in schedules), "bootstrap schedule width mismatch")
@@ -665,6 +828,7 @@ def _load_design_freeze(
         "schedules": schedules,
         "schedule_digest": observed,
         "source_sha256": freeze_sha256,
+        "runtime_source_binding": runtime_binding,
     }
 
 
@@ -994,6 +1158,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "source_table_synthetic": synthetic,
             "source_collection_manifest_path": str(manifest_path),
             "source_collection_manifest_sha256": table["source_manifest_sha256"],
+            "engine_dependency_graph": table["engine_dependency_graph"],
             "training_row_order_sha256": table["row_order_sha256"],
             "training_row_order_encoding": "episode_id,piece_index,root_state_digest newline joined",
             "design_freeze_path": str(freeze_path),

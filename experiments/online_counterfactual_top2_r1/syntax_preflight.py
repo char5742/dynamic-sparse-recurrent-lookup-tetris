@@ -53,10 +53,17 @@ def prove_strict_rejection(julia: Path) -> None:
         )
 
 
+def recursive_sources(root: Path, suffix: str) -> list[Path]:
+    return sorted(
+        path for path in root.rglob(f"*{suffix}")
+        if "__pycache__" not in path.parts
+    )
+
+
 def run_preflight(root: Path, julia: Path, entrypoints: tuple[str, ...]) -> dict[str, Any]:
     root = root.resolve()
-    python_paths = sorted(root.glob("*.py"))
-    julia_paths = sorted(root.glob("*.jl"))
+    python_paths = recursive_sources(root, ".py")
+    julia_paths = recursive_sources(root, ".jl")
     python_syntax(python_paths)
     strict_julia_syntax(julia.resolve(), julia_paths)
     prove_strict_rejection(julia.resolve())

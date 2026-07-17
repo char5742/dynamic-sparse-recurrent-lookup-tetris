@@ -329,6 +329,7 @@ published its pre-import milestones.  Merely including `engine_adapter.jl`
 does not load the game, checkpoint weights, Python, or OpenVINO.
 """
 function _construct_after_evaluator(
+    evaluator_module::Module,
     repository_root::AbstractString,
     evaluator_path::AbstractString,
     engine_path::AbstractString,
@@ -340,34 +341,62 @@ function _construct_after_evaluator(
         :GameState, :stable_node_list, :stable_node_key, :legacy_candidate_batch,
         :openvino_scores, :apply_node!, :board_features, :Tetris,
     )
-    all(name -> isdefined(Main, name), required) || error(
+    all(name -> isdefined(evaluator_module, name), required) || error(
         "canonical evaluator did not define the required engine bindings",
     )
-    sys = Main.pyimport("sys")
-    tools_path = joinpath(repository_root, "tools")
-    sys.path.insert(0, tools_path)
-    legacy_openvino = Main.pyimport("legacy_openvino")
-    openvino = Main.pyimport("openvino")
-    version = Main.pyconvert(String, openvino.__version__)
-    startswith(version, "2026.2.1") || error("OpenVINO runtime version mismatch: $version")
+    for name in (
+        :stable_node_list, :stable_node_key, :legacy_candidate_batch,
+        :openvino_scores, :apply_node!, :board_features,
+    )
+        parentmodule(getfield(evaluator_module, name)) === evaluator_module || error(
+            "evaluator binding $name was imported from an ambient module",
+        )
+    end
+    parentmodule(getfield(evaluator_module, :GameState)) ===
+        getfield(evaluator_module, :Tetris) || error(
+        "GameState was not imported from the frozen Tetris package",
+    )
+    pyimport = getfield(evaluator_module, :pyimport)
+    pyconvert = getfield(evaluator_module, :pyconvert)
+    legacy_openvino_path = joinpath(repository_root, "tools", "legacy_openvino.py")
+    isfile(legacy_openvino_path) || error("missing frozen legacy_openvino.py")
+    legacy_openvino_sha = bytes2hex(open(sha256, legacy_openvino_path))
+    importlib = pyimport("importlib.util")
+    module_name = "r1_legacy_openvino_$(legacy_openvino_sha[1:16])"
+    spec = importlib.spec_from_file_location(module_name, legacy_openvino_path)
+    isnothing(spec) && error("failed to create exact-path legacy_openvino module spec")
+    legacy_openvino = importlib.module_from_spec(spec)
+    spec.loader.exec_module(legacy_openvino)
+    loaded_python_path = normpath(abspath(pyconvert(String, legacy_openvino.__file__)))
+    loaded_python_path == normpath(abspath(legacy_openvino_path)) || error(
+        "legacy_openvino loaded from an ambient path: $loaded_python_path",
+    )
+    openvino = pyimport("openvino")
+    version = pyconvert(String, openvino.__version__)
+    version == "2026.2.1-21919-ede283a88e3-releases/2026/2" || error(
+        "OpenVINO runtime build mismatch: $version",
+    )
     inference = legacy_openvino.LegacyOpenVINOInference("NPU", 16)
 
-    mino_types = Tuple(typeof(piece) for piece in Main.Tetris.MINOS)
+    engine = evaluator_module
+    tetris = getfield(engine, :Tetris)
+    mino_types = Tuple(typeof(piece) for piece in tetris.MINOS)
     adapter = build_production_adapter(
         inference;
-        game_state_fn=Main.GameState,
-        stable_node_list_fn=Main.stable_node_list,
-        stable_node_key_fn=Main.stable_node_key,
-        legacy_candidate_batch_fn=Main.legacy_candidate_batch,
-        openvino_scores_fn=Main.openvino_scores,
-        apply_node_fn=Main.apply_node!,
-        board_features_fn=Main.board_features,
-        generate_mino_list_fn=Main.Tetris.generate_mino_list,
+        game_state_fn=getfield(engine, :GameState),
+        stable_node_list_fn=getfield(engine, :stable_node_list),
+        stable_node_key_fn=getfield(engine, :stable_node_key),
+        legacy_candidate_batch_fn=getfield(engine, :legacy_candidate_batch),
+        openvino_scores_fn=getfield(engine, :openvino_scores),
+        apply_node_fn=getfield(engine, :apply_node!),
+        board_features_fn=getfield(engine, :board_features),
+        generate_mino_list_fn=tetris.generate_mino_list,
         mino_types,
     )
     return merge(adapter, (;
         stable_node_key_source_sha256=bytes2hex(open(sha256, engine_path)),
         evaluator_source_sha256=bytes2hex(open(sha256, evaluator_path)),
+        legacy_openvino_source_sha256=legacy_openvino_sha,
         old_openvino_weight_npz_sha256=String(weights_sha),
         old_checkpoint_path=String(checkpoint_path),
         old_checkpoint_sha256=String(checkpoint_sha),
@@ -379,6 +408,123 @@ function _construct_after_evaluator(
         openvino_tail_device="CPU",
         openvino_batch_size=16,
     ))
+end
+
+const _FROZEN_NODE_SHA256 =
+    "e98d2052f9248f5c08c1eb58adaace1bd01533f287e682bf35a2fefa1325fe82"
+const _FROZEN_ANALYZER_SHA256 =
+    "24152e2549dcc6c3c25d928454268e8baaa4d45fea31044603917cfbabbe02bc"
+
+function _dependency_record(repository_root::AbstractString, relative_path::AbstractString)
+    normalized_relative = replace(String(relative_path), '\\' => '/')
+    path = joinpath(repository_root, split(normalized_relative, '/')...)
+    isfile(path) || error("missing engine dependency: $normalized_relative")
+    return (;
+        path=normalized_relative,
+        bytes=filesize(path),
+        sha256=bytes2hex(open(sha256, path)),
+    )
+end
+
+function _dependency_digest(records)
+    payload = IOBuffer()
+    for record in sort(collect(records); by=item -> item.path)
+        write(payload, record.path, UInt8(0), lowercase(record.sha256), '\n')
+    end
+    return bytes2hex(sha256(take!(payload)))
+end
+
+function _engine_dependency_graph(repository_root::AbstractString)
+    relative_paths = (
+        "experiments/online_counterfactual_top2_r1/engine_adapter.jl",
+        "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/analyzer.jl",
+        "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/components/node.jl",
+        "vendor/Tetris/lib/curses.jl",
+        "vendor/Tetris/lib/game.so",
+        "vendor/Tetris/lib/key_input.jl",
+        "vendor/Tetris/lib/pdcurses.dll",
+    )
+    records = sort(
+        [_dependency_record(repository_root, path) for path in relative_paths];
+        by=item -> item.path,
+    )
+    node = only(filter(item -> endswith(item.path, "/components/node.jl"), records))
+    analyzer = only(filter(item -> endswith(item.path, "/analyzer.jl"), records))
+    node.sha256 == _FROZEN_NODE_SHA256 || error("vendored Node graph hash mismatch")
+    analyzer.sha256 == _FROZEN_ANALYZER_SHA256 || error(
+        "vendored analyzer graph hash mismatch",
+    )
+
+    upstream = joinpath(repository_root, "upstream", "TetrisAI")
+    upstream_head = readchomp(`git -C $upstream rev-parse HEAD`)
+    upstream_status = read(`git -C $upstream status --porcelain=v1 --untracked-files=all`, String)
+    upstream_head == "6fdfb1d30197246fd862b716438e998f0315c830" || error(
+        "nested upstream TetrisAI HEAD mismatch",
+    )
+    isempty(upstream_status) || error("nested upstream TetrisAI repository is not clean")
+    runtime_records = filter(
+        item -> item.path !=
+                "experiments/online_counterfactual_top2_r1/engine_adapter.jl",
+        records,
+    )
+    return (;
+        schema_version="r1-engine-dependency-graph-v1",
+        encoding="sorted relative_path + NUL + lowercase sha256 + newline",
+        upstream_tetrisai=(; head=upstream_head, clean=true),
+        records,
+        graph_sha256=_dependency_digest(records),
+        runtime_closure_sha256=_dependency_digest(runtime_records),
+        node_source_sha256=node.sha256,
+        analyzer_source_sha256=analyzer.sha256,
+    )
+end
+
+function _load_frozen_evaluator(repository_root::AbstractString, evaluator_path::AbstractString)
+    original_node = normpath(joinpath(
+        repository_root, "upstream", "TetrisAI", "src", "core", "components", "node.jl",
+    ))
+    original_analyzer = normpath(joinpath(
+        repository_root, "upstream", "TetrisAI", "src", "core", "analyzer.jl",
+    ))
+    vendored_node = normpath(joinpath(
+        @__DIR__, "vendor", "TetrisAI", "src", "core", "components", "node.jl",
+    ))
+    vendored_analyzer = normpath(joinpath(
+        @__DIR__, "vendor", "TetrisAI", "src", "core", "analyzer.jl",
+    ))
+    bytes2hex(open(sha256, vendored_node)) == _FROZEN_NODE_SHA256 || error(
+        "vendored Node source hash mismatch",
+    )
+    bytes2hex(open(sha256, vendored_analyzer)) == _FROZEN_ANALYZER_SHA256 || error(
+        "vendored analyzer source hash mismatch",
+    )
+
+    evaluate_legacy = normpath(joinpath(repository_root, "scripts", "evaluate_legacy_checkpoint.jl"))
+    benchmark = normpath(joinpath(repository_root, "scripts", "benchmark_legacy_engine.jl"))
+    artifact_helpers = normpath(joinpath(repository_root, "scripts", "evaluation_artifact_helpers.jl"))
+    redirects = Dict(original_node => vendored_node, original_analyzer => vendored_analyzer)
+    allowed = Set((evaluate_legacy, benchmark, original_node, original_analyzer, artifact_helpers))
+    evaluator_module = Module(gensym(:R1FrozenLegacyEvaluator), true, false)
+    Core.eval(evaluator_module, :(const _R1_INCLUDE_REDIRECTS = $redirects))
+    Core.eval(evaluator_module, :(const _R1_ALLOWED_INCLUDES = $allowed))
+    Core.eval(evaluator_module, :(const _R1_SEEN_INCLUDES = String[]))
+    Core.eval(evaluator_module, quote
+        function include(path::AbstractString)
+            source = normpath(abspath(path))
+            source in _R1_ALLOWED_INCLUDES || error(
+                "unexpected recursive include in frozen legacy evaluator: $source",
+            )
+            push!(_R1_SEEN_INCLUDES, source)
+            target = get(_R1_INCLUDE_REDIRECTS, source, source)
+            return Base.include(@__MODULE__, target)
+        end
+    end)
+    Base.include(evaluator_module, evaluator_path)
+    seen_values = String.(Core.eval(evaluator_module, :(_R1_SEEN_INCLUDES)))
+    length(seen_values) == length(allowed) && Set(seen_values) == allowed || error(
+        "frozen legacy evaluator include closure differs from the audited graph",
+    )
+    return evaluator_module
 end
 
 function make_production_adapter()
@@ -400,12 +546,14 @@ function make_production_adapter()
     checkpoint_sha == "7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1" ||
         error("canonical old checkpoint hash mismatch")
 
-    # The canonical script recursively includes the exact engine and imports
-    # PythonCall.  Load into Main because all existing evaluation functions are
-    # defined there and are already source-audited by the repository harness.
-    isdefined(Main, :evaluate_openvino_episode) || Base.include(Main, evaluator_path)
-    return Base.invokelatest(
+    # Load the tracked evaluator chain into a fresh private module.  Its
+    # module-local include function remaps only the two historical ignored
+    # TetrisAI leaves to byte-identical, tracked R1 vendor copies and rejects
+    # any unexpected recursive include.  Ambient Main bindings are never used.
+    evaluator_module = _load_frozen_evaluator(repository_root, evaluator_path)
+    adapter = Base.invokelatest(
         _construct_after_evaluator,
+        evaluator_module,
         repository_root,
         evaluator_path,
         engine_path,
@@ -413,6 +561,9 @@ function make_production_adapter()
         checkpoint_path,
         checkpoint_sha,
     )
+    return merge(adapter, (;
+        engine_dependency_graph=_engine_dependency_graph(repository_root),
+    ))
 end
 
 end # module

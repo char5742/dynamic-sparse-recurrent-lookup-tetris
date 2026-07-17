@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
@@ -38,6 +39,45 @@ def main() -> None:
     assert all(os.environ[name] == "1" for name in (
         "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"
     ))
+    runtime_binding = fit._contract_document()["runtime_source_binding"]
+    live_graph = fit._expected_engine_dependency_graph(runtime_binding)
+    assert len(live_graph["records"]) == 7
+    assert fit._validate_engine_dependency_graph(
+        live_graph,
+        synthetic=False,
+        runtime_binding=runtime_binding,
+        label="test live",
+    ) is live_graph
+    assert fit._validate_engine_dependency_graph(
+        None,
+        synthetic=True,
+        runtime_binding=runtime_binding,
+        label="test synthetic",
+    ) is None
+    bad_graph = copy.deepcopy(live_graph)
+    bad_graph["records"][0]["sha256"] = "0" * 64
+    try:
+        fit._validate_engine_dependency_graph(
+            bad_graph,
+            synthetic=False,
+            runtime_binding=runtime_binding,
+            label="test tampered",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("tampered production engine dependency graph accepted")
+    try:
+        fit._validate_engine_dependency_graph(
+            live_graph,
+            synthetic=True,
+            runtime_binding=runtime_binding,
+            label="test synthetic tamper",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("non-null synthetic engine dependency graph accepted")
 
     with tempfile.TemporaryDirectory(prefix="r1-python-ridge-conformance-") as temporary:
         root = Path(temporary)
@@ -173,6 +213,13 @@ def main() -> None:
         assert python_artifact["training_bootstrap_schedule_sha256"] == fit.TRAINING_SCHEDULE_SHA256
         assert python_artifact["source_table_sha256"] == digest(table)
         assert python_artifact["source_collection_manifest_sha256"] == digest(manifest)
+        assert python_artifact["engine_dependency_graph"] is None
+        assert json.loads(table.read_text(encoding="utf-8"))["metadata"][
+            "engine_dependency_graph"
+        ] is None
+        assert json.loads(manifest.read_text(encoding="utf-8"))[
+            "engine_dependency_graph"
+        ] is None
         assert python_artifact["runtime_facts"]["numpy_version"] == "2.4.6"
 
         # Publication is no-overwrite: an exact rerun fails without changing

@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -111,12 +112,37 @@ EXPECTED_CALIBRATION_SCHEDULE_SHA256 = (
 EXPECTED_QUANTILE_METHOD = "linear_type7_position_1_plus_n_minus_1_p"
 EXPECTED_PYTHON_VERSION = "3.12.13"
 EXPECTED_NUMPY_VERSION = "2.4.6"
+EXPECTED_OPENVINO_FULL_VERSION = "2026.2.1-21919-ede283a88e3-releases/2026/2"
 EXPECTED_HANDOFF_ENVIRONMENT = {
     "calibration_table": "R1_EXPECTED_CALIBRATION_TABLE_SHA256",
     "calibration_manifest": "R1_EXPECTED_CALIBRATION_MANIFEST_SHA256",
     "ridge_artifact": "R1_EXPECTED_RIDGE_ARTIFACT_SHA256",
     "design_freeze": "R1_EXPECTED_DESIGN_FREEZE_SHA256",
 }
+EXPECTED_ENGINE_GRAPH_PATHS = (
+    "experiments/online_counterfactual_top2_r1/engine_adapter.jl",
+    "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/analyzer.jl",
+    "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/components/node.jl",
+    "vendor/Tetris/lib/curses.jl",
+    "vendor/Tetris/lib/game.so",
+    "vendor/Tetris/lib/key_input.jl",
+    "vendor/Tetris/lib/pdcurses.dll",
+)
+EXPECTED_UPSTREAM_TETRISAI_HEAD = "6fdfb1d30197246fd862b716438e998f0315c830"
+EXPECTED_NODE_SOURCE_SHA256 = "e98d2052f9248f5c08c1eb58adaace1bd01533f287e682bf35a2fefa1325fe82"
+EXPECTED_ANALYZER_SOURCE_SHA256 = "24152e2549dcc6c3c25d928454268e8baaa4d45fea31044603917cfbabbe02bc"
+EXPECTED_ENGINE_GRAPH_KEYS = frozenset(
+    {
+        "schema_version",
+        "encoding",
+        "upstream_tetrisai",
+        "records",
+        "graph_sha256",
+        "runtime_closure_sha256",
+        "node_source_sha256",
+        "analyzer_source_sha256",
+    }
+)
 
 
 class CalibrationError(ValueError):
@@ -157,6 +183,26 @@ class SourceHashEvidence:
     actual_sha256: str
     expected_sha256: str
     verified: bool
+
+
+@dataclass(frozen=True)
+class JsonByteSnapshot:
+    """One immutable byte read used for both SHA-256 and JSON decoding."""
+
+    path: Path
+    raw_bytes: bytes
+    actual_sha256: str
+    expected_sha256: str
+    value: dict[str, Any]
+
+    @property
+    def evidence(self) -> SourceHashEvidence:
+        return SourceHashEvidence(
+            str(self.path),
+            self.actual_sha256,
+            self.expected_sha256,
+            self.actual_sha256 == self.expected_sha256,
+        )
 
 
 def _require(condition: bool, message: str) -> None:
@@ -203,21 +249,75 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def source_hash_evidence(path: str | Path, expected_sha256: str) -> SourceHashEvidence:
+def _file_identity(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_size),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_ctime_ns),
+    )
+
+
+def _file_object_identity(stat_result: os.stat_result) -> tuple[int, int]:
+    return (int(stat_result.st_dev), int(stat_result.st_ino))
+
+
+def load_json_byte_snapshot(
+    path: str | Path,
+    expected_sha256: str,
+) -> JsonByteSnapshot:
+    """Read an immutable input exactly once, then hash and parse those bytes.
+
+    The file is kept open from the byte read through JSON decoding. Descriptor
+    and live-path identities are checked before returning, so an ordinary
+    in-place write or path replacement during the snapshot fails closed. No
+    hash-then-reopen path exists here.
+    """
+
     source_path = Path(path).resolve()
-    _require(source_path.is_file(), f"missing source artifact: {source_path}")
     expected = _require_digest(expected_sha256, str(source_path))
-    actual = sha256_file(source_path)
-    return SourceHashEvidence(str(source_path), actual, expected, actual == expected)
-
-
-def load_json(path: str | Path) -> dict[str, Any]:
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise CalibrationError(f"cannot load JSON {path}: {error}") from error
-    _require(isinstance(value, dict), f"JSON root must be an object: {path}")
-    return value
+        with source_path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw_bytes = stream.read()
+            after_read = os.fstat(stream.fileno())
+            _require(
+                _file_identity(before) == _file_identity(after_read),
+                f"immutable JSON changed during byte snapshot: {source_path}",
+            )
+            actual = hashlib.sha256(raw_bytes).hexdigest()
+            _require(
+                actual == expected,
+                f"immutable JSON differs from expected SHA-256: {source_path}",
+            )
+            try:
+                value = json.loads(raw_bytes)
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise CalibrationError(f"cannot load JSON {source_path}: {error}") from error
+            _require(isinstance(value, dict), f"JSON root must be an object: {source_path}")
+            after_parse = os.fstat(stream.fileno())
+            try:
+                live_path = source_path.stat(follow_symlinks=False)
+            except OSError as error:
+                raise CalibrationError(
+                    f"immutable JSON path disappeared during snapshot: {source_path}: {error}"
+                ) from error
+            before_identity = _file_identity(before)
+            after_parse_identity = _file_identity(after_parse)
+            live_identity = _file_identity(live_path)
+            _require(
+                before_identity == after_parse_identity
+                and _file_object_identity(before) == _file_object_identity(live_path),
+                "immutable JSON changed or was replaced during snapshot: "
+                f"{source_path}; before={before_identity}; "
+                f"after_parse={after_parse_identity}; live={live_identity}",
+            )
+    except CalibrationError:
+        raise
+    except OSError as error:
+        raise CalibrationError(f"cannot snapshot JSON {source_path}: {error}") from error
+    return JsonByteSnapshot(source_path, raw_bytes, actual, expected, value)
 
 
 def atomic_create_json(path: str | Path, value: Any) -> Path:
@@ -293,6 +393,151 @@ def schedule_digest(schedules: Sequence[Sequence[int]]) -> str:
 
 def feature_names_digest(feature_names: Sequence[str]) -> str:
     return hashlib.sha256("\n".join(feature_names).encode("utf-8")).hexdigest()
+
+
+def _engine_graph_digest(records: Sequence[dict[str, Any]]) -> str:
+    payload = b"".join(
+        str(record["path"]).encode("utf-8")
+        + b"\x00"
+        + str(record["sha256"]).lower().encode("ascii")
+        + b"\n"
+        for record in records
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_engine_dependency_graph(
+    graph: Any,
+    *,
+    synthetic: bool,
+    label: str,
+) -> dict[str, Any] | None:
+    if synthetic:
+        _require(graph is None, f"{label} synthetic engine dependency graph must be null")
+        return None
+    _require(isinstance(graph, dict), f"{label} production engine dependency graph missing")
+    _require(set(graph) == EXPECTED_ENGINE_GRAPH_KEYS, f"{label} engine graph key set mismatch")
+    _require(
+        _require_key(graph, "schema_version") == "r1-engine-dependency-graph-v1",
+        f"{label} engine graph schema mismatch",
+    )
+    _require(
+        _require_key(graph, "encoding")
+        == "sorted relative_path + NUL + lowercase sha256 + newline",
+        f"{label} engine graph encoding mismatch",
+    )
+    upstream = _require_key(graph, "upstream_tetrisai")
+    _require(
+        isinstance(upstream, dict) and set(upstream) == {"head", "clean"},
+        f"{label} upstream TetrisAI evidence shape mismatch",
+    )
+    _require(
+        _require_key(upstream, "head") == EXPECTED_UPSTREAM_TETRISAI_HEAD,
+        f"{label} upstream TetrisAI HEAD mismatch",
+    )
+    _require(
+        _require_bool(_require_key(upstream, "clean"), f"{label} upstream clean") is True,
+        f"{label} upstream TetrisAI is not clean",
+    )
+
+    records = _require_key(graph, "records")
+    _require(
+        isinstance(records, list) and len(records) == len(EXPECTED_ENGINE_GRAPH_PATHS),
+        f"{label} engine graph must contain exactly seven records",
+    )
+    normalized: list[dict[str, Any]] = []
+    repository = Path(__file__).resolve().parents[2]
+    for index, (record, expected_path) in enumerate(
+        zip(records, EXPECTED_ENGINE_GRAPH_PATHS, strict=True), 1
+    ):
+        _require(isinstance(record, dict), f"{label} engine record {index} must be an object")
+        _require(
+            set(record) == {"path", "bytes", "sha256"},
+            f"{label} engine record {index} key set mismatch",
+        )
+        path = str(_require_key(record, "path"))
+        _require(path == expected_path, f"{label} engine record order/path mismatch")
+        byte_count = _exact_int(_require_key(record, "bytes"), f"{label} {path} bytes")
+        _require(byte_count >= 0, f"{label} {path} negative byte count")
+        digest = _require_digest(_require_key(record, "sha256"), f"{label} {path}")
+        source_path = repository.joinpath(*path.split("/"))
+        _require(source_path.is_file(), f"{label} missing live engine dependency: {path}")
+        _require(not source_path.is_symlink(), f"{label} symlink engine dependency: {path}")
+        if hasattr(source_path, "is_junction"):
+            _require(not source_path.is_junction(), f"{label} junction engine dependency: {path}")
+        live_bytes = source_path.read_bytes()
+        _require(len(live_bytes) == byte_count, f"{label} live byte count mismatch: {path}")
+        _require(
+            hashlib.sha256(live_bytes).hexdigest() == digest,
+            f"{label} live source SHA mismatch: {path}",
+        )
+        normalized.append({"path": path, "bytes": byte_count, "sha256": digest})
+
+    graph_digest = _engine_graph_digest(normalized)
+    _require(
+        _require_digest(_require_key(graph, "graph_sha256"), f"{label} full graph")
+        == graph_digest,
+        f"{label} full engine graph digest mismatch",
+    )
+    runtime_records = [
+        record
+        for record in normalized
+        if record["path"] != "experiments/online_counterfactual_top2_r1/engine_adapter.jl"
+    ]
+    _require(
+        _require_digest(
+            _require_key(graph, "runtime_closure_sha256"), f"{label} runtime closure"
+        )
+        == _engine_graph_digest(runtime_records),
+        f"{label} runtime closure digest mismatch",
+    )
+    node_digest = next(
+        record["sha256"]
+        for record in normalized
+        if record["path"].endswith("/components/node.jl")
+    )
+    analyzer_digest = next(
+        record["sha256"]
+        for record in normalized
+        if record["path"].endswith("/analyzer.jl")
+    )
+    _require(node_digest == EXPECTED_NODE_SOURCE_SHA256, f"{label} frozen Node SHA mismatch")
+    _require(
+        analyzer_digest == EXPECTED_ANALYZER_SOURCE_SHA256,
+        f"{label} frozen analyzer SHA mismatch",
+    )
+    _require(
+        _require_digest(_require_key(graph, "node_source_sha256"), f"{label} Node source")
+        == node_digest,
+        f"{label} Node source digest mismatch",
+    )
+    _require(
+        _require_digest(
+            _require_key(graph, "analyzer_source_sha256"), f"{label} analyzer source"
+        )
+        == analyzer_digest,
+        f"{label} analyzer source digest mismatch",
+    )
+
+    upstream_path = repository / "upstream" / "TetrisAI"
+    try:
+        observed_head = subprocess.run(
+            ["git", "-C", str(upstream_path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        observed_status = subprocess.run(
+            ["git", "-C", str(upstream_path), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise CalibrationError(f"{label} cannot verify upstream TetrisAI: {error}") from error
+    _require(observed_head == EXPECTED_UPSTREAM_TETRISAI_HEAD, f"{label} live upstream HEAD mismatch")
+    _require(observed_status == "", f"{label} live upstream TetrisAI is not clean")
+    return graph
 
 
 def _validate_schedule(
@@ -426,7 +671,8 @@ def _validate_collection_table(
     maximum_rows: int,
     synthetic: bool,
     table_path: Path,
-) -> list[dict[str, Any]]:
+    table_actual_sha256: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     schema = "r1-training-table-v1" if role == "training" else "r1-calibration-table-v1"
     _require(_require_key(table, "schema_version") == schema, f"{role} table schema mismatch")
     _require(_require_key(table, "source_role") == role, f"{role} table source_role mismatch")
@@ -519,7 +765,7 @@ def _validate_collection_table(
     )
     _require(
         _require_digest(_require_key(manifest, "table_sha256"), f"{role} manifest table")
-        == sha256_file(table_path),
+        == _require_digest(table_actual_sha256, f"{role} consumed table snapshot"),
         f"{role} manifest does not bind the actual table",
     )
     _require(
@@ -534,6 +780,42 @@ def _validate_collection_table(
     _require(
         _require_key(manifest, "stable_node_key_source_sha256") == stable_digest,
         f"{role} manifest stable-order evidence mismatch",
+    )
+    metadata_backend = metadata.get("backend_binding")
+    manifest_backend = manifest.get("backend_binding")
+    _require(metadata_backend == manifest_backend, f"{role} backend binding differs between table and manifest")
+    if synthetic:
+        _require(metadata_backend is None, f"{role} synthetic backend binding must be null/absent")
+    else:
+        _require(isinstance(metadata_backend, dict), f"{role} production backend binding missing")
+        expected_backend = {
+            "old_openvino_weight_npz_sha256": "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba",
+            "old_checkpoint_sha256": "7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1",
+            "openvino_version": "2026.2.1",
+            "openvino_full_build": EXPECTED_OPENVINO_FULL_VERSION,
+            "complete_device": "NPU",
+            "tail_device": "CPU",
+            "complete_batch_size": 16,
+        }
+        for backend_key, expected_value in expected_backend.items():
+            _require(
+                _require_key(metadata_backend, backend_key) == expected_value,
+                f"{role} production backend {backend_key} mismatch",
+            )
+        _require_digest(
+            _require_key(metadata_backend, "evaluator_source_sha256"),
+            f"{role} evaluator source",
+        )
+    metadata_graph = _require_key(metadata, "engine_dependency_graph")
+    manifest_graph = _require_key(manifest, "engine_dependency_graph")
+    _require(
+        metadata_graph == manifest_graph,
+        f"{role} engine dependency graph differs between table and manifest",
+    )
+    validated_graph = _validate_engine_dependency_graph(
+        metadata_graph,
+        synthetic=synthetic,
+        label=role,
     )
     for key in ("validation_seed_used", "sealed_test_seed_used"):
         _require(
@@ -606,19 +888,20 @@ def _validate_collection_table(
             is True,
             f"{role} production manifest did not load the real model/game",
         )
-    return rows
+    return rows, validated_graph
 
 
 def _load_production_gate(
-    artifact: dict[str, Any],
+    artifact_snapshot: JsonByteSnapshot,
     *,
-    artifact_path: Path,
-    artifact_expected_sha256: str,
-    freeze_path: Path,
-    freeze_sha256: str,
+    freeze_snapshot: JsonByteSnapshot,
     freeze_details: dict[str, Any],
     synthetic: bool,
 ) -> tuple[dict[str, Any], GateArtifactEvidence, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    artifact = artifact_snapshot.value
+    artifact_path = artifact_snapshot.path
+    freeze_path = freeze_snapshot.path
+    freeze_sha256 = freeze_snapshot.actual_sha256
     _require(_require_key(artifact, "schema_version") == "r1-ridge-gate-v1", "ridge schema mismatch")
     _require(_require_key(artifact, "experiment_id") == "online_counterfactual_top2_R1", "ridge experiment mismatch")
     _require(_require_key(artifact, "fit_role") == "training_only", "ridge fit role mismatch")
@@ -686,17 +969,17 @@ def _load_production_gate(
 
     source_table_path = Path(str(_require_key(artifact, "source_table_path"))).resolve()
     source_manifest_path = Path(str(_require_key(artifact, "source_collection_manifest_path"))).resolve()
-    table_evidence = source_hash_evidence(
+    training_table_snapshot = load_json_byte_snapshot(
         source_table_path, _require_key(artifact, "source_table_sha256")
     )
-    manifest_evidence = source_hash_evidence(
+    training_manifest_snapshot = load_json_byte_snapshot(
         source_manifest_path, _require_key(artifact, "source_collection_manifest_sha256")
     )
-    _require(table_evidence.verified, "ridge source training table SHA mismatch")
-    _require(manifest_evidence.verified, "ridge source training manifest SHA mismatch")
-    training_table = load_json(source_table_path)
-    training_manifest = load_json(source_manifest_path)
-    training_rows = _validate_collection_table(
+    table_evidence = training_table_snapshot.evidence
+    manifest_evidence = training_manifest_snapshot.evidence
+    training_table = training_table_snapshot.value
+    training_manifest = training_manifest_snapshot.value
+    training_rows, training_engine_graph = _validate_collection_table(
         training_table,
         training_manifest,
         role="training",
@@ -705,6 +988,7 @@ def _load_production_gate(
         maximum_rows=288,
         synthetic=synthetic,
         table_path=source_table_path,
+        table_actual_sha256=training_table_snapshot.actual_sha256,
     )
     training_advantages = [float(_require_key(row, "advantage_unclipped_A6")) for row in training_rows]
     _require(all(math.isfinite(value) for value in training_advantages), "non-finite source training A6")
@@ -775,15 +1059,33 @@ def _load_production_gate(
         numeric_value_count,
     )
     _require(all((finite, feature_schema_exact, coefficient_shape_exact, hyperparameters_exact)), "ridge artifact gate evidence failed")
-    artifact_source_evidence = source_hash_evidence(artifact_path, artifact_expected_sha256)
+    artifact_source_evidence = artifact_snapshot.evidence
     _require(artifact_source_evidence.verified, "ridge artifact differs from fit-phase handoff SHA")
     provenance = {
         "artifact": asdict(artifact_source_evidence),
         "training_table": asdict(table_evidence),
         "training_manifest": asdict(manifest_evidence),
-        "design_freeze": asdict(source_hash_evidence(freeze_path, freeze_sha256)),
+        "design_freeze": asdict(freeze_snapshot.evidence),
     }
-    return provenance, evidence, means, scales, constant, coefficients
+    artifact_engine_graph = _require_key(artifact, "engine_dependency_graph")
+    validated_artifact_graph = _validate_engine_dependency_graph(
+        artifact_engine_graph,
+        synthetic=synthetic,
+        label="ridge artifact",
+    )
+    _require(
+        validated_artifact_graph == training_engine_graph,
+        "ridge artifact engine dependency graph differs from training collection",
+    )
+    return (
+        provenance,
+        evidence,
+        means,
+        scales,
+        constant,
+        coefficients,
+        training_engine_graph,
+    )
 
 
 def _type7_quantile(values: Sequence[float], probability: float) -> float:
@@ -1089,6 +1391,7 @@ def evaluate_calibration(
     artifact_evidence: GateArtifactEvidence,
     calibration_source_evidence: SourceHashEvidence,
     bootstrap_schedules: Sequence[Sequence[int]],
+    engine_dependency_graph: dict[str, Any] | None,
     forbidden_seed_used: bool = False,
     provenance: dict[str, Any] | None = None,
     runtime_evidence: dict[str, float] | None = None,
@@ -1183,6 +1486,7 @@ def evaluate_calibration(
         "bootstrap": bootstrap,
         "gate_artifact_evidence": asdict(artifact_evidence),
         "calibration_source_evidence": asdict(calibration_source_evidence),
+        "engine_dependency_graph": engine_dependency_graph,
         "thresholds": {
             "minimum_states": MINIMUM_STATES,
             "override_rate": {"minimum": MINIMUM_OVERRIDE_RATE, "maximum": MAXIMUM_OVERRIDE_RATE},
@@ -1239,21 +1543,22 @@ def run_calibration(
         set(expected_handoff_sha256) == set(input_paths),
         "incomplete R1 upstream handoff SHA set",
     )
-    handoff_evidence = {
-        name: source_hash_evidence(path, expected_handoff_sha256[name])
+    input_snapshots = {
+        name: load_json_byte_snapshot(path, expected_handoff_sha256[name])
         for name, path in input_paths.items()
+    }
+    handoff_evidence = {
+        name: snapshot.evidence for name, snapshot in input_snapshots.items()
     }
     _require(
         all(evidence.verified for evidence in handoff_evidence.values()),
         "R1 input differs from immutable upstream phase handoff",
     )
-    calibration_table = load_json(calibration_table_path)
-    calibration_manifest = load_json(calibration_manifest_path)
-    artifact = load_json(ridge_artifact_path)
-    freeze = load_json(freeze_path)
-    freeze_sha256 = handoff_evidence["design_freeze"].actual_sha256
+    calibration_table = input_snapshots["calibration_table"].value
+    calibration_manifest = input_snapshots["calibration_manifest"].value
+    freeze = input_snapshots["design_freeze"].value
     freeze_details = validate_freeze(freeze)
-    raw_rows = _validate_collection_table(
+    raw_rows, calibration_engine_graph = _validate_collection_table(
         calibration_table,
         calibration_manifest,
         role="calibration",
@@ -1262,15 +1567,25 @@ def run_calibration(
         maximum_rows=MAXIMUM_STATES,
         synthetic=synthetic,
         table_path=calibration_table_path,
+        table_actual_sha256=input_snapshots["calibration_table"].actual_sha256,
     )
-    provenance, artifact_evidence, means, scales, constant, coefficients = _load_production_gate(
-        artifact,
-        artifact_path=ridge_artifact_path,
-        artifact_expected_sha256=handoff_evidence["ridge_artifact"].expected_sha256,
-        freeze_path=freeze_path,
-        freeze_sha256=freeze_sha256,
+    (
+        provenance,
+        artifact_evidence,
+        means,
+        scales,
+        constant,
+        coefficients,
+        training_engine_graph,
+    ) = _load_production_gate(
+        input_snapshots["ridge_artifact"],
+        freeze_snapshot=input_snapshots["design_freeze"],
         freeze_details=freeze_details,
         synthetic=synthetic,
+    )
+    _require(
+        training_engine_graph == calibration_engine_graph,
+        "training and calibration engine dependency graphs differ",
     )
     if milestones:
         milestones.write("input_load_complete", details={"rows": len(raw_rows)})
@@ -1319,6 +1634,7 @@ def run_calibration(
         artifact_evidence=artifact_evidence,
         calibration_source_evidence=calibration_evidence,
         bootstrap_schedules=freeze_details["calibration_schedules"],
+        engine_dependency_graph=calibration_engine_graph,
         forbidden_seed_used=forbidden,
         provenance=provenance,
         runtime_evidence=runtime,

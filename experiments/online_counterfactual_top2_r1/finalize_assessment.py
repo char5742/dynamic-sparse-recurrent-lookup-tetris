@@ -16,6 +16,7 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -37,6 +38,46 @@ FEATURE_COUNT = 70
 COEFFICIENT_COUNT = 71
 ENSEMBLE_COUNT = 256
 NUMERIC_VALUE_COUNT = FEATURE_COUNT * 2 + COEFFICIENT_COUNT * ENSEMBLE_COUNT
+OPENVINO_FULL_VERSION = "2026.2.1-21919-ede283a88e3-releases/2026/2"
+ENGINE_DEPENDENCY_ENCODING = "sorted relative_path + NUL + lowercase sha256 + newline"
+UPSTREAM_TETRISAI_HEAD = "6fdfb1d30197246fd862b716438e998f0315c830"
+ENGINE_DEPENDENCY_PATHS = (
+    "experiments/online_counterfactual_top2_r1/engine_adapter.jl",
+    "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/analyzer.jl",
+    "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/components/node.jl",
+    "vendor/Tetris/lib/curses.jl",
+    "vendor/Tetris/lib/game.so",
+    "vendor/Tetris/lib/key_input.jl",
+    "vendor/Tetris/lib/pdcurses.dll",
+)
+NODE_SOURCE_DIGEST = "e98d2052f9248f5c08c1eb58adaace1bd01533f287e682bf35a2fefa1325fe82"
+ANALYZER_SOURCE_DIGEST = "24152e2549dcc6c3c25d928454268e8baaa4d45fea31044603917cfbabbe02bc"
+FROZEN_RUNTIME_DEPENDENCIES = {
+    "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/analyzer.jl": (
+        8114,
+        ANALYZER_SOURCE_DIGEST,
+    ),
+    "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/components/node.jl": (
+        298,
+        NODE_SOURCE_DIGEST,
+    ),
+    "vendor/Tetris/lib/curses.jl": (
+        2767,
+        "4dd113316c4f82a226563d7ac3237c366417211582722b3d4b4277dcb12ff922",
+    ),
+    "vendor/Tetris/lib/game.so": (
+        49870,
+        "d63a03f494cb0a6f1704624923c58cb521a8a45873ca400e7085c02b1bf5bf46",
+    ),
+    "vendor/Tetris/lib/key_input.jl": (
+        1448,
+        "c09571b424a49f01278f6903c0018f9a2dfc652dfd18b804c4ad2b6a37f2fc53",
+    ),
+    "vendor/Tetris/lib/pdcurses.dll": (
+        176673,
+        "0c770aa6721aa2155bbe2ef1d0f50ad2065da399085242454486c855c1f9fe67",
+    ),
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -94,12 +135,188 @@ def _digest(value: Any, label: str) -> str:
     return result
 
 
+def _lowercase_digest(value: Any, label: str) -> str:
+    result = _digest(value, label)
+    _require(type(value) is str and value == result, f"{label} SHA-256 is not canonical lowercase")
+    return result
+
+
 def _normal(path: Any) -> str:
     return os.path.normcase(str(Path(str(path)).resolve()))
 
 
 def _feature_digest(names: Sequence[str]) -> str:
     return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()
+
+
+def _dependency_digest(records: Sequence[dict[str, Any]]) -> str:
+    payload = b"".join(
+        str(record["path"]).encode("utf-8")
+        + b"\0"
+        + str(record["sha256"]).lower().encode("ascii")
+        + b"\n"
+        for record in sorted(records, key=lambda record: str(record["path"]))
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_engine_dependency_graph(
+    value: Any,
+    *,
+    synthetic: bool,
+    label: str,
+) -> dict[str, Any] | None:
+    if synthetic:
+        _require(value is None, f"{label} synthetic engine dependency graph must be null")
+        return None
+    _require(isinstance(value, dict), f"{label} engine dependency graph missing")
+    expected_keys = {
+        "schema_version",
+        "encoding",
+        "upstream_tetrisai",
+        "records",
+        "graph_sha256",
+        "runtime_closure_sha256",
+        "node_source_sha256",
+        "analyzer_source_sha256",
+    }
+    _require(set(value) == expected_keys, f"{label} engine dependency graph schema mismatch")
+    _require(
+        value["schema_version"] == "r1-engine-dependency-graph-v1",
+        f"{label} engine dependency graph version mismatch",
+    )
+    _require(value["encoding"] == ENGINE_DEPENDENCY_ENCODING, f"{label} dependency encoding mismatch")
+    upstream = value["upstream_tetrisai"]
+    _require(
+        isinstance(upstream, dict) and set(upstream) == {"head", "clean"},
+        f"{label} upstream TetrisAI evidence schema mismatch",
+    )
+    _require(upstream["head"] == UPSTREAM_TETRISAI_HEAD, f"{label} upstream TetrisAI HEAD mismatch")
+    _require(_bool(upstream["clean"], f"{label} upstream clean") is True, f"{label} upstream TetrisAI is dirty")
+    records = value["records"]
+    _require(isinstance(records, list), f"{label} engine dependency records missing")
+    _require(len(records) == len(ENGINE_DEPENDENCY_PATHS), f"{label} engine dependency cardinality mismatch")
+    normalized: list[dict[str, Any]] = []
+    for index, record in enumerate(records, 1):
+        _require(
+            isinstance(record, dict) and set(record) == {"path", "bytes", "sha256"},
+            f"{label} engine dependency record {index} schema mismatch",
+        )
+        relative_path = str(record["path"])
+        _require("\\" not in relative_path, f"{label} engine dependency path is not canonical")
+        normalized.append(
+            {
+                "path": relative_path,
+                "bytes": _integer(record["bytes"], f"{label} engine dependency bytes"),
+                "sha256": _lowercase_digest(
+                    record["sha256"], f"{label} engine dependency"
+                ),
+            }
+        )
+    _require(
+        [record["path"] for record in normalized] == list(ENGINE_DEPENDENCY_PATHS),
+        f"{label} engine dependency path/order mismatch",
+    )
+    _require(all(record["bytes"] >= 0 for record in normalized), f"{label} negative dependency size")
+    by_path = {record["path"]: record for record in normalized}
+    node_path = "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/components/node.jl"
+    analyzer_path = "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/analyzer.jl"
+    _require(by_path[node_path]["sha256"] == NODE_SOURCE_DIGEST, f"{label} vendored node hash mismatch")
+    _require(by_path[analyzer_path]["sha256"] == ANALYZER_SOURCE_DIGEST, f"{label} vendored analyzer hash mismatch")
+    for relative_path, (expected_bytes, expected_sha256) in FROZEN_RUNTIME_DEPENDENCIES.items():
+        _require(
+            by_path[relative_path] == {
+                "path": relative_path,
+                "bytes": expected_bytes,
+                "sha256": expected_sha256,
+            },
+            f"{label} frozen runtime dependency mismatch: {relative_path}",
+        )
+    _require(
+        _lowercase_digest(value["node_source_sha256"], f"{label} node source") == NODE_SOURCE_DIGEST,
+        f"{label} node convenience hash mismatch",
+    )
+    _require(
+        _lowercase_digest(value["analyzer_source_sha256"], f"{label} analyzer source") == ANALYZER_SOURCE_DIGEST,
+        f"{label} analyzer convenience hash mismatch",
+    )
+    _require(
+        _lowercase_digest(value["graph_sha256"], f"{label} dependency graph") == _dependency_digest(normalized),
+        f"{label} engine dependency graph digest mismatch",
+    )
+    runtime_records = [
+        record
+        for record in normalized
+        if record["path"] != "experiments/online_counterfactual_top2_r1/engine_adapter.jl"
+    ]
+    _require(
+        _lowercase_digest(value["runtime_closure_sha256"], f"{label} runtime closure")
+        == _dependency_digest(runtime_records),
+        f"{label} runtime closure digest mismatch",
+    )
+    return {
+        "schema_version": value["schema_version"],
+        "encoding": value["encoding"],
+        "upstream_tetrisai": {"head": upstream["head"], "clean": True},
+        "records": normalized,
+        "graph_sha256": value["graph_sha256"],
+        "runtime_closure_sha256": value["runtime_closure_sha256"],
+        "node_source_sha256": value["node_source_sha256"],
+        "analyzer_source_sha256": value["analyzer_source_sha256"],
+    }
+
+
+def _live_engine_dependency_graph(repository: Path) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    for relative_path in ENGINE_DEPENDENCY_PATHS:
+        path = repository.joinpath(*relative_path.split("/"))
+        _require(path.is_file(), f"missing live engine dependency: {relative_path}")
+        payload = path.read_bytes()
+        records.append(
+            {
+                "path": relative_path,
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    upstream_path = repository / "upstream" / "TetrisAI"
+    _require(upstream_path.is_dir(), "missing nested upstream TetrisAI repository")
+    try:
+        head_result = subprocess.run(
+            ["git", "-C", str(upstream_path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        status_result = subprocess.run(
+            ["git", "-C", str(upstream_path), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError(f"cannot verify nested upstream TetrisAI repository: {error}") from error
+    head = head_result.stdout.strip()
+    _require(head == UPSTREAM_TETRISAI_HEAD, "live upstream TetrisAI HEAD mismatch")
+    _require(not status_result.stdout, "live upstream TetrisAI repository is dirty")
+    runtime_records = [
+        record
+        for record in records
+        if record["path"] != "experiments/online_counterfactual_top2_r1/engine_adapter.jl"
+    ]
+    graph = {
+        "schema_version": "r1-engine-dependency-graph-v1",
+        "encoding": ENGINE_DEPENDENCY_ENCODING,
+        "upstream_tetrisai": {"head": head, "clean": True},
+        "records": records,
+        "graph_sha256": _dependency_digest(records),
+        "runtime_closure_sha256": _dependency_digest(runtime_records),
+        "node_source_sha256": NODE_SOURCE_DIGEST,
+        "analyzer_source_sha256": ANALYZER_SOURCE_DIGEST,
+    }
+    return _validate_engine_dependency_graph(graph, synthetic=False, label="live") or graph
 
 
 def _schedule_digest(schedules: Sequence[Sequence[int]]) -> str:
@@ -209,6 +426,10 @@ def validate_freeze(path: Path, document: dict[str, Any]) -> dict[str, Any]:
     _require([_integer(value, "freeze sample piece") for value in _required(document, "sample_piece_indices")] == list(SAMPLE_PIECES), "freeze sample schedule mismatch")
     _require(_number(_required(document, "ridge_lambda"), "freeze lambda") == 1.0, "freeze lambda mismatch")
     _require(_number(_required(document, "prediction_lower_quantile"), "freeze quantile") == 0.10, "freeze quantile mismatch")
+    _require(
+        _required(document, "prediction_quantile_method") == QUANTILE_METHOD,
+        "freeze prediction quantile method mismatch",
+    )
     _require(_number(_required(document, "override_strict_threshold"), "freeze threshold") == 0.05, "freeze threshold mismatch")
     _require(_required(document, "training_bootstrap_rng") == "Xoshiro(0x5231_2026)", "freeze training RNG mismatch")
     _require(_required(document, "calibration_bootstrap_rng") == "Xoshiro(0x5231_73106)", "freeze calibration RNG mismatch")
@@ -228,7 +449,8 @@ def validate_freeze(path: Path, document: dict[str, Any]) -> dict[str, Any]:
     _require(_digest(_required(immutable, "old_checkpoint_sha256"), "checkpoint") == CHECKPOINT_DIGEST, "freeze checkpoint binding mismatch")
     _require(_digest(_required(immutable, "old_openvino_weight_npz_sha256"), "OpenVINO weights") == WEIGHT_DIGEST, "freeze weight binding mismatch")
     backend = _required(document, "openvino_backend")
-    _require(_required(backend, "version") == "2026.2.1", "freeze OpenVINO version mismatch")
+    _require(_required(backend, "version") == "2026.2.1", "freeze OpenVINO semantic version mismatch")
+    _require(_required(backend, "full_build") == OPENVINO_FULL_VERSION, "freeze OpenVINO exact build mismatch")
     _require(_digest(_required(backend, "weight_sha256"), "backend weight") == WEIGHT_DIGEST, "freeze backend weight mismatch")
     _require(_required(backend, "complete_chunk") == {"device": "NPU", "batch_size": 16, "shape": "static", "eligible_candidate_count": 16}, "freeze complete-chunk backend mismatch")
     _require(_required(backend, "tail_chunk") == {"device": "CPU", "shape": "dynamic", "batch_semantics": "actual candidate count", "minimum_candidate_count": 1, "maximum_candidate_count": 15, "padding": False}, "freeze tail backend mismatch")
@@ -236,6 +458,12 @@ def validate_freeze(path: Path, document: dict[str, Any]) -> dict[str, Any]:
     expected_contract = Path(__file__).with_name("contract.json").resolve()
     _require(_normal(contract_path) == _normal(expected_contract), "freeze contract path mismatch")
     _require(_digest(_required(document, "contract_sha256"), "contract") == sha256_file(expected_contract), "freeze contract hash mismatch")
+    contract_document = load_json(expected_contract)
+    runtime_source_binding = _required(document, "runtime_source_binding")
+    _require(
+        runtime_source_binding == _required(contract_document, "runtime_source_binding"),
+        "freeze runtime source binding mismatch",
+    )
     eligibility_path = Path(str(_required(document, "eligibility_path"))).resolve()
     _require(eligibility_path.is_file(), "missing freeze eligibility source")
     _require(_digest(_required(document, "eligibility_sha256"), "eligibility") == sha256_file(eligibility_path), "freeze eligibility hash mismatch")
@@ -249,7 +477,12 @@ def validate_freeze(path: Path, document: dict[str, Any]) -> dict[str, Any]:
     )
     _require(_digest(_required(document, "training_bootstrap_schedule_sha256"), "training schedule") == TRAIN_SCHEDULE_DIGEST, "freeze training schedule digest mismatch")
     _require(_digest(_required(document, "calibration_bootstrap_schedule_sha256"), "calibration schedule") == CALIBRATION_SCHEDULE_DIGEST, "freeze calibration schedule digest mismatch")
-    return {"feature_names": names, "training_schedules": training, "calibration_schedules": calibration}
+    return {
+        "feature_names": names,
+        "training_schedules": training,
+        "calibration_schedules": calibration,
+        "runtime_source_binding": runtime_source_binding,
+    }
 
 
 def _validate_backend_evidence(value: Any, *, synthetic: bool, label: str) -> None:
@@ -261,6 +494,7 @@ def _validate_backend_evidence(value: Any, *, synthetic: bool, label: str) -> No
         "old_openvino_weight_npz_sha256": WEIGHT_DIGEST,
         "old_checkpoint_sha256": CHECKPOINT_DIGEST,
         "openvino_version": "2026.2.1",
+        "openvino_full_build": OPENVINO_FULL_VERSION,
         "complete_device": "NPU",
         "tail_device": "CPU",
         "complete_batch_size": 16,
@@ -419,11 +653,27 @@ def validate_collection(
     # mode accepts only absent/null, never forged production evidence.
     metadata_backend = metadata.get("backend_binding")
     manifest_backend = manifest.get("backend_binding")
+    metadata_dependency_graph = metadata.get("engine_dependency_graph")
+    manifest_dependency_graph = manifest.get("engine_dependency_graph")
     metadata_immutable = metadata.get("immutable_input_end_hashes")
     manifest_immutable = manifest.get("immutable_input_end_hashes")
     _validate_backend_evidence(metadata_backend, synthetic=synthetic, label=f"{role} metadata")
     _validate_backend_evidence(manifest_backend, synthetic=synthetic, label=f"{role} manifest")
     _require(metadata_backend == manifest_backend, f"{role} backend evidence differs")
+    normalized_metadata_graph = _validate_engine_dependency_graph(
+        metadata_dependency_graph,
+        synthetic=synthetic,
+        label=f"{role} metadata",
+    )
+    normalized_manifest_graph = _validate_engine_dependency_graph(
+        manifest_dependency_graph,
+        synthetic=synthetic,
+        label=f"{role} manifest",
+    )
+    _require(
+        normalized_metadata_graph == normalized_manifest_graph,
+        f"{role} engine dependency graph differs",
+    )
     _validate_immutable_evidence(metadata_immutable, synthetic=synthetic, label=f"{role} metadata")
     _validate_immutable_evidence(manifest_immutable, synthetic=synthetic, label=f"{role} manifest")
     _require(metadata_immutable == manifest_immutable, f"{role} immutable evidence differs")
@@ -449,6 +699,7 @@ def validate_collection(
         "manifest_sha256": manifest_sha256,
         "stable_node_key_source_sha256": stable,
         "backend_binding": manifest_backend,
+        "engine_dependency_graph": normalized_manifest_graph,
         "row_order_sha256": row_order_sha256,
     }
 
@@ -474,6 +725,15 @@ def validate_ridge(
     _require(_bool(_required(artifact, "all_finite"), "ridge finite") is True, "ridge not finite")
     _require_scope_false(artifact, ("validation_seed_used", "sealed_test_seed_used"), "ridge")
     _require(_required(artifact, "claim_scope") == "analytic_training_artifact_not_calibration_or_game_strength", "ridge claim scope mismatch")
+    artifact_dependency_graph = _validate_engine_dependency_graph(
+        _required(artifact, "engine_dependency_graph"),
+        synthetic=synthetic,
+        label="ridge artifact",
+    )
+    _require(
+        artifact_dependency_graph == training["engine_dependency_graph"],
+        "ridge artifact engine dependency graph differs from training collection",
+    )
     _require(_normal(_required(artifact, "source_table_path")) == _normal(training_table_path), "ridge training table path mismatch")
     _require(_digest(_required(artifact, "source_table_sha256"), "ridge source table") == training["table_sha256"], "ridge training table hash mismatch")
     _require(_normal(_required(artifact, "source_collection_manifest_path")) == _normal(training_manifest_path), "ridge training manifest path mismatch")
@@ -520,7 +780,14 @@ def validate_ridge(
     _require(_required(runtime, "python_version") == "3.12.13", "ridge Python version mismatch")
     _require(_required(runtime, "linear_algebra") == "numpy.linalg.cholesky+numpy.linalg.solve", "ridge linear algebra backend mismatch")
     _require(_normal(_required(runtime, "python_executable")) == _normal(sys.executable), "ridge recorded Python executable differs from finalizer")
-    return {"means": means, "scales": scales, "constant": constant, "coefficients": coefficients, "artifact_sha256": artifact_sha256}
+    return {
+        "means": means,
+        "scales": scales,
+        "constant": constant,
+        "coefficients": coefficients,
+        "artifact_sha256": artifact_sha256,
+        "engine_dependency_graph": artifact_dependency_graph,
+    }
 
 
 def _type7(values: Sequence[float], probability: float = 0.10) -> float:
@@ -689,6 +956,7 @@ def validate_calibration_assessment(
     ridge_path: Path,
     freeze_path: Path,
     input_sha256: dict[str, str],
+    engine_dependency_graph: dict[str, Any] | None,
 ) -> None:
     allowed_keys = {
         "experiment", "status", "promoted", "scope", "state_count",
@@ -702,12 +970,22 @@ def validate_calibration_assessment(
         "thresholds", "checks", "validation_seed_used", "sealed_test_seed_used",
         "game_strength_evidence", "model_improvement_evidence", "provenance",
         "runtime_evidence",
+        "engine_dependency_graph",
     }
     _require(set(assessment) == allowed_keys, "calibration assessment schema has missing or forbidden fields")
     _require(_required(assessment, "experiment") == "R1_online_counterfactual_top2_safety_gate", "calibration experiment mismatch")
     _require(_required(assessment, "status") == ("R1-calibration-promoted" if expected["promoted"] else "R1-calibration-rejected"), "calibration status disagrees with recomputation")
     _require(_bool(_required(assessment, "promoted"), "calibration promoted") is expected["promoted"], "calibration promotion disagrees with recomputation")
     _require(_required(assessment, "scope") == "calibration_only_not_game_strength_not_model_improvement", "calibration scope mismatch")
+    assessment_dependency_graph = _validate_engine_dependency_graph(
+        _required(assessment, "engine_dependency_graph"),
+        synthetic=synthetic,
+        label="calibration assessment",
+    )
+    _require(
+        assessment_dependency_graph == engine_dependency_graph,
+        "calibration assessment engine dependency graph differs from collection/ridge",
+    )
     integer_fields = (
         "state_count", "override_count", "override_episode_count", "unsafe_top2_terminal_count",
         "production_reference_mismatch_count", "selected_action_mismatch_count", "fallback_top1_mismatch_count",
@@ -860,6 +1138,15 @@ def assess(args: argparse.Namespace, milestones: Milestones) -> dict[str, Any]:
         _require(calibration["stable_node_key_source_sha256"] == stable_source_sha, "calibration stable-order source is not the live canonical engine")
         _require(training["backend_binding"] == calibration["backend_binding"], "training/calibration backend bindings differ")
         _require(training["backend_binding"]["evaluator_source_sha256"] == evaluator_source_sha, "collector evaluator source is not the live canonical evaluator")
+        _require(
+            training["engine_dependency_graph"] == calibration["engine_dependency_graph"],
+            "training/calibration engine dependency graphs differ",
+        )
+        live_dependency_graph = _live_engine_dependency_graph(repository)
+        _require(
+            training["engine_dependency_graph"] == live_dependency_graph,
+            "collector engine dependency graph differs from live runtime closure",
+        )
     milestones.write("collections_verified", training_rows=training["row_count"], calibration_rows=calibration["row_count"])
     ridge = validate_ridge(
         inputs["ridge_artifact"], documents["ridge_artifact"], synthetic=args.synthetic,
@@ -879,6 +1166,7 @@ def assess(args: argparse.Namespace, milestones: Milestones) -> dict[str, Any]:
         calibration_table_path=inputs["calibration_table"], calibration_manifest_path=inputs["calibration_manifest"],
         ridge_path=inputs["ridge_artifact"], freeze_path=inputs["design_freeze"],
         input_sha256=hashes,
+        engine_dependency_graph=calibration["engine_dependency_graph"],
     )
     _require(expected["promoted"], "calibration gate did not satisfy every preregistered promotion criterion")
     return {

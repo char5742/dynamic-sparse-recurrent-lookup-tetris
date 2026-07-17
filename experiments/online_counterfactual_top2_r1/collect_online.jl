@@ -227,23 +227,18 @@ end
 function _load_production_adapter(experiment_dir::AbstractString)
     adapter_path = joinpath(experiment_dir, "engine_adapter.jl")
     isfile(adapter_path) || error("missing production R1 engine adapter: $adapter_path")
+    isdefined(Main, :R1ProductionEngineAdapter) && error(
+        "ambient R1ProductionEngineAdapter is forbidden before the frozen adapter include",
+    )
     include(adapter_path)
-    if isdefined(Main, :make_production_adapter)
-        return Base.invokelatest(getfield(Main, :make_production_adapter))
-    elseif isdefined(Main, :R1ProductionEngineAdapter) &&
-           isdefined(
-               getfield(Main, :R1ProductionEngineAdapter), :make_production_adapter,
-           )
-        return Base.invokelatest(getfield(
-            getfield(Main, :R1ProductionEngineAdapter), :make_production_adapter,
-        ))
-    elseif isdefined(Main, :R1EngineAdapter) &&
-           isdefined(getfield(Main, :R1EngineAdapter), :make_production_adapter)
-        return Base.invokelatest(
-            getfield(getfield(Main, :R1EngineAdapter), :make_production_adapter)
-        )
-    end
-    error("engine_adapter.jl must define make_production_adapter()")
+    isdefined(Main, :R1ProductionEngineAdapter) || error(
+        "engine_adapter.jl did not define the frozen R1ProductionEngineAdapter module",
+    )
+    adapter_module = getfield(Main, :R1ProductionEngineAdapter)
+    isdefined(adapter_module, :make_production_adapter) || error(
+        "frozen R1ProductionEngineAdapter lacks make_production_adapter()",
+    )
+    return Base.invokelatest(getfield(adapter_module, :make_production_adapter))
 end
 
 function main(args=ARGS)
@@ -376,12 +371,14 @@ function _collect_after_imports(parsed, experiment_dir)
     backend_binding = parsed.synthetic ? nothing : (;
         old_openvino_weight_npz_sha256=String(adapter.old_openvino_weight_npz_sha256),
         old_checkpoint_sha256=String(adapter.old_checkpoint_sha256),
-        openvino_version=String(adapter.openvino_version),
+        openvino_version=String(contract.openvino_backend.version),
+        openvino_full_build=String(adapter.openvino_version),
         complete_device=String(adapter.openvino_complete_device),
         tail_device=String(adapter.openvino_tail_device),
         complete_batch_size=Int(adapter.openvino_batch_size),
         evaluator_source_sha256=String(adapter.evaluator_source_sha256),
     )
+    engine_dependency_graph = parsed.synthetic ? nothing : adapter.engine_dependency_graph
     immutable_input_end_hashes = if parsed.synthetic
         nothing
     else
@@ -418,6 +415,7 @@ function _collect_after_imports(parsed, experiment_dir)
             stable_node_key_source_sha256=String(adapter.stable_node_key_source_sha256),
             network_accounting,
             backend_binding,
+            engine_dependency_graph,
             immutable_input_end_hashes,
             counterfactual_states_completed=sample_count[],
             first32_elapsed_seconds=first32_elapsed_seconds[],
@@ -451,6 +449,7 @@ function _collect_after_imports(parsed, experiment_dir)
         stable_node_key_source_sha256=String(adapter.stable_node_key_source_sha256),
         network_accounting,
         backend_binding,
+        engine_dependency_graph,
         immutable_input_end_hashes,
         episode_count=length(collections),
         row_count=length(rows),

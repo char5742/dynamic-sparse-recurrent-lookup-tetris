@@ -18,6 +18,45 @@ $script:R1ExpectedHandoffEnvironmentNames = @(
     'R1_EXPECTED_DESIGN_FREEZE_SHA256'
 )
 
+if ($null -eq ('R1.WindowsDurablePublication' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace R1 {
+    public static class WindowsDurablePublication {
+        private const uint MOVEFILE_WRITE_THROUGH = 0x00000008;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool MoveFileExW(string existingName, string newName, uint flags);
+
+        public static void MoveNoReplaceWriteThrough(string source, string destination) {
+            // MOVEFILE_REPLACE_EXISTING is deliberately absent.  The call is
+            // both create-if-absent and, on Windows, does not return until the
+            // rename has been carried out to disk.
+            if (!MoveFileExW(source, destination, MOVEFILE_WRITE_THROUGH)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "MoveFileExW(MOVEFILE_WRITE_THROUGH) failed");
+            }
+        }
+    }
+}
+'@
+}
+
+function Get-R1DurablePublicationEvidence {
+    return [ordered]@{
+        platform='Windows'
+        temporary_file='FileStream WriteThrough plus Flush(true)'
+        publication='MoveFileExW without REPLACE_EXISTING'
+        publication_flag='MOVEFILE_WRITE_THROUGH (0x00000008)'
+        parent_directory_durability='MoveFileExW WRITE_THROUGH is the strongest documented Windows rename/metadata durability equivalent; Windows does not expose POSIX fsync(directory)'
+        overwrite_allowed=$false
+    }
+}
+
 function Write-R1JsonDurableAtomic([string]$Path, $Value) {
     $Full = [IO.Path]::GetFullPath($Path)
     $Parent = Split-Path -Parent $Full
@@ -34,9 +73,38 @@ function Write-R1JsonDurableAtomic([string]$Path, $Value) {
         )
         try { $Stream.Write($Bytes, 0, $Bytes.Length); $Stream.Flush($true) }
         finally { $Stream.Dispose() }
-        [IO.File]::Move($Temporary, $Full)
+        [R1.WindowsDurablePublication]::MoveNoReplaceWriteThrough($Temporary, $Full)
     } finally {
         if ([IO.File]::Exists($Temporary)) { [IO.File]::Delete($Temporary) }
+    }
+}
+
+function Resolve-R1ConcretePwsh([string]$Requested = '') {
+    $FrozenPath = 'C:\Program Files\PowerShell\7\pwsh.exe'
+    $FrozenVersion = '7.4.17'
+    $FrozenSize = [int64]290616
+    $FrozenSha256 = 'fedb2341c0b3837dfedc147ec582dec7f245a7b45faa97d23c4d4a1ee316ee2a'
+    $Path = if ([string]::IsNullOrWhiteSpace($Requested)) { $FrozenPath } else { $Requested }
+    $Path = [IO.Path]::GetFullPath($Path)
+    if (-not $Path.Equals($FrozenPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "PowerShell path differs from frozen pwsh 7.4.17: $Path"
+    }
+    if (-not [IO.File]::Exists($Path)) { throw "frozen pwsh is missing: $Path" }
+    $Item = Get-Item -LiteralPath $Path -Force
+    if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        [int64]$Item.Length -ne $FrozenSize) {
+        throw 'frozen pwsh file identity changed'
+    }
+    $ObservedSha = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($ObservedSha -cne $FrozenSha256) { throw 'frozen pwsh SHA-256 changed' }
+    $ObservedVersion = @(& $Path -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>&1) -join ''
+    if ($LASTEXITCODE -ne 0 -or $ObservedVersion.Trim() -cne $FrozenVersion) {
+        throw "exact pwsh $FrozenVersion is required; observed $ObservedVersion"
+    }
+    return [ordered]@{
+        path=$Path; version=$FrozenVersion; size_bytes=$FrozenSize
+        sha256=$FrozenSha256; windows_powershell_5_1_supported=$false
+        reparse_point=$false
     }
 }
 
@@ -692,6 +760,25 @@ function Invoke-R1MonitoredPhase {
     return $Record
 }
 
+function New-R1AuthoritativeFailureAssessment([string]$Reason, [string]$Stage) {
+    return [ordered]@{
+        status='assessment-fail'
+        success=$false
+        failures=@($Reason)
+        promotion='R1-calibration-rejected'
+        authority='wrapper-fail-closed'
+        failure_stage=$Stage
+        game_strength_evidence=$false
+        model_beat_claim=$false
+        game_evaluation_authorized=$false
+        development_authorized=$false
+        validation_seed_used=$false
+        sealed_test_seed_used=$false
+        sealed_test_authorized=$false
+        game_run=$false
+    }
+}
+
 function Invoke-R1PhasePipeline {
     [CmdletBinding()]
     param(
@@ -725,6 +812,8 @@ function Invoke-R1PhasePipeline {
     $ProducerLedger = [ordered]@{}
     $IntegrityBoundaryChecks = 0
     $PipelineOpen = $true
+    $FinalizerDisposition = 'not_reached'
+    $AuthoritativeFailureAssessment = $null
     foreach ($Phase in $script:R1ExpectedPhaseOrder) {
         if ($Phase -ne 'finalize_assessment' -and -not $PipelineOpen) {
             $Skipped += [ordered]@{ phase=$Phase; reason='prior required phase failed; no resume or rescue' }
@@ -739,6 +828,11 @@ function Invoke-R1PhasePipeline {
                 $Failures += $IntegrityFailure
                 $Skipped += [ordered]@{ phase=$Phase; reason=$IntegrityFailure }
                 $PipelineOpen = $false
+                if ($Phase -ceq 'finalize_assessment') {
+                    $FinalizerDisposition = 'blocked_by_boundary_integrity_failure'
+                    $AuthoritativeFailureAssessment = New-R1AuthoritativeFailureAssessment `
+                        $IntegrityFailure 'before_finalize_assessment'
+                }
                 continue
             }
         }
@@ -767,6 +861,7 @@ function Invoke-R1PhasePipeline {
             }
         }
         try {
+            if ($Phase -ceq 'finalize_assessment') { $FinalizerDisposition = 'launch_attempted' }
             $Record = Invoke-R1MonitoredPhase -Phase $Phase -Command @($Commands[$Phase]) `
                 -WorkingDirectory $WorkingDirectory -OutputDirectory $OutputDirectory `
                 -RunStarted $RunStarted -TotalHardWallSeconds $TotalHardWallSeconds `
@@ -778,6 +873,11 @@ function Invoke-R1PhasePipeline {
             $Failures += $LaunchFailure
             $Skipped += [ordered]@{ phase=$Phase; reason=$LaunchFailure }
             $PipelineOpen = $false
+            if ($Phase -ceq 'finalize_assessment') {
+                $FinalizerDisposition = 'invocation_failure'
+                $AuthoritativeFailureAssessment = New-R1AuthoritativeFailureAssessment `
+                    $LaunchFailure 'invoke_finalize_assessment'
+            }
             continue
         }
         $Phases += $Record
@@ -810,11 +910,23 @@ function Invoke-R1PhasePipeline {
             if ($Record.exit_code -ne 0) {
                 $Failures += "phase $Phase failed: $($Record.stop_reason)"
                 $PipelineOpen = $false
+                if ($Phase -ceq 'finalize_assessment') {
+                    $FinalizerDisposition = 'launched_failed'
+                    $AuthoritativeFailureAssessment = New-R1AuthoritativeFailureAssessment `
+                        "phase finalize_assessment failed: $($Record.stop_reason)" 'finalize_assessment_process'
+                }
+            } elseif ($Phase -ceq 'finalize_assessment') {
+                $FinalizerDisposition = 'launched_completed'
             }
         } catch {
             $PostprocessFailure = "phase $Phase wrapper postprocess failed after phase record: $($_.Exception.Message)"
             $Failures += $PostprocessFailure
             $PipelineOpen = $false
+            if ($Phase -ceq 'finalize_assessment') {
+                $FinalizerDisposition = 'postprocess_failure'
+                $AuthoritativeFailureAssessment = New-R1AuthoritativeFailureAssessment `
+                    $PostprocessFailure 'finalize_assessment_postprocess'
+            }
         }
     }
     if ($null -ne $BoundaryIntegrityCheck) {
@@ -822,7 +934,11 @@ function Invoke-R1PhasePipeline {
             & $BoundaryIntegrityCheck 'terminal'
             $IntegrityBoundaryChecks += 1
         } catch {
-            $Failures += "terminal boundary integrity check failed: $($_.Exception.Message)"
+            $TerminalIntegrityFailure = "terminal boundary integrity check failed: $($_.Exception.Message)"
+            $Failures += $TerminalIntegrityFailure
+            $FinalizerDisposition = 'terminal_integrity_failure'
+            $AuthoritativeFailureAssessment = New-R1AuthoritativeFailureAssessment `
+                $TerminalIntegrityFailure 'after_finalize_assessment'
         }
     }
     return [ordered]@{
@@ -835,6 +951,8 @@ function Invoke-R1PhasePipeline {
         phases=@($Phases)
         skipped_phases=@($Skipped)
         producer_completion_ledger=@($ProducerLedger.Values)
+        finalizer_disposition=$FinalizerDisposition
+        authoritative_failure_assessment=$AuthoritativeFailureAssessment
         integrity_boundary_checks=$IntegrityBoundaryChecks
         polling_interval_target_ms=200
         process_creation='CreateProcessW CREATE_SUSPENDED; assign Job; ResumeThread'

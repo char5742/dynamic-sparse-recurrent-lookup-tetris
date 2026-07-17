@@ -3,7 +3,7 @@
   "experiment_id": "online_counterfactual_top2_R1",
   "scientific_role": "frozen-old online counterfactual top-2 safety gate; system candidate only",
   "authorized_base_commit": "9b2f974d3f5950e4084dc27d546fffc25a736c90",
-  "authorized_implementation_parent_commit": "ca0af2af8aa041147658fa4f494d1f26a5dc86a7",
+  "authorized_implementation_parent_commit": "ddd0f6f83c0e2931cd4cd415531b30b3c80cd2bd",
   "immutable_inputs": {
     "old_checkpoint_sha256": "7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1",
     "old_openvino_weight_npz_sha256": "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba"
@@ -22,6 +22,7 @@
   },
   "openvino_backend": {
     "version": "2026.2.1",
+    "full_build": "2026.2.1-21919-ede283a88e3-releases/2026/2",
     "weight_format": "NPZ",
     "weight_sha256": "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba",
     "input_dtype": "Float32",
@@ -42,6 +43,41 @@
       "maximum_candidate_count": 15,
       "padding": false
     }
+  },
+  "runtime_source_binding": {
+    "upstream_tetrisai": {
+      "repository_relative_path": "upstream/TetrisAI",
+      "head": "6fdfb1d30197246fd862b716438e998f0315c830",
+      "clean_required": true
+    },
+    "vendored_tetrisai": {
+      "node": {
+        "original_relative_path": "upstream/TetrisAI/src/core/components/node.jl",
+        "vendor_relative_path": "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/components/node.jl",
+        "bytes": 298,
+        "sha256": "e98d2052f9248f5c08c1eb58adaace1bd01533f287e682bf35a2fefa1325fe82"
+      },
+      "analyzer": {
+        "original_relative_path": "upstream/TetrisAI/src/core/analyzer.jl",
+        "vendor_relative_path": "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/analyzer.jl",
+        "bytes": 8114,
+        "sha256": "24152e2549dcc6c3c25d928454268e8baaa4d45fea31044603917cfbabbe02bc"
+      }
+    },
+    "external_tetris_runtime": [
+      {"path": "vendor/Tetris/lib/curses.jl", "bytes": 2767, "sha256": "4dd113316c4f82a226563d7ac3237c366417211582722b3d4b4277dcb12ff922"},
+      {"path": "vendor/Tetris/lib/key_input.jl", "bytes": 1448, "sha256": "c09571b424a49f01278f6903c0018f9a2dfc652dfd18b804c4ad2b6a37f2fc53"},
+      {"path": "vendor/Tetris/lib/game.so", "bytes": 49870, "sha256": "d63a03f494cb0a6f1704624923c58cb521a8a45873ca400e7085c02b1bf5bf46"},
+      {"path": "vendor/Tetris/lib/pdcurses.dll", "bytes": 176673, "sha256": "0c770aa6721aa2155bbe2ef1d0f50ad2065da399085242454486c855c1f9fe67"}
+    ],
+    "python_cache_policy": {
+      "repository_cache_artifacts_forbidden": true,
+      "required_environment_variable": "PYTHONPYCACHEPREFIX",
+      "prefix_must_be_absolute": true,
+      "prefix_must_be_outside_repository": true
+    },
+    "runtime_closure_sha256": "fa908de68b6deb1581818bdb45c813b06d8886bc4fe33fd010830f7eef03a0e4",
+    "dependency_graph_digest_encoding": "sorted relative_path + NUL + lowercase sha256 + newline"
   },
   "analytic_runtime": {
     "production_backend": "Python NumPy analytic ridge",
@@ -118,6 +154,7 @@
     "bootstrap_rng": "Xoshiro(0x5231_2026)",
     "bootstrap_seed_uint64": 1378951206,
     "prediction_lower_quantile": 0.1,
+    "quantile_method": "linear_type7_position_1_plus_n_minus_1_p",
     "override_strict_threshold": 0.05,
     "sweep_authorized": false
   },

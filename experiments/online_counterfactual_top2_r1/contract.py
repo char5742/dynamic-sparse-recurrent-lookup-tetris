@@ -41,7 +41,8 @@ def validate_contract(contract: dict[str, Any]) -> None:
     calibration = contract.get("calibration_gate", {})
     policy = contract.get("canonical_policy", {})
     openvino = contract.get("openvino_backend", {})
-    runtime = contract.get("analytic_runtime", {})
+    analytic_runtime = contract.get("analytic_runtime", {})
+    source_runtime = contract.get("runtime_source_binding", {})
     counterfactual = contract.get("counterfactual", {})
     claims = contract.get("claims", {})
 
@@ -51,7 +52,7 @@ def validate_contract(contract: dict[str, Any]) -> None:
         failures.append("unexpected experiment_id")
     if contract.get("authorized_base_commit") != "9b2f974d3f5950e4084dc27d546fffc25a736c90":
         failures.append("authorized base changed")
-    if contract.get("authorized_implementation_parent_commit") != "ca0af2af8aa041147658fa4f494d1f26a5dc86a7":
+    if contract.get("authorized_implementation_parent_commit") != "ddd0f6f83c0e2931cd4cd415531b30b3c80cd2bd":
         failures.append("implementation parent changed")
     if not _exact_range(roles.get("training_seeds"), 73001, 73012):
         failures.append("training seed role changed")
@@ -112,6 +113,8 @@ def validate_contract(contract: dict[str, Any]) -> None:
     for observed, expected, label in exact_values:
         if observed != expected:
             failures.append(f"{label} changed")
+    if fit.get("quantile_method") != "linear_type7_position_1_plus_n_minus_1_p":
+        failures.append("prediction quantile interpolation changed")
     if fit.get("sweep_authorized") is not False:
         failures.append("hyperparameter sweep must be prohibited")
     if counterfactual.get("trajectory_writeback") is not False:
@@ -123,7 +126,11 @@ def validate_contract(contract: dict[str, Any]) -> None:
     weights = contract.get("immutable_inputs", {}).get("old_openvino_weight_npz_sha256")
     if weights != "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba":
         failures.append("canonical OpenVINO weight NPZ hash changed")
-    if openvino.get("version") != "2026.2.1" or openvino.get("weight_sha256") != weights:
+    if (
+        openvino.get("version") != "2026.2.1"
+        or openvino.get("full_build") != "2026.2.1-21919-ede283a88e3-releases/2026/2"
+        or openvino.get("weight_sha256") != weights
+    ):
         failures.append("OpenVINO version/weight binding changed")
     if any(openvino.get(name) != "Float32" for name in ("input_dtype", "output_dtype", "weight_dtype")):
         failures.append("OpenVINO FP32 graph contract changed")
@@ -133,15 +140,76 @@ def validate_contract(contract: dict[str, Any]) -> None:
     tail = openvino.get("tail_chunk", {})
     if tail != {"device": "CPU", "shape": "dynamic", "batch_semantics": "actual candidate count", "minimum_candidate_count": 1, "maximum_candidate_count": 15, "padding": False}:
         failures.append("OpenVINO dynamic CPU actual-tail contract changed")
-    if runtime.get("production_backend") != "Python NumPy analytic ridge":
+    upstream = source_runtime.get("upstream_tetrisai", {})
+    if upstream != {
+        "repository_relative_path": "upstream/TetrisAI",
+        "head": "6fdfb1d30197246fd862b716438e998f0315c830",
+        "clean_required": True,
+    }:
+        failures.append("upstream TetrisAI binding changed")
+    vendored = source_runtime.get("vendored_tetrisai", {})
+    expected_vendor = {
+        "node": (
+            "upstream/TetrisAI/src/core/components/node.jl",
+            "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/components/node.jl",
+            298,
+            "e98d2052f9248f5c08c1eb58adaace1bd01533f287e682bf35a2fefa1325fe82",
+        ),
+        "analyzer": (
+            "upstream/TetrisAI/src/core/analyzer.jl",
+            "experiments/online_counterfactual_top2_r1/vendor/TetrisAI/src/core/analyzer.jl",
+            8114,
+            "24152e2549dcc6c3c25d928454268e8baaa4d45fea31044603917cfbabbe02bc",
+        ),
+    }
+    for name, (original, path, size, digest) in expected_vendor.items():
+        record = vendored.get(name, {})
+        if (
+            record.get("original_relative_path"),
+            record.get("vendor_relative_path"),
+            record.get("bytes"),
+            record.get("sha256"),
+        ) != (original, path, size, digest):
+            failures.append(f"vendored TetrisAI {name} binding changed")
+    expected_external = {
+        "vendor/Tetris/lib/curses.jl": (2767, "4dd113316c4f82a226563d7ac3237c366417211582722b3d4b4277dcb12ff922"),
+        "vendor/Tetris/lib/key_input.jl": (1448, "c09571b424a49f01278f6903c0018f9a2dfc652dfd18b804c4ad2b6a37f2fc53"),
+        "vendor/Tetris/lib/game.so": (49870, "d63a03f494cb0a6f1704624923c58cb521a8a45873ca400e7085c02b1bf5bf46"),
+        "vendor/Tetris/lib/pdcurses.dll": (176673, "0c770aa6721aa2155bbe2ef1d0f50ad2065da399085242454486c855c1f9fe67"),
+    }
+    external = source_runtime.get("external_tetris_runtime")
+    observed_external = (
+        {
+            record.get("path"): (record.get("bytes"), record.get("sha256"))
+            for record in external
+            if isinstance(record, dict)
+        }
+        if isinstance(external, list)
+        else {}
+    )
+    if not isinstance(external, list) or len(external) != 4 or observed_external != expected_external:
+        failures.append("external Tetris runtime binding changed")
+    cache = source_runtime.get("python_cache_policy", {})
+    if cache != {
+        "repository_cache_artifacts_forbidden": True,
+        "required_environment_variable": "PYTHONPYCACHEPREFIX",
+        "prefix_must_be_absolute": True,
+        "prefix_must_be_outside_repository": True,
+    }:
+        failures.append("Python cache isolation policy changed")
+    if source_runtime.get("dependency_graph_digest_encoding") != "sorted relative_path + NUL + lowercase sha256 + newline":
+        failures.append("dependency graph digest encoding changed")
+    if source_runtime.get("runtime_closure_sha256") != "fa908de68b6deb1581818bdb45c813b06d8886bc4fe33fd010830f7eef03a0e4":
+        failures.append("runtime closure aggregate changed")
+    if analytic_runtime.get("production_backend") != "Python NumPy analytic ridge":
         failures.append("analytic production backend changed")
-    if (runtime.get("python_version"), runtime.get("numpy_version"), runtime.get("blas_threads")) != ("3.12.13", "2.4.6", 1):
+    if (analytic_runtime.get("python_version"), analytic_runtime.get("numpy_version"), analytic_runtime.get("blas_threads")) != ("3.12.13", "2.4.6", 1):
         failures.append("analytic runtime version/thread contract changed")
-    if runtime.get("base_python_sha256") != "3c6a206b7d93cca823934a83732220dcffd413fd1036d9fb82eebb64599cf7f3":
+    if analytic_runtime.get("base_python_sha256") != "3c6a206b7d93cca823934a83732220dcffd413fd1036d9fb82eebb64599cf7f3":
         failures.append("base Python hash changed")
-    if runtime.get("venv_launcher_sha256") != "5912d0884b23c0343983a864c6064242391e2265536f50b88624857e353882c9":
+    if analytic_runtime.get("venv_launcher_sha256") != "5912d0884b23c0343983a864c6064242391e2265536f50b88624857e353882c9":
         failures.append("venv launcher hash changed")
-    if runtime.get("thread_environment") != {"OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}:
+    if analytic_runtime.get("thread_environment") != {"OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}:
         failures.append("analytic thread environment changed")
     if any(claims.get(name) is not False for name in ("model_improvement", "validation_authorized", "sealed_test_authorized", "retry_authorized", "rescue_authorized")):
         failures.append("pre-development claim authorization must be false")
