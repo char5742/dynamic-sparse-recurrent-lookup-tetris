@@ -1,0 +1,10 @@
+zygote batch=4 step=1 seconds=26.401322 loss=3.443775415
+zygote batch=4 step=2 seconds=0.091340 loss=3.393189430
+zygote batch=4 step=3 seconds=0.105813 loss=3.351075172
+zygote batch=4 step=4 seconds=0.065224 loss=3.310392380
+zygote batch=4 step=5 seconds=0.086778 loss=3.270672798
+zygote batch=4 step=10 seconds=0.057994 loss=3.185131073
+zygote batch=4 step=100 seconds=0.091322 loss=3.127613544
+zygote batch=4 step=500 seconds=0.057587 loss=3.125931263
+zygote batch=4 step=1000 seconds=0.055547 loss=3.125909328
+wrote C:\Users\fshuu\Documents\tetris\experiments\ad_backend_retry_2026\artifacts\zygote_b4_n1000.json wall=93.593958 peak=1.081GiB

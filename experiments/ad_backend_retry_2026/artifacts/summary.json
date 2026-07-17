@@ -1,0 +1,168 @@
+{
+    "status": "completed",
+    "verdict": {
+        "native_cpu_winner": "Zygote",
+        "native_enzyme": "reject: static activity does not lower; runtime activity is slower and its AdamW loss trajectory diverges",
+        "compiled_winner": "Reactant+EnzymeMLIR for sufficiently long persistent fixed-shape steps",
+        "current_project_default": "Zygote until a changing-batch transfer/checkpoint-inclusive Reactant integration gate passes"
+    },
+    "environment": {
+        "versions": {
+            "julia": "1.12.6",
+            "lux": "1.31.4",
+            "zygote": "0.7.11",
+            "enzyme": "0.13.186",
+            "optimisers": "0.4.7",
+            "jld2": "0.6.5"
+        },
+        "reactant_version": "0.2.274",
+        "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+        "logical_cpu_threads": 20,
+        "julia_threads": 20,
+        "blas_threads": 10,
+        "total_memory_bytes": 67939368960,
+        "pinned_manifest_sha256": "09c5730de81a2b9ccfc7259ff6167e6814bb2a303916275ad0b8c7c3a958d3f8"
+    },
+    "workload": {
+        "model": "CompactCandidateQ(channels=8, blocks=1, spatial_channels=2)",
+        "parameter_count": 165051,
+        "action_width": 74,
+        "state_batch": 4,
+        "fixed_rows": [
+            1,
+            750,
+            1501,
+            2160
+        ],
+        "episode_ids": [
+            1,
+            3,
+            7,
+            12
+        ],
+        "action_counts": [
+            51,
+            34,
+            51,
+            16
+        ],
+        "valid_candidates": 152,
+        "dataset_path": "D:\\tetris-paper-plus\\datasets\\learning\\teacher_plus_dagger_c13_round1.jld2",
+        "dataset_sha256": "4f10cfcf545c97eb3f56e8511921a1a6b50fa5ab166fac2eb3575eacf84b71ba",
+        "checkpoint_path": "C:\\Users\\fshuu\\Documents\\tetris\\checkpoints\\learning\\C11b_listwise_165k_lr1e3_3000_fixed74.jld2",
+        "checkpoint_sha256": "3df9f4d233e235addc7bf9b5831c0823cff670261283d92c688efa0c8755e0d0",
+        "tracked_model_sha256": "793535dfc43e1c16a0b9196305f2e329438afc6aa458fdc7d8521ed1e36b1052",
+        "tracked_trainer_sha256": "654e7f7c0e05ca6c005ebeb39924769fcbfd5299ad4e4c0acb3bcb6e4fde4ec3"
+    },
+    "native_numerics": {
+        "zygote_loss": 3.4437754,
+        "enzyme_runtime_loss": 3.4437752,
+        "loss_absolute_error": 2.3841858e-7,
+        "gradient": {
+            "cosine": 0.9999999999901593,
+            "maximum_absolute_error": 2.302229404449463e-6,
+            "relative_l2": 4.6589425444169915e-6
+        },
+        "one_update_parameters": {
+            "cosine": 0.9999999994897658,
+            "maximum_absolute_error": 0.0009418763220310211,
+            "relative_l2": 3.194359638377183e-5
+        },
+        "static_activity_attempt": {
+            "status": "failed_in_preserved_prior_attempt",
+            "error": "EnzymeRuntimeActivityError; see native_numerics_b4_static_failure.log"
+        },
+        "runtime_activity_required": true
+    },
+    "stability": {
+        "zygote_completed_updates": 1000,
+        "reactant_completed_updates": 1000,
+        "native_enzyme_direct_completed_updates": 100,
+        "native_enzyme_lux_completed_updates": 100,
+        "zygote_final_loss": 3.1259093284606934,
+        "reactant_final_loss": 3.1259121894836426,
+        "native_enzyme_final_loss": 4.413848400115967,
+        "native_enzyme_direct_and_lux_loss_max_error": 0,
+        "reactant_checkpoint_loss_max_error": 3.814697265625e-6,
+        "reactant_final_parameters_vs_zygote": {
+            "cosine": 0.9999995295012751,
+            "maximum_absolute_error": 0.011612525999999998,
+            "relative_l2": 0.0009700503878477784
+        }
+    },
+    "state_batch_4": {
+        "first_update_seconds": {
+            "zygote": 26.4013216,
+            "native_enzyme_direct_runtime": 63.3333297,
+            "native_enzyme_lux_runtime": 62.7428783,
+            "reactant": 63.9454639
+        },
+        "warm_median_seconds": {
+            "zygote": 0.0609143,
+            "native_enzyme_direct_runtime": 0.1116275,
+            "native_enzyme_lux_runtime": 0.105294,
+            "reactant": 0.0130997,
+            "reactant_speedup_over_zygote": 4.650053054650106,
+            "zygote_speedup_over_native_enzyme_lux": 1.7285596321389232
+        },
+        "warm_median_allocated_bytes": {
+            "zygote": 48471751,
+            "native_enzyme_direct_runtime": 56582515,
+            "native_enzyme_lux_runtime": 56590515,
+            "reactant": 37424,
+            "zygote_over_reactant": 1295.2049754168447
+        },
+        "peak_working_set_bytes": {
+            "zygote": 1160392704,
+            "native_enzyme_direct_runtime": 1548713984,
+            "native_enzyme_lux_runtime": 1517637632,
+            "reactant": 1773187072
+        },
+        "compile_inclusive_seconds": {
+            "1000": {
+                "zygote": 92.9158638,
+                "reactant": 77.52265820000001,
+                "zygote_over_reactant": 1.1985639548154707
+            },
+            "100": {
+                "zygote": 33.3402708,
+                "reactant": 65.6915181,
+                "zygote_over_reactant": 0.5075277869092205
+            },
+            "500": {
+                "zygote": 59.956140100000006,
+                "reactant": 71.0395864,
+                "zygote_over_reactant": 0.8439821110782819
+            }
+        },
+        "observed_crossover": {
+            "first_update": 711,
+            "sustained_update": 711,
+            "zygote_seconds": 73.79112810000001,
+            "reactant_seconds": 73.7545441
+        }
+    },
+    "state_batch_16_zygote": {
+        "status": "completed; further sweep stopped after decisive state-batch-4 evidence",
+        "first_update_seconds": 26.7320816,
+        "warm_median_seconds": 0.2343444,
+        "compile_inclusive_100_seconds": 49.7977663,
+        "warm_median_allocated_bytes": 169948412,
+        "peak_working_set_bytes": 1275035648
+    },
+    "runtime_checks": {
+        "reactant_unique_compiled_thunks": 1,
+        "reactant_thunk_observations": 1000,
+        "reactant_no_recompile_observed": true,
+        "reactant_explicit_barrier_median_seconds": 1.0e-5,
+        "blas_or_fallback_warning_observed": false,
+        "native_enzyme_runtime_activity": true
+    },
+    "adoption_rule": {
+        "native_enzyme": "never select under these pins for this tracked model/loss",
+        "zygote": "select for dynamic work, fewer than 1000 planned same-shape updates, or before the integration gate passes",
+        "reactant": "eligible for >=1000 persistent same-shape updates; production switch only after changing-batch transfer, sampling, validation, and checkpoint costs are included and measured total time is >=1.15x faster with matching trajectories"
+    },
+    "held_out_test_seeds_used": false,
+    "game_scoring_run": false
+}

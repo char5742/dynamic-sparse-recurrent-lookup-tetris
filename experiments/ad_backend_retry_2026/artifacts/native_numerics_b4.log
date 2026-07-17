@@ -1,0 +1,72 @@
+{
+    "status": "completed",
+    "generated_at": "2026-07-18T02:12:04",
+    "versions": {
+        "julia": "1.12.6",
+        "lux": "1.31.4",
+        "zygote": "0.7.11",
+        "enzyme": "0.13.186",
+        "optimisers": "0.4.7",
+        "jld2": "0.6.5"
+    },
+    "julia_threads": 20,
+    "blas_threads": 10,
+    "workload": {
+        "model": "CompactCandidateQ(channels=8, blocks=1, spatial_channels=2)",
+        "parameter_count": 165051,
+        "action_width": 74,
+        "state_batch": 4,
+        "fixed_rows": [
+            1,
+            750,
+            1501,
+            2160
+        ],
+        "episode_ids": [
+            1,
+            3,
+            7,
+            12
+        ],
+        "action_counts": [
+            51,
+            34,
+            51,
+            16
+        ],
+        "valid_candidates": 152,
+        "dataset_path": "D:\\tetris-paper-plus\\datasets\\learning\\teacher_plus_dagger_c13_round1.jld2",
+        "dataset_sha256": "4f10cfcf545c97eb3f56e8511921a1a6b50fa5ab166fac2eb3575eacf84b71ba",
+        "checkpoint_path": "C:\\Users\\fshuu\\Documents\\tetris\\checkpoints\\learning\\C11b_listwise_165k_lr1e3_3000_fixed74.jld2",
+        "checkpoint_sha256": "3df9f4d233e235addc7bf9b5831c0823cff670261283d92c688efa0c8755e0d0",
+        "tracked_model_sha256": "793535dfc43e1c16a0b9196305f2e329438afc6aa458fdc7d8521ed1e36b1052",
+        "tracked_trainer_sha256": "654e7f7c0e05ca6c005ebeb39924769fcbfd5299ad4e4c0acb3bcb6e4fde4ec3"
+    },
+    "activities": {
+        "mode": "ReverseWithPrimal",
+        "return_value": "Active",
+        "parameters": "Duplicated with preallocated shadow",
+        "objective_model_state_data": "Const",
+        "runtime_activity": true,
+        "separate_loss_forward": false
+    },
+    "static_activity_attempt": {
+        "status": "failed_in_preserved_prior_attempt",
+        "error": "EnzymeRuntimeActivityError; see native_numerics_b4.log"
+    },
+    "losses": {
+        "zygote": 3.4437754,
+        "enzyme": 3.4437752,
+        "absolute_error": 2.3841858e-7
+    },
+    "enzyme_gradient_vs_zygote": {
+        "cosine": 0.9999999999901593,
+        "maximum_absolute_error": 2.302229404449463e-6,
+        "relative_l2": 4.6589425444169915e-6
+    },
+    "one_update_enzyme_parameters_vs_zygote": {
+        "cosine": 0.9999999994897658,
+        "maximum_absolute_error": 0.0009418763220310211,
+        "relative_l2": 3.194359638377183e-5
+    }
+}nothing

@@ -1,0 +1,41 @@
+ERROR: LoadError: EnzymeRuntimeActivityError: Detected potential need for runtime activity.
+
+Constant memory is stored (or returned) to a differentiable variable and correctness cannot be guaranteed with static activity analysis.
+This might be due to the use of a constant variable as temporary storage for active memory (https://enzyme.mit.edu/julia/stable/faq/#faq-runtime-activity).
+If Enzyme should be able to prove this use non-differentable, open an issue!
+
+To work around this issue, either:
+   a) rewrite this variable to not be conditionally active (fastest performance, slower to setup), or
+   b) set the Enzyme mode to turn on runtime activity (e.g. autodiff(set_runtime_activity(Reverse), ...) ). This will maintain correctness, but may slightly reduce performance.
+
+Failure within method:
+
+(::CompactCandidateQ)(::Tuple{Array{Float32, 4}, Array{Float32, 4}, Matrix{Float32}, Matrix{Float32}, Matrix{Float32}, Array{Float32, 3}}, ::@NamedTuple{stem::@NamedTuple{layer_1::@NamedTuple{weight::Array{Float32, 4}, bias::Vector{Float32}}, layer_2::@NamedTuple{}}, trunk::@NamedTuple{layer_1::@NamedTuple{layer_1::@NamedTuple{layer_1::@NamedTuple{weight::Array{Float32, 4}, bias::Vector{Float32}}, layer_2::@NamedTuple{}, layer_3::@NamedTuple{weight::Array{Float32, 4}, bias::Vector{Float32}}}, layer_2::@NamedTuple{}}}, projection::@NamedTuple{layer_1::@NamedTuple{weight::Array{Float32, 4}, bias::Vector{Float32}}, layer_2::@NamedTuple{}}, queue_encoder::@NamedTuple{layer_1::@NamedTuple{weight::Matrix{Float32}, bias::Vector{Float32}}, layer_2::@NamedTuple{weight::Matrix{Float32}, bias::Vector{Float32}}}, head::@NamedTuple{layer_1::@NamedTuple{weight::Matrix{Float32}, bias::Vector{Float32}}, layer_2::@NamedTuple{weight::Matrix{Float32}, bias::Vector{Float32}}, layer_3::@NamedTuple{weight::Matrix{Float32}, bias::Vector{Float32}}}}, ::@NamedTuple{stem::@NamedTuple{layer_1::@NamedTuple{}, layer_2::@NamedTuple{}}, trunk::@NamedTuple{layer_1::@NamedTuple{layer_1::@NamedTuple{layer_1::@NamedTuple{}, layer_2::@NamedTuple{}, layer_3::@NamedTuple{}}, layer_2::@NamedTuple{}}}, projection::@NamedTuple{layer_1::@NamedTuple{}, layer_2::@NamedTuple{}}, queue_encoder::@NamedTuple{layer_1::@NamedTuple{}, layer_2::@NamedTuple{}}, head::@NamedTuple{layer_1::@NamedTuple{}, layer_2::@NamedTuple{}, layer_3::@NamedTuple{}}})
+     @ Main C:\Users\fshuu\Documents\tetris\experiments\learning\compact_model.jl:43
+
+Hint: catch this exception as `err` and call `code_typed(err)` to inspect the surrounding code.
+
+Mismatched activity for:   store ptr %148, ptr addrspace(11) %151, align 8, !dbg !265, !tbaa !257, !alias.scope !260, !noalias !267 const val:   %148 = load ptr, ptr addrspace(11) %126, align 8, !dbg !255, !tbaa !257, !alias.scope !260, !noalias !261, !enzyme_type !262, !enzymejl_byref_BITS_VALUE !0, !enzymejl_source_type_Ptr\7BFloat32\7D !0
+ Julia value causing error:  Unknown object of type Ptr{Float32}
+ LLVM view of erring value:     %148 = load ptr, ptr addrspace(11) %126, align 8, !dbg !255, !tbaa !257, !alias.scope !260, !noalias !261, !enzyme_type !262, !enzymejl_byref_BITS_VALUE !0, !enzymejl_source_type_Ptr\7BFloat32\7D !0
+
+Stacktrace:
+ [1] reshape
+   @ .\reshapedarray.jl:50
+ [2] reshape
+   @ .\reshapedarray.jl:133
+ [3] reshape
+   @ .\reshapedarray.jl:132
+ [4] CompactCandidateQ
+   @ C:\Users\fshuu\Documents\tetris\experiments\learning\compact_model.jl:52
+
+Stacktrace:
+ [1] reshape
+   @ .\reshapedarray.jl:50 [inlined]
+ [2] reshape
+   @ .\reshapedarray.jl:133 [inlined]
+ [3] reshape
+   @ .\reshapedarray.jl:132 [inlined]
+ [4] CompactCandidateQ
+   @ C:\Users\fshuu\Documents\tetris\experiments\learning\compact_model.jl:52
+in expression starting at C:\Users\fshuu\Documents\tetris\experiments\ad_backend_retry_2026\check_numerics.jl:14

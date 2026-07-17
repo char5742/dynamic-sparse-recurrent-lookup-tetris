@@ -1,0 +1,8 @@
+enzyme_direct_runtime batch=4 step=1 seconds=63.333330 loss=3.443775177
+enzyme_direct_runtime batch=4 step=2 seconds=0.160932 loss=4.375718594
+enzyme_direct_runtime batch=4 step=3 seconds=0.113968 loss=4.507455349
+enzyme_direct_runtime batch=4 step=4 seconds=0.166127 loss=4.061595917
+enzyme_direct_runtime batch=4 step=5 seconds=0.103923 loss=4.047062874
+enzyme_direct_runtime batch=4 step=10 seconds=0.161977 loss=4.088383675
+enzyme_direct_runtime batch=4 step=100 seconds=0.094806 loss=4.413848400
+wrote C:\Users\fshuu\Documents\tetris\experiments\ad_backend_retry_2026\artifacts\enzyme_direct_runtime_b4_n100.json wall=75.278384 peak=1.442GiB

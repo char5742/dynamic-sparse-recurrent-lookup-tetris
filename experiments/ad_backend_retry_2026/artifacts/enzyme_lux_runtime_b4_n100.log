@@ -1,0 +1,8 @@
+enzyme_lux_runtime batch=4 step=1 seconds=62.742878 loss=3.443775177
+enzyme_lux_runtime batch=4 step=2 seconds=0.456526 loss=4.375718594
+enzyme_lux_runtime batch=4 step=3 seconds=0.100814 loss=4.507455349
+enzyme_lux_runtime batch=4 step=4 seconds=0.123784 loss=4.061595917
+enzyme_lux_runtime batch=4 step=5 seconds=0.130186 loss=4.047062874
+enzyme_lux_runtime batch=4 step=10 seconds=0.134183 loss=4.088383675
+enzyme_lux_runtime batch=4 step=100 seconds=0.102352 loss=4.413848400
+wrote C:\Users\fshuu\Documents\tetris\experiments\ad_backend_retry_2026\artifacts\enzyme_lux_runtime_b4_n100.json wall=74.646871 peak=1.413GiB

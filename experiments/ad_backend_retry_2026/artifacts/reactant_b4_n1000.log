@@ -1,0 +1,10 @@
+reactant batch=4 step=1 seconds=63.945464 barrier=0.080237700 loss=3.443774700
+reactant batch=4 step=2 seconds=0.187909 barrier=0.000014700 loss=3.393188477
+reactant batch=4 step=3 seconds=0.015005 barrier=0.000012200 loss=3.351074696
+reactant batch=4 step=4 seconds=0.015841 barrier=0.000009700 loss=3.310392141
+reactant batch=4 step=5 seconds=0.015626 barrier=0.000009400 loss=3.270672083
+reactant batch=4 step=10 seconds=0.015975 barrier=0.000010000 loss=3.185130835
+reactant batch=4 step=100 seconds=0.016029 barrier=0.000009800 loss=3.127613544
+reactant batch=4 step=500 seconds=0.012800 barrier=0.000009400 loss=3.125927448
+reactant batch=4 step=1000 seconds=0.013700 barrier=0.000010000 loss=3.125912189
+wrote C:\Users\fshuu\Documents\tetris\experiments\ad_backend_retry_2026\artifacts\reactant_b4_n1000.json wall=77.993028 peak=1.651GiB
