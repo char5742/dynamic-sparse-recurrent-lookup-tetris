@@ -20,7 +20,8 @@ The fixed contract is:
 - one temporary NPZ export followed by fresh OpenVINO CPU and NPU+CPU-tail
   compilation and numerical equivalence;
 - hard 25-minute, 8-GiB working-set, 300-second first-specialization and
-  120-second per-update stops, with no retry or tuning.
+  120-second per-update stops, enforced by the external process monitor with
+  no retry or tuning.
 
 `extract_rows.py` uses HDF5 hyperslabs because ordinary JLD2 loading would
 materialize forbidden validation rows 1501--2000.  It touches only the six
@@ -34,3 +35,8 @@ machine memory and constants can be reviewed before the one-shot run starts.
 All generated data and results must be under `D:\tetris-paper-plus`; temporary
 updated weights are explicitly non-promoted and never overwrite the historical
 checkpoint or tracked OpenVINO artifacts.
+
+At the start gate the wrapper atomically creates the canonical marker
+`D:\tetris-paper-plus\runs\legacy_full_feasibility_F.started.json`.  This
+global guard is independent of the chosen output directory, so a failed or
+stopped F execution cannot be retried by selecting a fresh directory.

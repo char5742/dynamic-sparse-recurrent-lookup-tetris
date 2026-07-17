@@ -24,6 +24,7 @@ $Manifest = Join-Path $Repository 'Manifest.toml'
 $FreezePath = Join-Path $OutputDirectory 'freeze.json'
 $MonitorPath = Join-Path $OutputDirectory 'monitor.json'
 $StartedPath = Join-Path $OutputDirectory 'started.json'
+$GlobalStartedPath = 'D:\tetris-paper-plus\runs\legacy_full_feasibility_F.started.json'
 $SubsetPath = Join-Path $OutputDirectory 'subset.npz'
 $SubsetJson = Join-Path $OutputDirectory 'subset.json'
 $JuliaPhase = Join-Path $OutputDirectory 'julia_phase.json'
@@ -42,6 +43,23 @@ function Write-JsonAtomic([string]$Path, $Value, [int]$Depth = 12) {
     $Temporary = "$Path.tmp"
     $Value | ConvertTo-Json -Depth $Depth | Set-Content -LiteralPath $Temporary -Encoding utf8
     Move-Item -LiteralPath $Temporary -Destination $Path -Force
+}
+
+function Write-JsonCreateNew([string]$Path, $Value, [int]$Depth = 12) {
+    $Json = $Value | ConvertTo-Json -Depth $Depth
+    $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
+    $Stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None
+    )
+    try {
+        $Stream.Write($Bytes, 0, $Bytes.Length)
+        $Stream.Flush($true)
+    } finally {
+        $Stream.Dispose()
+    }
 }
 
 function Get-ProcessSnapshot {
@@ -73,6 +91,9 @@ if (Test-Path -LiteralPath $OutputDirectory) {
 }
 if (Test-Path -LiteralPath $StartedPath) {
     throw 'one-shot F guard already exists; retry is prohibited'
+}
+if (Test-Path -LiteralPath $GlobalStartedPath) {
+    throw "global one-shot F guard already exists; retry is prohibited: $GlobalStartedPath"
 }
 if (-not (Test-Path -LiteralPath $SourceFingerprint -PathType Leaf)) {
     throw "missing clean source fingerprint: $SourceFingerprint"
@@ -130,7 +151,7 @@ $Processor = Get-CimInstance Win32_Processor | Select-Object -First 1
 $Computer = Get-CimInstance Win32_ComputerSystem
 $Commands = [ordered]@{
     extract = "`"$SystemPython`" `"$(Join-Path $Experiment 'extract_rows.py')`" `"$Dataset`" `"$SubsetPath`" `"$SubsetJson`""
-    julia = "`"$JuliaExe`" --startup-file=no --project=`"$Repository`" --threads=20 `"$(Join-Path $Experiment 'run_benchmark.jl')`" `"$OutputDirectory`" `"$SubsetPath`" `"$Checkpoint`" `"$FreezePath`""
+    julia = "F_OUTPUT_DIRECTORY=`"$OutputDirectory`" F_SUBSET_PATH=`"$SubsetPath`" F_CHECKPOINT_PATH=`"$Checkpoint`" F_FREEZE_PATH=`"$FreezePath`" `"$JuliaExe`" --startup-file=no --project=`"$Repository`" --threads=20 `"$(Join-Path $Experiment 'run_benchmark.jl')`""
     openvino = "`"$OpenVinoPython`" `"$(Join-Path $Experiment 'verify_openvino.py')`" `"$Repository`" `"$WeightsPath`" `"$ReferencePath`" `"$JuliaPhase`" `"$OpenVinoPhase`""
     finalize = "`"$SystemPython`" `"$(Join-Path $Experiment 'finalize_result.py')`" `"$OutputDirectory`""
 }
@@ -172,6 +193,7 @@ $Freeze = [ordered]@{
         actor_seconds_per_step = 0.411
         actor_refresh_count = 4
         t1000_limit_seconds = 1800
+        global_one_shot_marker = $GlobalStartedPath
     }
     machine = [ordered]@{
         computer_name = $env:COMPUTERNAME
@@ -209,6 +231,14 @@ $GitStatusAtGate = (& git -C $Repository status --porcelain=v1) -join "`n"
 if ($GitStatusAtGate.Length -ne 0 -or ((& git -C $Repository rev-parse HEAD).Trim() -ne $Commit)) {
     throw 'repository changed after freeze and before start gate; F execution refused'
 }
+Write-JsonCreateNew $GlobalStartedPath ([ordered]@{
+    benchmark = 'F legacy full-model continuation feasibility'
+    started_at = (Get-Date).ToString('o')
+    wrapper_pid = $PID
+    source_commit = $Commit
+    output_directory = $OutputDirectory
+    retry_prohibited = $true
+})
 Write-JsonAtomic $StartedPath ([ordered]@{
     started_at = (Get-Date).ToString('o')
     wrapper_pid = $PID
@@ -219,6 +249,10 @@ Write-JsonAtomic $StartedPath ([ordered]@{
 $env:F_BLAS_THREADS = '10'
 $env:OPENBLAS_NUM_THREADS = '10'
 $env:JULIA_NUM_THREADS = '20'
+$env:F_OUTPUT_DIRECTORY = $OutputDirectory
+$env:F_SUBSET_PATH = $SubsetPath
+$env:F_CHECKPOINT_PATH = $Checkpoint
+$env:F_FREEZE_PATH = $FreezePath
 $BenchmarkStarted = Get-Date
 $PeakWorkingSet = [int64]0
 $PeakPrivateBytes = [int64]0
@@ -250,7 +284,24 @@ function Invoke-MonitoredPhase(
         $script:PeakWorkingSet = [Math]::Max($script:PeakWorkingSet, [int64]$Process.WorkingSet64)
         $script:PeakPrivateBytes = [Math]::Max($script:PeakPrivateBytes, [int64]$Process.PrivateMemorySize64)
         $Elapsed = ((Get-Date) - $BenchmarkStarted).TotalSeconds
-        if ($Process.WorkingSet64 -gt $MaxWorkingSetBytes) {
+        $PerCallStop = $null
+        if ($Name -eq 'julia' -and (Test-Path -LiteralPath $JuliaPhase -PathType Leaf)) {
+            try {
+                $StageState = Get-Content -LiteralPath $JuliaPhase -Raw | ConvertFrom-Json
+                $StageElapsed = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0) - [double]$StageState.stage_started_unix
+                if ($StageState.stage -eq 'specialization_running' -and $StageElapsed -ge 300.0) {
+                    $PerCallStop = 'external first-specialization timeout reached 300 seconds'
+                } elseif ($StageState.stage -match '^warm_update_[1-6]_running$' -and $StageElapsed -ge 120.0) {
+                    $PerCallStop = "external $($StageState.stage) timeout reached 120 seconds"
+                }
+            } catch {
+                # Atomic JSON replacement can briefly race path metadata, but a
+                # malformed persistent file will still make the Julia phase fail.
+            }
+        }
+        if ($null -ne $PerCallStop) {
+            $StopReason = $PerCallStop
+        } elseif ($Process.WorkingSet64 -gt $MaxWorkingSetBytes) {
             $StopReason = 'peak working set exceeded 8 GiB'
         } elseif ($Elapsed -ge $HardWallSeconds) {
             $StopReason = 'hard 25-minute wall reached'
@@ -295,8 +346,7 @@ try {
     if ($Ok) {
         $Ok = Invoke-MonitoredPhase 'julia' $JuliaExe @(
             '--startup-file=no', "--project=$Repository", '--threads=20',
-            (Join-Path $Experiment 'run_benchmark.jl'), $OutputDirectory, $SubsetPath,
-            $Checkpoint, $FreezePath
+            (Join-Path $Experiment 'run_benchmark.jl')
         )
     }
     if ($Ok) {

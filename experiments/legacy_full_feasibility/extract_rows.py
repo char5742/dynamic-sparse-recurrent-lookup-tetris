@@ -95,6 +95,31 @@ def main() -> None:
         bootstrap_rows_1 = np.empty((6,), dtype=np.int32)
         bootstrap_actions = np.empty((6,), dtype=np.int16)
         bootstrap_q = np.empty((6,), dtype=np.float32)
+        terminal_mask = np.empty((6, N_STEP), dtype=np.bool_)
+
+        terminal_descriptor = file["terminal"][()]
+        if int(terminal_descriptor["len"]) != 2000:
+            raise RuntimeError("terminal BitVector length mismatch")
+        terminal_chunks = file[terminal_descriptor["chunks"]]
+        terminal_rows = np.asarray(
+            [int(row + offset) for row in base_rows for offset in range(N_STEP)],
+            dtype=np.int64,
+        )
+        packed_indices = np.unique(terminal_rows // 64)
+        packed_values = {
+            int(index): int(value)
+            for index, value in zip(
+                packed_indices, terminal_chunks[packed_indices], strict=True
+            )
+        }
+        for slot, base_row in enumerate(base_rows):
+            for offset in range(N_STEP):
+                row = int(base_row + offset)
+                terminal_mask[slot, offset] = bool(
+                    (packed_values[row // 64] >> (row % 64)) & 1
+                )
+        if np.any(terminal_mask):
+            raise RuntimeError("a preregistered n-step source crosses a terminal row")
 
         for slot, base_row in enumerate(base_rows):
             count = int(counts[slot])
@@ -161,6 +186,7 @@ def main() -> None:
         bootstrap_rows=bootstrap_rows_1,
         bootstrap_actions=bootstrap_actions,
         bootstrap_q=bootstrap_q,
+        terminal_mask=terminal_mask,
         source_rows=np.asarray(SOURCE_ROWS_1, dtype=np.int32),
         episode_ids=np.asarray(EXPECTED_EPISODES, dtype=np.int32),
         seeds=np.asarray(EXPECTED_SEEDS, dtype=np.int32),
@@ -180,8 +206,9 @@ def main() -> None:
         "bootstrap_actions": [int(value) for value in bootstrap_actions],
         "bootstrap_q": [float(value) for value in bootstrap_q],
         "targets": [float(value) for value in targets],
-        "terminal_mask": [False] * 6,
-        "terminal_mask_basis": "same-episode contiguous steps 1--4 exist for every source row",
+        "terminal_mask": terminal_mask.tolist(),
+        "terminal_packed_chunk_indices_zero_based": [int(value) for value in packed_indices],
+        "terminal_mask_basis": "direct bit extraction from JLD2 BitVector packed UInt64 chunks",
         "validation_rows_loaded": False,
         "validation_or_test_seeds_used": False,
     }

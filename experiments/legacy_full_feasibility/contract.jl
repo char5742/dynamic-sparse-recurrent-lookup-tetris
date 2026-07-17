@@ -29,6 +29,8 @@ const HARD_WALL_SECONDS = 25 * 60
 const ACTOR_SECONDS_PER_STEP = 0.411
 const ACTOR_REFRESH_COUNT = 4
 const TARGET_T1000_SECONDS = 1800.0
+const GLOBAL_ONE_SHOT_MARKER =
+    raw"D:\tetris-paper-plus\runs\legacy_full_feasibility_F.started.json"
 
 hex_sha256(path::AbstractString) = bytes2hex(open(sha256, path))
 
@@ -57,6 +59,25 @@ function expected_constants()
         actor_seconds_per_step=ACTOR_SECONDS_PER_STEP,
         actor_refresh_count=ACTOR_REFRESH_COUNT,
         target_t1000_seconds=TARGET_T1000_SECONDS,
+        global_one_shot_marker=GLOBAL_ONE_SHOT_MARKER,
+    )
+end
+
+function resolve_benchmark_paths(args, environment)
+    names = ("F_OUTPUT_DIRECTORY", "F_SUBSET_PATH", "F_CHECKPOINT_PATH", "F_FREEZE_PATH")
+    values = if isempty(args)
+        [get(environment, name, "") for name in names]
+    elseif length(args) == 4
+        collect(args)
+    else
+        error("F benchmark accepts either zero argv paths (environment contract) or exactly four")
+    end
+    all(value -> !isempty(value), values) || error("missing F benchmark path environment variable")
+    return (;
+        output_directory=abspath(values[1]),
+        subset_path=abspath(values[2]),
+        checkpoint_path=abspath(values[3]),
+        freeze_path=abspath(values[4]),
     )
 end
 
@@ -126,6 +147,29 @@ function tree_array_elements(value)
         )
     end
     return 0
+end
+
+function gradient_covers_parameters(parameters, gradient)
+    if parameters isa AbstractArray
+        return gradient isa AbstractArray && size(gradient) == size(parameters)
+    elseif parameters isa NamedTuple
+        gradient isa NamedTuple || return false
+        keys(gradient) == keys(parameters) || return false
+        return all(
+            key -> gradient_covers_parameters(
+                getproperty(parameters, key), getproperty(gradient, key)
+            ),
+            keys(parameters),
+        )
+    elseif parameters isa Tuple
+        gradient isa Tuple || return false
+        length(gradient) == length(parameters) || return false
+        return all(
+            gradient_covers_parameters(parameter, derivative)
+            for (parameter, derivative) in zip(parameters, gradient)
+        )
+    end
+    return gradient !== nothing
 end
 
 function tree_sum_abs2(value)
@@ -199,6 +243,7 @@ export CHECKPOINT_SHA256,
     ACTOR_SECONDS_PER_STEP,
     ACTOR_REFRESH_COUNT,
     TARGET_T1000_SECONDS,
+    GLOBAL_ONE_SHOT_MARKER,
     expected_constants,
     require_hash,
     chunk_ranges,
@@ -206,8 +251,10 @@ export CHECKPOINT_SHA256,
     frozen_nstep_target,
     tree_all_finite,
     tree_array_elements,
+    gradient_covers_parameters,
     tree_sum_abs2,
     tree_max_abs_difference,
-    atomic_write_json
+    atomic_write_json,
+    resolve_benchmark_paths
 
 end

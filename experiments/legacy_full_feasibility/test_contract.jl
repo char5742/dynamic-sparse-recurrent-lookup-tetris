@@ -17,6 +17,18 @@ end
     @test WEIGHT_DECAY === 1.0f-4
     @test LEGACY_PARAMETER_COUNT == 20_787_454
     @test HARD_WALL_SECONDS == 1500
+    @test GLOBAL_ONE_SHOT_MARKER ==
+          raw"D:\tetris-paper-plus\runs\legacy_full_feasibility_F.started.json"
+    environment = Dict(
+        "F_OUTPUT_DIRECTORY" => raw"D:\tetris-paper-plus\runs\f output with spaces",
+        "F_SUBSET_PATH" => raw"D:\tetris-paper-plus\runs\f output with spaces\subset.npz",
+        "F_CHECKPOINT_PATH" => raw"C:\Users\fshuu\Documents\tetris\1313\mainmodel copy 3.jld2",
+        "F_FREEZE_PATH" => raw"D:\tetris-paper-plus\runs\f output with spaces\freeze.json",
+    )
+    paths = resolve_benchmark_paths(String[], environment)
+    @test paths.checkpoint_path == environment["F_CHECKPOINT_PATH"]
+    @test occursin("mainmodel copy 3.jld2", paths.checkpoint_path)
+    @test_throws ErrorException resolve_benchmark_paths(["only-one"], environment)
 end
 
 @testset "historical chunk semantics" begin
@@ -43,4 +55,11 @@ end
     @test !tree_all_finite(bad)
     @test tree_array_elements(good) == 3
     @test tree_sum_abs2(good) == 14.0
+    parameters = (; a=ones(Float32, 2), nested=(; b=ones(Float32, 3)))
+    @test gradient_covers_parameters(
+        parameters, (; a=zeros(Float32, 2), nested=(; b=zeros(Float32, 3)))
+    )
+    @test !gradient_covers_parameters(
+        parameters, (; a=nothing, nested=(; b=zeros(Float32, 3)))
+    )
 end
