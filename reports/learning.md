@@ -113,7 +113,7 @@ pre-registered 300-update gate was top-1 >= C11a's 0.370 and MRR > 0.5272.
 C12 reached top-1 0.346 and MRR 0.5113 (CE 3.7381), failing both gates. The
 temperature sweep was stopped and the checkpoint rejected.
 
-## C13 DAgger pre-registration (execution paused for D0)
+## C13 DAgger round 1
 
 - Hypothesis: C11b fails mainly because its own rollout leaves the old-teacher
   state distribution; labels on student-visited states should reduce this
@@ -130,10 +130,72 @@ temperature sweep was stopped and the checkpoint rejected.
 - Time limit: 15 minutes teacher relabeling plus 5 minutes training. Stop on
   non-finite values, candidate overflow, validation collapse, or another early
   fixed-budget game-over. No further temperature sweep follows failure.
-- Status: source implementation and merge exporter are ready in
-  `experiments/learning/generate_teacher_dataset.jl` and
-  `experiments/learning/merge_teacher_datasets.jl`; **no DAgger rollout has
-  been executed**, per the main-agent D0 measurement hold.
+- Frozen source: commit `0480ad6e20db203ff6673289579bbed68faa82b4`,
+  source SHA-256 `dddb0483effad0140f4f34d8269703e28e0fbbfc605e6f6baf9e7bfdfda295e3`,
+  Manifest SHA-256 `2cfe650387ed772ec41bd9c3f6bba18f8d954b882d2fa3bfcc8cdbe6840c7b09`.
+
+### Realized DAgger data
+
+C11b rollout produced 660 states / 27,060 complete candidate labels. Per-seed
+terminal results were:
+
+| Seed | Pieces | Score |
+|---:|---:|---:|
+| 5742 | 105 | 1,800 |
+| 5743 | 250 | 6,200 |
+| 5744 | 41 | 0 |
+| 5745 | 121 | 1,400 |
+| 5746 | 57 | 600 |
+| 5747 | 86 | 1,100 |
+
+The NPU teacher run took 212.813 s (156.873 s inference, 36.639 s candidate
+generation). DAgger fraction was `660 / (1500 + 660) = 0.3056`, inside the
+pre-registered interpretable 0.15--0.50 range. Artifacts:
+
+- `D:\tetris-paper-plus\datasets\learning\dagger_c13_round1_c11b_5742_5747.jld2`
+  SHA-256 `ea90138cc340766486a9502e1cd9c8df6a3408c6f431028014c35da30443e05a`.
+- Merged 2,660-state dataset (2,160 train + unchanged 500 development):
+  `D:\tetris-paper-plus\datasets\learning\teacher_plus_dagger_c13_round1.jld2`,
+  SHA-256 `4f10cfcf545c97eb3f56e8511921a1a6b50fa5ab166fac2eb3575eacf84b71ba`.
+
+### Preregistered 500-update warm start
+
+One accidentally launched max-3,000 configuration was stopped at update 450,
+before its configured first non-preregistered snapshot, and is excluded from
+promotion. The clean run was re-executed from C11b with exactly the registered
+snapshots 0, 250, and 500:
+
+| Snapshot | Top-1 | MRR | Correlation | CE | Selected |
+|---:|---:|---:|---:|---:|---|
+| 0 | 0.484 | 0.6452 | 0.8513 | 3.4220 | no |
+| 250 | **0.484** | **0.6526** | 0.8491 | 3.4210 | **yes** |
+| 500 | 0.478 | 0.6333 | 0.8556 | 3.4178 | no |
+
+Selection is the preregistered lexicographic key (top-1, MRR, then lower CE),
+so update 250 wins and passes the top-1 >= 0.45 gate. Training wall time was
+60.697 s. Best checkpoint:
+
+`D:\tetris-paper-plus\checkpoints\learning\C13_round1_preregistered500_warm_c11b_best.jld2`
+
+SHA-256 `1273b55b7616f912a3120718f77770af39c489f7fbe51052f4810d8a03291270`.
+Its embedded metadata binds the source, merged dataset, C11b initializer,
+complete command/config, and update-250 metrics.
+
+### One-time paired 50-piece smoke
+
+Development seed 5751 was used once, with NEXT=5, one logical call per
+decision, no lookahead, and the same stable candidate generator.
+
+| Agent | Completed | Score | Candidates | Logical / physical calls | Inference | Wall |
+|---|---:|---:|---:|---:|---:|---:|
+| C13 update 250 | 50/50 | 1,100 | 2,051 | 50 / 50 | 0.477 s | 9.352 s |
+| Old 1313 OpenVINO NPU | 50/50 | 2,300 | 2,151 | 50 / 165 | 13.191 s | 24.855 s |
+
+Both survived, therefore the result is **C13-survival-pass**. The paired score
+difference is -1,200, so this is not a strength improvement and not evidence of
+beating the old model. Candidate and baseline run hashes are respectively
+`8772162009abbf481a6e00e747a47b76975d6632f8f90864b744953ff7cddbd9` and
+`367efbc59717c78eb063f5dca51d95cde991a67ee8e2aa91c434fcda6ba87cdb`.
 
 All summaries are appended to `experiments/learning/ledger.jsonl`. Sealed test
 seeds remain unused.

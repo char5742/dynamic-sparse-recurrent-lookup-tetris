@@ -23,6 +23,31 @@ scores never count as G2 evidence. `1313/` is input-only and ignored by Git.
 | E015 | Raising compact ListNet learning rate from 3e-4 to 1e-3 improves old-teacher imitation at the same 300 updates | All offline ranking metrics exceed E013 on the identical split/schedule | 2 min | top-1 .370 vs .222, MRR .527 vs .366, correlation .657 vs .488, CE 3.618 vs 3.776; 46.2 s wall | Adopt 1e-3; reject 3e-4 |
 | E016 | Extending the winning compact student to 3,000 updates produces a viable no-lookahead game policy | Offline ranking improves and a dataset-unused development game remains stable | 5 min | Offline improved to top-1 .484, MRR .645, correlation .851, CE 3.422 in 223.6 s, but seed5750 ended after 34/50 pieces at score 0 (old score at 50 pieces: 2,100) | Reject checkpoint as a game/model candidate; pure on-teacher-trajectory distillation suffers compounding distribution shift despite strong offline metrics |
 | E017 | Sharpening the teacher softmax from T=1.0 to T=0.25 fixes top-action imitation quickly | At 300 updates, top-1 >= .370 and MRR > .527 | 2 min | top-1 .346, MRR .511, CE 3.738, all below T=1.0 reference | Reject and stop temperature sweep; next learning mechanism is DAgger after evaluation freeze |
+| E018 | One DAgger round on C11b-visited states repairs the compact policy's early covariate-shift failure | Original-development top-1 >= .45, then both C13 and canonical old baseline complete the one-time seed5751/50-piece smoke | 25 min total | 660 DAgger states / 27,060 labels (30.6% of 2,160-row train aggregate). Preregistered snapshots: update0 top-1/MRR .484/.645; update250 .484/.653; update500 .478/.633. Update250 selected. Seed5751: C13 completed 50, score1,100; old completed50, score2,300; difference -1,200 | **C13-survival-pass only.** Covariate-shift survival gate passed, but score did not improve. Freeze update250 for the separately preregistered three-seed development strength screen; no G2/model-improvement claim. A mistakenly configured max3,000 run was stopped at update450 and excluded before the valid max500 rerun |
+
+## E018 provenance and replay
+
+- Git commit: `0480ad6e20db203ff6673289579bbed68faa82b4`
+- Source SHA-256: `dddb0483effad0140f4f34d8269703e28e0fbbfc605e6f6baf9e7bfdfda295e3`
+- Manifest SHA-256: `2cfe650387ed772ec41bd9c3f6bba18f8d954b882d2fa3bfcc8cdbe6840c7b09`
+- DAgger dataset: `D:\tetris-paper-plus\datasets\learning\dagger_c13_round1_c11b_5742_5747.jld2`, SHA-256 `ea90138cc340766486a9502e1cd9c8df6a3408c6f431028014c35da30443e05a`
+- Aggregate dataset: `D:\tetris-paper-plus\datasets\learning\teacher_plus_dagger_c13_round1.jld2`, SHA-256 `4f10cfcf545c97eb3f56e8511921a1a6b50fa5ab166fac2eb3575eacf84b71ba`
+- Selected update250 checkpoint: `D:\tetris-paper-plus\checkpoints\learning\C13_round1_preregistered500_warm_c11b_best.jld2`, SHA-256 `1273b55b7616f912a3120718f77770af39c489f7fbe51052f4810d8a03291270`
+- Candidate smoke JSON: `D:\tetris-paper-plus\runs\learning\compact_eval_seed5751_next5_steps50.json`, SHA-256 `8772162009abbf481a6e00e747a47b76975d6632f8f90864b744953ff7cddbd9`
+- Baseline smoke JSON: `runs/openvino_checkpoint_npu_seed5751_next5_steps50.json`, SHA-256 `367efbc59717c78eb063f5dca51d95cde991a67ee8e2aa91c434fcda6ba87cdb`
+
+Exact complete commands and configuration are embedded in the DAgger dataset,
+aggregate dataset, training checkpoint, and adjacent JSON summaries. Minimal
+replay commands, after setting the same `SOURCE_FINGERPRINT_PATH` and
+`EXPERIMENT_COMMAND`, are:
+
+```powershell
+julia --project=. --threads=20 experiments\learning\generate_teacher_dataset.jl
+julia --project=. experiments\learning\merge_teacher_datasets.jl
+julia --project=. --threads=20 experiments\learning\train_distillation.jl
+$env:COMPACT_EVAL_SEEDS='5751'; $env:COMPACT_EVAL_STEPS='50'; julia --project=. --threads=20 scripts\evaluate_compact_checkpoint.jl
+$env:LEGACY_EVAL_SEED='5751'; $env:LEGACY_EVAL_STEPS='50'; $env:OPENVINO_DEVICE='NPU'; julia --project=. --threads=20 scripts\evaluate_openvino_checkpoint.jl
+```
 
 ## Required record for new experiments
 
