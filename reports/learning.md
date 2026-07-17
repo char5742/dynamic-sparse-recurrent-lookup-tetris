@@ -199,3 +199,43 @@ beating the old model. Candidate and baseline run hashes are respectively
 
 All summaries are appended to `experiments/learning/ledger.jsonl`. Sealed test
 seeds remain unused.
+
+## C13 frozen three-seed strength screen
+
+The one-time development screen was frozen before execution in
+`D:\tetris-paper-plus\runs\c13_strength_screen_freeze_b6e8caa.json`
+(SHA-256 `5c7f01976b01d8dd938f22f454bc026692317c8bd6a76de3cb3dc8f4f4898126`).
+It binds commit `b6e8caa`, source SHA-256
+`b383aa1318fa38207e6e8289894926abe88dd2f6ef0e0563ea22c22238d1bbb2`,
+both checkpoint fingerprints, seeds 5752--5754, NEXT=5, HOLD, stable candidate
+order, no lookahead, one logical network call per decision, and a 100-piece
+limit. All six output paths were confirmed absent before execution and were
+guarded against overwrite.
+
+| Seed | C13 score / pieces | Old score / pieces | Paired difference | C13 inference / wall | Old inference / wall |
+|---:|---:|---:|---:|---:|---:|
+| 5752 | 1,900 / 100 | 6,200 / 100 | -4,300 | 0.748 / 15.153 s | 25.796 / 40.866 s |
+| 5753 | 1,100 / 100 | 5,100 / 100 | -4,000 | 0.798 / 14.984 s | 25.490 / 41.133 s |
+| 5754 | 2,800 / 100 | 5,800 / 100 | -3,000 | 0.771 / 15.095 s | 25.615 / 41.499 s |
+
+Candidate mean/median were 1,933.3 / 1,900 versus old-model 5,700 / 5,800.
+The paired mean/median differences were -3,766.7 / -4,000, zero of three
+differences were nonnegative, and both completion rates were 1.0. Completion
+non-regression therefore passed, but the three required strength criteria all
+failed. The frozen decision is **C13-strength-screen-FAIL**: do not promote C13,
+do not call it a model improvement, and do not expose sealed validation or test
+seeds. The next learning branch must use a stronger target or objective.
+
+The candidate was much faster in this fixed budget (mean model inference
+0.772 s versus 25.634 s for the OpenVINO/NPU old model), but this systems result
+does not offset the strength failure. The machine-readable result is
+`D:\tetris-paper-plus\runs\c13_strength_screen_results_b6e8caa.json`, SHA-256
+`8d23fa09f8aefd23bade8a600def2a68351b934f9abf2c34bdb550a5925fac5c`.
+It includes all six artifact hashes and checkpoint fingerprints.
+
+Two launcher anomalies are retained in that result. The first seed5752
+foreground command wrapper timed out during Julia startup with no JSON and no
+surviving process, so it was not a scientific trial. The detached launch then
+created the sole completed candidate JSON; a subsequent guarded invocation
+refused to run because the output already existed. No game or training run was
+started after the frozen six outputs completed.
