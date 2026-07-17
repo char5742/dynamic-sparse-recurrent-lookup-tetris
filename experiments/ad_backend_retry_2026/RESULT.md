@@ -66,8 +66,11 @@ Native Enzyme's losses started
 `3.443775, 4.375719, 4.507455, 4.061596, 4.047063` and ended at `4.413848`
 after 100 updates; Zygote descended to `3.127614` at update 100. Lux's cached
 AutoEnzyme runtime path produced exactly the same 100 losses as the direct
-path. Lux zeroes the cached shadow recursively in place, so stale shadow
-accumulation does not explain the divergence.
+path. Inspection of the pinned Lux extension does not establish that its
+cached derivative buffer is explicitly zeroed before every repeated call, so
+the earlier stronger claim about Lux's cache was removed. This ambiguity does
+not rescue native Enzyme: the direct path explicitly zeroes its preallocated
+shadow before every call and independently reproduces the divergent trajectory.
 
 ## Timing and memory at the historical shape
 
@@ -167,3 +170,29 @@ Primary technical references:
 
 Raw logs, complete per-update timings/allocations, full parameter vectors,
 machine summary, and failure ledger are in this directory and `artifacts/`.
+
+## Clean independent rerun
+
+A fresh-process rerun later on 2026-07-18 reproduced the split verdict without
+touching any game, production checkpoint outcome, validation row, or evaluation
+seed. The rerun files are under `D:\tetris-paper-plus\runs`:
+
+| file | SHA-256 |
+|---|---|
+| `ad_recheck_native_numerics_b4.json` | `9f604f0272dc3db82cd580f2ed184616df2c7a5890da715e5963fee5cbfb497c` |
+| `ad_recheck_zygote_b4_n100.json` | `dbae89f0f14413ff18a70219cb1f3a58a78c90ea845bbb5aa3d3dd25cba9e27e` |
+| `ad_recheck_enzyme_direct_runtime_b4_n100.json` | `9b3e081648e0d23cb497bf127a610218212742c286b44cf958062691eb11a533` |
+| `ad_recheck_reactant_b4_n1000.json` | `18e02dadb31477773a3ff7fd5a59e724c3f258be6eeb869655d4652b5329634d` |
+| `ad_recheck_zygote_b4_n1000.json` | `68b86ab24bf3391a663a404b92c4a82e17c1983c6b20438dddfd8d9db7ade97e` |
+
+The initial gradient comparison again gave cosine
+`0.999999999990`, maximum absolute error `2.30e-6`, and one-update
+parameter maximum error `9.42e-4`. Native Zygote reached loss `3.127614` at
+update 100 with a 63.25 ms warm median and 48.47 MB median allocation; direct
+runtime-activity Enzyme instead reached `4.413848`, with a 113.95 ms warm
+median and 56.58 MB. In the fixed-shape 1,000-update comparison, Zygote took
+95.750 s and Reactant + EnzymeMLIR took 82.575 s; the cumulative traces crossed
+and stayed crossed at update 761. Reactant retained one compiled thunk, ended
+within `2.86e-6` loss of Zygote, and its final parameters had cosine
+`0.9999995295` versus Zygote. These are independent reproductions, not new
+universal crossover claims.
