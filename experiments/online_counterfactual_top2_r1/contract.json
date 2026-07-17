@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "experiment_id": "online_counterfactual_top2_R1",
+  "scientific_role": "frozen-old online counterfactual top-2 safety gate; system candidate only",
+  "authorized_base_commit": "9b2f974d3f5950e4084dc27d546fffc25a736c90",
+  "authorized_implementation_parent_commit": "ca0af2af8aa041147658fa4f494d1f26a5dc86a7",
+  "immutable_inputs": {
+    "old_checkpoint_sha256": "7b0f78edd0867d468c376f1b5375bb9a4d2195fa0fa5f76f94924723b26adfc1",
+    "old_openvino_weight_npz_sha256": "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba"
+  },
+  "canonical_policy": {
+    "next_count": 5,
+    "hold": true,
+    "candidate_order": "stable_node_key",
+    "candidate_chunk": 16,
+    "tail_semantics": "actual tail candidate count",
+    "tie_break": "first in stable canonical order",
+    "piece_limit": 250,
+    "allowed_actions": ["old_top1", "old_top2"],
+    "fallback_action": "old_top1",
+    "deploy_lookahead": 0
+  },
+  "openvino_backend": {
+    "version": "2026.2.1",
+    "weight_format": "NPZ",
+    "weight_sha256": "2ee741ebef7b7c0c5cbc0f86492e8b8d935989af149bff467a3ba8ca633375ba",
+    "input_dtype": "Float32",
+    "output_dtype": "Float32",
+    "weight_dtype": "Float32",
+    "npu_internal_precision": "selected by OpenVINO",
+    "complete_chunk": {
+      "device": "NPU",
+      "batch_size": 16,
+      "shape": "static",
+      "eligible_candidate_count": 16
+    },
+    "tail_chunk": {
+      "device": "CPU",
+      "shape": "dynamic",
+      "batch_semantics": "actual candidate count",
+      "minimum_candidate_count": 1,
+      "maximum_candidate_count": 15,
+      "padding": false
+    }
+  },
+  "analytic_runtime": {
+    "production_backend": "Python NumPy analytic ridge",
+    "python_version": "3.12.13",
+    "numpy_version": "2.4.6",
+    "base_python_sha256": "3c6a206b7d93cca823934a83732220dcffd413fd1036d9fb82eebb64599cf7f3",
+    "venv_launcher_sha256": "5912d0884b23c0343983a864c6064242391e2265536f50b88624857e353882c9",
+    "blas_threads": 1,
+    "thread_environment": {
+      "OPENBLAS_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1"
+    },
+    "julia_role": "independent numeric reference only"
+  },
+  "data_roles": {
+    "training_seeds": [73001, 73002, 73003, 73004, 73005, 73006, 73007, 73008, 73009, 73010, 73011, 73012],
+    "calibration_seeds": [73101, 73102, 73103, 73104, 73105, 73106],
+    "sample_pieces": [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240],
+    "minimum_training_states": 240,
+    "minimum_calibration_states": 120,
+    "forbidden_development_seeds": [5742, 5743, 5744, 5745, 5746, 5747, 5748, 5749, 5750, 5751, 5752, 5753, 5754, 5755],
+    "conditional_development_seeds": [5756, 5757],
+    "forbidden_validation_seeds": [8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008],
+    "forbidden_sealed_test_first": 91001,
+    "forbidden_sealed_test_last": 91032
+  },
+  "counterfactual": {
+    "horizon_pieces": 6,
+    "root_included": true,
+    "gamma": 0.997,
+    "reward_scale": 600.0,
+    "bootstrap": "gamma^6 * max canonical old-Q(s6)",
+    "terminal_bootstrap": 0.0,
+    "advantage": "G6(old_top2)-G6(old_top1)",
+    "fit_target_clip": [-2.0, 2.0],
+    "post_root_policy": "canonical old policy",
+    "branch_requirement": "independent state and RNG copies with identical future-piece/RNG digest",
+    "trajectory_writeback": false
+  },
+  "feature_schema": {
+    "version": "r1-fixed-70-v1",
+    "delta_direction": "old_top2-minus-old_top1",
+    "standardization": "training mean/std only; constant features become zero",
+    "nonfinite_policy": "fallback old_top1 and mark row ineligible",
+    "piece_ids": ["I", "O", "S", "Z", "J", "L", "T"],
+    "piece_slots": ["hold", "next1", "next2", "next3", "next4", "next5"],
+    "names": [
+      "old_q_top1_raw", "old_q_top2_raw", "old_q_gap_top1_minus_top2",
+      "old_q_top1_within_state_z", "old_q_top2_within_state_z", "old_q_gap_within_state_z",
+      "valid_action_count",
+      "delta_immediate_score", "delta_cleared_lines", "delta_holes", "delta_covered_cells",
+      "delta_aggregate_height", "delta_max_height", "delta_bumpiness", "delta_well_sum",
+      "delta_row_transitions", "delta_column_transitions", "delta_ren", "delta_b2b", "delta_tspin",
+      "current_holes", "current_covered_cells", "current_aggregate_height", "current_max_height",
+      "current_bumpiness", "current_well_sum", "current_row_transitions", "current_column_transitions",
+      "hold_I", "hold_O", "hold_S", "hold_Z", "hold_J", "hold_L", "hold_T",
+      "next1_I", "next1_O", "next1_S", "next1_Z", "next1_J", "next1_L", "next1_T",
+      "next2_I", "next2_O", "next2_S", "next2_Z", "next2_J", "next2_L", "next2_T",
+      "next3_I", "next3_O", "next3_S", "next3_Z", "next3_J", "next3_L", "next3_T",
+      "next4_I", "next4_O", "next4_S", "next4_Z", "next4_J", "next4_L", "next4_T",
+      "next5_I", "next5_O", "next5_S", "next5_Z", "next5_J", "next5_L", "next5_T"
+    ],
+    "feature_count": 70,
+    "feature_names_sha256": "7e89c16b57dcebac56e3ab4c5be161d5e5430c682e60f3b565dd23ab3b04ac44",
+    "fit_intercept": true,
+    "coefficient_count": 71,
+    "maximum_coefficient_count": 99
+  },
+  "fit": {
+    "method": "episode-cluster bootstrap analytic ridge",
+    "ridge_lambda": 1.0,
+    "ensemble_count": 256,
+    "bootstrap_rng": "Xoshiro(0x5231_2026)",
+    "bootstrap_seed_uint64": 1378951206,
+    "prediction_lower_quantile": 0.1,
+    "override_strict_threshold": 0.05,
+    "sweep_authorized": false
+  },
+  "training_gate": {
+    "positive_fraction_min": 0.02,
+    "positive_fraction_max": 0.40
+  },
+  "calibration_gate": {
+    "override_fraction_min": 0.01,
+    "override_fraction_max": 0.15,
+    "minimum_override_states": 12,
+    "minimum_episodes_with_override": 4,
+    "precision_min": 0.70,
+    "precision_lower_bound_strict_min": 0.50,
+    "mean_unclipped_advantage_min": 0.10,
+    "mean_advantage_lower_bound_strict_min": 0.0,
+    "cluster_bootstrap_count": 2000,
+    "cluster_bootstrap_rng": "Xoshiro(0x5231_73106)",
+    "cluster_bootstrap_seed_uint64": 22063558918,
+    "forbid_top2_terminal_when_top1_survives": true,
+    "decision_median_overhead_ms_max": 0.10
+  },
+  "resource_limits": {
+    "data_process_tree_private_bytes_max": 4294967296,
+    "data_process_tree_working_set_bytes_max": 2147483648,
+    "fit_process_tree_private_bytes_max": 1073741824,
+    "first_32_projection_seconds_max": 3300,
+    "data_fit_calibration_wall_seconds_max": 3900,
+    "including_conditional_development_wall_seconds_max": 4800,
+    "telemetry_interval_ms": 200
+  },
+  "claims": {
+    "model_improvement": false,
+    "game_strength_evidence_before_development": false,
+    "validation_authorized": false,
+    "sealed_test_authorized": false,
+    "retry_authorized": false,
+    "rescue_authorized": false
+  }
+}
