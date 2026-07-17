@@ -36,8 +36,15 @@ function main()
                 loss
             end
         else
+            snapshot = step == 1 ? primal_snapshot(parameters, problem) : nothing
             @timed begin
                 gradient, loss = direct_enzyme_gradient!(shadow, problem, parameters, BACKEND)
+                if step == 1
+                    mutation = primal_mutation_report(snapshot, parameters, problem)
+                    mutation.unchanged || error(
+                        "invalid standalone Enzyme path: gradient call mutated primal inputs: $mutation"
+                    )
+                end
                 Optimisers.update!(optimizer_state, parameters, gradient)
                 loss
             end
@@ -87,6 +94,7 @@ function main()
             parameters="Duplicated with one preallocated/reused shadow",
             shadow_zeroed_before_each_update=true,
             objective_model_state_batch="Const",
+            primal_input_mutation_guard=true,
             separate_loss_forward=false,
             split_tape=false,
         ),
@@ -112,4 +120,3 @@ function main()
 end
 
 main()
-

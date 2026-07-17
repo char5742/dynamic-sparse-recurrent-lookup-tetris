@@ -2,10 +2,11 @@ include(joinpath(@__DIR__, "common.jl"))
 
 const STATE_BATCH = parse(Int, get(ENV, "AD_BLIND_STATE_BATCH", "4"))
 const BLAS_THREADS = parse(Int, get(ENV, "AD_BLIND_BLAS_THREADS", "10"))
+const NUMERICS_MODE = Symbol(get(ENV, "AD_BLIND_NUMERICS_MODE", "enzyme_runtime"))
 const OUTPUT = get(
     ENV,
     "AD_BLIND_OUTPUT",
-    joinpath(BLIND_OUTPUT_ROOT, "numerics_b$(STATE_BATCH).json"),
+    joinpath(BLIND_OUTPUT_ROOT, "numerics_$(NUMERICS_MODE)_b$(STATE_BATCH).json"),
 )
 BLAS.set_num_threads(BLAS_THREADS)
 
@@ -48,41 +49,34 @@ function one_update(problem, gradient)
     return parameters
 end
 
+function isolated_enzyme_probe(backend, zygote_gradient, zygote_loss)
+    problem = load_fixed_problem(STATE_BATCH)
+    parameters = deepcopy(problem.parameters)
+    snapshot = primal_snapshot(parameters, problem)
+    shadow = Enzyme.make_zero(parameters)
+    try
+        gradient, loss = direct_enzyme_gradient!(shadow, problem, parameters, backend)
+        mutation = primal_mutation_report(snapshot, parameters, problem)
+        return (;
+            status=mutation.unchanged ? "completed" : "invalid_primal_mutation",
+            loss,
+            loss_absolute_error=abs(loss - zygote_loss),
+            gradient=gradient_diagnostics(zygote_gradient, gradient),
+            primal_mutation=mutation,
+            one_update_parameters=mutation.unchanged ? numerical_comparison(
+                one_update(problem, zygote_gradient), one_update(problem, gradient)
+            ) : nothing,
+        )
+    catch exception
+        return (; status="failed", error=sprint(showerror, exception))
+    end
+end
+
 problem = load_fixed_problem(STATE_BATCH)
 zygote_gradient, zygote_loss = native_zygote_gradient(problem, problem.parameters)
-enzyme_runtime = Enzyme.make_zero(problem.parameters)
-runtime_gradient, runtime_loss = direct_enzyme_gradient!(
-    enzyme_runtime, problem, problem.parameters, :enzyme_runtime
-)
-enzyme_strongzero = Enzyme.make_zero(problem.parameters)
-strongzero_result = try
-    strongzero_gradient, strongzero_loss = direct_enzyme_gradient!(
-        enzyme_strongzero, problem, problem.parameters, :enzyme_runtime_strongzero
-    )
-    (;
-        status="completed",
-        loss=strongzero_loss,
-        gradient=gradient_diagnostics(zygote_gradient, strongzero_gradient),
-        one_update_parameters=numerical_comparison(
-            one_update(problem, zygote_gradient), one_update(problem, strongzero_gradient)
-        ),
-    )
-catch exception
-    (; status="failed", error=sprint(showerror, exception))
-end
-static_result = try
-    static_shadow = Enzyme.make_zero(problem.parameters)
-    static_gradient, static_loss = direct_enzyme_gradient!(
-        static_shadow, problem, problem.parameters, :enzyme_static
-    )
-    (;
-        status="completed",
-        loss=static_loss,
-        gradient=gradient_diagnostics(zygote_gradient, static_gradient),
-    )
-catch exception
-    (; status="failed", error=sprint(showerror, exception))
-end
+NUMERICS_MODE in (:enzyme_runtime, :enzyme_runtime_strongzero, :enzyme_static) ||
+    error("unsupported isolated numerics mode $NUMERICS_MODE")
+enzyme_result = isolated_enzyme_probe(NUMERICS_MODE, zygote_gradient, zygote_loss)
 
 document = (;
     status="completed",
@@ -93,17 +87,9 @@ document = (;
     workload=input_provenance(problem),
     source=blind_source_provenance(),
     zygote_loss,
-    runtime=(;
-        loss=runtime_loss,
-        loss_absolute_error=abs(runtime_loss - zygote_loss),
-        gradient=gradient_diagnostics(zygote_gradient, runtime_gradient),
-        one_update_parameters=numerical_comparison(
-            one_update(problem, zygote_gradient), one_update(problem, runtime_gradient)
-        ),
-    ),
-    strongzero=strongzero_result,
-    static=static_result,
+    isolation="one Enzyme mode per fresh process, fresh problem, and primal mutation check",
+    mode=String(NUMERICS_MODE),
+    enzyme=enzyme_result,
 )
 write_json(OUTPUT, document)
 println(JSON3.pretty(document))
-

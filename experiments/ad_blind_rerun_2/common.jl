@@ -65,3 +65,41 @@ function optimizer_description()
         included_in_timed_update=true,
     )
 end
+
+function primal_content_comparison(reference, candidate)
+    ref = Float64.(flat_parameters(reference))
+    cand = Float64.(flat_parameters(candidate))
+    length(ref) == length(cand) || return (;
+        equal=false,
+        reference_length=length(ref),
+        candidate_length=length(cand),
+        maximum_absolute_error=Inf,
+    )
+    delta = cand .- ref
+    return (;
+        equal=isequal(ref, cand),
+        reference_length=length(ref),
+        candidate_length=length(cand),
+        maximum_absolute_error=maximum(abs, delta; init=0.0),
+    )
+end
+
+function primal_snapshot(parameters, problem)
+    return (;
+        parameters=deepcopy(parameters),
+        state=deepcopy(problem.state),
+        batch=deepcopy(problem.batch),
+    )
+end
+
+function primal_mutation_report(snapshot, parameters, problem)
+    parameters_report = primal_content_comparison(snapshot.parameters, parameters)
+    state_report = primal_content_comparison(snapshot.state, problem.state)
+    batch_report = primal_content_comparison(snapshot.batch, problem.batch)
+    return (;
+        unchanged=parameters_report.equal && state_report.equal && batch_report.equal,
+        parameters=parameters_report,
+        state=state_report,
+        batch=batch_report,
+    )
+end

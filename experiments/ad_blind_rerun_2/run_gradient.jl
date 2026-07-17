@@ -20,14 +20,33 @@ function main()
     allocations = Int[]
     gc_times = Float64[]
     losses = Float64[]
+    enzyme_reference_loss = nothing
 
     for call in 1:CALLS
+        snapshot = BACKEND === :enzyme_runtime && call == 1 ?
+                   primal_snapshot(parameters, problem) : nothing
         measurement = if BACKEND === :zygote
             @timed native_zygote_gradient(problem, parameters)
         else
             @timed direct_enzyme_gradient!(shadow, problem, parameters, BACKEND)
         end
         gradient, loss = measurement.value
+        if snapshot !== nothing
+            mutation = primal_mutation_report(snapshot, parameters, problem)
+            mutation.unchanged || error(
+                "invalid standalone Enzyme gradient: call mutated primal inputs: $mutation"
+            )
+        end
+        if BACKEND === :enzyme_runtime
+            if enzyme_reference_loss === nothing
+                enzyme_reference_loss = loss
+            elseif !isequal(loss, enzyme_reference_loss)
+                error(
+                    "invalid standalone Enzyme gradient: fixed-input loss drifted from " *
+                    "$(enzyme_reference_loss) to $(loss) at call $call"
+                )
+            end
+        end
         finite_tree(gradient) || error("non-finite gradient at call $call")
         push!(times, measurement.time)
         push!(allocations, measurement.bytes)
