@@ -94,6 +94,7 @@ function main()
     seeds = parse.(Int, split(get(ENV, "COMPACT_EVAL_SEEDS", "5742"), ','))
     max_steps = parse(Int, get(ENV, "COMPACT_EVAL_STEPS", string(PAPER_EPISODE_STEPS)))
     next_count = parse(Int, get(ENV, "COMPACT_EVAL_NEXT", "5"))
+    checkpoint_fingerprint = checkpoint_file_fingerprint(checkpoint_path)
     checkpoint = load_compact_checkpoint(checkpoint_path)
     compile_seconds = @elapsed begin
         # Compile on a real candidate set but do not advance the scored episode.
@@ -111,6 +112,7 @@ function main()
         timestamp=string(now()),
         experiment="compact_model_fixed_budget_evaluation",
         checkpoint_path,
+        checkpoint_fingerprint,
         julia_version=string(VERSION),
         lux_version=string(Base.pkgversion(Lux)),
         backend="Lux native",

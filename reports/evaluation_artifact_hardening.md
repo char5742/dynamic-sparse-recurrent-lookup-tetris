@@ -37,12 +37,22 @@ behavior.
 
 ## Verification
 
-`julia --project=. --threads=4 test\\runtests.jl` passed all 46 tests:
+`julia --project=. --threads=4 test\\runtests.jl` passed all 48 tests:
 
 - engine/RNG replay: 6/6
 - freeze/export/G2 validation: 25/25
-- artifact accounting and collision-resistant names: 15/15
+- artifact accounting, checkpoint identity, and collision-resistant names: 17/17
 
 The artifact tests cover candidate counts 0, 1, 16, 17, 32, and 33 at batch 16,
 invalid inputs, exact expected filenames, and filename inequality at 50 versus
 250 steps. No game evaluation or model inference was run.
+
+## Checkpoint identity follow-up
+
+An audit found that evaluator JSON identified checkpoints only by path. Both
+evaluators now retain their legacy `checkpoint` or `checkpoint_path` key and also
+record a `checkpoint_fingerprint` object containing the normalized absolute path,
+file size in bytes, and lowercase SHA-256 digest. The fingerprint is computed
+before loading/compiling the evaluated checkpoint. A three-byte `abc` fixture
+checks all three fields against its known SHA-256; a missing checkpoint is also
+rejected. Existing evaluation JSON files were not opened or changed.

@@ -1,3 +1,15 @@
+using SHA
+
+function checkpoint_file_fingerprint(path::AbstractString)
+    absolute_path = normpath(abspath(path))
+    isfile(absolute_path) || error("checkpoint does not exist: $absolute_path")
+    return (;
+        absolute_path,
+        bytes=filesize(absolute_path),
+        sha256=bytes2hex(open(sha256, absolute_path)),
+    )
+end
+
 function chunked_backend_requests(candidate_count::Integer, batch_size::Integer)
     candidate_count >= 0 || throw(ArgumentError("candidate_count must be nonnegative"))
     batch_size > 0 || throw(ArgumentError("batch_size must be positive"))

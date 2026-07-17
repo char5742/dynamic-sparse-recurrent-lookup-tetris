@@ -1,6 +1,19 @@
 include(joinpath(ROOT, "scripts", "evaluation_artifact_helpers.jl"))
 
 @testset "evaluation artifact accounting and names" begin
+    mktempdir() do directory
+        checkpoint_path = joinpath(directory, "checkpoint.bin")
+        write(checkpoint_path, "abc")
+        @test checkpoint_file_fingerprint(checkpoint_path) == (;
+            absolute_path=normpath(abspath(checkpoint_path)),
+            bytes=3,
+            sha256="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+        @test_throws ErrorException checkpoint_file_fingerprint(
+            joinpath(directory, "missing.bin")
+        )
+    end
+
     @test chunked_backend_requests(0, 16) == 0
     @test chunked_backend_requests(1, 16) == 1
     @test chunked_backend_requests(16, 16) == 1

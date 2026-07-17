@@ -99,6 +99,10 @@ function openvino_main()
     sys = pyimport("sys")
     sys.path.insert(0, joinpath(ROOT, "tools"))
     legacy_openvino = pyimport("legacy_openvino")
+    checkpoint_path = normpath(
+        abspath(joinpath(ROOT, "1313", "mainmodel copy 3.jld2"))
+    )
+    checkpoint_fingerprint = checkpoint_file_fingerprint(checkpoint_path)
     device = get(ENV, "OPENVINO_DEVICE", "NPU")
     batch_size = parse(Int, get(ENV, "OPENVINO_BATCH", "16"))
     @info "Compiling OpenVINO legacy policy" device batch_size
@@ -126,7 +130,8 @@ function openvino_main()
             io,
             (;
                 timestamp=string(now()),
-                checkpoint=joinpath(ROOT, "1313", "mainmodel copy 3.jld2"),
+                checkpoint=checkpoint_path,
+                checkpoint_fingerprint,
                 julia_version=string(VERSION),
                 lux_version=string(Base.pkgversion(Lux)),
                 openvino_version=pyconvert(String, pyimport("openvino").__version__),
