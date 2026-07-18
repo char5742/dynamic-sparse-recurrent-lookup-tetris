@@ -331,8 +331,11 @@ function manifest_counts(manifest)
         candidate_total += Int(part.candidate_total)
     end
     counts["states.total"] = sum(
-        value for (key, value) in counts if startswith(key, "states.") &&
-        count(==('.'), key) == 1
+        (
+            value for (key, value) in counts if startswith(key, "states.") &&
+            count(==('.'), key) == 1
+        );
+        init=0,
     )
     counts["episodes.total"] = length(manifest.parts)
     counts["candidates.total"] = candidate_total
