@@ -332,7 +332,7 @@ end
 function main()
     dataset_path = abspath(get(
         ENV, "BEAT_TEACHER_DATASET",
-        raw"D:\tetris-paper-plus\datasets\learning\teacher_plus_dagger_c13_round1.jld2",
+        raw"D:\tetris-paper-plus\datasets\beat_first_v1\teacher_v2",
     ))
     run_root = abspath(get(
         ENV, "BEAT_RUN_ROOT", raw"D:\tetris-paper-plus\runs\beat_first_v1",
@@ -347,7 +347,7 @@ function main()
     variant in CONVERGENCE_VARIANTS || error(
         "BEAT_VARIANT must be one of $(CONVERGENCE_VARIANTS); got $variant",
     )
-    state_batch = parse(Int, get(ENV, "BEAT_STATE_BATCH", "2"))
+    state_batch = parse(Int, get(ENV, "BEAT_STATE_BATCH", "4"))
     n_quantiles = parse(Int, get(ENV, "BEAT_N_QUANTILES", "16"))
     learning_rate = parse(Float32, get(ENV, "BEAT_LEARNING_RATE", "3e-4"))
     weight_decay = parse(Float32, get(ENV, "BEAT_WEIGHT_DECAY", "1e-4"))
@@ -357,8 +357,8 @@ function main()
     0.0 < validation_fraction < 1.0 || error("validation fraction must be in (0,1)")
     evaluation_interval = parse(Int, get(ENV, "BEAT_EVAL_INTERVAL", "200"))
     100 <= evaluation_interval <= 250 || error("BEAT_EVAL_INTERVAL must be in 100:250")
-    min_epochs = parse(Float64, get(ENV, "BEAT_MIN_EPOCHS", "3"))
-    max_epochs = parse(Float64, get(ENV, "BEAT_MAX_EPOCHS", "20"))
+    min_epochs = parse(Float64, get(ENV, "BEAT_MIN_EPOCHS", "1"))
+    max_epochs = parse(Float64, get(ENV, "BEAT_MAX_EPOCHS", "3"))
     1.0 <= min_epochs <= max_epochs || error("require 1 <= min epochs <= max epochs")
     patience = parse(Int, get(ENV, "BEAT_EARLY_STOP_PATIENCE", "6"))
     train_eval_max = parse(Int, get(ENV, "BEAT_TRAIN_EVAL_STATES", "256"))

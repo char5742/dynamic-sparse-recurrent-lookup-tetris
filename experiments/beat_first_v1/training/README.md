@@ -33,12 +33,14 @@ Native Julia + Zygote fallback.
 
 ```powershell
 $env:BEAT_VARIANT='gravity_film'
+$env:BEAT_TEACHER_DATASET='D:\tetris-paper-plus\datasets\beat_first_v1\teacher_v2'
+$env:BEAT_STATE_BATCH='4'
 $env:BEAT_BACKEND='reactant'
 $env:BEAT_BACKEND_SOURCE='C:\Users\fshuu\Documents\tetris\experiments\beat_first_v1\backend\fixedshape_learner.jl'
 $env:BEAT_BACKEND_MODULE='BeatFirstFixedShapeBackend'
 $env:BEAT_EVAL_INTERVAL='200'
-$env:BEAT_MIN_EPOCHS='3'
-$env:BEAT_MAX_EPOCHS='20'
+$env:BEAT_MIN_EPOCHS='1'
+$env:BEAT_MAX_EPOCHS='3'
 julia --project=experiments/beat_first_v1 experiments/beat_first_v1/training/train_supervised.jl
 ```
 
