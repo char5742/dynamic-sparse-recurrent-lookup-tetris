@@ -89,17 +89,17 @@ const MODEL_DEFAULTS = (;
         hidden_features=1536,
     ),
     gravity_film_medium=(;
-        architecture_version=2,
-        channels=192,
-        depth=14,
-        pointwise_features=64,
+        architecture_version=3,
+        channels=128,
+        depth=10,
+        pointwise_features=32,
         branch_channels=32,
         queue_features=64,
         aux_features=64,
         condition_features=128,
-        grid_features=512,
+        grid_features=1024,
         local_features=128,
-        hidden_features=1536,
+        hidden_features=1280,
     ),
 )
 
@@ -150,6 +150,36 @@ const LEGACY_GRAVITY_DEFAULTS = (;
     ),
 )
 
+# Preserve the exact v2 constructors for already-recorded smoke artifacts and
+# any checkpoint explicitly carrying architecture_version=2. The current
+# Medium default below is v3; Small intentionally remains v2.
+const V2_GRAVITY_DEFAULTS = (;
+    gravity_film=(;
+        channels=112,
+        depth=10,
+        pointwise_features=48,
+        branch_channels=32,
+        queue_features=64,
+        aux_features=64,
+        condition_features=128,
+        grid_features=256,
+        local_features=96,
+        hidden_features=704,
+    ),
+    gravity_film_medium=(;
+        channels=192,
+        depth=14,
+        pointwise_features=64,
+        branch_channels=32,
+        queue_features=64,
+        aux_features=64,
+        condition_features=128,
+        grid_features=512,
+        local_features=128,
+        hidden_features=1536,
+    ),
+)
+
 function model_family(kind::Symbol)
     if kind in (:preact_eca, :preact_eca_medium)
         return :preact_eca
@@ -191,7 +221,11 @@ function _resolved_model_config(kind::Symbol, requested::NamedTuple)
         merge(getproperty(LEGACY_PREACT_DEFAULTS, kind), (; architecture_version=1))
     elseif version == 1 && family === :gravity_film
         merge(getproperty(LEGACY_GRAVITY_DEFAULTS, kind), (; architecture_version=1))
+    elseif version == 2 && family === :gravity_film
+        merge(getproperty(V2_GRAVITY_DEFAULTS, kind), (; architecture_version=2))
     elseif version == 2
+        defaults
+    elseif version == 3 && kind === :gravity_film_medium
         defaults
     else
         error("unsupported $(family) architecture_version=$(version)")
@@ -218,7 +252,7 @@ function build_model(kind::Symbol; n_quantiles::Int=16, kwargs...)
     elseif family === :gravity_film
         if architecture_version == 1
             return GravityFiLMConvNeXtQ(; constructor_config..., n_quantiles)
-        elseif architecture_version == 2
+        elseif architecture_version in (2, 3)
             return EfficientGravityFiLMConvNeXtQ(;
                 constructor_config..., n_quantiles
             )
