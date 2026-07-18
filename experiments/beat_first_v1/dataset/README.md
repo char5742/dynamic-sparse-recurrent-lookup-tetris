@@ -6,6 +6,14 @@ canonical `stable_node_list`, `legacy_candidate_batch`, `openvino_scores`, and
 order with multiplicity intact. Old-Q labels retain the historical static
 NPU-batch-16 plus actual-size dynamic CPU-tail semantics.
 
+The physical part capacity is 208 candidates. The original empirical width 74
+was invalidated by validation seed 121006, which produced 75 canonical
+candidates. The engine-level bound is 204 (current plus HOLD, each with at most
+34 direct landings and two rotation-tuck variants), rounded to the next
+batch-16 boundary. Training scans `action_counts` first and compiles only at
+the observed dataset maximum; it does not execute 208 padded candidates per
+state.
+
 Each episode is one bounded JLD2 part. A JSON sidecar contains its key, split,
 rollout role, seed, counts, byte size, and SHA-256. `manifest.json` is replaced
 atomically after every episode. Resume skips manifest entries and reconciles a

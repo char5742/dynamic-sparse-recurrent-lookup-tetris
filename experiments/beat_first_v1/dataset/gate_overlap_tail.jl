@@ -138,7 +138,7 @@ function gate_main()
                 isempty(nodes) && break
                 candidate_count = length(nodes)
                 candidate_count <= MAX_CANDIDATES || error(
-                    "gate seed $seed produced $candidate_count candidates, above fixed 74",
+                    "gate seed $seed produced $candidate_count candidates, above proven storage capacity $MAX_CANDIDATES",
                 )
                 packing_seconds += @elapsed input = legacy_candidate_batch(
                     state, nodes; next_count,

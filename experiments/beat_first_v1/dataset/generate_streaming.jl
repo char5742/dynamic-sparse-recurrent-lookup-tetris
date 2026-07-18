@@ -200,7 +200,7 @@ function _generate_episode(
         generation_seconds += @elapsed nodes = stable_node_list(state)
         isempty(nodes) && break
         length(nodes) <= MAX_CANDIDATES || error(
-            "seed $(spec.seed) produced $(length(nodes)) candidates, above fixed 74",
+            "seed $(spec.seed) produced $(length(nodes)) candidates, above proven storage capacity $MAX_CANDIDATES",
         )
         input = legacy_candidate_batch(state, nodes; next_count)
         inference_seconds += @elapsed old_scores = _teacher_scores(

@@ -24,7 +24,7 @@ def test_canonical_engine_and_teacher_are_reused():
 
 def test_historical_tail_and_fixed_width_are_frozen():
     assert 'teacher_batch == 16' in GENERATOR
-    assert "const MAX_CANDIDATES = 74" in SCHEMA
+    assert "const MAX_CANDIDATES = 208" in SCHEMA
     assert "preserves_candidate_multiplicity=true" in SCHEMA
     assert "actual-size dynamic CPU tail" in SCHEMA
 

@@ -19,7 +19,12 @@ export MAX_CANDIDATES,
        manifest_counts,
        write_manifest!
 
-const MAX_CANDIDATES = 74
+# Canonical `get_node_list` concatenates current and HOLD candidates without a
+# cross-piece deduplication. Each piece has at most 34 direct landings and each
+# can contribute the base plus two rotation-tuck results: 2 * 34 * 3 = 204.
+# Round storage to the next NPU batch-16 boundary. Learners trim this physical
+# capacity to the dataset's observed maximum before compiling.
+const MAX_CANDIDATES = 208
 const FORMAT_VERSION = 2
 
 struct EpisodeSpec
@@ -43,7 +48,7 @@ end
 function allocate_episode(max_steps::Int; max_candidates::Int=MAX_CANDIDATES)
     max_steps > 0 || throw(ArgumentError("max_steps must be positive"))
     max_candidates == MAX_CANDIDATES || error(
-        "beat-first v1 freezes candidate width at $MAX_CANDIDATES",
+        "beat-first v1 freezes storage capacity at $MAX_CANDIDATES",
     )
     return (;
         boards=zeros(UInt8, 24, 10, 1, max_steps),
