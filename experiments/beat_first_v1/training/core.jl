@@ -9,6 +9,12 @@ using Statistics
 
 export MAX_CANDIDATES,
        AUX_FEATURE_NAMES,
+       EpochSampler,
+       next_batch!,
+       sampler_snapshot,
+       restore_sampler,
+       sampler_consumed_states,
+       atomic_jldsave,
        load_teacher_dataset,
        allocate_host_batch,
        pack_batch!,
@@ -19,7 +25,7 @@ export MAX_CANDIDATES,
        promotion_key,
        optional_target_coverage
 
-const MAX_CANDIDATES = 74
+const MAX_CANDIDATES = 208
 
 # Keep this order synchronized with BeatFirstModels. Values are deliberately
 # scale-bounded so that the three small candidate networks can consume them
@@ -45,16 +51,169 @@ const QUANTILE_TEACHER_WEIGHT = 0.05f0
 const LISTNET_TEMPERATURE = 0.50f0
 const HUBER_DELTA = 1.0f0
 
+const SHARDED_FORMAT_VERSION = 3
+const REQUIRED_TRAIN_STATES = 100_000
+
+function _environment_flag(name::AbstractString, default::Bool=false)
+    raw = lowercase(strip(get(ENV, name, string(default))))
+    raw in ("true", "1", "yes") && return true
+    raw in ("false", "0", "no") && return false
+    error("$name must be true or false; got $(repr(raw))")
+end
+
+"""Shuffle-without-replacement state-row sampler with resumable epoch position."""
+mutable struct EpochSampler{R<:AbstractRNG}
+    source_rows::Vector{Int}
+    permutation::Vector{Int}
+    cursor::Int
+    completed_epochs::Int
+    rng::R
+end
+
+function EpochSampler(source_rows::AbstractVector{<:Integer}, rng::AbstractRNG)
+    rows = Int.(source_rows)
+    isempty(rows) && throw(ArgumentError("sampler source rows cannot be empty"))
+    allunique(rows) || throw(ArgumentError("sampler source rows must be unique"))
+    permutation = copy(rows)
+    shuffle!(rng, permutation)
+    return EpochSampler(rows, permutation, 1, 0, rng)
+end
+
+function _validate_sampler!(sampler::EpochSampler)
+    isempty(sampler.source_rows) && error("sampler source rows cannot be empty")
+    allunique(sampler.source_rows) || error("sampler source rows are not unique")
+    length(sampler.permutation) == length(sampler.source_rows) || error(
+        "sampler permutation length does not match source rows",
+    )
+    sort(sampler.permutation) == sort(sampler.source_rows) || error(
+        "sampler permutation is not a permutation of the training rows",
+    )
+    1 <= sampler.cursor <= length(sampler.permutation) + 1 || error(
+        "sampler cursor is outside the epoch permutation",
+    )
+    sampler.completed_epochs >= 0 || error("sampler completed epoch count is negative")
+    return sampler
+end
+
+function _begin_next_epoch!(sampler::EpochSampler)
+    sampler.permutation .= sampler.source_rows
+    shuffle!(sampler.rng, sampler.permutation)
+    sampler.cursor = 1
+    return sampler
+end
+
+"""Return one fixed batch, crossing an epoch boundary without dropping rows.
+
+Each epoch permutation contains every source row exactly once. If a batch
+straddles a boundary, its tail is taken from the next independently shuffled
+epoch rather than discarding the previous epoch's remainder.
+"""
+function next_batch!(sampler::EpochSampler, batch_size::Int)
+    batch_size > 0 || throw(ArgumentError("batch size must be positive"))
+    rows = Vector{Int}(undef, batch_size)
+    filled = 0
+    while filled < batch_size
+        sampler.cursor > length(sampler.permutation) && _begin_next_epoch!(sampler)
+        available = length(sampler.permutation) - sampler.cursor + 1
+        taken = min(batch_size - filled, available)
+        source = sampler.cursor:(sampler.cursor + taken - 1)
+        destination = (filled + 1):(filled + taken)
+        rows[destination] .= @view sampler.permutation[source]
+        sampler.cursor += taken
+        filled += taken
+        if sampler.cursor > length(sampler.permutation)
+            sampler.completed_epochs += 1
+        end
+    end
+    return rows
+end
+
+sampler_snapshot(sampler::EpochSampler) = (;
+    format_version=1,
+    source_rows=copy(sampler.source_rows),
+    permutation=copy(sampler.permutation),
+    cursor=sampler.cursor,
+    completed_epochs=sampler.completed_epochs,
+    rng=deepcopy(sampler.rng),
+)
+
+function restore_sampler(source_rows::AbstractVector{<:Integer}, snapshot)
+    hasproperty(snapshot, :format_version) && Int(snapshot.format_version) == 1 || error(
+        "unsupported or missing sampler snapshot format",
+    )
+    expected_rows = Int.(source_rows)
+    Int.(snapshot.source_rows) == expected_rows || error(
+        "checkpoint sampler rows do not match the current training split",
+    )
+    sampler = EpochSampler(
+        expected_rows,
+        Int.(snapshot.permutation),
+        Int(snapshot.cursor),
+        Int(snapshot.completed_epochs),
+        deepcopy(snapshot.rng),
+    )
+    return _validate_sampler!(sampler)
+end
+
+function sampler_consumed_states(sampler::EpochSampler)
+    width = length(sampler.source_rows)
+    return sampler.cursor == width + 1 ?
+           sampler.completed_epochs * width :
+           sampler.completed_epochs * width + sampler.cursor - 1
+end
+
+"""Write a JLD2 file through a same-directory `.tmp` and atomic rename."""
+function atomic_jldsave(path::AbstractString; kwargs...)
+    destination = abspath(path)
+    mkpath(dirname(destination))
+    temporary = destination * ".tmp"
+    isfile(temporary) && rm(temporary; force=true)
+    try
+        jldsave(temporary; kwargs...)
+        mv(temporary, destination; force=true)
+    catch
+        isfile(temporary) && rm(temporary; force=true)
+        rethrow()
+    end
+    return destination
+end
+
 function _load_sharded_teacher_dataset(
     root::AbstractString;
     max_candidates::Int,
+    allow_partial_dataset::Bool,
 )
     manifest_path = joinpath(root, "manifest.json")
     isfile(manifest_path) || error("sharded dataset manifest does not exist: $manifest_path")
     manifest = JSON3.read(read(manifest_path, String))
+    hasproperty(manifest, :format_version) || error(
+        "sharded dataset manifest has no format_version",
+    )
+    Int(manifest.format_version) == SHARDED_FORMAT_VERSION || error(
+        "sharded dataset format must be $SHARDED_FORMAT_VERSION; got $(manifest.format_version)",
+    )
+    hasproperty(manifest, :counts) || error("sharded dataset manifest has no counts")
+    manifest_counts = Dict{String,Int}(
+        String(key) => Int(value) for (key, value) in pairs(manifest.counts)
+    )
+    training_states = get(manifest_counts, "states.train", 0)
+    validation_states = get(manifest_counts, "states.validation", 0)
+    if !allow_partial_dataset
+        training_states >= REQUIRED_TRAIN_STATES || error(
+            "directory dataset has $training_states training states; require >= $REQUIRED_TRAIN_STATES " *
+            "(set BEAT_ALLOW_PARTIAL_DATASET=true only for bounded smoke tests)",
+        )
+        validation_states > 0 || error(
+            "directory dataset has no validation states " *
+            "(set BEAT_ALLOW_PARTIAL_DATASET=true only for bounded smoke tests)",
+        )
+    end
     parts = collect(manifest.parts)
     isempty(parts) && error("sharded teacher dataset manifest has no parts")
     states = sum(Int(part.row_count) for part in parts)
+    get(manifest_counts, "states.total", states) == states || error(
+        "manifest states.total does not match the sum of part row counts",
+    )
 
     boards = zeros(UInt8, 24, 10, 1, states)
     placements = zeros(UInt8, 24, 10, 1, max_candidates, states)
@@ -131,6 +290,9 @@ function _load_sharded_teacher_dataset(
         candidate_death_available,
         source_path=abspath(root),
         manifest_path=abspath(manifest_path),
+        manifest_format_version=Int(manifest.format_version),
+        manifest_counts,
+        partial_dataset_allowed=allow_partial_dataset,
         geometry_cache=nothing,
     )
 end
@@ -139,9 +301,10 @@ function load_teacher_dataset(
     path::AbstractString;
     max_candidates::Int=MAX_CANDIDATES,
     geometry_cache_max_states::Int=2_048,
+    allow_partial_dataset::Bool=_environment_flag("BEAT_ALLOW_PARTIAL_DATASET", false),
 )
     dataset = if isdir(path)
-        _load_sharded_teacher_dataset(path; max_candidates)
+        _load_sharded_teacher_dataset(path; max_candidates, allow_partial_dataset)
     else
         jldopen(path, "r") do file
         action_counts = Int.(file["action_counts"])
@@ -185,6 +348,10 @@ function load_teacher_dataset(
                 Bool.(file["death"]) : falses(max_candidates, length(action_counts)),
             candidate_death_available=fill(haskey(file, "death"), length(action_counts)),
             source_path=abspath(path),
+            manifest_path=nothing,
+            manifest_format_version=nothing,
+            manifest_counts=nothing,
+            partial_dataset_allowed=false,
             # A cache of every candidate in a 100k-state dataset would consume
             # more memory than the model. Disable it above the configured cap.
             geometry_cache=length(action_counts) <= geometry_cache_max_states ?

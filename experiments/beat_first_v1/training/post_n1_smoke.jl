@@ -127,6 +127,8 @@ function _peak_rss_bytes()
     end
 end
 
+_compiled_candidate_width(dataset) = 16 * cld(maximum(dataset.action_counts), 16)
+
 function _model_smoke(kind::Symbol, dataset, seed::UInt64, witness_batch::Int)
     setup = setup_model(kind, Xoshiro(seed); n_quantiles=16)
     total_parameters = Int(setup.meta.parameters)
@@ -135,7 +137,8 @@ function _model_smoke(kind::Symbol, dataset, seed::UInt64, witness_batch::Int)
         "$kind has $trainable_parameters trainable / $total_parameters total parameters",
     )
 
-    batch = allocate_host_batch(witness_batch)
+    candidate_width = _compiled_candidate_width(dataset)
+    batch = allocate_host_batch(witness_batch; max_candidates=candidate_width)
     # The first state of an episode can have an exactly empty board.  A
     # bias-free board stem then has a mathematically zero weight gradient even
     # though it is fully trainable.  Use the first deterministic non-empty
@@ -153,7 +156,7 @@ function _model_smoke(kind::Symbol, dataset, seed::UInt64, witness_batch::Int)
     output, _ = setup.model(batch.inputs, setup.ps, Lux.testmode(setup.st))
     forward_seconds = time() - forward_started
     _allfinite(output) || error("$kind forward output contains a non-finite value")
-    size(output.q) == (1, MAX_CANDIDATES * witness_batch) || error(
+    size(output.q) == (1, candidate_width * witness_batch) || error(
         "$kind Q output has an unexpected shape $(size(output.q))",
     )
     gradient = _gradient_witness(kind, setup, batch)
@@ -167,6 +170,7 @@ function _model_smoke(kind::Symbol, dataset, seed::UInt64, witness_batch::Int)
             exact_trainable_parameters=trainable_parameters,
             all_parameters_trainable=total_parameters == trainable_parameters,
             witness_state_batch=witness_batch,
+            compiled_candidate_width=candidate_width,
             witness_rows,
             forward_seconds,
             forward_finite=true,
@@ -187,7 +191,8 @@ function _reactant_benchmark(
     updates::Int,
 )
     setup = setup_model(kind, Xoshiro(seed); n_quantiles=16)
-    batch = allocate_host_batch(state_batch)
+    candidate_width = _compiled_candidate_width(dataset)
+    batch = allocate_host_batch(state_batch; max_candidates=candidate_width)
     pack_batch!(batch, dataset, collect(1:state_batch))
     optimiser = Optimisers.AdamW(3.0f-4, (0.9, 0.999), 1.0f-4)
     learner = init_backend(
@@ -197,7 +202,7 @@ function _reactant_benchmark(
         optimiser,
         supervised_objective,
         batch;
-        max_candidates=MAX_CANDIDATES,
+        max_candidates=candidate_width,
         backend=get(ENV, "BEAT_SMOKE_BACKEND_DEVICE", "cpu"),
     )
 

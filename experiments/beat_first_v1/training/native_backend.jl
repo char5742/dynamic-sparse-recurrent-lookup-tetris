@@ -18,10 +18,12 @@ function init_backend(
     optimiser,
     objective,
     _host_template=nothing;
-    max_candidates::Int=74,
+    max_candidates::Int=208,
     backend::AbstractString="cpu",
 )
-    max_candidates == 74 || error("native beat-first learner requires 74 candidates")
+    1 <= max_candidates <= 208 || error(
+        "native beat-first learner candidate width must be in 1:208",
+    )
     lowercase(backend) in ("cpu", "native", "zygote") || error(
         "unsupported native backend device: $backend",
     )

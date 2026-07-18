@@ -1,4 +1,5 @@
 using Lux
+using JLD2
 using Optimisers
 using Random
 using Test
@@ -10,9 +11,65 @@ using .BeatFirstTrainingCore
 using .BeatFirstNativeBackend
 using .BeatFirstRLStage2
 
+@testset "epoch sampler resume and no-replacement order" begin
+    sampler = EpochSampler(collect(1:10), Xoshiro(0x5151))
+    batch_1 = next_batch!(sampler, 4)
+    batch_2 = next_batch!(sampler, 4)
+    snapshot = sampler_snapshot(sampler)
+    @test sampler_consumed_states(sampler) == 8
+    batch_3 = next_batch!(sampler, 4)
+    restored = restore_sampler(collect(1:10), snapshot)
+    @test next_batch!(restored, 4) == batch_3
+
+    batch_4 = next_batch!(sampler, 4)
+    batch_5 = next_batch!(sampler, 4)
+    sequence = vcat(batch_1, batch_2, batch_3, batch_4, batch_5)
+    @test sort(sequence[1:10]) == collect(1:10)
+    @test sort(sequence[11:20]) == collect(1:10)
+    @test sampler.completed_epochs == 2
+    @test sampler_consumed_states(sampler) == 20
+    @test_throws ErrorException restore_sampler(collect(2:11), snapshot)
+end
+
+@testset "atomic checkpoint JLD2 roundtrip" begin
+    mktempdir() do directory
+        path = joinpath(directory, "checkpoint.jld2")
+        sampler = EpochSampler(collect(1:8), Xoshiro(0x7171))
+        next_batch!(sampler, 4)
+        atomic_jldsave(
+            path;
+            checkpoint_format_version=2,
+            ps=(; weight=reshape(Float32[1, 2, 3, 4], 2, 2)),
+            st=(;),
+            optimizer_state=(; moment=Float32[0.5, 0.25]),
+            train_state_step=1,
+            backend_updates=1,
+            trainer_state=(; update=1, packed_states=4, history=Any[(; update=1)]),
+            sampler_state=sampler_snapshot(sampler),
+            control_state=(; evaluations_completed=0, stale_evaluations=0),
+            config=(; variant="tiny"),
+        )
+        @test isfile(path)
+        @test !isfile(path * ".tmp")
+        jldopen(path, "r") do file
+            @test file["checkpoint_format_version"] == 2
+            @test file["train_state_step"] == 1
+            @test file["trainer_state"].packed_states == 4
+            @test file["sampler_state"].cursor == 5
+            @test file["ps"].weight == reshape(Float32[1, 2, 3, 4], 2, 2)
+        end
+        atomic_jldsave(path; checkpoint_format_version=2, replacement=true)
+        @test !isfile(path * ".tmp")
+        jldopen(path, "r") do file
+            @test file["replacement"]
+            @test !haskey(file, "ps")
+        end
+    end
+end
+
 function synthetic_dataset()
     states = 4
-    max_actions = 74
+    max_actions = 80
     boards = zeros(UInt8, 24, 10, 1, states)
     placements = zeros(UInt8, 24, 10, 1, max_actions, states)
     action_counts = [3, 2, 3, 2]
@@ -63,11 +120,11 @@ end
 
 @testset "fixed candidate packing" begin
     dataset = synthetic_dataset()
-    batch = allocate_host_batch(2)
+    batch = allocate_host_batch(2; max_candidates=80)
     pack_batch!(batch, dataset, [1, 2])
-    @test size(batch.mask) == (74, 2)
+    @test size(batch.mask) == (80, 2)
     @test sum(batch.mask; dims=1) == reshape(Float32[3, 2], 1, 2)
-    @test size(batch.inputs.aux) == (37, 148)
+    @test size(batch.inputs.aux) == (37, 160)
     @test all(isfinite, batch.inputs.aux)
     @test batch.targets.top1_mask[2, 1] == 1
     @test batch.targets.top2_mask[3, 1] == 1
@@ -80,7 +137,7 @@ end
 
 @testset "shared native objective and metrics" begin
     dataset = synthetic_dataset()
-    batch = allocate_host_batch(2)
+    batch = allocate_host_batch(2; max_candidates=80)
     pack_batch!(batch, dataset, [1, 2])
     model = TinyCanonical()
     ps, st = Lux.setup(Xoshiro(1), model)

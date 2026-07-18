@@ -29,7 +29,8 @@ function main()
         raw"D:\tetris-paper-plus\datasets\learning\teacher_plus_dagger_c13_round1.jld2",
     ))
     state_batch = parse(Int, get(ENV, "BEAT_SMOKE_STATE_BATCH", "1"))
-    batch = allocate_host_batch(state_batch)
+    candidate_width = 16 * cld(maximum(dataset.action_counts), 16)
+    batch = allocate_host_batch(state_batch; max_candidates=candidate_width)
     pack_batch!(batch, dataset, collect(1:state_batch))
     kind = Symbol(get(ENV, "BEAT_SMOKE_MODEL", "preact_eca"))
     setup = setup_model(kind, Xoshiro(0x42656174536d6f6b65); n_quantiles=16)
@@ -40,7 +41,7 @@ function main()
         Optimisers.AdamW(3.0f-4, (0.9, 0.999), 1.0f-4),
         supervised_objective,
         batch;
-        max_candidates=MAX_CANDIDATES,
+        max_candidates=candidate_width,
         backend="cpu",
     )
     started = time()

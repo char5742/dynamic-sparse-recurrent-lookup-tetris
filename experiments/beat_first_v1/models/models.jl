@@ -281,7 +281,8 @@ function model_metadata(kind::Symbol, ps; n_quantiles::Int, config)
             q=(1, :N), death_logit=(1, :N), quantiles=(n_quantiles, :N)
         ),
         ranking_source=:q,
-        fixed_candidate_count=74,
+        candidate_storage_capacity=208,
+        compiled_candidate_width=:dataset_observed_batch16,
         candidate_mask_location=:loss,
     )
 end
@@ -300,11 +301,11 @@ function setup_model(
     return (; model, ps, st, meta)
 end
 
-"""Run fixed-74 shape checks for every registered preset when explicitly called."""
+"""Run fixed-80 shape checks for every registered preset when explicitly called."""
 function smoke_all_models(; seed::UInt64=0x426561745631, n_quantiles::Int=16)
     return map(TRAINING_MODEL_KINDS) do kind
         model = build_model(kind; n_quantiles)
-        result = forward_smoke(model; seed, candidates=74)
+        result = forward_smoke(model; seed, candidates=80)
         (; kind, parameters=result.parameters, output=result.output)
     end
 end

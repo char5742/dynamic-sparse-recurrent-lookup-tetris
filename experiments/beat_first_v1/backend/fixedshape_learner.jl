@@ -6,7 +6,7 @@ using Reactant
 
 export FixedShapeLearner, init_backend, train_step!, host_checkpoint, compiled_thunk_id
 
-const DEFAULT_MAX_CANDIDATES = 74
+const DEFAULT_MAX_CANDIDATES = 208
 
 """Persistent Reactant learner for one fixed candidate-batch shape.
 
@@ -83,6 +83,7 @@ function init_backend(
     host_template;
     max_candidates::Int=DEFAULT_MAX_CANDIDATES,
     backend::AbstractString="cpu",
+    restore=nothing,
 )
     max_candidates > 0 || throw(ArgumentError("max_candidates must be positive"))
     Reactant.set_default_backend(backend)
@@ -95,9 +96,53 @@ function init_backend(
 
     device = Lux.reactant_device(; force=true)
     device_parameters, device_states = device((parameters, states))
-    train_state = Lux.Training.TrainState(
+    fresh_train_state = Lux.Training.TrainState(
         model, device_parameters, device_states, optimiser
     )
+    backend_updates = 0
+    train_state = if restore === nothing
+        fresh_train_state
+    else
+        required = (:parameters, :states, :optimizer_state, :step, :backend_updates)
+        all(name -> hasproperty(restore, name), required) || error(
+            "Reactant restore is missing one of $(required)",
+        )
+        restored_step = Int(restore.step)
+        backend_updates = Int(restore.backend_updates)
+        restored_step >= 0 || error("restored TrainState step is negative")
+        backend_updates >= 0 || error("restored backend update count is negative")
+        restored_step == backend_updates || error(
+            "restored TrainState step=$restored_step != backend updates=$backend_updates",
+        )
+        restored_parameters, restored_states, restored_optimizer_state = device((
+            restore.parameters,
+            restore.states,
+            restore.optimizer_state,
+        ))
+        typeof(restored_parameters) === typeof(fresh_train_state.parameters) || error(
+            "restored parameter tree is incompatible with the fresh model",
+        )
+        typeof(restored_states) === typeof(fresh_train_state.states) || error(
+            "restored state tree is incompatible with the fresh model",
+        )
+        typeof(restored_optimizer_state) === typeof(fresh_train_state.optimizer_state) || error(
+            "restored optimizer state is incompatible with the pinned optimizer",
+        )
+        # Lux 1.31.4 pins this internal layout. Preserve the fresh cache,
+        # allocator, objective slot, model, and Reactant-compatible optimizer;
+        # replace only the four durable training fields.
+        Lux.Training.TrainState(
+            fresh_train_state.cache,
+            fresh_train_state.objective_function,
+            fresh_train_state.allocator_cache,
+            fresh_train_state.model,
+            restored_parameters,
+            restored_states,
+            fresh_train_state.optimizer,
+            restored_optimizer_state,
+            restored_step,
+        )
+    end
     return FixedShapeLearner(
         model,
         objective,
@@ -108,7 +153,7 @@ function init_backend(
         max_candidates,
         batch_size,
         nothing,
-        0,
+        backend_updates,
     )
 end
 
