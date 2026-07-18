@@ -1,6 +1,7 @@
-# N1 pre-marker engineering smoke: terminal result
+# N1 pre-marker engineering smoke result
 
-Status: **`N1-engineering-smoke-FAIL`**. This is a plumbing result only. No
+Status: **`N1-engineering-smoke-pass`** after one clean-audited,
+duplicate-preserving identity correction. This is a plumbing result only. No
 N1 experiment marker was created, no model was trained or changed, and this is
 not evidence for or against a top-2 neural gate's scientific hypothesis.
 
@@ -41,7 +42,7 @@ Both were explicitly classified as retryable engineering-launch failures by
 the research coordinator. The fixes added recursive Julia parse-error
 detection and tested scalar/list OpenVINO device normalization.
 
-## Final actual smoke
+## Initial seed-observing smoke
 
 Durable output:
 
@@ -66,65 +67,106 @@ ERROR: stable candidate keys are not unique
 score_nodes -> branch_rollout -> main
 ```
 
-Per the preregistered stop instruction, this seed/branch-observing smoke was not
-retried. It therefore did **not** reach a complete G12 pair, label/advantage,
+That source revision was not retried. It therefore did **not** reach a complete
+G12 pair, label/advantage,
 redacted label digest, C13 checkpoint load, 64x2 extraction, discarded update,
 or gate decision. No `smoke_result.json` exists. No label or return value was
 printed or persisted.
 
-This failure must not be repaired by silently deleting or merging colliding
-candidates: candidate multiplicity and 16-candidate chunk boundaries are part
-of the historical LayerNorm policy semantics. A subsequent, scientifically
-distinct design must adjudicate whether `stable_node_key` is only an ordering
-key or must be extended with a deterministic tie-breaker that preserves every
-candidate.
+The independent identity audit found that `stable_node_key` is an ordering key,
+not a uniqueness assertion. It authorized exactly one plumbing correction that
+preserves candidate multiplicity and historical 16-candidate chunk boundaries.
+No candidate could be deleted, merged, or secondarily reordered.
+
+## Authorized duplicate-preserving correction and passing smoke
+
+The correction assigns each candidate a state-local reference:
+
+```text
+(1-based ordinal, stable-key digest, action digest, afterstate digest)
+```
+
+Each decision binds its root-state digest, candidate count, and ordered vector
+digest. The exact same ordinal binds raw candidate tensor position, OpenVINO Q
+output, historical chunk/within-chunk/actual-tail coordinates, selected node,
+and replay afterstate. Repeat runs compare ordered-vector, Q-binding,
+selected-instance, and replay sequence digests. Duplicates remain separate.
+
+A fresh clean agent audited this source and returned GO. The one authorized
+fresh smoke then passed:
+
+`D:\tetris-paper-plus\runs\n1_engineering_smoke_73200_20260718T001242Z`
+
+Verified results:
+
+- OpenVINO reports accelerator `NPU` and tail `CPU`.
+- The root retained all 34 candidates in exact stable-sort order; Q was finite.
+- Strict first-max top-1/top-2 selected distinct ordinals.
+- Both forced branches and their frozen-old-policy continuations completed
+  finite unbootstrapped G12 computation with deterministic ordered candidate,
+  Q/chunk, selected-instance, and replay digests.
+- Only redacted label evidence digest
+  `60f752e7f3df928dab3fbfb5805d3e14aba3dda594b35ab05780c454dac0f9e8`
+  was persisted. Neither G12 values, label, nor advantage was printed/stored.
+- The real frozen C13 update-250 checkpoint loaded unchanged. Raw candidate
+  inputs had the six expected shapes; its actual post-swish layer-2
+  representation was finite, deterministic `64 x 2`, and the final layer
+  reconstructed the full forward output exactly.
+- One finite 65-parameter logistic-head update ran and was discarded.
+- The label-free pre-update gate executed fail-closed fallback; it did not use
+  the label or return advantage.
+- All three bound model artifacts remained hash-identical and no N1 marker was
+  created.
 
 ## Tests
 
-Before the final actual smoke:
+Before the corrected fresh smoke:
 
-- Julia pure/core tests: 14/14 pass.
+- Julia pure/core tests: 22/22 pass, including duplicate-key preservation and
+  ordinal/chunk binding fixtures.
 - Julia complete-source parse check: 1/1 pass, recursively rejecting
   `Expr(:error)` and `Expr(:incomplete)`.
 - Python static loading/world-age/source contract tests: pass.
 - Independent C13 access check: the frozen update-250 checkpoint has 165,051
   parameters and its actual layer-2 post-swish output is 64-dimensional; on a
   real C13 row, applying the final layer to it exactly reconstructed the full
-  forward output (max absolute difference 0). The terminal N1 smoke itself did
-  not reach this step.
+  forward output (max absolute difference 0). The corrected fresh smoke also
+  exercised this exact step on the root top-1/top-2 inputs.
 
 ## Runtime evidence
 
-| Field | Final actual smoke |
+| Field | Corrected passing smoke |
 |---|---:|
-| Monitor wall | 20.7047779 s |
-| Samples | 49 at nominal 200 ms |
-| Peak process-tree private | 2,489,311,232 B (2.318 GiB) |
-| Peak process-tree working set | 1,365,622,784 B (1.272 GiB) |
+| Monitor wall | 37.4514132 s |
+| Smoke main | 27.7960000 s |
+| NPU/CPU model compile | 1.09599996 s |
+| Samples | 89 at nominal 200 ms |
+| Peak process-tree private | 2,608,627,712 B (2.429 GiB) |
+| Peak process-tree working set | 1,301,626,880 B (1.212 GiB) |
 | Private cap | 4,294,967,296 B |
 | Working-set cap | 2,147,483,648 B |
 | Timeout | 300 s |
 | Cap/timeout violation | none |
+| Process exit code | 0 |
 
-The PowerShell monitor recorded `exit_code: null` despite the parent shell
-receiving exit code 1; the stderr stack and absence of `smoke_result.json`
-remain the authoritative failure evidence. This monitor defect does not affect
-the measured resource peaks but must be fixed before any future promotion
-harness.
+The runner now owns a native `System.Diagnostics.Process` handle. This fixed
+the retained `Start-Process` null-exit-code defect; the passing monitor records
+integer exit code 0 and `smoke_result_exists: true`.
 
 Artifact hashes:
 
 | Artifact | SHA-256 |
 |---|---|
-| `smoke.jl` | `ecc2caedc5d1db66130e814c241783c55eb70861d6c08c764553973966d5c520` |
-| `n1_smoke_core.jl` | `cf2d609ef30997bf646fc2f6f33d440e7f1bfc4a87100af75532256f1a53b6e6` |
-| `run_monitored_smoke.ps1` | `e45f053229f94b223e01ecedcead8b36ebd4a4ef5f4e7b9f3b124369fb675211` |
-| `test_n1_smoke_core.jl` | `5178fdcb1dfa390c79575a6b27f7dcc245a763f3adb2ce989e3959b80c8d4e8c` |
-| `test_static_contract.py` | `947e5b81ea833d567a182210d91a891a0561d157856e6eade568375fd78b364b` |
-| final `monitor_result.json` | `ffc3a2d7453348321285dd78b37e0441f3d107b6808cb3778d6264524f898024` |
-| final `resource_samples.jsonl` | `7172ce17101a7ed1528b24e9c762988c75403aa95104c1d286f5db1c4e045fed` |
-| final `stderr.log` | `8517165268d0a04be65e4017d6eb12055dac40ef295231fa7c51be5ac74b58ad` |
-| final empty `stdout.log` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| `smoke.jl` | `b49cb23448258d21ffbf8cfe685ccea0a4d2bb761c076fcf48022b56cea6f006` |
+| `n1_smoke_core.jl` | `a69a98c534bc145498e36f029252c93bb4d905d1fe6b18a4d7a00b5c3b30cd18` |
+| `run_monitored_smoke.ps1` | `d222bc82798e13d08f709059086d98ab048de1e6c93551ac79d30974843617df` |
+| `test_n1_smoke_core.jl` | `b43ebfe59567044ae24bb01d6e4ab655fb57d47ef07d5db7b9cc10379641c4f2` |
+| `test_static_contract.py` | `bb66384954e566a2e642885d80e12ad52c38c629b776569270db9a07c8e1a212` |
+| passing `monitor_result.json` | `5c619c29ebf7554c3b9613ca4366876fbfc366c24f4e033d0a941d21c2569378` |
+| passing `resource_samples.jsonl` | `fb82404ee20c0bebb519d9d83242970f67377409f0fa99f65f2a23f4a012e4d8` |
+| passing `smoke_result.json` | `d2b381d59680bace9f365958353c68737cb69c87cb9185af14ca535e94b4fb75` |
+| passing empty `stderr.log` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| passing `stdout.log` | `3c0b465d21f29d546157fd2f1fcb46a809e1b6c5b82e624cf0e05dcb3ada0e56` |
 
 Bound identities remained read-only:
 

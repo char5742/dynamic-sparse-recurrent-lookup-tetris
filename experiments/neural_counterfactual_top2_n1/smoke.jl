@@ -115,6 +115,19 @@ function action_digest(node)
     ), "|"))
 end
 
+function stable_key_payload(value)
+    if value isa Tuple
+        return "(" * join(stable_key_payload.(value), ",") * ")"
+    elseif value isa Bool
+        return value ? "true" : "false"
+    elseif value isa Integer
+        return string(value)
+    end
+    error("unsupported stable-node-key component $(typeof(value))")
+end
+
+stable_key_digest(key) = text_sha256(stable_key_payload(key))
+
 function float_vector_digest(values::AbstractVector{Float32})
     io = IOBuffer()
     for value in values
@@ -135,48 +148,100 @@ function score_nodes(inference, state)
     before = state_digest(state)
     nodes = stable_node_list(state)
     state_digest(state) == before || error("candidate generation mutated state")
-    isempty(nodes) && return nodes, Float32[], nothing
     keys = stable_node_key.(nodes)
-    allunique(keys) || error("stable candidate keys are not unique")
+    # `stable_node_key` is an ordering key, not a unique identity.  Preserve
+    # every duplicate and bind its historical 1-based ordinal end-to-end.
+    references = make_candidate_refs(
+        stable_key_digest.(keys),
+        action_digest.(nodes),
+        state_digest.((node.game_state for node in nodes)),
+    )
+    context = make_decision_context(before, references)
+    if isempty(nodes)
+        return (;
+            nodes,
+            scores=Float32[],
+            input=nothing,
+            references,
+            context,
+            q_binding_digest=q_ordinal_binding_digest(references, Float32[]),
+        )
+    end
     input = legacy_candidate_batch(state, nodes; next_count=5)
+    all(size(value, ndims(value)) == length(nodes) for value in input) ||
+        error("raw candidate tensors do not preserve candidate ordinals")
     scores = openvino_scores(inference, input)
     length(scores) == length(nodes) || error("OpenVINO candidate count mismatch")
     all(isfinite, scores) || error("OpenVINO produced non-finite old-Q")
     state_digest(state) == before || error("OpenVINO scoring mutated state")
-    return nodes, scores, input
+    q_binding_digest = q_ordinal_binding_digest(references, scores; chunk_size=16)
+    return (; nodes, scores, input, references, context, q_binding_digest)
 end
 
-function branch_rollout(root, forced_node, inference)
+sequence_digest(values) = text_sha256(join(values, "\n"))
+
+function branch_rollout(root, root_decision, forced_ordinal::Int, inference)
     branch = GameState(root)
     state_digest(branch) == state_digest(root) || error("GameState(root) clone mismatch")
     rewards = Float64[]
     trace_parts = String[]
+    ordered_vector_digests = String[root_decision.context.ordered_candidate_vector_digest]
+    q_binding_digests = String[root_decision.q_binding_digest]
+    forced_reference = root_decision.references[forced_ordinal]
+    forced_reference.ordinal == forced_ordinal || error("forced candidate ordinal mismatch")
+    selected_instance_digests = String[candidate_instance_digest(forced_reference)]
+    replay_digests = String[]
 
     score_before = branch.score
+    forced_node = root_decision.nodes[forced_ordinal]
     apply_node!(branch, forced_node)
-    state_digest(branch) == state_digest(forced_node.game_state) ||
+    observed_afterstate = state_digest(branch)
+    observed_afterstate == forced_reference.afterstate_digest ||
         error("forced root action replay mismatch")
     push!(rewards, Float64(branch.score - score_before))
-    push!(trace_parts, action_digest(forced_node), state_digest(branch))
+    push!(replay_digests, text_sha256(
+        forced_reference.afterstate_digest * "|" * observed_afterstate,
+    ))
+    push!(trace_parts, candidate_instance_digest(forced_reference), observed_afterstate)
 
     for _ in 2:N1_HORIZON
         branch.game_over_flag && break
-        nodes, scores, _ = score_nodes(inference, branch)
-        isempty(nodes) && break
-        selected = argmax(scores)
+        decision = score_nodes(inference, branch)
+        isempty(decision.nodes) && break
+        selected = argmax(decision.scores)
+        selected_reference = decision.references[selected]
+        selected_reference.ordinal == selected || error("selected candidate ordinal mismatch")
+        push!(
+            ordered_vector_digests,
+            decision.context.ordered_candidate_vector_digest,
+        )
+        push!(q_binding_digests, decision.q_binding_digest)
+        push!(selected_instance_digests, candidate_instance_digest(selected_reference))
         score_before = branch.score
-        chosen = nodes[selected]
+        chosen = decision.nodes[selected]
         apply_node!(branch, chosen)
-        state_digest(branch) == state_digest(chosen.game_state) ||
+        observed_afterstate = state_digest(branch)
+        observed_afterstate == selected_reference.afterstate_digest ||
             error("old-policy continuation action replay mismatch")
+        push!(replay_digests, text_sha256(
+            selected_reference.afterstate_digest * "|" * observed_afterstate,
+        ))
         push!(rewards, Float64(branch.score - score_before))
-        push!(trace_parts, action_digest(chosen), state_digest(branch))
+        push!(trace_parts, candidate_instance_digest(selected_reference), observed_afterstate)
     end
     length(rewards) <= N1_HORIZON || error("branch exceeded frozen horizon")
     value = discounted_score(rewards; gamma=N1_GAMMA)
     isfinite(value) || error("G12 was non-finite")
     trace_digest = text_sha256(join(trace_parts, "\n"))
-    return (; value, trace_digest, placements=length(rewards))
+    return (;
+        value,
+        trace_digest,
+        placements=length(rewards),
+        ordered_vector_sequence_digest=sequence_digest(ordered_vector_digests),
+        q_binding_sequence_digest=sequence_digest(q_binding_digests),
+        selected_instance_sequence_digest=sequence_digest(selected_instance_digests),
+        replay_sequence_digest=sequence_digest(replay_digests),
+    )
 end
 
 function load_c13()
@@ -226,7 +291,7 @@ function c13_penultimate64(model, input, parameters, model_state)
     return hidden64
 end
 
-function label_evidence_digest(first_branch, second_branch, first_action, second_action)
+function label_evidence_digest(first_branch, second_branch, first_instance, second_instance)
     io = IOBuffer()
     write(io, codeunits("N1-redacted-G12-label-v1\0"))
     write(io, reinterpret(UInt64, first_branch.value))
@@ -234,8 +299,8 @@ function label_evidence_digest(first_branch, second_branch, first_action, second
     write(io, UInt8(second_branch.value > first_branch.value))
     write(io, codeunits(first_branch.trace_digest))
     write(io, codeunits(second_branch.trace_digest))
-    write(io, codeunits(first_action))
-    write(io, codeunits(second_action))
+    write(io, codeunits(first_instance))
+    write(io, codeunits(second_instance))
     return bytes2hex(SHA.sha256(take!(io)))
 end
 
@@ -276,30 +341,49 @@ function main(output_directory::AbstractString)
 
     root = GameState(Xoshiro(N1_SEED))
     root_digest_before = state_digest(root)
-    nodes, root_scores, root_input = score_nodes(inference, root)
-    length(nodes) >= 2 || error("engineering root did not have top-2 candidates")
-    top1, top2 = stable_top_two(root_scores)
-    top1 == argmax(root_scores) || error("strict stable top-1 differs from argmax")
-    top1_action = action_digest(nodes[top1])
-    top2_action = action_digest(nodes[top2])
-    top1_action != top2_action || error("root top-1/top-2 actions aliased")
+    root_decision = score_nodes(inference, root)
+    length(root_decision.nodes) >= 2 ||
+        error("engineering root did not have top-2 candidates")
+    top1, top2 = stable_top_two(root_decision.scores)
+    top1 != top2 || error("strict top-1/top-2 ordinals aliased")
+    top1 == argmax(root_decision.scores) ||
+        error("strict stable top-1 differs from argmax")
+    root_decision.references[top1].ordinal == top1 || error("top-1 ordinal mismatch")
+    root_decision.references[top2].ordinal == top2 || error("top-2 ordinal mismatch")
+    top1_instance = candidate_instance_digest(root_decision.references[top1])
+    top2_instance = candidate_instance_digest(root_decision.references[top2])
+    top1_instance != top2_instance || error("root top-1/top-2 instances aliased")
 
-    first_branch = branch_rollout(root, nodes[top1], inference)
-    second_branch = branch_rollout(root, nodes[top2], inference)
-    first_repeat = branch_rollout(root, nodes[top1], inference)
-    second_repeat = branch_rollout(root, nodes[top2], inference)
+    first_branch = branch_rollout(root, root_decision, top1, inference)
+    second_branch = branch_rollout(root, root_decision, top2, inference)
+    first_repeat = branch_rollout(root, root_decision, top1, inference)
+    second_repeat = branch_rollout(root, root_decision, top2, inference)
     branch_determinism =
         first_branch.value == first_repeat.value &&
         second_branch.value == second_repeat.value &&
         first_branch.trace_digest == first_repeat.trace_digest &&
         second_branch.trace_digest == second_repeat.trace_digest &&
         first_branch.placements == first_repeat.placements &&
-        second_branch.placements == second_repeat.placements
+        second_branch.placements == second_repeat.placements &&
+        first_branch.ordered_vector_sequence_digest ==
+            first_repeat.ordered_vector_sequence_digest &&
+        second_branch.ordered_vector_sequence_digest ==
+            second_repeat.ordered_vector_sequence_digest &&
+        first_branch.q_binding_sequence_digest ==
+            first_repeat.q_binding_sequence_digest &&
+        second_branch.q_binding_sequence_digest ==
+            second_repeat.q_binding_sequence_digest &&
+        first_branch.selected_instance_sequence_digest ==
+            first_repeat.selected_instance_sequence_digest &&
+        second_branch.selected_instance_sequence_digest ==
+            second_repeat.selected_instance_sequence_digest &&
+        first_branch.replay_sequence_digest == first_repeat.replay_sequence_digest &&
+        second_branch.replay_sequence_digest == second_repeat.replay_sequence_digest
     branch_determinism || error("counterfactual G12/trace was not deterministic")
     state_digest(root) == root_digest_before || error("branch rollout mutated root")
 
     c13 = load_c13()
-    pair_input = candidate_pair(root_input, (top1, top2))
+    pair_input = candidate_pair(root_decision.input, (top1, top2))
     expected_pair_shapes = (
         (24, 10, 1, 2), (24, 10, 1, 2), (1, 2),
         (1, 2), (1, 2), (7, 6, 2),
@@ -349,7 +433,7 @@ function main(output_directory::AbstractString)
         all(isfinite, discarded_weights) && isfinite(discarded_bias)
     discarded_update_finite || error("discarded logistic update was non-finite")
     redacted_digest = label_evidence_digest(
-        first_branch, second_branch, top1_action, top2_action,
+        first_branch, second_branch, top1_instance, top2_instance,
     )
     private_label = 0.0f0
     fill!(discarded_weights, 0.0f0)
@@ -387,12 +471,17 @@ function main(output_directory::AbstractString)
             next_count=5,
             hold_enabled=true,
             candidate_order="stable_node_key; strict first-max ties",
-            root_candidate_count=length(nodes),
-            root_q_shape=size(root_scores),
-            root_q_finite=all(isfinite, root_scores),
-            root_q_digest=float_vector_digest(root_scores),
-            top1_action_digest=top1_action,
-            top2_action_digest=top2_action,
+            duplicate_stable_keys_preserved=true,
+            secondary_sort_or_deduplication=false,
+            root_candidate_count=length(root_decision.nodes),
+            root_q_shape=size(root_decision.scores),
+            root_q_finite=all(isfinite, root_decision.scores),
+            root_q_digest=float_vector_digest(root_decision.scores),
+            root_ordered_candidate_vector_digest=
+                root_decision.context.ordered_candidate_vector_digest,
+            root_q_ordinal_chunk_binding_digest=root_decision.q_binding_digest,
+            top1_candidate_instance_digest=top1_instance,
+            top2_candidate_instance_digest=top2_instance,
             root_unchanged=state_digest(root) == root_digest_before,
         ),
         counterfactual=(;
@@ -402,6 +491,26 @@ function main(output_directory::AbstractString)
             branch_start_identical=true,
             values_finite=isfinite(first_branch.value) && isfinite(second_branch.value),
             deterministic=branch_determinism,
+            ordered_vector_repeat_match=
+                first_branch.ordered_vector_sequence_digest ==
+                    first_repeat.ordered_vector_sequence_digest &&
+                second_branch.ordered_vector_sequence_digest ==
+                    second_repeat.ordered_vector_sequence_digest,
+            q_binding_repeat_match=
+                first_branch.q_binding_sequence_digest ==
+                    first_repeat.q_binding_sequence_digest &&
+                second_branch.q_binding_sequence_digest ==
+                    second_repeat.q_binding_sequence_digest,
+            selected_instance_repeat_match=
+                first_branch.selected_instance_sequence_digest ==
+                    first_repeat.selected_instance_sequence_digest &&
+                second_branch.selected_instance_sequence_digest ==
+                    second_repeat.selected_instance_sequence_digest,
+            replay_digest_repeat_match=
+                first_branch.replay_sequence_digest ==
+                    first_repeat.replay_sequence_digest &&
+                second_branch.replay_sequence_digest ==
+                    second_repeat.replay_sequence_digest,
             redacted_label_evidence_sha256=redacted_digest,
         ),
         c13_penultimate=(;

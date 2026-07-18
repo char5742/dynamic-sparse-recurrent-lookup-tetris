@@ -58,3 +58,19 @@ check rejected it. The durable output is
 Monitor wall time was 13.165 s, peak private committed memory was 2,280,521,728
 bytes, and peak working set was 1,169,149,952 bytes. Scalar and sequence device
 properties now share a tested normalization function.
+
+The first seed-observing source revision stopped at the first continuation
+state because it incorrectly required `stable_node_key` to be unique. A clean
+identity audit determined that the key orders candidates but does not uniquely
+identify them. It authorized one correction: preserve every candidate in exact
+stable-sort order and bind it by 1-based ordinal plus key/action/afterstate
+digests through raw input, historical Q chunk, selection, and replay. No
+candidate is deduplicated or secondarily reordered.
+
+The one authorized corrected smoke passed at
+`D:\tetris-paper-plus\runs\n1_engineering_smoke_73200_20260718T001242Z`.
+It completed deterministic G12 branches, real C13 `64 x 2` penultimate
+extraction, one finite discarded 65-parameter update, and a label-free fallback
+decision. Only a redacted label-evidence digest was saved; no return value,
+label, or advantage was printed or persisted. The native process monitor
+recorded exit code 0 and remained below both resource caps. See `RESULT.md`.

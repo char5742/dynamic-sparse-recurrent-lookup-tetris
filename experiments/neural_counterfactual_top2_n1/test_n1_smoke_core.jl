@@ -33,6 +33,26 @@ using .N1SmokeCore
     @test all(iszero, weights)
     @test normalize_execution_devices("NPU") == ["NPU"]
     @test normalize_execution_devices(["NPU", "CPU"]) == ["NPU", "CPU"]
+
+    # A stable ordering key is not a unique candidate identity.  Preserve both
+    # colliding entries, and bind Q/chunk coordinates to their ordinals.
+    duplicate_refs = make_candidate_refs(
+        ["same-key", "same-key"],
+        ["same-action", "same-action"],
+        ["same-afterstate", "same-afterstate"],
+    )
+    @test length(duplicate_refs) == 2
+    @test duplicate_refs[1].stable_key_digest == duplicate_refs[2].stable_key_digest
+    @test duplicate_refs[1].ordinal == 1
+    @test duplicate_refs[2].ordinal == 2
+    @test candidate_instance_digest(duplicate_refs[1]) !=
+          candidate_instance_digest(duplicate_refs[2])
+    duplicate_context = make_decision_context("same-root", duplicate_refs)
+    @test duplicate_context.count == 2
+    @test !isempty(duplicate_context.ordered_candidate_vector_digest)
+    @test !isempty(q_ordinal_binding_digest(
+        duplicate_refs, Float32[3, 3]; chunk_size=16,
+    ))
 end
 
 function contains_parse_error(value)

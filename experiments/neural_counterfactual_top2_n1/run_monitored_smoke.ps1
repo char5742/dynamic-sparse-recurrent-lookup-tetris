@@ -31,12 +31,33 @@ $Arguments = @(
     $Smoke,
     $OutputDirectory
 )
-$LaunchedProcess = Start-Process -FilePath $Julia -ArgumentList $Arguments `
-    -WorkingDirectory $RepoRoot -PassThru `
-    -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
-# Start-Process's wrapper can expose a null ExitCode after redirected launch on
-# Windows PowerShell. Reattach a native Process handle before monitoring.
-$Process = [System.Diagnostics.Process]::GetProcessById($LaunchedProcess.Id)
+function Quote-NativeArgument([string]$Value) {
+    # These frozen paths contain no quotes. Standard Windows argv quoting still
+    # protects spaces and keeps the exact argument vector explicit.
+    if ($Value.Contains('"')) {
+        throw "N1 runner refuses a quote in a native argument"
+    }
+    return '"' + $Value + '"'
+}
+
+# Windows PowerShell's Start-Process wrapper returned a null ExitCode in all
+# retained prior launches. A native Process instance owns the handle and has a
+# separately preflighted, reliable ExitCode property.
+$StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+$StartInfo.FileName = $Julia
+$StartInfo.Arguments = (($Arguments | ForEach-Object {
+    Quote-NativeArgument $_
+}) -join ' ')
+$StartInfo.WorkingDirectory = $RepoRoot
+$StartInfo.UseShellExecute = $false
+$StartInfo.CreateNoWindow = $true
+$StartInfo.RedirectStandardOutput = $true
+$StartInfo.RedirectStandardError = $true
+$Process = New-Object System.Diagnostics.Process
+$Process.StartInfo = $StartInfo
+[void]$Process.Start()
+$StdoutTask = $Process.StandardOutput.ReadToEndAsync()
+$StderrTask = $Process.StandardError.ReadToEndAsync()
 
 function Get-TreeProcessIds([int]$RootId) {
     $Rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)
@@ -105,12 +126,24 @@ try {
         $Process.Refresh()
     }
     $Process.WaitForExit()
-    $Process.Refresh()
     $CapturedExitCode = $Process.ExitCode
 } finally {
+    if (-not $Process.HasExited) {
+        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+        $Process.WaitForExit()
+    }
+    [System.IO.File]::WriteAllText(
+        $Stdout,
+        [string]$StdoutTask.Result,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    [System.IO.File]::WriteAllText(
+        $Stderr,
+        [string]$StderrTask.Result,
+        [System.Text.UTF8Encoding]::new($false)
+    )
     $WallSeconds = ((Get-Date) - $Started).TotalSeconds
     if ($null -eq $CapturedExitCode -and $Process.HasExited) {
-        $Process.Refresh()
         $CapturedExitCode = $Process.ExitCode
     }
     $ExitCode = if ($null -ne $LimitReason) { -1 } else { $CapturedExitCode }

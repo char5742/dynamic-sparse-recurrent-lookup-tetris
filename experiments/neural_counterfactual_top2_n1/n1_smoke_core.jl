@@ -1,13 +1,20 @@
 module N1SmokeCore
 
 using LinearAlgebra
+using SHA
 
 export candidate_pair,
+       candidate_instance_digest,
        discounted_score,
        gate_decision,
        logistic_head_update,
+       make_candidate_refs,
+       make_decision_context,
        normalize_execution_devices,
+       q_ordinal_binding_digest,
        stable_top_two
+
+_text_digest(value::AbstractString) = bytes2hex(SHA.sha256(codeunits(value)))
 
 """First-max stable top-1/top-2 scan over an already stable candidate order."""
 function stable_top_two(values::AbstractVector{<:Real})
@@ -37,6 +44,73 @@ function candidate_pair(input::Tuple, indices::NTuple{2,Int})
         )
         value[selectors...]
     end
+end
+
+"""Preserve every ordered candidate, even when identity components collide."""
+function make_candidate_refs(
+    stable_key_digests::AbstractVector{<:AbstractString},
+    action_digests::AbstractVector{<:AbstractString},
+    afterstate_digests::AbstractVector{<:AbstractString},
+)
+    count = length(stable_key_digests)
+    length(action_digests) == count == length(afterstate_digests) ||
+        error("candidate identity vector lengths differ")
+    return [
+        (;
+            ordinal=index,
+            stable_key_digest=String(stable_key_digests[index]),
+            action_digest=String(action_digests[index]),
+            afterstate_digest=String(afterstate_digests[index]),
+        )
+        for index in 1:count
+    ]
+end
+
+function candidate_instance_digest(reference)
+    return _text_digest(join((
+        string(reference.ordinal),
+        String(reference.stable_key_digest),
+        String(reference.action_digest),
+        String(reference.afterstate_digest),
+    ), "|"))
+end
+
+function make_decision_context(root_state_digest::AbstractString, references)
+    ordered_digest = _text_digest(join(candidate_instance_digest.(references), "\n"))
+    return (;
+        root_state_digest=String(root_state_digest),
+        count=length(references),
+        ordered_candidate_vector_digest=ordered_digest,
+    )
+end
+
+"""Bind every Q output and its historical chunk coordinate to one ordinal."""
+function q_ordinal_binding_digest(
+    references,
+    values::AbstractVector{Float32};
+    chunk_size::Int=16,
+)
+    length(references) == length(values) || error("Q/candidate count mismatch")
+    chunk_size > 0 || error("chunk size must be positive")
+    lines = String[]
+    count = length(references)
+    for (reference, value) in zip(references, values)
+        ordinal = Int(reference.ordinal)
+        1 <= ordinal <= count || error("candidate ordinal is outside decision context")
+        chunk = cld(ordinal, chunk_size)
+        within_chunk = mod1(ordinal, chunk_size)
+        chunk_first = (chunk - 1) * chunk_size + 1
+        actual_chunk_size = min(chunk_size, count - chunk_first + 1)
+        push!(lines, join((
+            string(ordinal),
+            string(chunk),
+            string(within_chunk),
+            string(actual_chunk_size),
+            candidate_instance_digest(reference),
+            string(reinterpret(UInt32, value); base=16, pad=8),
+        ), "|"))
+    end
+    return _text_digest(join(lines, "\n"))
 end
 
 """Unbootstrapped discounted sum. `rewards[1]` has exponent zero."""
