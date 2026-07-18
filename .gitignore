@@ -4,6 +4,7 @@
 /checkpoints/
 /datasets/
 /runs/
+/.experiment_state/
 *.jl.cov
 *.jl.mem
 __pycache__/

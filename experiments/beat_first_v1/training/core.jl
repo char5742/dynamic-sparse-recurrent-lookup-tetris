@@ -5,6 +5,7 @@ using JSON3
 using LinearAlgebra
 using Lux
 using Random
+using SHA
 using Statistics
 
 export MAX_CANDIDATES,
@@ -48,6 +49,7 @@ const OLD_Q_WEIGHT = 0.25f0
 const MARGIN_WEIGHT = 0.15f0
 const DEATH_WEIGHT = 0.10f0
 const QUANTILE_TEACHER_WEIGHT = 0.05f0
+const GEOMETRY_WEIGHT = 0.10f0
 const LISTNET_TEMPERATURE = 0.50f0
 const HUBER_DELTA = 1.0f0
 
@@ -231,15 +233,43 @@ function _load_sharded_teacher_dataset(
     terminal = falses(states)
     candidate_death = falses(max_candidates, states)
     candidate_death_available = falses(states)
+    line_clear = zeros(Int8, max_candidates, states)
+    max_height = zeros(Int8, max_candidates, states)
+    holes = zeros(Int16, max_candidates, states)
+    cavities = zeros(Int16, max_candidates, states)
     predefined_split = fill(:unspecified, states)
 
+    resolved_root = realpath(root)
+    resolved_part_paths = Set{String}()
     cursor = 1
     for part in parts
         count = Int(part.row_count)
         rows = cursor:(cursor + count - 1)
         part_path = normpath(joinpath(root, String(part.relative_path)))
         isfile(part_path) || error("manifest references missing part: $part_path")
-        jldopen(part_path, "r") do file
+        resolved_part = realpath(part_path)
+        relative_part = relpath(resolved_part, resolved_root)
+        relative_components = splitpath(relative_part)
+        (!isabspath(relative_part) && !isempty(relative_components) &&
+         first(relative_components) != "..") || error(
+            "manifest part resolves outside the dataset root: $part_path",
+        )
+        resolved_key = Sys.iswindows() ?
+            lowercase(normpath(resolved_part)) : normpath(resolved_part)
+        resolved_key in resolved_part_paths && error(
+            "manifest aliases the same resolved part more than once: $part_path",
+        )
+        push!(resolved_part_paths, resolved_key)
+        expected_bytes = Int(part.bytes)
+        filesize(resolved_part) == expected_bytes || error(
+            "manifest part byte count mismatch: $part_path",
+        )
+        expected_sha256 = lowercase(String(part.sha256))
+        actual_sha256 = bytes2hex(open(sha256, resolved_part))
+        actual_sha256 == expected_sha256 || error(
+            "manifest part SHA-256 mismatch: $part_path",
+        )
+        jldopen(resolved_part, "r") do file
             part_counts = Int.(file["action_counts"])
             length(part_counts) == count || error("manifest row count mismatch: $part_path")
             maximum(part_counts) <= max_candidates || error(
@@ -260,6 +290,14 @@ function _load_sharded_teacher_dataset(
             episode_ids[rows] .= Int.(file["episode_ids"])
             episode_steps[rows] .= Int.(file["episode_steps"])
             terminal[rows] .= Bool.(file["terminal"])
+            required_geometry = ("line_clear", "max_height", "holes", "cavities")
+            all(name -> haskey(file, name), required_geometry) || error(
+                "format-3 part is missing stored geometry targets: $part_path",
+            )
+            line_clear[:, rows] .= Int8.(file["line_clear"])
+            max_height[:, rows] .= Int8.(file["max_height"])
+            holes[:, rows] .= Int16.(file["holes"])
+            cavities[:, rows] .= Int16.(file["cavities"])
             if haskey(file, "death")
                 candidate_death[:, rows] .= Bool.(file["death"])
                 candidate_death_available[rows] .= true
@@ -288,10 +326,16 @@ function _load_sharded_teacher_dataset(
         terminal,
         candidate_death,
         candidate_death_available,
+        line_clear,
+        max_height,
+        holes,
+        cavities,
         source_path=abspath(root),
         manifest_path=abspath(manifest_path),
         manifest_format_version=Int(manifest.format_version),
         manifest_counts,
+        part_integrity_verified=true,
+        verified_part_count=length(resolved_part_paths),
         partial_dataset_allowed=allow_partial_dataset,
         geometry_cache=nothing,
     )
@@ -347,10 +391,16 @@ function load_teacher_dataset(
             candidate_death=haskey(file, "death") ?
                 Bool.(file["death"]) : falses(max_candidates, length(action_counts)),
             candidate_death_available=fill(haskey(file, "death"), length(action_counts)),
+            line_clear=haskey(file, "line_clear") ? Int8.(file["line_clear"]) : nothing,
+            max_height=haskey(file, "max_height") ? Int8.(file["max_height"]) : nothing,
+            holes=haskey(file, "holes") ? Int16.(file["holes"]) : nothing,
+            cavities=haskey(file, "cavities") ? Int16.(file["cavities"]) : nothing,
             source_path=abspath(path),
             manifest_path=nothing,
             manifest_format_version=nothing,
             manifest_counts=nothing,
+            part_integrity_verified=nothing,
+            verified_part_count=nothing,
             partial_dataset_allowed=false,
             # A cache of every candidate in a 100k-state dataset would consume
             # more memory than the model. Disable it above the configured cap.
@@ -372,6 +422,20 @@ function load_teacher_dataset(
         all(isfinite, @view(dataset.teacher_q[1:count, row])) || error(
             "non-finite teacher Q in state $row",
         )
+        if hasproperty(dataset, :line_clear) && dataset.line_clear !== nothing
+            all(value -> 0 <= value <= 4, @view(dataset.line_clear[1:count, row])) || error(
+                "line-clear target outside 0:4 in state $row",
+            )
+            all(value -> 0 <= value <= 24, @view(dataset.max_height[1:count, row])) || error(
+                "max-height target outside 0:24 in state $row",
+            )
+            all(value -> 0 <= value <= 240, @view(dataset.holes[1:count, row])) || error(
+                "holes target outside 0:240 in state $row",
+            )
+            all(value -> 0 <= value <= 240, @view(dataset.cavities[1:count, row])) || error(
+                "cavities target outside 0:240 in state $row",
+            )
+        end
     end
     return dataset
 end
@@ -540,6 +604,10 @@ function pack_batch!(batch, dataset, rows::AbstractVector{Int})
     for array in values(batch.targets)
         fill!(array, 0.0f0)
     end
+    stored_geometry = hasproperty(dataset, :line_clear) && dataset.line_clear !== nothing &&
+                      hasproperty(dataset, :max_height) && dataset.max_height !== nothing &&
+                      hasproperty(dataset, :holes) && dataset.holes !== nothing &&
+                      hasproperty(dataset, :cavities) && dataset.cavities !== nothing
 
     for (slot, row) in enumerate(rows)
         1 <= row <= length(dataset.action_counts) || throw(BoundsError(dataset.action_counts, row))
@@ -586,10 +654,27 @@ function pack_batch!(batch, dataset, rows::AbstractVector{Int})
             batch.inputs.difference[:, :, 1, flat] .= entry.difference
             batch.inputs.local_mask[:, :, 1, flat] .= entry.local_mask
             batch.inputs.aux[:, flat] .= entry.aux
-            batch.targets.line_clear[action, slot] = Float32(entry.line_clear)
-            batch.targets.max_height[action, slot] = Float32(entry.geometry.max_height)
-            batch.targets.holes[action, slot] = Float32(entry.geometry.holes)
-            batch.targets.cavities[action, slot] = Float32(entry.geometry.cavities)
+            if stored_geometry
+                expected_line_clear = Int(dataset.line_clear[action, row])
+                expected_max_height = Int(dataset.max_height[action, row])
+                expected_holes = Int(dataset.holes[action, row])
+                expected_cavities = Int(dataset.cavities[action, row])
+                expected_line_clear == Int(entry.line_clear) &&
+                    expected_max_height == Int(entry.geometry.max_height) &&
+                    expected_holes == Int(entry.geometry.holes) &&
+                    expected_cavities == Int(entry.geometry.cavities) || error(
+                    "stored geometry target mismatch at state $row candidate $action",
+                )
+                batch.targets.line_clear[action, slot] = Float32(expected_line_clear)
+                batch.targets.max_height[action, slot] = Float32(expected_max_height)
+                batch.targets.holes[action, slot] = Float32(expected_holes)
+                batch.targets.cavities[action, slot] = Float32(expected_cavities)
+            else
+                batch.targets.line_clear[action, slot] = Float32(entry.line_clear)
+                batch.targets.max_height[action, slot] = Float32(entry.geometry.max_height)
+                batch.targets.holes[action, slot] = Float32(entry.geometry.holes)
+                batch.targets.cavities[action, slot] = Float32(entry.geometry.cavities)
+            end
         end
     end
     return batch
@@ -658,6 +743,50 @@ function _quantile_teacher_loss(quantiles, teacher_q, mask)
     return sum(weight .* _huber(error) .* valid) / max(sum(valid) * k, 1.0f0)
 end
 
+function _geometry_losses(output, batch, width::Int, state_batch::Int)
+    if !hasproperty(output, :geometry)
+        zero_loss = zero(eltype(batch.targets.teacher_q))
+        return (;
+            geometry_loss=zero_loss,
+            line_clear_loss=zero_loss,
+            max_height_loss=zero_loss,
+            holes_loss=zero_loss,
+            cavities_loss=zero_loss,
+        )
+    end
+
+    geometry = output.geometry
+    size(geometry) == (4, width * state_batch) || error(
+        "model geometry has size $(size(geometry)); expected $((4, width * state_batch))",
+    )
+    line_clear_prediction = reshape(geometry[1, :], width, state_batch)
+    max_height_prediction = reshape(geometry[2, :], width, state_batch)
+    holes_prediction = reshape(geometry[3, :], width, state_batch)
+    cavities_prediction = reshape(geometry[4, :], width, state_batch)
+    line_clear_loss = _masked_mean(
+        _huber(line_clear_prediction .- batch.targets.line_clear ./ 4.0f0), batch.mask,
+    )
+    max_height_loss = _masked_mean(
+        _huber(max_height_prediction .- batch.targets.max_height ./ 24.0f0), batch.mask,
+    )
+    holes_loss = _masked_mean(
+        _huber(holes_prediction .- batch.targets.holes ./ 240.0f0), batch.mask,
+    )
+    cavities_loss = _masked_mean(
+        _huber(cavities_prediction .- batch.targets.cavities ./ 240.0f0), batch.mask,
+    )
+    geometry_loss = (
+        line_clear_loss + max_height_loss + holes_loss + cavities_loss
+    ) / 4.0f0
+    return (;
+        geometry_loss,
+        line_clear_loss,
+        max_height_loss,
+        holes_loss,
+        cavities_loss,
+    )
+end
+
 """Return every supervised loss component from one already-computed output."""
 function supervised_components(output, batch)
     width, state_batch = size(batch.mask)
@@ -673,9 +802,11 @@ function supervised_components(output, batch)
         batch.targets.death_mask,
     )
     quantile = _quantile_teacher_loss(output.quantiles, batch.targets.teacher_q, batch.mask)
+    geometry = _geometry_losses(output, batch, width, state_batch)
     loss = LISTNET_WEIGHT * listnet + OLD_Q_WEIGHT * old_q +
            MARGIN_WEIGHT * margin + DEATH_WEIGHT * death +
-           QUANTILE_TEACHER_WEIGHT * quantile
+           QUANTILE_TEACHER_WEIGHT * quantile +
+           GEOMETRY_WEIGHT * geometry.geometry_loss
     return (;
         composite_loss=loss,
         listnet_loss=listnet,
@@ -684,6 +815,7 @@ function supervised_components(output, batch)
         margin_loss=margin,
         death_loss=death,
         quantile_teacher_loss=quantile,
+        geometry...,
         valid_candidates=sum(batch.mask),
     )
 end
@@ -783,7 +915,8 @@ function evaluation_metrics(
 
     component_names = (
         :composite_loss, :listnet_loss, :old_q_loss, :q_huber_loss, :margin_loss,
-        :death_loss, :quantile_teacher_loss,
+        :death_loss, :quantile_teacher_loss, :geometry_loss, :line_clear_loss,
+        :max_height_loss, :holes_loss, :cavities_loss,
     )
     component_sums = Dict(name => 0.0 for name in component_names)
     top1 = Bool[]
@@ -839,10 +972,10 @@ promotion_key(metrics) = (
 )
 
 optional_target_coverage(dataset) = (;
-    line_clear="derived for every candidate; canonical model has no separate output head, so used as geometry only",
-    max_height="derived for every candidate; canonical model has no separate output head, so used in aux input",
-    holes="derived for every candidate; canonical model has no separate output head, so used in aux input",
-    cavities="derived for every candidate; canonical model has no separate output head, so used in aux input",
+    line_clear="stored or derived for every candidate, consistency-checked when stored; trained by the normalized geometry head",
+    max_height="stored or derived for every candidate, consistency-checked when stored; used in aux input and geometry head",
+    holes="stored or derived for every candidate, consistency-checked when stored; used in aux input and geometry head",
+    cavities="stored or derived for every candidate, consistency-checked when stored; used in aux input and geometry head",
     death=hasproperty(dataset, :candidate_death_available) && any(dataset.candidate_death_available) ?
         "all-candidate death labels where supplied; trained through death_logit" :
         "legacy selected-action terminal labels only; trained through death_logit",

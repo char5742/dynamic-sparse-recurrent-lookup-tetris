@@ -77,6 +77,7 @@ function PreActECAQ(;
     aux_features::Int=64,
     hidden_features::Int=256,
     n_quantiles::Int=16,
+    geometry_heads::Bool=false,
 )
     blocks = Chain((PreActECABlock(channels; groups) for _ in 1:depth)...)
     feature_count = channels + queue_features + aux_features
@@ -89,7 +90,9 @@ function PreActECAQ(;
             Dense(AUX_FEATURES => aux_features, swish),
             Dense(aux_features => aux_features, swish),
         ),
-        CandidateHeads(feature_count; hidden_features, n_quantiles),
+        make_candidate_heads(
+            feature_count; hidden_features, n_quantiles, geometry_heads,
+        ),
         channels,
     )
 end
@@ -199,6 +202,7 @@ function EfficientPreActECAQ(;
     aux_features::Int=96,
     hidden_features::Int=1536,
     n_quantiles::Int=16,
+    geometry_heads::Bool=false,
 )
     blocks = Chain(
         (
@@ -218,7 +222,9 @@ function EfficientPreActECAQ(;
             Dense(AUX_FEATURES => aux_features, swish),
             Dense(aux_features => aux_features, swish),
         ),
-        CandidateHeads(head_features; hidden_features, n_quantiles),
+        make_candidate_heads(
+            head_features; hidden_features, n_quantiles, geometry_heads,
+        ),
         channels,
     )
 end

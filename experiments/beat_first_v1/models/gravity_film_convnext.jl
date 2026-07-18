@@ -105,6 +105,7 @@ function GravityFiLMConvNeXtQ(;
     pooled_features::Int=96,
     hidden_features::Int=320,
     n_quantiles::Int=16,
+    geometry_heads::Bool=false,
 )
     queue_features + aux_features == condition_features || error(
         "condition_features must equal queue_features + aux_features"
@@ -134,7 +135,9 @@ function GravityFiLMConvNeXtQ(;
         GroupNorm(channels, 1, gelu),
         Conv((1, 1), channels => pooled_features, gelu),
         Conv((1, 1), channels => pooled_features, gelu),
-        CandidateHeads(head_features; hidden_features, n_quantiles),
+        make_candidate_heads(
+            head_features; hidden_features, n_quantiles, geometry_heads,
+        ),
         channels,
     )
 end
@@ -310,6 +313,7 @@ function EfficientGravityFiLMConvNeXtQ(;
     local_features::Int=96,
     hidden_features::Int=704,
     n_quantiles::Int=16,
+    geometry_heads::Bool=false,
 )
     queue_features + aux_features == condition_features || error(
         "condition_features must equal queue_features + aux_features"
@@ -343,7 +347,9 @@ function EfficientGravityFiLMConvNeXtQ(;
         GroupNorm(channels, 1, gelu),
         Dense(20 * channels => grid_features, gelu),
         Dense(channels => local_features, gelu),
-        CandidateHeads(head_features; hidden_features, n_quantiles),
+        make_candidate_heads(
+            head_features; hidden_features, n_quantiles, geometry_heads,
+        ),
         channels,
     )
 end

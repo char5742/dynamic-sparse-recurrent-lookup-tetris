@@ -13,7 +13,9 @@ const EXPERIMENT_DIR = normpath(joinpath(TRAINING_DIR, ".."))
 
 include(joinpath(TRAINING_DIR, "core.jl"))
 include(joinpath(TRAINING_DIR, "native_backend.jl"))
+include(joinpath(TRAINING_DIR, "metrics_resume.jl"))
 using .BeatFirstTrainingCore
+using .BeatFirstMetricsResume
 
 const MODEL_SOURCE = abspath(get(
     ENV, "BEAT_MODEL_SOURCE", joinpath(EXPERIMENT_DIR, "models", "models.jl"),
@@ -51,6 +53,29 @@ const CONVERGENCE_VARIANTS = (
 )
 
 sha256_file(path) = bytes2hex(open(sha256, path))
+sha256_text(value::AbstractString) = bytes2hex(sha256(codeunits(value)))
+
+function source_closure_sha256(paths)
+    normalized = sort(abspath.(collect(paths)))
+    all(isfile, normalized) || error("source closure contains a missing file")
+    payload = join(
+        (replace(path, '\\' => '/') * "\0" * sha256_file(path) for path in normalized),
+        "\n",
+    )
+    return sha256_text(payload)
+end
+
+function _git_metadata()
+    repository_root = normpath(joinpath(EXPERIMENT_DIR, "..", ".."))
+    commit = readchomp(`git -C $repository_root rev-parse HEAD`)
+    tracked_status = strip(readchomp(
+        `git -C $repository_root status --porcelain --untracked-files=no`,
+    ))
+    isempty(tracked_status) || error(
+        "supervised training requires a committed tracked worktree; status: $tracked_status",
+    )
+    return (; commit, tracked_worktree_clean=true)
+end
 
 const CHECKPOINT_FORMAT_VERSION = 2
 const RESUME_CONFIG_FIELDS = (
@@ -64,6 +89,8 @@ const RESUME_CONFIG_FIELDS = (
     :dataset_path,
     :dataset_sha256,
     :dataset_states,
+    :dataset_part_integrity_verified,
+    :dataset_verified_part_count,
     :storage_candidate_width,
     :candidate_width,
     :observed_candidate_width,
@@ -77,7 +104,10 @@ const RESUME_CONFIG_FIELDS = (
     :validation_eval_states,
     :partial_dataset_allowed,
     :model_source_sha256,
+    :model_source_closure_sha256,
     :training_source_sha256,
+    :training_core_source_sha256,
+    :metrics_resume_source_sha256,
     :backend,
     :backend_source_sha256,
     :backend_device,
@@ -95,6 +125,8 @@ const RESUME_CONFIG_FIELDS = (
     :gradient_evaluation_interval,
     :stability_top1_delta,
     :stability_loss_ratio,
+    :git_commit,
+    :git_tracked_worktree_clean,
     :julia_version,
     :lux_version,
     :optimisers_version,
@@ -256,6 +288,13 @@ function _gradient_diagnostics(run::ConvergenceRun, checkpoint, batch; witness::
         first=witness_for(prefixes.first),
         middle=witness_for(prefixes.middle),
         final=witness_for(prefixes.final),
+        queue=witness_for("queue"),
+        aux=witness_for("aux"),
+        shared_head=witness_for("heads.shared."),
+        q_head=witness_for("heads.q."),
+        death_head=witness_for("heads.death."),
+        quantile_head=witness_for("heads.quantiles."),
+        geometry_head=witness_for("heads.geometry."),
     )
     passed = all(item -> isfinite(item.gradient_norm) && item.gradient_norm > 0.0, values(paths))
     passed || error("end-to-end gradient witness failed for $(run.variant): $paths")
@@ -535,6 +574,7 @@ function main()
         "trainable_count=$trainable_count != total_count=$total_count",
     )
     optimiser = Optimisers.AdamW(learning_rate, (0.9, 0.999), weight_decay)
+    git = _git_metadata()
 
     minimum_updates = ceil(Int, min_epochs * length(split.training_rows) / state_batch)
     default_maximum = ceil(Int, max_epochs * length(split.training_rows) / state_batch)
@@ -550,6 +590,15 @@ function main()
             "BEAT_BACKEND_SOURCE",
             joinpath(EXPERIMENT_DIR, "backend", "fixedshape_learner.jl"),
         ))
+    model_source_closure = (
+        MODEL_SOURCE,
+        joinpath(dirname(MODEL_SOURCE), "common.jl"),
+        joinpath(dirname(MODEL_SOURCE), "preact_eca.jl"),
+        joinpath(dirname(MODEL_SOURCE), "gravity_film_convnext.jl"),
+        joinpath(dirname(MODEL_SOURCE), "tetris_convnext.jl"),
+    )
+    training_core_source = joinpath(TRAINING_DIR, "core.jl")
+    metrics_resume_source = joinpath(TRAINING_DIR, "metrics_resume.jl")
     config = (;
         experiment_id=run_id,
         variant=String(variant),
@@ -563,6 +612,8 @@ function main()
         dataset_sha256=isdir(dataset_path) ?
             sha256_file(joinpath(dataset_path, "manifest.json")) : sha256_file(dataset_path),
         dataset_states=length(dataset.action_counts),
+        dataset_part_integrity_verified=dataset.part_integrity_verified,
+        dataset_verified_part_count=dataset.verified_part_count,
         storage_candidate_width,
         candidate_width,
         observed_candidate_width,
@@ -578,8 +629,13 @@ function main()
         optional_target_coverage=optional_target_coverage(dataset),
         model_source=MODEL_SOURCE,
         model_source_sha256=sha256_file(MODEL_SOURCE),
+        model_source_closure_sha256=source_closure_sha256(model_source_closure),
         training_source=abspath(@__FILE__),
         training_source_sha256=sha256_file(abspath(@__FILE__)),
+        training_core_source=training_core_source,
+        training_core_source_sha256=sha256_file(training_core_source),
+        metrics_resume_source=metrics_resume_source,
+        metrics_resume_source_sha256=sha256_file(metrics_resume_source),
         backend=BACKEND_KIND,
         backend_source=backend_source_path,
         backend_source_sha256=sha256_file(backend_source_path),
@@ -598,6 +654,8 @@ function main()
         gradient_evaluation_interval,
         stability_top1_delta,
         stability_loss_ratio,
+        git_commit=git.commit,
+        git_tracked_worktree_clean=git.tracked_worktree_clean,
         julia_version=string(VERSION),
         lux_version=string(Base.pkgversion(Lux)),
         optimisers_version=string(Base.pkgversion(Optimisers)),
@@ -619,7 +677,26 @@ function main()
         lowercase(normpath(resume.path)) == lowercase(normpath(latest_path)) || error(
             "resume must use the run's latest checkpoint: expected $latest_path, got $(resume.path)",
         )
-        isfile(metrics_path) || error("resume metrics log does not exist: $metrics_path")
+        repair_metrics_log!(
+            metrics_path,
+            (;
+                update=Int(resume.trainer_state.update),
+                history=resume.trainer_state.history,
+                metrics=merge(resume.metrics, resume.status),
+            ),
+            latest_path;
+            artifact_field=:latest_checkpoint,
+            allowed_extra_fields=(
+                :last_two_finite_stable,
+                :finite_q_and_margin,
+                :game_eligible,
+                :classification,
+                :trainable_count,
+                :total_count,
+                :promotion_rule,
+                :latest_checkpoint,
+            ),
+        )
         BACKEND_KIND in ("native", "zygote", "cpu") && error(
             "durable resume is currently restricted to the pinned Reactant backend",
         )
@@ -774,12 +851,13 @@ function main()
             trainable_count,
             total_count,
         )
-        _save_checkpoint(
+        initial_latest = _save_checkpoint(
             latest_path, run, initial_checkpoint, initial, config, initial_status,
             sampler, control_state(),
         )
         open(metrics_path, "a") do io
-            JSON3.write(io, merge(initial, initial_status)); write(io, '\n')
+            JSON3.write(io, merge(initial, initial_status, (; latest_checkpoint=initial_latest)))
+            write(io, '\n')
         end
     else
         @info "Resumed convergence run" checkpoint=resume.path update=run.update packed_states=run.packed_states evaluations_completed

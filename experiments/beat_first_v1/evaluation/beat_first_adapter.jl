@@ -2,6 +2,7 @@ module BeatFirstCandidateAdapter
 
 using JLD2
 using Lux
+using Statistics
 
 const EXPERIMENT_ROOT = normpath(joinpath(@__DIR__, ".."))
 include(joinpath(EXPERIMENT_ROOT, "models", "models.jl"))
@@ -19,6 +20,7 @@ struct CandidatePolicy{M,P,S,C}
     update::Int
     stage::Int
     model_config::C
+    ranking_source::Symbol
 end
 
 function _required(file, name::AbstractString)
@@ -43,6 +45,8 @@ function build_candidate_policy(checkpoint_path::AbstractString)
             model_config=meta.config,
             update=haskey(file, "update") ? Int(file["update"]) : 0,
             stage=haskey(file, "stage") ? Int(file["stage"]) : 0,
+            ranking_source=hasproperty(meta, :ranking_source) ?
+                           Symbol(meta.ranking_source) : :q,
         )
     end
     payload.kind in BeatFirstModels.MODEL_KINDS || error(
@@ -69,6 +73,7 @@ function build_candidate_policy(checkpoint_path::AbstractString)
         payload.update,
         payload.stage,
         payload.model_config,
+        payload.ranking_source,
     )
 end
 
@@ -149,7 +154,13 @@ end
 function score_candidate_set(policy::CandidatePolicy, state, ordered_nodes)
     input = _pack_candidate_set(state, ordered_nodes)
     output, _ = policy.model(input, policy.ps, policy.st)
-    scores = Float32.(vec(Array(output.q)))
+    scores = if policy.ranking_source === :q
+        Float32.(vec(Array(output.q)))
+    elseif policy.ranking_source === :mean_quantiles
+        Float32.(vec(Array(mean(output.quantiles; dims=1))))
+    else
+        error("unsupported beat-first ranking source $(policy.ranking_source)")
+    end
     length(scores) == length(ordered_nodes) || error(
         "beat-first Q head returned the wrong candidate count"
     )
@@ -166,7 +177,7 @@ function candidate_policy_metadata(policy::CandidatePolicy)
         checkpoint_update=policy.update,
         checkpoint_stage=policy.stage,
         model_config=policy.model_config,
-        ranking_head="scalar q",
+        ranking_head=String(policy.ranking_source),
         aux_order=BeatFirstModels.INPUT_CONTRACT.aux_order,
     )
 end

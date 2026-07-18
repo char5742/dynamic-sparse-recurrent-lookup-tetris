@@ -129,6 +129,18 @@ struct CandidateHeads <: Lux.AbstractLuxContainerLayer{
     n_quantiles::Int
 end
 
+"""Current multi-task head; legacy `CandidateHeads` remains checkpoint-compatible."""
+struct GeometryCandidateHeads <: Lux.AbstractLuxContainerLayer{
+    (:shared, :q, :death, :quantiles, :geometry)
+}
+    shared
+    q
+    death
+    quantiles
+    geometry
+    n_quantiles::Int
+end
+
 function CandidateHeads(
     input_features::Int; hidden_features::Int=256, n_quantiles::Int=16
 )
@@ -145,6 +157,32 @@ function CandidateHeads(
     )
 end
 
+function GeometryCandidateHeads(
+    input_features::Int; hidden_features::Int=256, n_quantiles::Int=16
+)
+    n_quantiles >= 1 || error("n_quantiles must be positive")
+    return GeometryCandidateHeads(
+        Chain(
+            Dense(input_features => hidden_features, gelu),
+            Dense(hidden_features => hidden_features, gelu),
+        ),
+        Dense(hidden_features => 1),
+        Dense(hidden_features => 1),
+        Dense(hidden_features => n_quantiles),
+        Dense(hidden_features => 4),
+        n_quantiles,
+    )
+end
+
+make_candidate_heads(
+    input_features::Int;
+    hidden_features::Int,
+    n_quantiles::Int,
+    geometry_heads::Bool,
+) = geometry_heads ?
+    GeometryCandidateHeads(input_features; hidden_features, n_quantiles) :
+    CandidateHeads(input_features; hidden_features, n_quantiles)
+
 function (layer::CandidateHeads)(features, ps, st)
     shared, shared_st = layer.shared(features, ps.shared, st.shared)
     q, q_st = layer.q(shared, ps.q, st.q)
@@ -158,6 +196,25 @@ function (layer::CandidateHeads)(features, ps, st)
         q=q_st,
         death=death_st,
         quantiles=quantiles_st,
+    )
+    return output, next_state
+end
+
+function (layer::GeometryCandidateHeads)(features, ps, st)
+    shared, shared_st = layer.shared(features, ps.shared, st.shared)
+    q, q_st = layer.q(shared, ps.q, st.q)
+    death_logit, death_st = layer.death(shared, ps.death, st.death)
+    quantiles, quantiles_st = layer.quantiles(
+        shared, ps.quantiles, st.quantiles
+    )
+    geometry, geometry_st = layer.geometry(shared, ps.geometry, st.geometry)
+    output = (; q, death_logit, quantiles, geometry)
+    next_state = (;
+        shared=shared_st,
+        q=q_st,
+        death=death_st,
+        quantiles=quantiles_st,
+        geometry=geometry_st,
     )
     return output, next_state
 end
@@ -215,6 +272,10 @@ function forward_smoke(model; seed::UInt64=0x426561745631, candidates::Int=74)
     size(output.q) == (1, n) || error("q smoke shape mismatch")
     size(output.death_logit) == (1, n) || error("death smoke shape mismatch")
     size(output.quantiles, 2) == n || error("quantile smoke shape mismatch")
+    if hasproperty(output, :geometry)
+        size(output.geometry) == (4, n) || error("geometry smoke shape mismatch")
+        all(isfinite, output.geometry) || error("geometry smoke contains non-finite values")
+    end
     all(isfinite, output.q) || error("q smoke contains non-finite values")
     return (; output, next_state, parameters=parameter_count(ps))
 end

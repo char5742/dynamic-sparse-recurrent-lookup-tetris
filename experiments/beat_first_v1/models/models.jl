@@ -47,13 +47,14 @@ const MODEL_KINDS = (
 
 const MODEL_DEFAULTS = (;
     preact_eca=(;
-        architecture_version=1,
+        architecture_version=2,
         channels=96,
         depth=8,
         groups=8,
         queue_features=64,
         aux_features=64,
         hidden_features=256,
+        geometry_heads=true,
     ),
     tetris_convnext=(;
         architecture_version=1,
@@ -65,7 +66,7 @@ const MODEL_DEFAULTS = (;
         hidden_features=256,
     ),
     gravity_film=(;
-        architecture_version=2,
+        architecture_version=3,
         channels=112,
         depth=10,
         pointwise_features=48,
@@ -76,9 +77,10 @@ const MODEL_DEFAULTS = (;
         grid_features=256,
         local_features=96,
         hidden_features=704,
+        geometry_heads=true,
     ),
     preact_eca_medium=(;
-        architecture_version=2,
+        architecture_version=3,
         channels=192,
         depth=12,
         bottleneck_channels=48,
@@ -87,9 +89,10 @@ const MODEL_DEFAULTS = (;
         queue_features=96,
         aux_features=96,
         hidden_features=1536,
+        geometry_heads=true,
     ),
     gravity_film_medium=(;
-        architecture_version=3,
+        architecture_version=4,
         channels=128,
         depth=10,
         pointwise_features=32,
@@ -100,6 +103,7 @@ const MODEL_DEFAULTS = (;
         grid_features=1024,
         local_features=128,
         hidden_features=1280,
+        geometry_heads=true,
     ),
 )
 
@@ -151,8 +155,8 @@ const LEGACY_GRAVITY_DEFAULTS = (;
 )
 
 # Preserve the exact v2 constructors for already-recorded smoke artifacts and
-# any checkpoint explicitly carrying architecture_version=2. The current
-# Medium default below is v3; Small intentionally remains v2.
+# any checkpoint explicitly carrying architecture_version=2. Current geometry
+# heads use later architecture versions and therefore cannot alter this tree.
 const V2_GRAVITY_DEFAULTS = (;
     gravity_film=(;
         channels=112,
@@ -177,6 +181,36 @@ const V2_GRAVITY_DEFAULTS = (;
         grid_features=512,
         local_features=128,
         hidden_features=1536,
+    ),
+)
+
+# PreAct Medium v2 preceded the geometry auxiliary head.
+const V2_PREACT_DEFAULTS = (;
+    preact_eca_medium=(;
+        channels=192,
+        depth=12,
+        bottleneck_channels=48,
+        groups=8,
+        grid_features=512,
+        queue_features=96,
+        aux_features=96,
+        hidden_features=1536,
+    ),
+)
+
+# Gravity Medium v3 was the compute-rebalanced trunk without geometry outputs.
+const V3_GRAVITY_DEFAULTS = (;
+    gravity_film_medium=(;
+        channels=128,
+        depth=10,
+        pointwise_features=32,
+        branch_channels=32,
+        queue_features=64,
+        aux_features=64,
+        condition_features=128,
+        grid_features=1024,
+        local_features=128,
+        hidden_features=1280,
     ),
 )
 
@@ -208,7 +242,7 @@ function _resolved_model_config(kind::Symbol, requested::NamedTuple)
     end
 
     # Versionless non-empty configs came from the original v1 checkpoints.
-    # Empty requests mean today's registered default (v2 for Gravity/Medium).
+    # Empty requests mean today's registered architecture generation.
     version = if hasproperty(requested, :architecture_version)
         Int(requested.architecture_version)
     elseif !isempty(propertynames(requested))
@@ -223,14 +257,34 @@ function _resolved_model_config(kind::Symbol, requested::NamedTuple)
         merge(getproperty(LEGACY_GRAVITY_DEFAULTS, kind), (; architecture_version=1))
     elseif version == 2 && family === :gravity_film
         merge(getproperty(V2_GRAVITY_DEFAULTS, kind), (; architecture_version=2))
-    elseif version == 2
+    elseif version == 2 && family === :preact_eca && kind === :preact_eca_medium
+        merge(V2_PREACT_DEFAULTS.preact_eca_medium, (; architecture_version=2))
+    elseif version == 2 && family === :preact_eca && kind === :preact_eca
         defaults
-    elseif version == 3 && kind === :gravity_film_medium
+    elseif version == 3 && family === :preact_eca && kind === :preact_eca_medium
+        defaults
+    elseif version == 3 && family === :gravity_film && kind === :gravity_film
+        defaults
+    elseif version == 3 && family === :gravity_film && kind === :gravity_film_medium
+        merge(V3_GRAVITY_DEFAULTS.gravity_film_medium, (; architecture_version=3))
+    elseif version == 4 && kind === :gravity_film_medium
         defaults
     else
         error("unsupported $(family) architecture_version=$(version)")
     end
-    return merge(base, requested, (; architecture_version=version))
+    resolved = merge(base, requested, (; architecture_version=version))
+    geometry_expected =
+        (kind === :preact_eca && version == 2) ||
+        (kind === :preact_eca_medium && version == 3) ||
+        (kind === :gravity_film && version == 3) ||
+        (kind === :gravity_film_medium && version == 4)
+    geometry_enabled = hasproperty(resolved, :geometry_heads) &&
+                       Bool(resolved.geometry_heads)
+    geometry_enabled == geometry_expected || error(
+        "$(kind) architecture_version=$(version) requires " *
+        "geometry_heads=$(geometry_expected)",
+    )
+    return resolved
 end
 
 function build_model(kind::Symbol; n_quantiles::Int=16, kwargs...)
@@ -244,15 +298,17 @@ function build_model(kind::Symbol; n_quantiles::Int=16, kwargs...)
     if family === :tetris_convnext
         return TetrisConvNeXtQ(; constructor_config..., n_quantiles)
     elseif family === :preact_eca
-        if architecture_version == 1
+        if kind === :preact_eca && architecture_version in (1, 2)
             return PreActECAQ(; constructor_config..., n_quantiles)
-        elseif architecture_version == 2
+        elseif kind === :preact_eca_medium && architecture_version == 1
+            return PreActECAQ(; constructor_config..., n_quantiles)
+        elseif kind === :preact_eca_medium && architecture_version in (2, 3)
             return EfficientPreActECAQ(; constructor_config..., n_quantiles)
         end
     elseif family === :gravity_film
         if architecture_version == 1
             return GravityFiLMConvNeXtQ(; constructor_config..., n_quantiles)
-        elseif architecture_version in (2, 3)
+        elseif architecture_version in (2, 3, 4)
             return EfficientGravityFiLMConvNeXtQ(;
                 constructor_config..., n_quantiles
             )
@@ -278,7 +334,9 @@ function model_metadata(kind::Symbol, ps; n_quantiles::Int, config)
         config,
         input_contract=INPUT_CONTRACT,
         output_contract=(;
-            q=(1, :N), death_logit=(1, :N), quantiles=(n_quantiles, :N)
+            q=(1, :N), death_logit=(1, :N), quantiles=(n_quantiles, :N),
+            geometry=hasproperty(config, :geometry_heads) && Bool(config.geometry_heads) ?
+                     (4, :N) : nothing,
         ),
         ranking_source=:q,
         candidate_storage_capacity=208,
