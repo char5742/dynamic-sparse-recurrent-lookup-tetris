@@ -1,39 +1,80 @@
-# Beat-first training
+# Beat-first convergence training
 
-This directory is the short critical-path trainer for the three architectures
-in `../models`. It does not read validation or sealed game seeds.
+`train_supervised.jl` trains exactly four frozen registry presets, one run at a
+time: `preact_eca`, `preact_eca_medium`, `gravity_film`, and
+`gravity_film_medium`. Every parameter is passed to the optimizer; startup
+fails unless `trainable_parameter_count == total_parameter_count` and a
+Zygote witness finds non-zero gradients in the first, middle, and final
+backbone paths.
 
-Stage 1 runs fixed-width (74 candidates) end-to-end teacher pretraining with:
+The teacher objective is fixed-width (74 candidates) and combines ListNet,
+old-Q Huber, top-1/top-2 margin, selected-action death BCE, and quantile teacher
+loss. Train/validation rows are separated by seed when the dataset provides
+`seed_ids`/`episode_seeds`, otherwise by complete episode. Geometry caching is
+automatically disabled for datasets above 2,048 states, so a 100k+ state file
+does not create an unbounded object cache.
 
-- masked standardized ListNet (primary),
-- old-Q Huber regression,
-- teacher top-1/top-2 margin regression,
-- selected-action death BCE,
-- a small quantile-to-teacher initialization loss.
+Every configurable 100--250 updates, the driver overwrites `latest`, updates
+`best`, and appends JSONL containing decomposed train/validation losses,
+top-1/NDCG/pairwise, Q mean/std, action margin, global gradient norm, parameter
+norm, updates/s, and epoch equivalent. A checkpoint is game-eligible only when
+it has completed at least one epoch, validation top-1 is at least 0.80, the
+last two evaluations are finite/stable, and Q/margin diagnostics are finite.
+The periodic train/validation subsets are deterministic (defaults 256/512
+states) and their exact row counts and split groups are recorded.
+The expensive host-side full-gradient diagnostic is refreshed every five
+evaluations by default (`BEAT_GRAD_EVAL_INTERVAL`) and each record identifies
+the update at which that norm was observed; the one-time layer witness always
+runs at update zero.
 
-The teacher file has exact all-candidate line-clear/geometry targets derivable
-from board plus placement, but only selected-action death observations. The
-packer records all of them; the frozen model interface currently consumes the
-geometry as its 37 engineered input features and exposes only Q, death, and
-quantile heads.
+Reactant + EnzymeMLIR is selected by default. Supply the fixed-shape backend
+source explicitly; switch only the backend environment variable for the
+Native Julia + Zygote fallback.
 
-Successive halving is a single process and a single driver: all three models
-receive the same stage-1 row schedule, the best two receive stage 2, and the
-best one receives stage 3. Promotion is lexicographic held-out teacher
-top-1/NDCG/pairwise accuracy/old-Q Huber. Game-score promotion remains a
-separate evaluation step.
+```powershell
+$env:BEAT_VARIANT='gravity_film'
+$env:BEAT_BACKEND='reactant'
+$env:BEAT_BACKEND_SOURCE='C:\Users\fshuu\Documents\tetris\experiments\beat_first_v1\backend\fixedshape_learner.jl'
+$env:BEAT_BACKEND_MODULE='BeatFirstFixedShapeBackend'
+$env:BEAT_EVAL_INTERVAL='200'
+$env:BEAT_MIN_EPOCHS='3'
+$env:BEAT_MAX_EPOCHS='20'
+julia --project=experiments/beat_first_v1 experiments/beat_first_v1/training/train_supervised.jl
+```
 
-Native fallback example:
+Fallback:
 
 ```powershell
 $env:BEAT_BACKEND='native'
-$env:BEAT_HALVING_UPDATES='100,200,500'
-julia --project=. experiments/beat_first_v1/training/train_supervised.jl
+julia --project=experiments/beat_first_v1 experiments/beat_first_v1/training/train_supervised.jl
 ```
 
-For Reactant, set `BEAT_BACKEND_SOURCE` and `BEAT_BACKEND_MODULE` to the fixed
-shape backend. Both paths share `supervised_objective` exactly.
+`rl_stage2.jl` retains the PER, n-step, EMA, teacher-decay, and QR-DQN
+primitives. It must not be started until a supervised checkpoint reports
+`game_eligible=true` and then passes the fixed development-game gate.
 
-`rl_stage2.jl` contains the next-stage PER, n-step, EMA, teacher-decay, and
-QR-DQN primitives. It is intentionally not launched until the teacher champion
-passes fixed development games.
+After the N1 insurance run has exited, `post_n1_smoke.jl` performs the bounded
+full-parameter preflight and Reactant throughput measurement. Its safe default
+is one model (`preact_eca`), state batch 2, and five updates; use comma-separated
+values only when deliberately sequencing more variants or batches. Both a
+legacy JLD2 teacher file and a sharded dataset directory with `manifest.json`
+are accepted through `BEAT_TEACHER_DATASET`.
+
+```powershell
+$env:BEAT_SMOKE_VARIANTS='preact_eca'
+$env:BEAT_SMOKE_STATE_BATCHES='2'
+$env:BEAT_SMOKE_UPDATES='5'
+$env:BEAT_SMOKE_OUTPUT='D:\tetris-paper-plus\runs\beat_first_v1\preact_small_smoke.json'
+julia --project=experiments/beat_first_v1 experiments/beat_first_v1/training/post_n1_smoke.jl
+```
+
+Explicit Medium/batch sweep (run only after N1 and preferably one model per
+process to avoid contaminating peak-memory measurements):
+
+```powershell
+$env:BEAT_SMOKE_VARIANTS='gravity_film_medium'
+$env:BEAT_SMOKE_STATE_BATCHES='2,4,8'
+$env:BEAT_SMOKE_UPDATES='10'
+$env:BEAT_TEACHER_DATASET='D:\tetris-paper-plus\datasets\learning\teacher_100k'
+julia --project=experiments/beat_first_v1 experiments/beat_first_v1/training/post_n1_smoke.jl
+```

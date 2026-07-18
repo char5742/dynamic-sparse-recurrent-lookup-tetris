@@ -281,6 +281,68 @@ class LegacyOpenVINOInference:
             results.append(np.asarray(compiled(batch)[0]).reshape(-1))
         return np.concatenate(results).astype(np.float32, copy=False)
 
+    def predict_overlap_tail(self, board, placement, ren, back_to_back, tspin, queue):
+        """Overlap the unchanged dynamic CPU tail with static accelerator chunks.
+
+        This is an opt-in scheduling optimization for the bounded teacher-data
+        generator.  Chunk boundaries, devices, actual tail shape, output order,
+        and FP32 conversion are identical to :meth:`predict`.  The method is
+        intentionally single-caller: the dataset generator enters embedded
+        CPython only from its main Julia thread.
+        """
+        inputs = self._inputs(board, placement, ren, back_to_back, tspin, queue)
+        candidate_count = len(inputs["board"])
+        if candidate_count == 0:
+            return np.empty((0,), dtype=np.float32)
+
+        tail_size = candidate_count % self.batch_size
+        full_stop = candidate_count - tail_size
+        results = []
+
+        # With no full accelerator chunk there is nothing to overlap.  Keep
+        # the original CompiledModel call path exactly as-is.
+        if full_stop == 0:
+            return np.asarray(self.tail(inputs)[0]).reshape(-1).astype(
+                np.float32, copy=False
+            )
+
+        tail_request = None
+        if tail_size:
+            # Create lazily so ordinary serial users pay no request-allocation
+            # cost and retain the existing construction/predict path.
+            tail_request = getattr(self, "_overlap_tail_request", None)
+            if tail_request is None:
+                tail_request = self.tail.create_infer_request()
+                self._overlap_tail_request = tail_request
+            tail_batch = {
+                name: value[full_stop:candidate_count]
+                for name, value in inputs.items()
+            }
+            # share_inputs=False copies the actual-size dynamic inputs before
+            # returning, so their lifetime cannot race the accelerator calls.
+            tail_request.start_async(tail_batch, share_inputs=False)
+
+        try:
+            for start in range(0, full_stop, self.batch_size):
+                stop = start + self.batch_size
+                batch = {name: value[start:stop] for name, value in inputs.items()}
+                results.append(
+                    np.asarray(self.accelerator(batch)[0]).reshape(-1)
+                )
+        finally:
+            # Do not leave the reusable dynamic request busy if an accelerator
+            # call raises; the original accelerator exception still propagates.
+            if tail_request is not None:
+                tail_request.wait()
+
+        if tail_request is not None:
+            # Copy because the request owns this buffer and reuses it on the
+            # next variable-shape tail.
+            results.append(
+                np.asarray(tail_request.results[0]).reshape(-1).copy()
+            )
+        return np.concatenate(results).astype(np.float32, copy=False)
+
 
 class LegacyOpenVINOFeatures(LegacyOpenVINOInference):
     """Frozen 249-wide representation used to fine-tune only the value head."""

@@ -1,6 +1,7 @@
 module BeatFirstTrainingCore
 
 using JLD2
+using JSON3
 using LinearAlgebra
 using Lux
 using Random
@@ -11,8 +12,10 @@ export MAX_CANDIDATES,
        load_teacher_dataset,
        allocate_host_batch,
        pack_batch!,
+       supervised_components,
        supervised_objective,
        teacher_metrics,
+       evaluation_metrics,
        promotion_key,
        optional_target_coverage
 
@@ -42,8 +45,105 @@ const QUANTILE_TEACHER_WEIGHT = 0.05f0
 const LISTNET_TEMPERATURE = 0.50f0
 const HUBER_DELTA = 1.0f0
 
-function load_teacher_dataset(path::AbstractString; max_candidates::Int=MAX_CANDIDATES)
-    dataset = jldopen(path, "r") do file
+function _load_sharded_teacher_dataset(
+    root::AbstractString;
+    max_candidates::Int,
+)
+    manifest_path = joinpath(root, "manifest.json")
+    isfile(manifest_path) || error("sharded dataset manifest does not exist: $manifest_path")
+    manifest = JSON3.read(read(manifest_path, String))
+    parts = collect(manifest.parts)
+    isempty(parts) && error("sharded teacher dataset manifest has no parts")
+    states = sum(Int(part.row_count) for part in parts)
+
+    boards = zeros(UInt8, 24, 10, 1, states)
+    placements = zeros(UInt8, 24, 10, 1, max_candidates, states)
+    ren = zeros(Float32, 1, states)
+    back_to_back = zeros(Float32, 1, states)
+    tspin = zeros(Float32, max_candidates, states)
+    queues = zeros(UInt8, 7, 6, states)
+    teacher_q = fill(Float32(NaN), max_candidates, states)
+    action_counts = zeros(Int, states)
+    selected_actions = zeros(Int, states)
+    rewards = zeros(Float32, states)
+    seed_ids = zeros(Int, states)
+    episode_ids = zeros(Int, states)
+    episode_steps = zeros(Int, states)
+    terminal = falses(states)
+    candidate_death = falses(max_candidates, states)
+    candidate_death_available = falses(states)
+    predefined_split = fill(:unspecified, states)
+
+    cursor = 1
+    for part in parts
+        count = Int(part.row_count)
+        rows = cursor:(cursor + count - 1)
+        part_path = normpath(joinpath(root, String(part.relative_path)))
+        isfile(part_path) || error("manifest references missing part: $part_path")
+        jldopen(part_path, "r") do file
+            part_counts = Int.(file["action_counts"])
+            length(part_counts) == count || error("manifest row count mismatch: $part_path")
+            maximum(part_counts) <= max_candidates || error(
+                "part exceeds fixed candidate width $max_candidates: $part_path",
+            )
+            boards[:, :, :, rows] .= file["boards"]
+            placements[:, :, :, :, rows] .= file["placements"]
+            ren[:, rows] .= Float32.(file["ren"])
+            back_to_back[:, rows] .= Float32.(file["back_to_back"])
+            tspin[:, rows] .= Float32.(file["tspin"])
+            queues[:, :, rows] .= file["queues"]
+            teacher_q[:, rows] .= Float32.(file["teacher_q"])
+            action_counts[rows] .= part_counts
+            selected_actions[rows] .= Int.(file["selected_actions"])
+            rewards[rows] .= Float32.(file["rewards"])
+            seed_ids[rows] .= haskey(file, "seed_ids") ?
+                Int.(file["seed_ids"]) : fill(Int(part.seed), count)
+            episode_ids[rows] .= Int.(file["episode_ids"])
+            episode_steps[rows] .= Int.(file["episode_steps"])
+            terminal[rows] .= Bool.(file["terminal"])
+            if haskey(file, "death")
+                candidate_death[:, rows] .= Bool.(file["death"])
+                candidate_death_available[rows] .= true
+            end
+        end
+        predefined_split[rows] .= Symbol(String(part.split))
+        cursor += count
+    end
+    cursor == states + 1 || error("sharded dataset materialization ended at wrong row")
+    return (;
+        boards,
+        placements,
+        ren,
+        back_to_back,
+        tspin,
+        queues,
+        teacher_q,
+        action_counts,
+        selected_actions,
+        rewards,
+        seed_ids,
+        episode_ids,
+        split_group_ids=seed_ids,
+        predefined_split,
+        episode_steps,
+        terminal,
+        candidate_death,
+        candidate_death_available,
+        source_path=abspath(root),
+        manifest_path=abspath(manifest_path),
+        geometry_cache=nothing,
+    )
+end
+
+function load_teacher_dataset(
+    path::AbstractString;
+    max_candidates::Int=MAX_CANDIDATES,
+    geometry_cache_max_states::Int=2_048,
+)
+    dataset = if isdir(path)
+        _load_sharded_teacher_dataset(path; max_candidates)
+    else
+        jldopen(path, "r") do file
         action_counts = Int.(file["action_counts"])
         maximum(action_counts) <= max_candidates || error(
             "dataset has $(maximum(action_counts)) candidates; fixed learner width is $max_candidates",
@@ -55,6 +155,16 @@ function load_teacher_dataset(path::AbstractString; max_candidates::Int=MAX_CAND
         )
         missing = filter(name -> !haskey(file, name), required)
         isempty(missing) || error("teacher dataset is missing required fields: $(join(missing, ", "))")
+        # Prefer an explicit environment/training seed grouping when supplied.
+        # Older datasets only have episode_ids; an episode is still a leakage-
+        # safe split group because no state from it can cross train/validation.
+        split_group_ids = if haskey(file, "seed_ids")
+            Int.(file["seed_ids"])
+        elseif haskey(file, "episode_seeds")
+            Int.(file["episode_seeds"])
+        else
+            Int.(file["episode_ids"])
+        end
         return (;
             boards=file["boards"],
             placements=file["placements"],
@@ -67,14 +177,25 @@ function load_teacher_dataset(path::AbstractString; max_candidates::Int=MAX_CAND
             selected_actions=Int.(file["selected_actions"]),
             rewards=Float32.(file["rewards"]),
             episode_ids=Int.(file["episode_ids"]),
+            split_group_ids,
+            predefined_split=fill(:unspecified, length(action_counts)),
             episode_steps=Int.(file["episode_steps"]),
             terminal=Bool.(file["terminal"]),
+            candidate_death=haskey(file, "death") ?
+                Bool.(file["death"]) : falses(max_candidates, length(action_counts)),
+            candidate_death_available=fill(haskey(file, "death"), length(action_counts)),
             source_path=abspath(path),
-            geometry_cache=Dict{Tuple{Int,Int},Any}(),
-        )
+            # A cache of every candidate in a 100k-state dataset would consume
+            # more memory than the model. Disable it above the configured cap.
+            geometry_cache=length(action_counts) <= geometry_cache_max_states ?
+                Dict{Tuple{Int,Int},Any}() : nothing,
+            )
+        end
     end
     states = length(dataset.action_counts)
     states > 0 || error("teacher dataset is empty")
+    length(dataset.split_group_ids) == states || error("split group length mismatch")
+    length(dataset.predefined_split) == states || error("predefined split length mismatch")
     all((1 .<= dataset.selected_actions) .&
         (dataset.selected_actions .<= dataset.action_counts)) || error(
         "teacher dataset contains an invalid selected action",
@@ -233,7 +354,7 @@ function _candidate_geometry_entry(dataset, board, row::Int, action::Int)
         ]
         return (; after, difference, local_mask, aux, line_clear, geometry)
     end
-    if hasproperty(dataset, :geometry_cache)
+    if hasproperty(dataset, :geometry_cache) && dataset.geometry_cache !== nothing
         return get!(build, dataset.geometry_cache, (row, action))
     end
     return build()
@@ -272,9 +393,17 @@ function pack_batch!(batch, dataset, rows::AbstractVector{Int})
         batch.targets.top1_mask[top1, slot] = 1.0f0
         batch.targets.top2_mask[top2, slot] = 1.0f0
         batch.targets.margin[1, slot] = teacher[top1] - teacher[top2]
-        selected = dataset.selected_actions[row]
-        batch.targets.death[selected, slot] = Float32(dataset.terminal[row])
-        batch.targets.death_mask[selected, slot] = 1.0f0
+        if hasproperty(dataset, :candidate_death_available) &&
+           dataset.candidate_death_available[row]
+            batch.targets.death[1:count_actions, slot] .= Float32.(
+                @view dataset.candidate_death[1:count_actions, row]
+            )
+            batch.targets.death_mask[1:count_actions, slot] .= 1.0f0
+        else
+            selected = dataset.selected_actions[row]
+            batch.targets.death[selected, slot] = Float32(dataset.terminal[row])
+            batch.targets.death_mask[selected, slot] = 1.0f0
+        end
 
         for action in 1:width
             flat = _flat_index(action, slot, width)
@@ -362,9 +491,8 @@ function _quantile_teacher_loss(quantiles, teacher_q, mask)
     return sum(weight .* _huber(error) .* valid) / max(sum(valid) * k, 1.0f0)
 end
 
-"""Shared fixed-shape objective for Native Zygote and Reactant/EnzymeMLIR."""
-function supervised_objective(model, ps, st, batch)
-    output, next_state = model(batch.inputs, ps, st)
+"""Return every supervised loss component from one already-computed output."""
+function supervised_components(output, batch)
     width, state_batch = size(batch.mask)
     q = _reshape_q(output, width, state_batch)
     listnet = _listnet_loss(q, batch.targets.teacher_z, batch.mask)
@@ -381,14 +509,23 @@ function supervised_objective(model, ps, st, batch)
     loss = LISTNET_WEIGHT * listnet + OLD_Q_WEIGHT * old_q +
            MARGIN_WEIGHT * margin + DEATH_WEIGHT * death +
            QUANTILE_TEACHER_WEIGHT * quantile
-    statistics = (;
+    return (;
+        composite_loss=loss,
         listnet_loss=listnet,
         old_q_loss=old_q,
+        q_huber_loss=old_q,
         margin_loss=margin,
         death_loss=death,
         quantile_teacher_loss=quantile,
         valid_candidates=sum(batch.mask),
     )
+end
+
+"""Shared fixed-shape objective for Native Zygote and Reactant/EnzymeMLIR."""
+function supervised_objective(model, ps, st, batch)
+    output, next_state = model(batch.inputs, ps, st)
+    statistics = supervised_components(output, batch)
+    loss = statistics.composite_loss
     return loss, next_state, statistics
 end
 
@@ -460,6 +597,73 @@ function teacher_metrics(
     )
 end
 
+"""Full convergence metrics for a fixed, leakage-free row set.
+
+Rows are evaluated only in complete fixed-shape batches. Callers should pass a
+deterministic subset whose length is a multiple of the state batch size.
+"""
+function evaluation_metrics(
+    dataset,
+    rows::AbstractVector{Int},
+    host_batch,
+    predict_batch::Function,
+)
+    batch_size = size(host_batch.mask, 2)
+    length(rows) >= batch_size || error("evaluation rows are smaller than the fixed batch")
+    usable = length(rows) - mod(length(rows), batch_size)
+    usable > 0 || error("no complete evaluation batch")
+    selected_rows = @view rows[1:usable]
+
+    component_names = (
+        :composite_loss, :listnet_loss, :old_q_loss, :q_huber_loss, :margin_loss,
+        :death_loss, :quantile_teacher_loss,
+    )
+    component_sums = Dict(name => 0.0 for name in component_names)
+    top1 = Bool[]
+    ndcg = Float64[]
+    pairwise = Float64[]
+    q_values = Float64[]
+    action_margins = Float64[]
+    batches = 0
+
+    for partition in Iterators.partition(selected_rows, batch_size)
+        packed_rows = collect(partition)
+        pack_batch!(host_batch, dataset, packed_rows)
+        output = predict_batch(host_batch)
+        components = supervised_components(output, host_batch)
+        for name in component_names
+            component_sums[name] += Float64(getproperty(components, name))
+        end
+        q = Array(_reshape_q(output, size(host_batch.mask)...))
+        for (slot, row) in enumerate(packed_rows)
+            count_actions = dataset.action_counts[row]
+            prediction = @view q[1:count_actions, slot]
+            teacher = @view dataset.teacher_q[1:count_actions, row]
+            push!(top1, argmax(prediction) == argmax(teacher))
+            push!(ndcg, _ndcg(prediction, teacher))
+            push!(pairwise, _pairwise_accuracy(prediction, teacher))
+            append!(q_values, prediction)
+            ordering = partialsortperm(prediction, 1:min(2, count_actions); rev=true)
+            push!(action_margins, count_actions >= 2 ?
+                prediction[ordering[1]] - prediction[ordering[2]] : 0.0)
+        end
+        batches += 1
+    end
+
+    losses = NamedTuple{component_names}(
+        Tuple(component_sums[name] / batches for name in component_names),
+    )
+    return merge(losses, (;
+        states=usable,
+        top1_agreement=mean(top1),
+        ndcg=mean(ndcg),
+        pairwise_accuracy=mean(pairwise),
+        q_mean=mean(q_values),
+        q_std=std(q_values; corrected=false),
+        action_margin=mean(action_margins),
+    ))
+end
+
 promotion_key(metrics) = (
     metrics.top1_agreement,
     metrics.ndcg,
@@ -472,7 +676,9 @@ optional_target_coverage(dataset) = (;
     max_height="derived for every candidate; canonical model has no separate output head, so used in aux input",
     holes="derived for every candidate; canonical model has no separate output head, so used in aux input",
     cavities="derived for every candidate; canonical model has no separate output head, so used in aux input",
-    death="observed only for selected teacher actions and trained through death_logit",
+    death=hasproperty(dataset, :candidate_death_available) && any(dataset.candidate_death_available) ?
+        "all-candidate death labels where supplied; trained through death_logit" :
+        "legacy selected-action terminal labels only; trained through death_logit",
 )
 
 end # module

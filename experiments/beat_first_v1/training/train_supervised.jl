@@ -6,347 +6,602 @@ using Optimisers
 using Random
 using SHA
 using Statistics
+using Zygote
 
 const TRAINING_DIR = @__DIR__
 const EXPERIMENT_DIR = normpath(joinpath(TRAINING_DIR, ".."))
-const REPOSITORY_ROOT = normpath(joinpath(EXPERIMENT_DIR, "..", ".."))
 
 include(joinpath(TRAINING_DIR, "core.jl"))
 include(joinpath(TRAINING_DIR, "native_backend.jl"))
 using .BeatFirstTrainingCore
 
-# The selected source is included before main is compiled, avoiding runtime
-# method-definition/world-age problems while keeping the training driver
-# independent of the three architecture implementations.
 const MODEL_SOURCE = abspath(get(
-    ENV,
-    "BEAT_MODEL_SOURCE",
-    joinpath(EXPERIMENT_DIR, "models", "models.jl"),
+    ENV, "BEAT_MODEL_SOURCE", joinpath(EXPERIMENT_DIR, "models", "models.jl"),
 ))
 isfile(MODEL_SOURCE) || error("BEAT_MODEL_SOURCE does not exist: $MODEL_SOURCE")
 include(MODEL_SOURCE)
 const MODEL_MODULE_NAME = Symbol(get(ENV, "BEAT_MODEL_MODULE", "BeatFirstModels"))
-isdefined(Main, MODEL_MODULE_NAME) || error(
-    "model source did not define module $MODEL_MODULE_NAME",
-)
+isdefined(Main, MODEL_MODULE_NAME) || error("model module $MODEL_MODULE_NAME was not defined")
 const MODEL_API = getfield(Main, MODEL_MODULE_NAME)
 
-const BACKEND_KIND = lowercase(get(ENV, "BEAT_BACKEND", "native"))
+const BACKEND_KIND = lowercase(get(ENV, "BEAT_BACKEND", "reactant"))
 const BACKEND_API = if BACKEND_KIND in ("native", "zygote", "cpu")
     BeatFirstNativeBackend
 else
-    source = abspath(get(ENV, "BEAT_BACKEND_SOURCE", ""))
+    source = abspath(get(
+        ENV,
+        "BEAT_BACKEND_SOURCE",
+        joinpath(EXPERIMENT_DIR, "backend", "fixedshape_learner.jl"),
+    ))
     isfile(source) || error("BEAT_BACKEND_SOURCE does not exist: $source")
     include(source)
     module_name = Symbol(get(ENV, "BEAT_BACKEND_MODULE", "BeatFirstFixedShapeBackend"))
-    isdefined(Main, module_name) || error("backend source did not define module $module_name")
+    isdefined(Main, module_name) || error("backend module $module_name was not defined")
     getfield(Main, module_name)
 end
 
+# Exactly the two surviving architectures, each at the model registry's frozen
+# Small and Medium presets. ConvNeXt-only and ad-hoc sizes are intentionally not
+# accepted by this convergence driver.
+const CONVERGENCE_VARIANTS = (
+    :preact_eca,
+    :preact_eca_medium,
+    :gravity_film,
+    :gravity_film_medium,
+)
+
 sha256_file(path) = bytes2hex(open(sha256, path))
 
-mutable struct CandidateRun
-    kind::Symbol
+mutable struct ConvergenceRun
+    variant::Symbol
     model
     learner
     meta
     update::Int
-    train_seconds::Float64
-    losses::Vector{Float64}
-    stages::Vector{Any}
+    packed_states::Int
+    training_wall_seconds::Float64
+    history::Vector{Any}
+    last_gradient_diagnostics
+    first_update_wall_seconds
+    backend_recompile_count::Int
 end
 
-function _parse_update_budgets(value::AbstractString)
-    result = parse.(Int, split(value, ','))
-    length(result) == 3 || error("BEAT_HALVING_UPDATES must contain three comma-separated budgets")
-    all(>(0), result) || error("halving update budgets must be positive")
-    return result
-end
-
-function _setup_model(kind::Symbol, rng, n_quantiles::Int)
-    isdefined(MODEL_API, :setup_model) || error("model module lacks setup_model")
-    setup = MODEL_API.setup_model(kind, rng; n_quantiles)
-    model, ps, st, meta = setup.model, setup.ps, setup.st, setup.meta
-    output_keys = (:q, :death_logit, :quantiles)
-    return model, ps, st, merge((; output_keys), meta)
-end
-
-function _init_run(
-    kind::Symbol,
-    seed::UInt64,
-    n_quantiles::Int,
-    learning_rate::Float32,
-    weight_decay::Float32,
-    host_template,
-)
-    model, ps, st, meta = _setup_model(kind, Xoshiro(seed), n_quantiles)
-    optimiser = Optimisers.AdamW(
-        learning_rate, (0.9, 0.999), weight_decay,
-    )
-    learner = BACKEND_API.init_backend(
-        model,
-        ps,
-        st,
-        optimiser,
-        supervised_objective,
-        host_template;
-        max_candidates=MAX_CANDIDATES,
-        backend=get(ENV, "BEAT_BACKEND_DEVICE", "cpu"),
-    )
-    return CandidateRun(kind, model, learner, meta, 0, 0.0, Float64[], Any[])
-end
-
-function _host_checkpoint(run::CandidateRun)
+function _host_checkpoint(run::ConvergenceRun)
     raw = BACKEND_API.host_checkpoint(run.learner)
     return (;
         ps=hasproperty(raw, :ps) ? raw.ps : raw.parameters,
         st=hasproperty(raw, :st) ? raw.st : raw.states,
         optimizer_state=raw.optimizer_state,
-        step=raw.step,
+        step=hasproperty(raw, :backend_updates) ? Int(raw.backend_updates) : Int(raw.step),
     )
 end
 
-function _predictor(run::CandidateRun)
-    checkpoint = _host_checkpoint(run)
-    test_state = Lux.testmode(checkpoint.st)
-    return batch -> first(run.model(batch.inputs, checkpoint.ps, test_state))
-end
-
-function _train_stage!(
-    run::CandidateRun,
-    dataset,
-    host_batch,
-    row_schedule,
-)
-    stage_started = time()
-    first_loss = nothing
-    last_statistics = nothing
-    @info "Beat-first training stage started" kind=run.kind stage_updates=length(row_schedule) current_update=run.update
-    for (stage_update, rows) in enumerate(row_schedule)
-        pack_started = time()
-        pack_batch!(host_batch, dataset, rows)
-        pack_seconds = time() - pack_started
-        statistics = BACKEND_API.train_step!(run.learner, host_batch)
-        loss = Float64(statistics.loss)
-        isfinite(loss) || error("$(run.kind) produced non-finite loss at update $(run.update + 1)")
-        first_loss = isnothing(first_loss) ? loss : first_loss
-        push!(run.losses, loss)
-        run.update += 1
-        run.train_seconds += Float64(statistics.wall_seconds) + pack_seconds
-        last_statistics = merge(statistics, (; external_pack_seconds=pack_seconds))
-        if stage_update == 1 || stage_update % 25 == 0 || stage_update == length(row_schedule)
-            @info "Beat-first training progress" kind=run.kind stage_update total_update=run.update loss updates_per_second=stage_update/(time()-stage_started)
+function _parameter_arrays(value)
+    arrays = Any[]
+    function visit(item)
+        if item isa NamedTuple || item isa Tuple
+            foreach(visit, values(item))
+        elseif item isa AbstractArray
+            push!(arrays, item)
         end
     end
-    elapsed = time() - stage_started
-    return (;
-        updates=length(row_schedule),
-        first_loss,
-        last_loss=last(run.losses),
-        wall_seconds=elapsed,
-        updates_per_second=length(row_schedule) / elapsed,
-        candidates_per_second=length(row_schedule) * length(host_batch.mask) / elapsed,
-        last_statistics,
-    )
+    visit(value)
+    return arrays
 end
 
-function _save_checkpoint(
-    run::CandidateRun,
-    path::AbstractString,
-    metrics,
-    stage::Int,
-    config,
+parameter_count(value) = sum(length, _parameter_arrays(value); init=0)
+parameter_norm(value) = sqrt(sum(
+    sum(abs2, Float64.(Array(array))) for array in _parameter_arrays(value);
+    init=0.0,
+))
+
+function _gradient_leaves(parameters, gradients)
+    records = NamedTuple[]
+    function visit(path::String, parameter, gradient)
+        if parameter isa NamedTuple
+            for key in keys(parameter)
+                child_gradient = gradient === nothing ? nothing : getproperty(gradient, key)
+                child_path = isempty(path) ? String(key) : "$path.$key"
+                visit(child_path, getproperty(parameter, key), child_gradient)
+            end
+        elseif parameter isa Tuple
+            for index in eachindex(parameter)
+                child_gradient = gradient === nothing ? nothing : gradient[index]
+                visit("$path.$index", parameter[index], child_gradient)
+            end
+        elseif parameter isa AbstractArray
+            norm = gradient isa AbstractArray ?
+                sqrt(sum(abs2, Float64.(Array(gradient)))) : 0.0
+            push!(records, (; path, parameters=length(parameter), gradient_norm=norm))
+        end
+    end
+    visit("", parameters, gradients)
+    return records
+end
+
+function _prefix_gradient_norm(leaves, prefix::AbstractString)
+    return sqrt(sum(
+        record.gradient_norm^2 for record in leaves if startswith(record.path, prefix);
+        init=0.0,
+    ))
+end
+
+function _gradient_diagnostics(run::ConvergenceRun, checkpoint, batch; witness::Bool=false)
+    gradient = only(Zygote.gradient(
+        ps -> first(supervised_objective(run.model, ps, checkpoint.st, batch)),
+        checkpoint.ps,
+    ))
+    leaves = _gradient_leaves(checkpoint.ps, gradient)
+    global_norm = sqrt(sum(record.gradient_norm^2 for record in leaves; init=0.0))
+    result = (;
+        global_gradient_norm=global_norm,
+        parameter_norm=parameter_norm(checkpoint.ps),
+        finite=isfinite(global_norm),
+    )
+    witness || return result
+
+    depth = Int(run.meta.depth)
+    prefixes = run.meta.family === :preact_eca ? (;
+        first="stem",
+        middle="blocks.layer_$(cld(depth, 2))",
+        final="blocks.layer_$depth",
+    ) : (;
+        first="board_stem",
+        middle="blocks.layer_$(cld(depth, 2))",
+        final="blocks.layer_$depth",
+    )
+    witness_for(prefix) = (;
+        path=prefix,
+        gradient_norm=_prefix_gradient_norm(leaves, prefix),
+    )
+    paths = (;
+        first=witness_for(prefixes.first),
+        middle=witness_for(prefixes.middle),
+        final=witness_for(prefixes.final),
+    )
+    passed = all(item -> isfinite(item.gradient_norm) && item.gradient_norm > 0.0, values(paths))
+    passed || error("end-to-end gradient witness failed for $(run.variant): $paths")
+    return merge(result, (; backbone_gradient_witness=paths, witness_passed=passed))
+end
+
+function _group_split(dataset, seed::UInt64, fraction::Float64)
+    if hasproperty(dataset, :predefined_split) &&
+       any(split -> split !== :unspecified, dataset.predefined_split)
+        allowed = Set((:train, :validation))
+        all(split -> split in allowed, dataset.predefined_split) || error(
+            "predefined dataset split contains an unknown value",
+        )
+        training_rows = findall(==(:train), dataset.predefined_split)
+        validation_rows = findall(==(:validation), dataset.predefined_split)
+        isempty(training_rows) && error("predefined split has no training rows")
+        isempty(validation_rows) && error("predefined split has no validation rows")
+        training_groups = sort(unique(dataset.split_group_ids[training_rows]))
+        validation_groups = sort(unique(dataset.split_group_ids[validation_rows]))
+        isempty(intersect(training_groups, validation_groups)) || error(
+            "seed leakage across predefined train/validation split",
+        )
+        return (; training_rows, validation_rows, validation_groups,
+                training_groups, predefined=true)
+    end
+    groups = sort(unique(dataset.split_group_ids))
+    length(groups) >= 2 || error("at least two episode/seed groups are required")
+    explicit = strip(get(ENV, "BEAT_VALIDATION_GROUPS", ""))
+    validation_groups = if isempty(explicit)
+        shuffled = copy(groups)
+        shuffle!(Xoshiro(seed), shuffled)
+        count = clamp(round(Int, length(groups) * fraction), 1, length(groups) - 1)
+        sort(shuffled[1:count])
+    else
+        requested = sort(unique(parse.(Int, split(explicit, ','))))
+        all(group -> group in groups, requested) || error("unknown validation group")
+        1 <= length(requested) < length(groups) || error("invalid validation group count")
+        requested
+    end
+    validation_set = Set(validation_groups)
+    validation_rows = findall(group -> group in validation_set, dataset.split_group_ids)
+    training_rows = findall(group -> !(group in validation_set), dataset.split_group_ids)
+    isempty(training_rows) && error("empty training split")
+    isempty(validation_rows) && error("empty validation split")
+    return (; training_rows, validation_rows, validation_groups,
+            training_groups=sort(setdiff(groups, validation_groups)), predefined=false)
+end
+
+function _fixed_subset(rows, maximum_states::Int, batch_size::Int, seed::UInt64)
+    maximum_states >= batch_size || error("evaluation state cap is below fixed batch size")
+    selected = copy(rows)
+    shuffle!(Xoshiro(seed), selected)
+    resize!(selected, min(length(selected), maximum_states))
+    usable = length(selected) - mod(length(selected), batch_size)
+    usable >= batch_size || error("split is smaller than one fixed evaluation batch")
+    resize!(selected, usable)
+    return selected
+end
+
+function _all_finite(value)
+    for item in values(value)
+        item isa Number && !isfinite(item) && return false
+    end
+    return true
+end
+
+function _last_two_stable(history; top1_delta::Float64, loss_ratio::Float64)
+    length(history) >= 2 || return false
+    previous, current = history[end - 1], history[end]
+    _all_finite(previous.training) && _all_finite(current.training) &&
+        _all_finite(previous.validation) && _all_finite(current.validation) || return false
+    isfinite(previous.global_gradient_norm) && isfinite(current.global_gradient_norm) &&
+        isfinite(previous.parameter_norm) && isfinite(current.parameter_norm) || return false
+    abs(current.validation.top1_agreement - previous.validation.top1_agreement) <= top1_delta ||
+        return false
+    previous_loss = max(abs(previous.validation.composite_loss), 1.0e-8)
+    abs(current.validation.composite_loss - previous.validation.composite_loss) /
+        previous_loss <= loss_ratio || return false
+    return isfinite(current.validation.q_mean) && isfinite(current.validation.q_std) &&
+           isfinite(current.validation.action_margin)
+end
+
+function _classification(history, eligible::Bool)
+    eligible && return "game_eligible"
+    current = last(history)
+    gap = current.training.top1_agreement - current.validation.top1_agreement
+    gap >= 0.10 && return "overfit"
+    current.training.top1_agreement < 0.80 && return "underfit_or_optimization_headroom"
+    current.validation.top1_agreement < 0.80 && return "generalization_headroom"
+    return "unstable_or_insufficient_epoch"
+end
+
+function _evaluate!(
+    run::ConvergenceRun,
+    dataset,
+    host_batch,
+    training_eval_rows,
+    validation_eval_rows,
+    witness_batch,
+    training_rows_count::Int,
+    witness::Bool,
+    compute_gradient::Bool,
+    stability_top1_delta::Float64,
+    stability_loss_ratio::Float64,
 )
     checkpoint = _host_checkpoint(run)
+    test_state = Lux.testmode(checkpoint.st)
+    predictor = batch -> first(run.model(batch.inputs, checkpoint.ps, test_state))
+    training = evaluation_metrics(dataset, training_eval_rows, host_batch, predictor)
+    validation = evaluation_metrics(dataset, validation_eval_rows, host_batch, predictor)
+    if compute_gradient
+        run.last_gradient_diagnostics = merge(
+            _gradient_diagnostics(run, checkpoint, witness_batch; witness),
+            (; observed_at_update=run.update),
+        )
+    end
+    gradients = run.last_gradient_diagnostics
+    gradients === nothing && error("no gradient diagnostic has been recorded")
+    elapsed = max(run.training_wall_seconds, eps(Float64))
+    record = (;
+        update=run.update,
+        epoch_equivalent=run.packed_states / training_rows_count,
+        updates_per_second=run.update / elapsed,
+        training,
+        validation,
+        global_gradient_norm=gradients.global_gradient_norm,
+        parameter_norm=parameter_norm(checkpoint.ps),
+        gradients_finite=gradients.finite,
+        gradient_observed_at_update=gradients.observed_at_update,
+        gradient_fresh=compute_gradient,
+        first_update_wall_seconds=run.first_update_wall_seconds,
+        backend_recompile_count=run.backend_recompile_count,
+        backbone_gradient_witness=witness ? gradients.backbone_gradient_witness : nothing,
+        witness_passed=witness ? gradients.witness_passed : true,
+    )
+    push!(run.history, record)
+    stable = _last_two_stable(
+        run.history; top1_delta=stability_top1_delta, loss_ratio=stability_loss_ratio,
+    )
+    finite_q_margin = isfinite(validation.q_mean) && isfinite(validation.q_std) &&
+                      isfinite(validation.action_margin)
+    return merge(record, (;
+        last_two_finite_stable=stable,
+        finite_q_and_margin=finite_q_margin,
+    )), checkpoint
+end
+
+function _save_checkpoint(path, run, checkpoint, record, config, status)
     mkpath(dirname(path))
     jldsave(
         path;
-        model_kind=String(run.kind),
+        model_kind=String(run.variant),
         ps=checkpoint.ps,
         st=checkpoint.st,
         optimizer_state=checkpoint.optimizer_state,
         update=run.update,
-        stage,
-        metrics,
+        metrics=record,
+        history=run.history,
         meta=run.meta,
         config,
-        losses=run.losses,
+        status,
     )
     return (; path=abspath(path), bytes=filesize(path), sha256=sha256_file(path))
 end
 
-function _json_safe_meta(meta)
-    return Dict(String(key) => string(value) for (key, value) in pairs(meta))
+function _write_json(path, value)
+    open(path, "w") do io
+        JSON3.pretty(io, value)
+    end
 end
 
 function main()
     dataset_path = abspath(get(
-        ENV,
-        "BEAT_TEACHER_DATASET",
+        ENV, "BEAT_TEACHER_DATASET",
         raw"D:\tetris-paper-plus\datasets\learning\teacher_plus_dagger_c13_round1.jld2",
     ))
-    checkpoint_root = abspath(get(
-        ENV,
-        "BEAT_CHECKPOINT_ROOT",
-        raw"D:\tetris-paper-plus\checkpoints\beat_first_v1",
-    ))
     run_root = abspath(get(
-        ENV,
-        "BEAT_RUN_ROOT",
-        raw"D:\tetris-paper-plus\runs\beat_first_v1",
+        ENV, "BEAT_RUN_ROOT", raw"D:\tetris-paper-plus\runs\beat_first_v1",
     ))
-    mkpath(checkpoint_root)
+    checkpoint_root = abspath(get(
+        ENV, "BEAT_CHECKPOINT_ROOT", raw"D:\tetris-paper-plus\checkpoints\beat_first_v1",
+    ))
     mkpath(run_root)
-    dataset = load_teacher_dataset(dataset_path)
-    episodes = sort(unique(dataset.episode_ids))
-    validation_episode_count = parse(Int, get(ENV, "BEAT_VALIDATION_EPISODES", "2"))
-    1 <= validation_episode_count < length(episodes) || error("invalid validation episode count")
-    validation_episodes = episodes[(end - validation_episode_count + 1):end]
-    training_rows = findall(id -> !(id in validation_episodes), dataset.episode_ids)
-    validation_rows = findall(id -> id in validation_episodes, dataset.episode_ids)
-    isempty(training_rows) && error("empty teacher training split")
-    isempty(validation_rows) && error("empty held-out teacher split")
+    mkpath(checkpoint_root)
 
-    single_model = strip(get(ENV, "BEAT_SINGLE_MODEL", ""))
-    model_kinds = if isempty(single_model)
-        Symbol.(split(get(
-            ENV,
-            "BEAT_MODEL_KINDS",
-            join(string.(MODEL_API.MODEL_KINDS), ','),
-        ), ','))
-    else
-        [Symbol(single_model)]
-    end
-    length(model_kinds) in (1, 3) || error("trainer requires one lazy model or three halving models")
-    length(unique(model_kinds)) == length(model_kinds) || error("model kinds must be distinct")
-    all(kind -> kind in MODEL_API.MODEL_KINDS, model_kinds) || error("unknown model kind")
-    budgets = _parse_update_budgets(get(ENV, "BEAT_HALVING_UPDATES", "100,200,500"))
-    max_stage = parse(Int, get(ENV, "BEAT_MAX_HALVING_STAGE", "3"))
-    1 <= max_stage <= 3 || error("BEAT_MAX_HALVING_STAGE must be in 1:3")
+    variant = Symbol(get(ENV, "BEAT_VARIANT", "preact_eca"))
+    variant in CONVERGENCE_VARIANTS || error(
+        "BEAT_VARIANT must be one of $(CONVERGENCE_VARIANTS); got $variant",
+    )
     state_batch = parse(Int, get(ENV, "BEAT_STATE_BATCH", "2"))
     n_quantiles = parse(Int, get(ENV, "BEAT_N_QUANTILES", "16"))
     learning_rate = parse(Float32, get(ENV, "BEAT_LEARNING_RATE", "3e-4"))
     weight_decay = parse(Float32, get(ENV, "BEAT_WEIGHT_DECAY", "1e-4"))
     seed = parse(UInt64, get(ENV, "BEAT_TRAIN_SEED", "2026071801"))
-    run_id = get(ENV, "BEAT_RUN_ID", "beat_teacher_$(Dates.format(now(), "yyyymmdd_HHMMSS"))")
+    split_seed = parse(UInt64, get(ENV, "BEAT_SPLIT_SEED", "2026071817"))
+    validation_fraction = parse(Float64, get(ENV, "BEAT_VALIDATION_FRACTION", "0.10"))
+    0.0 < validation_fraction < 1.0 || error("validation fraction must be in (0,1)")
+    evaluation_interval = parse(Int, get(ENV, "BEAT_EVAL_INTERVAL", "200"))
+    100 <= evaluation_interval <= 250 || error("BEAT_EVAL_INTERVAL must be in 100:250")
+    min_epochs = parse(Float64, get(ENV, "BEAT_MIN_EPOCHS", "3"))
+    max_epochs = parse(Float64, get(ENV, "BEAT_MAX_EPOCHS", "20"))
+    1.0 <= min_epochs <= max_epochs || error("require 1 <= min epochs <= max epochs")
+    patience = parse(Int, get(ENV, "BEAT_EARLY_STOP_PATIENCE", "6"))
+    train_eval_max = parse(Int, get(ENV, "BEAT_TRAIN_EVAL_STATES", "256"))
+    validation_eval_max = parse(Int, get(ENV, "BEAT_VAL_EVAL_STATES", "512"))
+    stability_top1_delta = parse(Float64, get(ENV, "BEAT_STABLE_TOP1_DELTA", "0.03"))
+    stability_loss_ratio = parse(Float64, get(ENV, "BEAT_STABLE_LOSS_RATIO", "0.25"))
+    gradient_evaluation_interval = parse(Int, get(ENV, "BEAT_GRAD_EVAL_INTERVAL", "5"))
+    gradient_evaluation_interval >= 1 || error("BEAT_GRAD_EVAL_INTERVAL must be positive")
+    run_id = get(ENV, "BEAT_RUN_ID", "$(variant)_$(Dates.format(now(), "yyyymmdd_HHMMSS"))")
 
+    cache_max = parse(Int, get(ENV, "BEAT_GEOMETRY_CACHE_MAX_STATES", "2048"))
+    dataset = load_teacher_dataset(dataset_path; geometry_cache_max_states=cache_max)
+    split = _group_split(dataset, split_seed, validation_fraction)
+    length(split.training_rows) >= state_batch || error("training split is smaller than batch")
+    length(split.validation_rows) >= state_batch || error("validation split is smaller than batch")
+    training_eval_rows = _fixed_subset(
+        split.training_rows, train_eval_max, state_batch, seed + 0x101,
+    )
+    validation_eval_rows = _fixed_subset(
+        split.validation_rows, validation_eval_max, state_batch, seed + 0x202,
+    )
+
+    host_batch = allocate_host_batch(state_batch)
+    witness_batch = allocate_host_batch(state_batch)
+    pack_batch!(host_batch, dataset, split.training_rows[1:state_batch])
+    pack_batch!(witness_batch, dataset, training_eval_rows[1:state_batch])
+
+    setup = MODEL_API.setup_model(variant, Xoshiro(seed); n_quantiles)
+    total_count = Int(setup.meta.parameters)
+    trainable_count = parameter_count(setup.ps)
+    trainable_count == total_count || error(
+        "trainable_count=$trainable_count != total_count=$total_count",
+    )
+    optimiser = Optimisers.AdamW(learning_rate, (0.9, 0.999), weight_decay)
+    learner = BACKEND_API.init_backend(
+        setup.model, setup.ps, setup.st, optimiser, supervised_objective, host_batch;
+        max_candidates=MAX_CANDIDATES,
+        backend=get(ENV, "BEAT_BACKEND_DEVICE", "cpu"),
+    )
+    run = ConvergenceRun(
+        variant, setup.model, learner, setup.meta, 0, 0, 0.0, Any[], nothing,
+        nothing, 0,
+    )
+
+    minimum_updates = ceil(Int, min_epochs * length(split.training_rows) / state_batch)
+    default_maximum = ceil(Int, max_epochs * length(split.training_rows) / state_batch)
+    maximum_updates = parse(Int, get(ENV, "BEAT_MAX_UPDATES", string(default_maximum)))
+    maximum_updates >= minimum_updates || error(
+        "BEAT_MAX_UPDATES=$maximum_updates is below minimum $minimum_updates",
+    )
+    manifest = joinpath(dirname(Base.active_project()), "Manifest.toml")
+    backend_source_path = BACKEND_KIND in ("native", "zygote", "cpu") ?
+        joinpath(TRAINING_DIR, "native_backend.jl") :
+        abspath(get(
+            ENV,
+            "BEAT_BACKEND_SOURCE",
+            joinpath(EXPERIMENT_DIR, "backend", "fixedshape_learner.jl"),
+        ))
     config = (;
-        run_id,
+        experiment_id=run_id,
+        variant=String(variant),
+        family=String(setup.meta.family),
+        preset=String(setup.meta.preset),
+        model_config=setup.meta.config,
+        total_parameter_count=total_count,
+        trainable_parameter_count=trainable_count,
+        all_parameters_end_to_end=trainable_count == total_count,
         dataset_path,
-        dataset_sha256=sha256_file(dataset_path),
+        dataset_sha256=isdir(dataset_path) ?
+            sha256_file(joinpath(dataset_path, "manifest.json")) : sha256_file(dataset_path),
+        dataset_states=length(dataset.action_counts),
+        split_kind=split.predefined ? "manifest_predefined_seed_group" : "episode_or_seed_group",
+        split_seed,
+        training_groups=split.training_groups,
+        validation_groups=split.validation_groups,
+        training_states=length(split.training_rows),
+        validation_states=length(split.validation_rows),
+        training_eval_states=length(training_eval_rows),
+        validation_eval_states=length(validation_eval_rows),
+        optional_target_coverage=optional_target_coverage(dataset),
         model_source=MODEL_SOURCE,
         model_source_sha256=sha256_file(MODEL_SOURCE),
-        model_kinds=String.(model_kinds),
-        single_model_mode=length(model_kinds) == 1,
+        training_source=abspath(@__FILE__),
+        training_source_sha256=sha256_file(abspath(@__FILE__)),
         backend=BACKEND_KIND,
+        backend_source=backend_source_path,
+        backend_source_sha256=sha256_file(backend_source_path),
         backend_device=get(ENV, "BEAT_BACKEND_DEVICE", "cpu"),
-        budgets,
-        max_stage,
         state_batch,
         n_quantiles,
         learning_rate,
         weight_decay,
         seed,
-        training_episode_ids=sort(unique(dataset.episode_ids[training_rows])),
-        validation_episode_ids=validation_episodes,
-        held_out_test_seeds_used=false,
-        optional_target_coverage=optional_target_coverage(dataset),
-    )
-    host_batch = allocate_host_batch(state_batch)
-    length(training_rows) >= state_batch || error("training split is smaller than state batch")
-    # Reactant validates its owned host template before the first compile.
-    # Supply one real nonempty fixed-shape batch; subsequent packs change values only.
-    pack_batch!(host_batch, dataset, training_rows[1:state_batch])
-    candidates = CandidateRun[]
-    for kind in model_kinds
-        model_index = findfirst(==(kind), MODEL_API.MODEL_KINDS)
-        push!(candidates, _init_run(
-            kind,
-            seed + UInt64(model_index - 1),
-            n_quantiles,
-            learning_rate,
-            weight_decay,
-            host_batch,
-        ))
-    end
-
-    started = time()
-    rng = Xoshiro(seed + 0x9e3779b97f4a7c15)
-    stage_results = Any[]
-    survivors = candidates
-    survivor_counts = length(candidates) == 1 ? (1, 1, 1) : (2, 1, 1)
-    for stage in 1:max_stage
-        stage_schedule = [rand(rng, training_rows, state_batch) for _ in 1:budgets[stage]]
-        evaluations = Any[]
-        for run in survivors
-            training = _train_stage!(run, dataset, host_batch, stage_schedule)
-            metrics = teacher_metrics(
-                dataset,
-                validation_rows,
-                host_batch,
-                _predictor(run),
-            )
-            checkpoint_path = joinpath(
-                checkpoint_root, "$(run_id)_$(run.kind)_stage$(stage).jld2",
-            )
-            checkpoint = _save_checkpoint(run, checkpoint_path, metrics, stage, config)
-            record = (;
-                kind=String(run.kind),
-                stage,
-                total_updates=run.update,
-                parameter_count=get(run.meta, :parameters, nothing),
-                training,
-                metrics,
-                checkpoint,
-            )
-            push!(run.stages, record)
-            push!(evaluations, record)
-            @info "Beat-first teacher stage complete" record
-        end
-        order = sortperm(
-            survivors;
-            by=run -> promotion_key(last(run.stages).metrics),
-            rev=true,
-            alg=MergeSort,
-        )
-        keep = min(survivor_counts[stage], length(survivors))
-        promoted = survivors[order[1:keep]]
-        push!(stage_results, (;
-            stage,
-            evaluations,
-            promoted=String.(getfield.(promoted, :kind)),
-            selection_metric="lexicographic(top1, ndcg, pairwise, -old_q_huber)",
-        ))
-        survivors = promoted
-    end
-
-    champion = length(survivors) == 1 ? only(survivors) : nothing
-    champion_record = isnothing(champion) ? nothing : last(champion.stages)
-    summary = (;
-        experiment_id=run_id,
-        generated_at=string(now()),
-        config,
+        evaluation_interval,
+        min_epochs,
+        max_epochs,
+        minimum_updates,
+        maximum_updates,
+        patience,
+        gradient_evaluation_interval,
         julia_version=string(VERSION),
         lux_version=string(Base.pkgversion(Lux)),
-        model_metadata=Dict(String(run.kind) => _json_safe_meta(run.meta) for run in candidates),
-        stages=stage_results,
-        champion=isnothing(champion) ? nothing : String(champion.kind),
-        champion_checkpoint=isnothing(champion_record) ? nothing : champion_record.checkpoint,
-        champion_teacher_metrics=isnothing(champion_record) ? nothing : champion_record.metrics,
-        current_survivors=String.(getfield.(survivors, :kind)),
-        total_wall_seconds=time() - started,
-        completion_reason=max_stage == 3 ?
-            "configured 3-to-2-to-1 teacher successive halving completed" :
-            "configured teacher halving stage $max_stage completed",
-        next_action=max_stage == 3 ?
-            "run fixed development games, then promote only the champion to end-to-end RL" :
-            "review stage metrics and continue the frozen halving schedule with only current survivors",
+        optimisers_version=string(Base.pkgversion(Optimisers)),
+        zygote_version=string(Base.pkgversion(Zygote)),
+        project=Base.active_project(),
+        manifest_sha256=isfile(manifest) ? sha256_file(manifest) : nothing,
+        held_out_test_seeds_used=false,
     )
-    summary_path = joinpath(run_root, "$(run_id).json")
-    open(summary_path, "w") do io
-        JSON3.pretty(io, summary)
+
+    summary_path = joinpath(run_root, "$run_id.json")
+    metrics_path = joinpath(run_root, "$(run_id)_metrics.jsonl")
+    latest_path = joinpath(checkpoint_root, "$(run_id)_latest.jld2")
+    best_path = joinpath(checkpoint_root, "$(run_id)_best.jld2")
+    eligible_best_path = joinpath(checkpoint_root, "$(run_id)_eligible_best.jld2")
+    isfile(metrics_path) && error("metrics path already exists: $metrics_path")
+
+    rng = Xoshiro(seed + 0x9e3779b97f4a7c15)
+    best_top1 = -Inf
+    best_update = 0
+    eligible_best_top1 = -Inf
+    eligible_best_update = 0
+    stale_evaluations = 0
+    evaluations_completed = 0
+    completion_reason = "maximum_updates"
+
+    # Update zero supplies the mandatory one-time first/middle/final backbone
+    # witness before any optimizer step can obscure a frozen parameter path.
+    initial, initial_checkpoint = _evaluate!(
+        run, dataset, host_batch, training_eval_rows, validation_eval_rows,
+        witness_batch, length(split.training_rows), true, true,
+        stability_top1_delta, stability_loss_ratio,
+    )
+    initial_status = (;
+        game_eligible=false,
+        classification="pretraining_baseline",
+        trainable_count,
+        total_count,
+    )
+    _save_checkpoint(latest_path, run, initial_checkpoint, initial, config, initial_status)
+    open(metrics_path, "a") do io
+        JSON3.write(io, merge(initial, initial_status)); write(io, '\n')
     end
-    @info "Beat-first teacher pretraining complete" summary_path champion=summary.champion survivors=summary.current_survivors
+
+    while run.update < maximum_updates
+        rows = rand(rng, split.training_rows, state_batch)
+        pack_started = time()
+        pack_batch!(host_batch, dataset, rows)
+        pack_seconds = time() - pack_started
+        statistics = BACKEND_API.train_step!(run.learner, host_batch)
+        loss = Float64(statistics.loss)
+        isfinite(loss) || error("non-finite loss at update $(run.update + 1)")
+        run.first_update_wall_seconds === nothing &&
+            (run.first_update_wall_seconds = Float64(statistics.wall_seconds))
+        hasproperty(statistics, :recompiled) && Bool(statistics.recompiled) &&
+            (run.backend_recompile_count += 1)
+        run.backend_recompile_count == 0 || error(
+            "fixed-shape backend recompiled at update $(run.update + 1)",
+        )
+        run.update += 1
+        run.packed_states += state_batch
+        run.training_wall_seconds += Float64(statistics.wall_seconds) + pack_seconds
+
+        evaluate_now = run.update % evaluation_interval == 0 || run.update == maximum_updates
+        evaluate_now || continue
+        evaluations_completed += 1
+        compute_gradient = evaluations_completed % gradient_evaluation_interval == 0 ||
+                           run.update == maximum_updates
+        record, checkpoint = _evaluate!(
+            run, dataset, host_batch, training_eval_rows, validation_eval_rows,
+            witness_batch, length(split.training_rows), false, compute_gradient,
+            stability_top1_delta, stability_loss_ratio,
+        )
+        epoch_ok = record.epoch_equivalent >= 1.0
+        top1_ok = record.validation.top1_agreement >= 0.80
+        eligible = epoch_ok && top1_ok && record.last_two_finite_stable &&
+                   record.finite_q_and_margin && record.gradients_finite
+        status = (;
+            game_eligible=eligible,
+            classification=_classification(run.history, eligible),
+            trainable_count,
+            total_count,
+            promotion_rule="epoch>=1 && val_top1>=0.80 && last2_finite_stable && finite_Q_margin",
+        )
+        latest = _save_checkpoint(latest_path, run, checkpoint, record, config, status)
+        if record.validation.top1_agreement > best_top1
+            best_top1 = record.validation.top1_agreement
+            best_update = run.update
+            stale_evaluations = 0
+            _save_checkpoint(best_path, run, checkpoint, record, config, status)
+        else
+            stale_evaluations += 1
+        end
+        if eligible && record.validation.top1_agreement > eligible_best_top1
+            eligible_best_top1 = record.validation.top1_agreement
+            eligible_best_update = run.update
+            _save_checkpoint(eligible_best_path, run, checkpoint, record, config, status)
+        end
+        open(metrics_path, "a") do io
+            JSON3.write(io, merge(record, status, (; latest_checkpoint=latest)))
+            write(io, '\n')
+        end
+        @info "Convergence checkpoint" variant update=run.update epoch=record.epoch_equivalent updates_per_second=record.updates_per_second train_top1=record.training.top1_agreement val_top1=record.validation.top1_agreement val_loss=record.validation.composite_loss classification=status.classification game_eligible=eligible
+
+        if record.epoch_equivalent >= min_epochs && stale_evaluations >= patience
+            completion_reason = "validation_plateau"
+            break
+        end
+    end
+
+    final_record = last(run.history)
+    final_epoch_ok = final_record.epoch_equivalent >= 1.0
+    final_top1_ok = final_record.validation.top1_agreement >= 0.80
+    final_stable = _last_two_stable(
+        run.history; top1_delta=stability_top1_delta, loss_ratio=stability_loss_ratio,
+    )
+    game_eligible = final_epoch_ok && final_top1_ok && final_stable &&
+                    isfinite(final_record.validation.q_mean) &&
+                    isfinite(final_record.validation.q_std) &&
+                    isfinite(final_record.validation.action_margin) &&
+                    final_record.gradients_finite
+    summary = (;
+        generated_at=string(now()),
+        config,
+        completion_reason,
+        completed_updates=run.update,
+        completed_epoch_equivalent=final_record.epoch_equivalent,
+        best_validation_top1=best_top1,
+        best_update,
+        eligible_best_validation_top1=isfinite(eligible_best_top1) ? eligible_best_top1 : nothing,
+        eligible_best_update=eligible_best_update == 0 ? nothing : eligible_best_update,
+        final=final_record,
+        game_eligible,
+        classification=_classification(run.history, game_eligible),
+        latest_checkpoint=latest_path,
+        best_checkpoint=isfile(best_path) ? best_path : nothing,
+        eligible_best_checkpoint=isfile(eligible_best_path) ? eligible_best_path : nothing,
+        metrics_jsonl=metrics_path,
+        next_action=game_eligible ?
+            "eligible for fixed-development-game evaluation" :
+            "do not run game promotion; inspect underfit/overfit/headroom classification",
+    )
+    _write_json(summary_path, summary)
+    @info "Supervised convergence run complete" summary_path game_eligible classification=summary.classification best_validation_top1=best_top1
     return summary
 end
 

@@ -170,11 +170,30 @@ function local_mean_2d(x, mask)
     return reshape(numerator ./ denominator, size(x, 3), size(x, 4))
 end
 
+"""Fixed 4x5 mean grid for the canonical 24x10 candidate board.
+
+The grid retains coarse height and column location while moving the expensive
+capacity out of the full-resolution spatial trunk. Each output cell summarizes
+an exact 6x2 input tile, so this operation has no padding or boundary ambiguity.
+"""
+function fixed_grid_mean_4x5(x)
+    size(x, 1) == BOARD_HEIGHT || error("grid pool expects board height 24")
+    size(x, 2) == BOARD_WIDTH || error("grid pool expects board width 10")
+    channels = size(x, 3)
+    batch = size(x, 4)
+    tiled = reshape(x, 6, 4, 2, 5, channels, batch)
+    pooled = mean(tiled; dims=(1, 3))
+    return reshape(pooled, 20 * channels, batch)
+end
+
 """Count nested Lux parameters without importing an optimizer package."""
 parameter_count(x::AbstractArray) = length(x)
 parameter_count(x::NamedTuple) = sum(parameter_count, values(x); init=0)
 parameter_count(x::Tuple) = sum(parameter_count, x; init=0)
 parameter_count(x) = 0
+
+"""Count every trainable array leaf, including every auxiliary output head."""
+all_parameter_count(ps) = parameter_count(ps)
 
 function smoke_input(; candidates::Int=74, state_batch::Int=1)
     n = candidates * state_batch

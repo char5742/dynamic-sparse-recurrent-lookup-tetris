@@ -106,6 +106,12 @@ end
     @test 0 <= metrics.top1_agreement <= 1
     @test 0 <= metrics.ndcg <= 1
     @test 0 <= metrics.pairwise_accuracy <= 1
+    convergence = evaluation_metrics(dataset, [3, 4], batch, predict_batch)
+    @test isfinite(convergence.composite_loss)
+    @test convergence.q_huber_loss == convergence.old_q_loss
+    @test isfinite(convergence.q_mean)
+    @test isfinite(convergence.q_std)
+    @test isfinite(convergence.action_margin)
 end
 
 @testset "stage-2 replay and QR targets" begin
