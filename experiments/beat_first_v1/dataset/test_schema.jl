@@ -5,7 +5,7 @@ using .BeatFirstTeacherDatasetV2
 
 @testset "empty manifest counts" begin
     empty_manifest = (;
-        format_version=2,
+        format_version=3,
         created_at="2026-07-18T00:00:00",
         updated_at="2026-07-18T00:00:00",
         parts=Any[],

@@ -239,7 +239,7 @@ function main()
     output_root = abspath(get(
         ENV,
         "BEAT_DATASET_ROOT",
-        raw"D:\tetris-paper-plus\datasets\beat_first_v1\teacher_v2",
+        raw"D:\tetris-paper-plus\datasets\beat_first_v1\teacher_v3",
     ))
     plan_name = lowercase(get(ENV, "BEAT_DATASET_PLAN", "base"))
     plan_name in ("base", "dagger") || error("BEAT_DATASET_PLAN must be base or dagger")

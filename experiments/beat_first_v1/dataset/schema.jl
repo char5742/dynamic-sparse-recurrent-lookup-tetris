@@ -25,7 +25,7 @@ export MAX_CANDIDATES,
 # Round storage to the next NPU batch-16 boundary. Learners trim this physical
 # capacity to the dataset's observed maximum before compiling.
 const MAX_CANDIDATES = 208
-const FORMAT_VERSION = 2
+const FORMAT_VERSION = 3
 
 struct EpisodeSpec
     split::Symbol

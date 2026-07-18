@@ -1,4 +1,4 @@
-# Beat-first teacher dataset v2
+# Beat-first teacher dataset v3
 
 This is the mainline, resumable teacher/DAgger data path. It reuses the
 canonical `stable_node_list`, `legacy_candidate_batch`, `openvino_scores`, and
@@ -13,6 +13,9 @@ candidates. The engine-level bound is 204 (current plus HOLD, each with at most
 batch-16 boundary. Training scans `action_counts` first and compiles only at
 the observed dataset maximum; it does not execute 208 padded candidates per
 state.
+
+Format v3 uses a new `teacher_v3` root. The interrupted v2 prefix remains
+preserved separately; 74-axis v2 parts are never mixed with 208-axis v3 parts.
 
 Each episode is one bounded JLD2 part. A JSON sidecar contains its key, split,
 rollout role, seed, counts, byte size, and SHA-256. `manifest.json` is replaced
