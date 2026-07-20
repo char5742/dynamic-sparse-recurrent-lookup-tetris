@@ -1,0 +1,173 @@
+format_version = 1
+experiment_id = "sparse_3l_dynamic_k64_k256_teacher_20000_v1"
+purpose = "one fresh bounded teacher-ranking convergence test of the detached k64 scout / conditional k256 CPU-SLIDE policy; no game-strength claim"
+hypothesis = "A state-level raw-Q margin gate can spend k256 selected compute only on ambiguous candidate sets while retaining the fixed-k128 mean selected-compute budget and improving top-1 separation."
+expected_mechanism = "Every state evaluates all valid candidates with fixed-WTA k64. If the stable valid-only raw-Q top-two margin is strictly below 0.02, all candidates are rerun from the immutable packed inputs at k256 and only the chosen k64 or k256 tapes receive VJP and sparse optimizer updates."
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-CPF1 with state-level dynamic-k64-k256"
+routing_mode = "dynamic_k64_k256_v1"
+routing_policy = "fixed-wta-state-margin-dynamic-k64-k256-v1"
+base_routing_policy = "wta-collision-count-stable-id-prefilter-v1"
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_bytes = 1268581
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+fresh_start_required = true
+resume_forbidden = true
+retry_forbidden = true
+rescue_forbidden = true
+checkpoint_selection_forbidden = true
+checkpoint_version = 2
+serialized_owner_variant = "k128"
+serialized_owner_active_counts = [48, 40, 40]
+total_parameters = 19924022
+learner_candidate_width = 80
+observed_max_candidates = 76
+state_batch = 1
+maximum_updates = 20000
+epochs_ceiling = 1.0
+evaluate_initial = false
+evaluation_updates = [2000, 4000, 6000, 8000, 10000, 12000, 14000, 16000, 18000, 20000]
+checkpoint_updates = [2000, 4000, 6000, 8000, 10000, 12000, 14000, 16000, 18000, 20000]
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+sampler = "Xoshiro fixed episode-separated teacher_v3 order"
+learning_rate = 0.0001
+weight_decay = 0.0
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1.0e-8
+objective_margin_mode = "fixed_teacher_top2"
+objective_margin_weight = 0.15
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 90
+
+[dynamic_k]
+gate_source = "stable valid-only raw Q"
+margin_threshold = 0.02
+comparison = "expand iff margin < Float32(0.02); equality remains k64"
+scout_active_counts = [24, 20, 20]
+expanded_active_counts = [96, 80, 80]
+scout_training_probes = [3, 2, 2]
+expanded_training_probes = [12, 10, 10]
+scout_forward_macs_per_candidate = 32020
+clear_core_training_macs_per_candidate = 78504
+expanded_chosen_training_macs_per_candidate = 267552
+expanded_total_core_training_macs_per_candidate = 299572
+k128_core_budget_macs_per_candidate = 141520
+maximum_candidate_weighted_expansion_fraction = 0.285052563012286
+scout_is_detached = true
+rerun_all_valid_candidates_on_expansion = true
+chosen_pass_only_vjp = true
+chosen_pass_only_sparse_optimizer = true
+base_checkpoint_topology_is_immutable = true
+dense_fallback_forbidden = true
+mongoose_forbidden = true
+nnue_substitution_forbidden = true
+
+[selected_compute_gate]
+first_enforced_update = 2000
+enforced_at_every_later_evaluation = true
+accounting_scope = "core selected forward plus chosen VJP/sketch only; excludes WTA rerank, routing bytes, and wall-clock overhead"
+maximum_candidate_weighted_expansion_fraction = 0.285052563012286
+maximum_mean_core_training_macs_per_candidate = 141520
+require_exact_integer_inequality = "cumulative_core_training_macs <= 141520 * cumulative_candidates"
+require_finite_recursive_metrics = true
+require_active_only_sparse_optimizer = true
+
+[midpoint_gate]
+update = 10000
+minimum_held_top1 = 0.166015625
+minimum_held_action_margin = 0.02
+failure_action = "after both the update-10000 metric and checkpoint are durably observed and hashed, terminate only the owned Julia PID and publish terminal failure"
+
+[success_gate]
+update = 20000
+minimum_final_held_top1 = 0.25
+strictly_greater_final_held_ndcg = 0.9374244614677424
+strictly_greater_final_held_pairwise = 0.7407546814419289
+minimum_final_held_action_margin = 0.02
+require_exact_metric_updates = true
+require_exact_checkpoint_updates = true
+require_no_route_or_bucket_cap_failure = true
+require_finite_recursive_metrics = true
+require_optimizer_clocks_equal_update = true
+require_dynamic_state_count_equal_update = true
+require_serialized_base_active_counts = [48, 40, 40]
+
+[pinned_runtime]
+julia_path = "C:/Users/fshuu/.julia/juliaup/julia-1.12.6+0.x64.w64.mingw32/bin/julia.exe"
+julia_bytes = 170952
+julia_sha256 = "4b1984610b12c9ac119340261bee08d93a0032989b0c35d20ffddaadba241043"
+julia_version = "1.12.6"
+project_path = "experiments/beat_first_v1/Project.toml"
+project_bytes = 1221
+project_sha256 = "62bbd9b624a4e2963e0382c86c8b4ff56b865c539e41ce1e8535cc7416ae4c7a"
+manifest_path = "experiments/beat_first_v1/Manifest.toml"
+manifest_bytes = 47731
+manifest_sha256 = "6ef9ed11797722e72e62d1d4e500da59d0bc14124f96344f93a14a322ec9a10a"
+
+[pinned_sources]
+source_closure_sha256 = "c1b4862a95ed893ccb1a75a6f3f2aac9b4b265606fc5171ab7bdcbaaff2c01af"
+teacher_training_bytes = 104571
+teacher_training_sha256 = "478c1adc7321474857663f9f5ed0c916bcef545f2f1f54d91d0e926f771c3e22"
+dynamic_k_bytes = 28207
+dynamic_k_sha256 = "2ff6d17c59cc616caa90878ac3ff451fbbf8f02d61440ab49d8d1e3f6f1a5d97"
+dynamic_k_test_bytes = 20670
+dynamic_k_test_sha256 = "e276cc95940fb2b1c55b25d3b54acde834823ea3fede8c006f9dc840b53ac097"
+entrypoint_sha256 = "41893978e984c0c696470aa15d73ae54eae01deba05e0db776a9269e25897b5d"
+module_sha256 = "8756a5f99c0f18554985fb60a2dd565300ef7c2fb67159f64ddf41a808ef36bd"
+mongoose_overlay_sha256 = "0cbd4b31740a7573380dd0737ed3a5f9544094f428fbf18e3ef89e8c64d36416"
+geometry_sha256 = "5ec92d85be3f888554c1f2700e06a1e3dc5531d25b354677bb208eb6978d3a27"
+model_sha256 = "ff94f5771d1cbb09532348b8603019c5aa3126979dfef74ac277d223a749e7ac"
+optimizer_sha256 = "a5c057e015e3b9677510faaf07e3c26ca993233e09ab9f602296fbd3299b5790"
+runtime_sha256 = "9552adefc3bad185146cc1053f6358c3f40c5e5a81a76ecbb0f3b08e6bb6be4a"
+checkpoint_sha256 = "425fd756af3b1d2f029a4f5a0241e588acb563863a5da8be6131bd3e3a661340"
+features_sha256 = "0a96497f69271bd900054be72c33c13a244b7909631b75dc95183730872197b7"
+wta_index_sha256 = "be270e8e36fe356be496e834edac1b3c6a13416fcd517a3e651319eb5b581ceb"
+training_core_sha256 = "05a8592019d302e951828035c252f3a80f5567f45a533fec82ec2c6631ca2aa6"
+
+[prelaunch_evidence]
+focused_dynamic_tests_passed = 106793
+focused_dynamic_tests_total = 106793
+focused_dynamic_stdout_sha256 = "0b9b1d6036cc73c4323b80bcb004f3cc51457eee97dce6d459bb11ee2c54b271"
+focused_dynamic_stderr_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+regression_tests_passed = 2436
+regression_tests_total = 2436
+regression_stderr_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+teacher_v3_cli_smoke_exit_code = 0
+teacher_v3_cli_smoke_root = "C:/tmp/tetris_dynamic_k_cli_smoke_20260719T1742/sparse_3l_20260719T174306"
+teacher_v3_cli_smoke_checkpoint_bytes = 248662155
+teacher_v3_cli_smoke_checkpoint_sha256 = "033558816af697083b48e9339efc38cd38ba089d0dd7c5b818cc91e54f4566e4"
+teacher_v3_cli_smoke_metrics_sha256 = "c234bc5d98c1af1001c0353cd7aabaaed3ee5b804871cc98d96eb394bbe76d11"
+teacher_v3_cli_smoke_policy_observation = "one expanded state and one clear state; candidate-weighted expansion 0.6699 was observed before, and is not evidence for passing, the first update-2000 compute gate"
+
+[stop_conditions]
+conditions = [
+  "trainer exits nonzero or exceeds 90 minutes",
+  "another Julia process overlaps the owned process",
+  "any pinned path, byte count, SHA-256, source closure, controller, contract, runtime, Project, Manifest, or dataset manifest changes",
+  "the exact fresh output root exists, escapes the allowed run parent, or traverses a reparse point",
+  "a resume, retry, rescue, alternate seed, alternate order, alternate objective, alternate variant, or alternate routing mode is requested",
+  "any metric, gradient, Q value, margin, dynamic policy field, or optimizer telemetry is non-finite",
+  "the candidate-weighted expansion or mean selected-compute gate fails at update 2000 or later",
+  "the base serialized active counts cease to be k128 or VJP/optimizer updates escape the chosen active support",
+  "the update-10000 pruning gate fails after its metric and checkpoint are captured",
+  "the update-20000 success gate or exact artifact cadence fails",
+]
+
+[interpretation]
+allowed = "one bounded teacher-ranking, dynamic active-width, selected-compute, active-only sparse-update, checkpoint-continuation, and runtime-throughput experiment"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+  "MONGOOSE claim",
+  "NNUE claim",
+]
+validation_game_seeds_touched = false
+sealed_game_seeds_touched = false

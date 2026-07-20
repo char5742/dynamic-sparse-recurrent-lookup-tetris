@@ -1,0 +1,59 @@
+format_version = 1
+experiment_id = "sparse_3l_teacher_signal_cpf_2500_v1"
+purpose = "bounded collision-prefilter pivot verification plus teacher-ranking screen; no game-strength claim"
+hypothesis = "Collision-count/stable-ID prefiltering removes the exact-dot overflow while preserving the positive three-layer teacher-ranking trajectory."
+expected_mechanism = "All bucket links remain independently capped and collision-counted; only rows beyond the reserved exact-dot budget are deterministically shortlisted before selected-only forward/backward."
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-CPF1-k64"
+routing_policy = "wta-collision-count-stable-id-prefilter-v1"
+checkpoint_version = 2
+total_parameters = 19924022
+active_neurons_by_layer = [24, 20, 20]
+learner_candidate_width = 80
+state_batch = 1
+maximum_updates = 2500
+epochs_ceiling = 1.0
+evaluation_interval = 500
+checkpoint_interval = 500
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 15
+
+[success_gate]
+baseline_update = 0
+final_update = 2500
+require_finite_metrics = true
+require_no_route_or_bucket_cap_failure = true
+require_prefilter_activation = true
+require_held_ndcg_delta = 0.015
+require_held_pairwise_delta = 0.015
+require_held_top1_non_regression = true
+maximum_held_composite_loss_fraction = 0.95
+
+[stop_conditions]
+conditions = [
+  "trainer exits nonzero",
+  "another Julia process overlaps",
+  "the independent bucket-entry cap is exceeded",
+  "the exact-score cap is exceeded after prefiltering and probe reservation",
+  "any loss, gradient, Q value, or margin is non-finite",
+  "the update-2500 teacher-ranking gate is not met",
+]
+
+[interpretation]
+allowed = "bounded routing-pivot and teacher-ranking learning-signal evidence"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+]

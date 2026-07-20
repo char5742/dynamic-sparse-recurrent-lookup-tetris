@@ -1,0 +1,193 @@
+{
+  "schema": "heterogeneous-265k-post-idle-source-manifest-v1",
+  "status": "UNEXECUTED_STATIC_ONLY",
+  "freeze_basis": "SOURCE_ONLY_STATIC_REVIEW_NO_EXECUTION",
+  "files": [
+    {
+      "name": "benchmark_contract",
+      "relative_path": "post_idle_benchmark_contract.json",
+      "sha256": "cf48d1162248dbcd9ff7e652b6e0b0974aacc326581256b05a808e0305871607",
+      "byte_length": 14309
+    },
+    {
+      "name": "provider",
+      "relative_path": "post_idle_production_provider.jl",
+      "sha256": "87e1eb1757993618c3c3cea9da94b298e7a645422fab95a0abe5813b7311749a",
+      "byte_length": 20006
+    },
+    {
+      "name": "substrate",
+      "relative_path": "post_idle_substrate.jl",
+      "sha256": "ce5b1ee603383fddca5a68f66ad9734c6576f5e661a199e22cea1359b41dd287",
+      "byte_length": 18944
+    },
+    {
+      "name": "runner",
+      "relative_path": "run_post_idle_benchmark.jl",
+      "sha256": "7d79c5b858d39f1b32d5e5ef061bf5f3188b3f432364ab599535be851d98ce9e",
+      "byte_length": 20130
+    },
+    {
+      "name": "validator",
+      "relative_path": "post_idle_result_validator.py",
+      "sha256": "f73e0d04761216737fc3ef6267cd2ff43546b9aa91fac87547987a42c78cf4fb",
+      "byte_length": 68308
+    },
+    {
+      "name": "validator_contract",
+      "relative_path": "post_idle_validator_contract.json",
+      "sha256": "7f8961fd2aa68b1ab3646273680973efeb713bce4a90956de08524f84cb16592",
+      "byte_length": 6602
+    },
+    {
+      "name": "validator_test",
+      "relative_path": "test_post_idle_result_validator.py",
+      "sha256": "d1005c001099d86a3a53aca57222edb9a5cfe3b20c77cc9370f626df9e6bf441",
+      "byte_length": 24001
+    },
+    {
+      "name": "heterogeneous_module",
+      "relative_path": "Heterogeneous265K.jl",
+      "sha256": "299f278cce61b391393895831344cb5da553b13545c58a61a81db4b49513f6ea",
+      "byte_length": 488
+    },
+    {
+      "name": "windows_cpu_sets",
+      "relative_path": "windows_cpu_sets.jl",
+      "sha256": "57ba06406b432eac366a9381a3f37d962aedfbe8b5bc50a4070517ed9488ce44",
+      "byte_length": 25840
+    },
+    {
+      "name": "windows_evidence_runtime_hook",
+      "relative_path": "windows_evidence_runtime_hook.jl",
+      "sha256": "fb318687ffd37f4f1ba35ef786b409147a66868b910d8a6b6fbe9bde05b8dd5d",
+      "byte_length": 9982
+    },
+    {
+      "name": "windows_residency_ram_evidence",
+      "relative_path": "windows_residency_ram_evidence.jl",
+      "sha256": "de964b93a4a2ad02b2a58ae46bdad86210b0c2f12593aa56d2098917fec8b1c7",
+      "byte_length": 57513
+    },
+    {
+      "name": "evidence_contract",
+      "relative_path": "windows_residency_ram_evidence_contract.json",
+      "sha256": "19cc5f5de5ecaddee61779ace9166f4589947078befd0e0643ec1296cbc2333e",
+      "byte_length": 9080
+    },
+    {
+      "name": "etw_evidence_validator",
+      "relative_path": "windows_residency_ram_evidence.jl",
+      "sha256": "de964b93a4a2ad02b2a58ae46bdad86210b0c2f12593aa56d2098917fec8b1c7",
+      "byte_length": 57513
+    },
+    {
+      "name": "imc_evidence_validator",
+      "relative_path": "windows_residency_ram_evidence.jl",
+      "sha256": "de964b93a4a2ad02b2a58ae46bdad86210b0c2f12593aa56d2098917fec8b1c7",
+      "byte_length": 57513
+    },
+    {
+      "name": "hashstem",
+      "relative_path": "hashstem.jl",
+      "sha256": "777996a7ba2d665d5248fa273d46c7732dd947c87a40b2761ecab863742b943c",
+      "byte_length": 23602
+    },
+    {
+      "name": "hashstem_openvino",
+      "relative_path": "hashstem_openvino.py",
+      "sha256": "77147479878c489de583b838f14778b3dd9237d4661561d1de9ee786caacddd3",
+      "byte_length": 8099
+    },
+    {
+      "name": "hashstem_master",
+      "relative_path": "hashstem_master.jl",
+      "sha256": "e6cb4b5948e1e43d9f670dcad40b036fee7cff9818087b16e5805ecb73e3ee99",
+      "byte_length": 31995
+    },
+    {
+      "name": "pipeline",
+      "relative_path": "pipeline.jl",
+      "sha256": "e7a8834842583cf21530839549109d150d9df1abb6aaf28377d6ce073225c2b6",
+      "byte_length": 41255
+    },
+    {
+      "name": "fixedshape_learner",
+      "relative_path": "../backend/fixedshape_learner.jl",
+      "sha256": "c7b9e09d2b7272a29c0f72d01c85e66f78eab17627876b3d8e368ecc0ea9b3f7",
+      "byte_length": 17128
+    },
+    {
+      "name": "lifecycle",
+      "relative_path": "lifecycle.jl",
+      "sha256": "cfd06b2cbcb9bc8db226b2f3432938d321c69443db32868b5a701c4b1c3d5d26",
+      "byte_length": 29712
+    },
+    {
+      "name": "sparse_hashstem_bridge",
+      "relative_path": "sparse_hashstem_bridge.jl",
+      "sha256": "f15f6bf197dd5b1c8978be9ee50b6a6a2f84d8060741800f3a81e11ae043018a",
+      "byte_length": 25922
+    },
+    {
+      "name": "sparse3_module",
+      "relative_path": "../sparse_dynamic_3layer/SparseDynamic3Layer.jl",
+      "sha256": "03c107ad9d6a429ee2e4f5988e4972a3d24b8904506ab2246192748115f35482",
+      "byte_length": 2906
+    },
+    {
+      "name": "sparse3_geometry",
+      "relative_path": "../sparse_dynamic_3layer/geometry.jl",
+      "sha256": "9f2cd937a8fb64409d2d4d33a7c1fe0b65483c5aa76a0a17e522564423d65792",
+      "byte_length": 11937
+    },
+    {
+      "name": "sparse3_model",
+      "relative_path": "../sparse_dynamic_3layer/model.jl",
+      "sha256": "ff94f5771d1cbb09532348b8603019c5aa3126979dfef74ac277d223a749e7ac",
+      "byte_length": 23135
+    },
+    {
+      "name": "sparse3_optimizer",
+      "relative_path": "../sparse_dynamic_3layer/optimizer.jl",
+      "sha256": "a5c057e015e3b9677510faaf07e3c26ca993233e09ab9f602296fbd3299b5790",
+      "byte_length": 20897
+    },
+    {
+      "name": "sparse3_runtime",
+      "relative_path": "../sparse_dynamic_3layer/runtime.jl",
+      "sha256": "b1ab6f7cfaae904f9d61b131713b03a1f0e2df27bfe74243fb8dd734f5c5bbfe",
+      "byte_length": 27267
+    },
+    {
+      "name": "sparse3_checkpoint",
+      "relative_path": "../sparse_dynamic_3layer/checkpoint.jl",
+      "sha256": "1f16d184954afc52771d7e9d1df2a52aa2288b3995c087ba35f5e6d40a160666",
+      "byte_length": 6849
+    },
+    {
+      "name": "common_features",
+      "relative_path": "../sparse_dynamic/features.jl",
+      "sha256": "0a96497f69271bd900054be72c33c13a244b7909631b75dc95183730872197b7",
+      "byte_length": 9360
+    },
+    {
+      "name": "common_wta_index",
+      "relative_path": "../sparse_dynamic/wta_index.jl",
+      "sha256": "1806f2d1ca66a79174b2180d79351180ed42a9a43b084466a102b93c76391b96",
+      "byte_length": 23787
+    },
+    {
+      "name": "project_toml",
+      "relative_path": "../Project.toml",
+      "sha256": "62bbd9b624a4e2963e0382c86c8b4ff56b865c539e41ce1e8535cc7416ae4c7a",
+      "byte_length": 1221
+    },
+    {
+      "name": "manifest_toml",
+      "relative_path": "../Manifest.toml",
+      "sha256": "6ef9ed11797722e72e62d1d4e500da59d0bc14124f96344f93a14a322ec9a10a",
+      "byte_length": 47731
+    }
+  ]
+}

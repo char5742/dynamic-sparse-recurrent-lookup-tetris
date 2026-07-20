@@ -1,0 +1,200 @@
+{
+  "schema": "heterogeneous-265k-igpu-hashstem-training-probe-contract-v1",
+  "status": "UNEXECUTED_STATIC_CONTRACT",
+  "scope": {
+    "track": "265K heterogeneous systems only",
+    "component": "Learned HashStem training",
+    "evidence_class": "COMPONENT_TRAINING_PROBE_ONLY",
+    "promotion_authority": "NONE",
+    "pure_cpu_sparse_model_evidence": false,
+    "game_strength_evidence": false,
+    "nnue_or_parent_child_reuse": false,
+    "external_gate_still_required": "P-core sparse slowdown under concurrent iGPU training must be <= 1.10x"
+  },
+  "backend": {
+    "operating_system": "native Windows",
+    "framework": "PyTorch XPU",
+    "device_policy": "exactly one enumerated torch.xpu device and exactly one matching healthy Intel CIM video controller",
+    "system_contract_status": "BOUND_LIVE_HOST",
+    "host_id_derivation": "sha256: plus SHA-256 of compact UTF-8 JSON in exact key order UUID,Vendor,Name,IdentifyingNumber after trimming all values and uppercasing UUID from the single live Win32_ComputerSystemProduct record; the live receipt is retained on success, fail-closed identity mismatch, and later numeric rejection",
+    "cpu_control_policy": "GetSystemCpuSetInformation must reproduce the byte-bound windows-cpu-set-topology-v1 SHA-256, classify exactly 8P+12E without numbering assumptions, and derive the control thread count as the eight live P-core CPU Sets; --cpu-threads is mandatory and must equal that derived and contract-bound value",
+    "required_system_contract_fields": [
+      "schema",
+      "status",
+      "host_id",
+      "cpu.exact_name",
+      "cpu.cpu_set_topology_sha256",
+      "cpu.hashstem_control_threads",
+      "igpu.integrated",
+      "igpu.torch_xpu_device_count",
+      "igpu.torch_xpu_index",
+      "igpu.torch_xpu_exact_name",
+      "igpu.cim_exact_name",
+      "igpu.pnp_device_id",
+      "igpu.driver_version"
+    ],
+    "silent_fallback": "forbidden; CPU, CUDA, AUTO, OpenVINO GPU, an ambiguous XPU/CIM mapping, or an identity mismatch emits UNAVAILABLE_FAIL_CLOSED",
+    "compile": "torch.compile backend=inductor, fullgraph=true, dynamic=false; CPU and XPU controls use the same policy",
+    "precision": "FP32 only; autocast, TF32 claims, BF16, FP16, and INT8 are outside this probe"
+  },
+  "hashstem": {
+    "graph_schema": "learned-hashstem-v1-conv-dw-pw-pool-1039x214-relu",
+    "batch": 16,
+    "input_features": 559,
+    "output_features": 256,
+    "trainable_parameters": 223504,
+    "source_master_requirement": "runtime-validated master checkpoint at master_version=optimizer_step=backend_updates=0",
+    "source_snapshot_requirement": "exact JSON types and values from the hashstem_master.jl exporter contract: schema=learned-hashstem-snapshot-source-v1, exact hashstem_schema, status=UNEXECUTED_STATIC_ONLY, immutable_source=true, openvino_compiled=false, publish_authorized=false, weights_file=hashstem_snapshot_weights.npz, source_checkpoint_manifest_sha256 equal to the bound master manifest, and an explicitly supplied byte-bound NPZ whose every FP32 array is bitwise identical to the source master; JSON numeric 1/0 cannot substitute for booleans",
+    "optimizer": {
+      "name": "AdamW",
+      "learning_rate": 0.0003,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "epsilon": 1e-8,
+      "weight_decay": 0.0001,
+      "foreach": false,
+      "fused": false,
+      "initial_state": "empty because only a version-zero CPU master is accepted"
+    },
+    "loss": "sum(output * pre-masked output_cotangent) plus auxiliary_weight times masked Huber over output columns 193:202 (Julia one-based)",
+    "normalization": "frozen input_mean and input_inv_std buffers, never optimizer parameters"
+  },
+  "witness": {
+    "schema": "igpu-hashstem-training-witness-v1",
+    "npz_allow_pickle": false,
+    "accepted_kinds": [
+      "teacher_v3_train",
+      "deterministic_synthetic_component_only"
+    ],
+    "reserved_seed_free_required": true,
+    "development_validation_sealed_seed_use_forbidden": true,
+    "teacher_v3_policy": "teacher_v3_train requires a byte-bound dataset manifest and teacher_split=train",
+    "synthetic_policy": "synthetic witness requires a bound generator source and seed_namespace=synthetic_component_only_no_game_rng",
+    "row_count": "positive multiple of 16",
+    "mask_policy": "output_cotangent and auxiliary_mask are already multiplied by state_mask; masked rows must be exactly zero",
+    "required_arrays": [
+      "packed",
+      "output_cotangent",
+      "auxiliary_target",
+      "auxiliary_mask",
+      "state_mask",
+      "reference_output",
+      "reference_loss",
+      "reference_grad_conv3",
+      "reference_grad_conv3_bias",
+      "reference_grad_depthwise5x1",
+      "reference_grad_depthwise_bias",
+      "reference_grad_pointwise",
+      "reference_grad_pointwise_bias",
+      "reference_grad_dense",
+      "reference_grad_dense_bias",
+      "reference_updated_conv3",
+      "reference_updated_conv3_bias",
+      "reference_updated_depthwise5x1",
+      "reference_updated_depthwise_bias",
+      "reference_updated_pointwise",
+      "reference_updated_pointwise_bias",
+      "reference_updated_dense",
+      "reference_updated_dense_bias"
+    ],
+    "cpu_reference": "the first batch reference output/loss/gradients/updated weights must be exported from the bound CPU master with the exact loss and AdamW contract"
+  },
+  "timing": {
+    "clock": "Windows QueryPerformanceCounter via Python perf_counter_ns",
+    "fixed_shape": true,
+    "warmups_minimum": 5,
+    "timed_updates_minimum": 50,
+    "percentile": "nearest-rank p50 and p95 without interpolation",
+    "required_stages": [
+      "h2d_submit",
+      "h2d_sync",
+      "zero_grad",
+      "forward_submit",
+      "forward_sync",
+      "backward_submit",
+      "backward_sync",
+      "optimizer_submit",
+      "optimizer_sync",
+      "d2h_submit",
+      "d2h_sync",
+      "total"
+    ],
+    "compile": "wrapper construction and first fixed-shape forward/backward compilation are reported separately and excluded from steady-state percentiles",
+    "end_to_end_boundary": "host-resident fixed batch before transfer through copied FP32 output/loss after optimizer publication and explicit synchronization",
+    "updates_per_second": "timed updates divided by the sum of raw total QPC intervals; reported only as supplemental throughput and never used for the authoritative speed gate",
+    "raw_receipt": "every per-update stage interval remains in the result artifact"
+  },
+  "numeric_gates": {
+    "finite_required": true,
+    "cpu_output_maximum_absolute_error": 0.00001,
+    "training_loss_maximum_absolute_error": 0.0001,
+    "training_gradient_cosine_minimum": 0.999,
+    "training_gradient_relative_l2_maximum": 0.001,
+    "training_gradient_maximum_absolute_error": 0.0001,
+    "updated_parameter_maximum_absolute_error": 0.0001,
+    "real_backward_optimizer_weight_change_required": true,
+    "all_eight_parameter_tensors_receive_step_one_adamw_state": true,
+    "nonzero_first_and_second_moment_required": true,
+    "normalization_bitwise_unchanged": true
+  },
+  "performance_gates": {
+    "xpu_end_to_end_total_p50_speedup_vs_cpu_minimum": 1.15,
+    "xpu_end_to_end_p95_ratio_vs_cpu_maximum": 1.0,
+    "numeric_gates_required": true,
+    "later_integrated_p_sparse_slowdown_maximum": 1.10
+  },
+  "ram_contention_receipt": {
+    "sampling_source": "Windows GetProcessMemoryInfo plus GlobalMemoryStatusEx",
+    "sampling_scope": "component process and host physical-memory pressure only",
+    "required_fields": [
+      "sampling_period_ms",
+      "before",
+      "after",
+      "working_set_peak_bytes",
+      "private_bytes_peak",
+      "minimum_available_physical_bytes",
+      "maximum_memory_load_percent",
+      "raw_samples"
+    ],
+    "limitations": "this receipt is not DRAM-bandwidth or P-core sparse contention evidence; the independent ETW/IMC integrated gate remains mandatory"
+  },
+  "checkpoint_sync": {
+    "artifact": "fresh probe-only checkpoint directory",
+    "required_members": [
+      "igpu_one_step_state.pt",
+      "hashstem_probe_master_weights.npz",
+      "hashstem_probe_snapshot_weights.npz",
+      "probe_master_metadata.json",
+      "probe_snapshot_metadata.json",
+      "probe_checkpoint_manifest.json"
+    ],
+    "requirements": [
+      "saved model and AdamW tensors reload with identical dtype, shape, and raw contiguous CPU bytes; value equality is insufficient because signed zero and NaN payloads are bit patterns",
+      "probe master and snapshot weight archives are byte-identical",
+      "normalization SHA-256 is unchanged",
+      "source master/snapshot/system/witness/contract hashes are bound",
+      "probe master version and optimizer step advance together by exactly one",
+      "candidate snapshot binds the advanced probe master version",
+      "publication and production continuation remain unauthorized"
+    ]
+  },
+  "decisions": {
+    "pass": "COMPONENT_PASS_PENDING_P_SPARSE_AND_SYSTEM_GATES",
+    "reject": "REJECT_COMPONENT",
+    "unavailable": "UNAVAILABLE_FAIL_CLOSED",
+    "unavailable_exit_code": 2,
+    "reject_exit_code": 3,
+    "pass_exit_code": 0,
+    "adoption_authorized": false
+  },
+  "prohibited_claims": [
+    "old model beaten",
+    "new model stronger",
+    "iGPU training adopted",
+    "full heterogeneous pipeline faster",
+    "P-core sparse slowdown passed",
+    "RAM bandwidth passed",
+    "pure CPU dynamic sparse model improved",
+    "NNUE improved"
+  ]
+}

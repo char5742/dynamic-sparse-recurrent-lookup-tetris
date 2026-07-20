@@ -1,0 +1,273 @@
+{
+  "schema": "heterogeneous-265k-post-idle-benchmark-contract-v1",
+  "status": "UNEXECUTED_STATIC_CONTRACT",
+  "scope": {
+    "track": "heterogeneous systems only",
+    "nnue": "excluded",
+    "model": "Tetris-SLIDE-DeepNeuronBank-Q20-B3 plus learned HashStem",
+    "sparse_geometry": {
+      "active_counts": [26, 22, 22],
+      "row_dimensions": [560, 321, 321],
+      "active_trainable_parameters": 34338,
+      "forward_macs": 34316,
+      "parameter_training_macs": 84120,
+      "route_rerank_mac_cap": 106496,
+      "active_weight_bytes": 137352,
+      "route_plus_active_weight_bytes": 563336
+    },
+    "active_device_abi": {
+      "batch": 16,
+      "layer_1": {
+        "input": [16, 560],
+        "selected_weights": [16, 26, 560],
+        "output_activations": [16, 26]
+      },
+      "layer_2": {
+        "input": [16, 321],
+        "selected_weights": [16, 22, 321],
+        "output_activations": [16, 22]
+      },
+      "layer_3": {
+        "input": [16, 321],
+        "selected_weights": [16, 22, 321],
+        "output_activations": [16, 22]
+      },
+      "between_layers": "CPU ID-keyed CountSketch and query composition; this dependency forces a visible device synchronization between layer calls",
+      "final_head": "CPU 256-to-22 head after the layer-3 CountSketch; included in end-to-end timing",
+      "tail": "actual-length CPU active path, never accelerator padding",
+      "minimum_fp32_transfer_bytes_per_complete_batch": {
+        "layer_1_selected_weights": 931840,
+        "layer_2_selected_weights": 451968,
+        "layer_3_selected_weights": 451968,
+        "three_layer_inputs": 76928,
+        "three_layer_outputs": 4480,
+        "host_to_device_total": 1912704,
+        "device_to_host_total": 4480
+      }
+    },
+    "hashstem_geometry": {
+      "input_features": 559,
+      "output_features": 256,
+      "fixed_npu_batch": 16,
+      "parameters": 223504,
+      "macs_per_candidate": 433546
+    }
+  },
+  "execution_policy": {
+    "sequential_cells_only": true,
+    "fresh_process_per_cell": true,
+    "warmup_candidate_sets": 256,
+    "timed_candidate_sets": 4096,
+    "warmup_training_supersteps": 64,
+    "timed_training_supersteps": 1024,
+    "independent_repetitions": 3,
+    "cell_wall_timeout_seconds": 1800,
+    "candidate_order": "stored stable order, duplicates preserved",
+    "witness_split": "teacher_v3 train only; no development, validation, or sealed game seeds",
+    "candidate_policy": "all valid candidates exactly once; no truncation, deduplication, or observable padding",
+    "tail_policy": "fixed batches of 16 plus deterministic actual-length CPU tail; report both physical calls",
+    "pre_cell_idle_seconds": 30,
+    "quiescence_gate": "postpone cell unless no unrelated Julia/Python/OpenVINO process is active and host CPU utilization remains below 5 percent for the final 10 seconds",
+    "clock": "Windows QueryPerformanceCounter raw ticks and one recorded QueryPerformanceFrequency per process",
+    "percentile": "nearest-rank over per-candidate-set or per-superstep end-to-end QPC samples; no interpolation",
+    "compile_and_first_call": "reported separately and excluded from steady p50/p95, but included in compile-amortized totals at 100, 1000, and all timed samples"
+  },
+  "matrix": [
+    {
+      "id": "A0_cpu_route_cpu_active",
+      "purpose": "reference sparse-stage forward and selected-only training",
+      "hashstem_input": "frozen reference output from the witness",
+      "routing": "CPU P-cores",
+      "gather": "CPU P-cores",
+      "active_forward": "CPU P-cores",
+      "active_vjp_optimizer": "CPU P-cores",
+      "required_backend": "CPU",
+      "comparison": null,
+      "timed_boundary": "hashstem output available through copied 22-value candidate output; training subcase continues through selected-only optimizer publication"
+    },
+    {
+      "id": "A1_cpu_route_gather_npu_active",
+      "purpose": "bounded active-block offload experiment",
+      "hashstem_input": "same frozen reference output as A0",
+      "routing": "CPU P-cores",
+      "gather": "CPU P-cores",
+      "active_forward": "NPU, three dependent fixed-shape layer calls plus final output materialization",
+      "active_vjp_optimizer": "not authorized unless an explicit fixed-shape VJP graph compiles on NPU; otherwise forward-only",
+      "required_backend": "OpenVINO device exactly NPU; AUTO and silent CPU fallback forbidden",
+      "comparison": "A0_cpu_route_cpu_active",
+      "timed_boundary": "CPU route begin through gather, pack, bind, host-to-device visibility, submit, wait, output copy, CPU CountSketch/scatter, and final copied 22-value output"
+    },
+    {
+      "id": "A2_cpu_route_gather_igpu_active",
+      "purpose": "bounded active-block offload experiment",
+      "hashstem_input": "same frozen reference output as A0",
+      "routing": "CPU P-cores",
+      "gather": "CPU P-cores",
+      "active_forward": "Intel iGPU, three dependent fixed-shape layer calls plus final output materialization",
+      "active_vjp_optimizer": "separate training subcase only when forward, backward, and selected-weight update remain on the iGPU between declared transfers",
+      "required_backend": "native Windows Intel XPU device with recorded name, driver, PCI identity, runtime and kernel-device evidence; silent CPU fallback forbidden",
+      "comparison": "A0_cpu_route_cpu_active",
+      "timed_boundary": "CPU route begin through gather, pack, host-to-device transfer, submit, synchronization, device-to-host transfer, CPU CountSketch/scatter, and final copied 22-value output"
+    },
+    {
+      "id": "H0_cpu_hashstem_cpu_sparse",
+      "purpose": "integrated CPU inference control",
+      "hashstem": "CPU learned HashStem at actual lengths",
+      "routing_gather_sparse": "CPU P-cores",
+      "stem_training": "disabled",
+      "required_backend": "CPU",
+      "comparison": null,
+      "timed_boundary": "raw canonical candidate tensors before 559-value packing through copied candidate-set scores and deterministic top-1"
+    },
+    {
+      "id": "H1_npu_hashstem_cpu_sparse",
+      "purpose": "NPU HashStem adoption candidate",
+      "hashstem": "OpenVINO NPU fixed batch 16 with deterministic CPU actual-length tail",
+      "routing_gather_sparse": "CPU P-cores",
+      "stem_training": "disabled",
+      "required_backend": "OpenVINO device exactly NPU with snapshot and IR digest binding",
+      "comparison": "H0_cpu_hashstem_cpu_sparse",
+      "timed_boundary": "raw canonical candidate tensors before 559-value packing through NPU bind/submit/wait/copied output, CPU tail, CPU sparse stage, copied candidate-set scores, and deterministic top-1"
+    },
+    {
+      "id": "F0_npu_stem_cpu_sparse_cpu_training",
+      "purpose": "full-pipeline control for the iGPU training decision",
+      "hashstem_inference": "NPU fixed batch 16 plus CPU tail",
+      "routing_gather_sparse_training": "CPU P-cores",
+      "hashstem_master_training": "CPU",
+      "required_backends": ["CPU", "NPU"],
+      "comparison": null,
+      "timed_boundary": "slot acquisition through packing, inference, sparse route/gather/forward/VJP/update, CPU stem backward/update, refresh barrier, verified snapshot publication, and slot release"
+    },
+    {
+      "id": "F1_npu_stem_cpu_sparse_igpu_training",
+      "purpose": "requested full heterogeneous pipeline",
+      "hashstem_inference": "NPU fixed batch 16 plus CPU tail",
+      "routing_gather_sparse_training": "CPU P-cores",
+      "hashstem_master_training": "Intel iGPU",
+      "required_backends": ["CPU", "NPU", "Intel iGPU XPU"],
+      "comparison": "F0_npu_stem_cpu_sparse_cpu_training",
+      "timed_boundary": "slot acquisition through packing, NPU inference, CPU sparse route/gather/forward/VJP/update, iGPU transfer/forward/backward/update/synchronization, refresh drain, fresh export/compile/numeric verification, atomic snapshot publication, and slot release"
+    }
+  ],
+  "qpc_stage_schema": {
+    "common": [
+      "acquire_begin", "acquire_end", "pack_begin", "pack_end",
+      "total_begin", "total_end"
+    ],
+    "per_sparse_layer_l1_l2_l3": [
+      "route_begin", "route_end", "gather_begin", "gather_end",
+      "device_pack_begin", "device_pack_end", "h2d_begin", "h2d_end",
+      "submit_begin", "submit_end", "wait_begin", "wait_end",
+      "d2h_begin", "d2h_end", "scatter_begin", "scatter_end",
+      "active_compute_begin", "active_compute_end"
+    ],
+    "hashstem": [
+      "hash_pack_begin", "hash_pack_end", "hash_bind_begin", "hash_bind_end",
+      "hash_submit_begin", "hash_submit_end", "hash_wait_begin", "hash_wait_end",
+      "hash_copy_begin", "hash_copy_end", "tail_begin", "tail_end"
+    ],
+    "training": [
+      "sparse_vjp_begin", "sparse_vjp_end", "sparse_optimizer_begin", "sparse_optimizer_end",
+      "stem_h2d_begin", "stem_h2d_end", "stem_forward_begin", "stem_forward_end",
+      "stem_backward_begin", "stem_backward_end", "stem_optimizer_begin", "stem_optimizer_end",
+      "stem_sync_begin", "stem_sync_end", "refresh_drain_begin", "refresh_drain_end",
+      "snapshot_export_begin", "snapshot_export_end", "snapshot_compile_begin", "snapshot_compile_end",
+      "snapshot_verify_begin", "snapshot_verify_end", "snapshot_publish_begin", "snapshot_publish_end"
+    ],
+    "requirements": [
+      "store raw QPC ticks for every timed sample",
+      "all intervals must be monotonic and lie inside total_begin..total_end",
+      "explicit transfer and synchronization intervals may not be folded into kernel time",
+      "device event clocks are supplemental and may not replace QPC end-to-end timing",
+      "report p50 and p95 for every populated stage plus total residence"
+    ]
+  },
+  "numeric_gates": {
+    "reference": "scalar or established CPU FP32 oracle from the exact same witness and weight snapshot",
+    "route_ids": "bit-exact ordered neuron IDs for all three layers and every candidate",
+    "final_top1": "bit-exact selected candidate index for every candidate set using stable ascending-index tie-break",
+    "cpu_maximum_absolute_error": 0.00001,
+    "accelerator_maximum_absolute_error": 0.01,
+    "finite_outputs_required": true,
+    "training_loss_maximum_absolute_error": 0.0001,
+    "training_gradient_cosine_minimum": 0.999,
+    "training_gradient_relative_l2_maximum": 0.001,
+    "updated_stem_parameter_maximum_absolute_error": 0.0001,
+    "snapshot_version_and_weight_digest_exact": true
+  },
+  "performance_gates": {
+    "A1_and_A2_vs_A0": {
+      "end_to_end_throughput_speedup_minimum": 1.15,
+      "end_to_end_p95_ratio_maximum": 1.0,
+      "numeric_gates_required": true
+    },
+    "H1_vs_H0": {
+      "end_to_end_candidate_set_throughput_speedup_minimum": 1.15,
+      "end_to_end_p95_ratio_maximum": 1.0,
+      "concurrent_cpu_sparse_slowdown_maximum": 1.10,
+      "numeric_gates_required": true
+    },
+    "F1_vs_F0": {
+      "complete_superstep_throughput_speedup_minimum": 1.15,
+      "complete_superstep_p95_ratio_maximum": 1.0,
+      "concurrent_cpu_sparse_slowdown_maximum": 1.10,
+      "numeric_gates_required": true,
+      "checkpoint_resume_and_snapshot_refresh_required": true
+    }
+  },
+  "contention_matrix": [
+    "CPU sparse isolated",
+    "NPU HashStem isolated",
+    "CPU sparse concurrent with NPU HashStem",
+    "iGPU stem training isolated",
+    "CPU sparse concurrent with iGPU stem training",
+    "NPU HashStem concurrent with iGPU stem training",
+    "full NPU HashStem plus CPU sparse plus iGPU stem training"
+  ],
+  "resource_evidence": {
+    "independent_contract": "windows_residency_ram_evidence_contract.json",
+    "independent_contract_status": "UNEXECUTED_STATIC_ONLY",
+    "cpu": [
+      "CPU Set topology and readback hashes", "ETW whole-stage residency",
+      "per-role CPU time", "effective frequency", "context switches", "LLC misses when available"
+    ],
+    "accelerators": [
+      "requested and actual backend", "device name and stable identity", "driver and runtime versions",
+      "compile properties", "utilization samples", "device busy time", "device-event timing when supported"
+    ],
+    "memory": [
+      "process private bytes p50 and peak", "working set p50 and peak", "page faults",
+      "DRAM read bytes", "DRAM write bytes", "read GB/s", "write GB/s", "total GB/s",
+      "counter source", "counter width", "counter scaling", "overflow and multiplex status"
+    ],
+    "ram_bandwidth_gate": "same-session Intel PCM raw uncore/IMC counter evidence is mandatory for heterogeneous adoption; stock pcm-memory CSV, unavailable raw adapters, overflow, reset, multiplex or unattributable system-wide traffic make the affected adoption decision INCONCLUSIVE_FAIL_CLOSED",
+    "contention_report": "for every concurrent pair report isolated and concurrent p50/p95, slowdown ratio, throughput, DRAM bandwidth, and device utilization from the same system-contract hash"
+  },
+  "unavailable_backend_policy": {
+    "status": "UNAVAILABLE_FAIL_CLOSED",
+    "artifact_required": true,
+    "artifact_fields": [
+      "matrix_cell_id", "requested_backend", "enumerated_backends", "device_identity",
+      "driver_versions", "runtime_versions", "probe_or_compile_exception", "timestamp_utc",
+      "source_hashes", "system_contract_sha256"
+    ],
+    "exit_code": 2,
+    "rules": [
+      "never substitute CPU, AUTO, AUTO:*, or another accelerator inside the failed cell",
+      "never copy a component-only timing into an integrated cell",
+      "continue production only under the separately named CPU fallback cell",
+      "missing timing, numeric, route, top1, contention, ETW, or RAM-bandwidth evidence cannot pass adoption"
+    ]
+  },
+  "required_result_fields": [
+    "matrix_cell_id", "status", "source_hashes", "witness_sha256", "weights_sha256",
+    "system_contract_sha256", "CPU_set_topology_sha256", "backend_identity",
+    "warmup_count", "timed_count", "raw_qpc_artifact_sha256", "stage_p50_ns", "stage_p95_ns",
+    "end_to_end_p50_ns", "end_to_end_p95_ns", "candidate_sets_per_second", "candidates_per_second",
+    "compile_ns", "first_call_ns", "compile_amortized_totals", "route_id_matches", "route_id_total",
+    "top1_matches", "top1_total", "maximum_absolute_error", "gradient_numeric_evidence",
+    "contention_evidence", "ram_bandwidth_evidence", "private_bytes_peak", "working_set_peak",
+    "gates", "decision", "failure_reason"
+  ]
+}

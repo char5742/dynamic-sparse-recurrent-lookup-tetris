@@ -1,0 +1,180 @@
+{
+  "schema": "heterogeneous-265k-post-idle-validator-contract-v1",
+  "status": "UNEXECUTED_STATIC_ONLY",
+  "scope": {
+    "decision": "H0 three-layer approximately-20M CPU-only versus H1 NPU HashStem plus the identical CPU sparse model",
+    "promotion_scope": "SYSTEMS_GATE_ONLY",
+    "excluded": [
+      "pure-CPU dynamic-sparse scientific promotion",
+      "NNUE or search-reuse evidence",
+      "A1 NPU active-block offload",
+      "A2 iGPU active-block offload",
+      "teacher, development, validation, and game claims"
+    ]
+  },
+  "artifact_reference": {
+    "required_fields": ["relative_path", "sha256", "byte_length"],
+    "path_rule": "relative to the containing manifest/evidence and resolving inside bundle artifact_root",
+    "sha256_rule": "lowercase 64-hex over the exact bytes parsed",
+    "byte_length_rule": "exact nonnegative integer"
+  },
+  "bundle": {
+    "schema": "heterogeneous-265k-post-idle-validation-bundle-v1",
+    "status": "READY_FOR_INDEPENDENT_VALIDATION",
+    "promotion_scope": "SYSTEMS_GATE_ONLY",
+    "artifact_root": ".",
+    "required_artifacts": [
+      "benchmark_contract",
+      "source_manifest",
+      "input",
+      "sparse_checkpoint",
+      "master",
+      "snapshot",
+      "system_contract",
+      "provider_source",
+      "runner_source",
+      "substrate_source"
+    ],
+    "required_cells": {
+      "A0_cpu_route_cpu_active": [1, 2, 3],
+      "H0_cpu_hashstem_cpu_sparse": [1, 2, 3],
+      "H1_npu_hashstem_cpu_sparse": [1, 2, 3]
+    },
+    "cell_entry": {
+      "required_fields": ["repetition", "summary", "records"],
+      "summary_and_records": "artifact_reference"
+    },
+    "required_external_evidence": [
+      "etw_provider_source",
+      "imc_provider_source",
+      "etw",
+      "imc"
+    ]
+  },
+  "runner_receipts": {
+    "records_per_repetition": 4096,
+    "sequences": [257, 4352],
+    "warmup_count": 256,
+    "fresh_process_receipts": ["run_uuid", "process_id", "process_identity_qpc", "process_started_utc"],
+    "raw_ordering": ["action_digests", "route_ids", "output_bits_candidate_major"],
+    "summary_decision_must_remain": "NO_ADOPTION_BEFORE_VALIDATOR_ETW_IMC_GATE",
+    "summary_gate_values": "never trusted; every value is recomputed from records"
+  },
+  "physical_h1_formulas": {
+    "npu_calls_per_candidate_set": "floor(candidate_count / 16)",
+    "cpu_tail_calls_per_candidate_set": "candidate_count % 16 == 0 ? 0 : 1",
+    "h2d_bytes_per_npu_call": 35776,
+    "d2h_bytes_per_npu_call": 16384,
+    "physical_waits_per_npu_call": 1,
+    "hash_bind_qpc_occurrences_per_npu_call": 2,
+    "hash_submit_qpc_occurrences_per_npu_call": 1,
+    "hash_wait_qpc_occurrences_per_npu_call": 1,
+    "hash_d2h_qpc_occurrences_per_npu_call": 1
+  },
+  "numeric_and_rank_gates": {
+    "reference": "A0 frozen witness HashStem output plus production three-layer CPU sparse",
+    "h0_cpu_maximum_absolute_error": 0.00001,
+    "h1_npu_maximum_absolute_error": 0.01,
+    "h1_actual_length_cpu_tail_maximum_absolute_error": 0.00001,
+    "ordered_action_digests": "exact for every candidate set",
+    "ordered_route_ids_l1_l2_l3": "exact for every candidate",
+    "full_stable_action_ranking": "exact descending ranking-output score with ascending candidate-index tie-break",
+    "top1": "exact"
+  },
+  "performance_gates": {
+    "aggregation": "every matched repetition and pooled speed must pass",
+    "h1_over_h0_speedup_minimum": 1.15,
+    "h1_end_to_end_p95_ratio_maximum": 1.0,
+    "h1_over_h0_cpu_sparse_p50_slowdown_maximum": 1.1,
+    "h1_over_h0_cpu_sparse_p95_slowdown_maximum": 1.1,
+    "percentile": "one-based nearest rank ceil(p*N), no interpolation, derived from raw QPC intervals"
+  },
+  "etw_evidence": {
+    "schema": "heterogeneous-265k-etw-evidence-v1",
+    "status": "MEASURED_COMPLETE",
+    "required_top_level": [
+      "provider_source_sha256",
+      "benchmark_contract_sha256",
+      "system_contract_sha256",
+      "source_manifest_sha256",
+      "evidence_contract_sha256",
+      "captures"
+    ],
+    "provider_source_rule": "must equal the ETW validator source named by the frozen source manifest and differ from benchmark runner/provider/substrate sources",
+    "captures": "exactly H0/H1 repetitions 1,2,3",
+    "required_capture_fields": [
+      "cell_id",
+      "repetition",
+      "records_sha256",
+      "run_uuid",
+      "process_id",
+      "process_identity_qpc",
+      "qpc_frequency",
+      "begin_qpc",
+      "end_qpc",
+      "complete_timed_window_covered",
+      "lost_events",
+      "lost_buffers",
+      "role_assignments_verified",
+      "sparse_stage_events",
+      "hash_stage_events",
+      "outside_assigned_cpu_set_events",
+      "raw_trace"
+    ],
+    "inconclusive_if": [
+      "missing evidence or raw trace",
+      "incomplete timed-window coverage",
+      "lost events or buffers"
+    ]
+  },
+  "imc_evidence": {
+    "schema": "heterogeneous-265k-imc-evidence-v1",
+    "status": "MEASURED_COMPLETE",
+    "required_top_level": [
+      "provider_source_sha256",
+      "benchmark_contract_sha256",
+      "system_contract_sha256",
+      "source_manifest_sha256",
+      "evidence_contract_sha256",
+      "captures"
+    ],
+    "provider_source_rule": "must equal the IMC validator source named by the frozen source manifest and differ from benchmark runner/provider/substrate sources",
+    "captures": "exactly H0/H1 repetitions 1,2,3",
+    "required_capture_fields": [
+      "cell_id",
+      "repetition",
+      "records_sha256",
+      "run_uuid",
+      "qpc_frequency",
+      "begin_qpc",
+      "end_qpc",
+      "counter_source",
+      "counter_width_bits",
+      "bytes_per_count_numerator",
+      "bytes_per_count_denominator",
+      "read_counter_start",
+      "read_counter_end",
+      "write_counter_start",
+      "write_counter_end",
+      "time_enabled_ticks",
+      "time_running_ticks",
+      "multiplexed",
+      "overflow",
+      "reported_read_bytes",
+      "reported_write_bytes",
+      "raw_counter_artifact"
+    ],
+    "inconclusive_if": [
+      "missing evidence or raw counters",
+      "multiplexed or overflowed counter",
+      "time_enabled differs from time_running",
+      "unauditable wrap or incomplete timed-window coverage"
+    ],
+    "forbidden_substitutes": ["process I/O bytes", "theoretical DIMM bandwidth"]
+  },
+  "decisions": {
+    "ADOPT": "all source, artifact, raw-record, numeric, rank, performance, ETW and IMC gates pass",
+    "REJECT": "complete evidence proves a mismatch, regression, malformed/tampered artifact, or failed gate",
+    "INCONCLUSIVE_FAIL_CLOSED": "required ETW/IMC evidence is unavailable or cannot support a valid measurement"
+  }
+}

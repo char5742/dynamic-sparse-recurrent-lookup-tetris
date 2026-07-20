@@ -19,6 +19,13 @@ export MAX_CANDIDATES,
        load_teacher_dataset,
        allocate_host_batch,
        pack_batch!,
+       STANDARDIZED_LISTNET_MARGIN_OBJECTIVE_MODE,
+       RAW_TEACHER_TOP_GAP_OBJECTIVE_MODE,
+       normalize_objective_mode,
+       FIXED_TEACHER_TOP2_MARGIN_MODE,
+       STUDENT_HARD_NEGATIVE_MARGIN_MODE,
+       normalize_margin_mode,
+       hard_negative_selection,
        supervised_components,
        supervised_objective,
        teacher_metrics,
@@ -52,6 +59,44 @@ const QUANTILE_TEACHER_WEIGHT = 0.05f0
 const GEOMETRY_WEIGHT = 0.10f0
 const LISTNET_TEMPERATURE = 0.50f0
 const HUBER_DELTA = 1.0f0
+const RAW_TEACHER_TOP_GAP_WEIGHT = 1.0f0
+
+# Objective composition and margin-witness selection are deliberately separate.
+# The raw-gap arm removes the scale-invariant standardized ListNet term and uses
+# exactly one copy of the existing teacher-fixed raw top-gap Huber term.
+const STANDARDIZED_LISTNET_MARGIN_OBJECTIVE_MODE =
+    :standardized_listnet_plus_margin
+const RAW_TEACHER_TOP_GAP_OBJECTIVE_MODE = :raw_teacher_top_gap_huber
+
+function normalize_objective_mode(mode::Symbol)
+    mode in (
+        STANDARDIZED_LISTNET_MARGIN_OBJECTIVE_MODE,
+        RAW_TEACHER_TOP_GAP_OBJECTIVE_MODE,
+    ) || throw(ArgumentError(
+        "objective mode must be standardized_listnet_plus_margin or " *
+        "raw_teacher_top_gap_huber; got $mode",
+    ))
+    return mode
+end
+
+normalize_objective_mode(mode::AbstractString) =
+    normalize_objective_mode(Symbol(strip(mode)))
+
+const FIXED_TEACHER_TOP2_MARGIN_MODE = :fixed_teacher_top2
+const STUDENT_HARD_NEGATIVE_MARGIN_MODE = :student_hard_negative
+
+function normalize_margin_mode(mode::Symbol)
+    mode in (
+        FIXED_TEACHER_TOP2_MARGIN_MODE,
+        STUDENT_HARD_NEGATIVE_MARGIN_MODE,
+    ) || throw(ArgumentError(
+        "margin mode must be fixed_teacher_top2 or student_hard_negative; got $mode",
+    ))
+    return mode
+end
+
+normalize_margin_mode(mode::AbstractString) =
+    normalize_margin_mode(Symbol(strip(mode)))
 
 const SHARDED_FORMAT_VERSION = 3
 const REQUIRED_TRAIN_STATES = 100_000
@@ -716,6 +761,146 @@ function _huber(values; delta::Float32=HUBER_DELTA)
     )
 end
 
+@inline function _stable_argmax(values, valid_indices, excluded::Int=0)
+    best = 0
+    for index in valid_indices
+        index == excluded && continue
+        if best == 0 || values[index] > values[best]
+            best = index
+        end
+    end
+    return best
+end
+
+"""Select a fixed hard-negative witness for each state.
+
+Teacher and student ties are resolved by the lowest candidate ID. The returned
+masks are deliberately computed before an AD pullback and must be passed back
+to `supervised_components`; hard routing is therefore stop-gradient while the
+selected `q[y]` and `q[h]` remain differentiable.
+"""
+function hard_negative_selection(q::AbstractMatrix, batch)
+    width, state_batch = size(batch.mask)
+    size(q) == (width, state_batch) || throw(DimensionMismatch(
+        "hard-negative Q shape $(size(q)) != batch shape $((width, state_batch))",
+    ))
+    teacher = batch.targets.teacher_q
+    size(teacher) == (width, state_batch) || throw(DimensionMismatch(
+        "teacher-Q shape differs from the hard-negative batch",
+    ))
+    value_type = promote_type(eltype(q), eltype(teacher), Float32)
+    teacher_top1_mask = zeros(value_type, width, state_batch)
+    hard_negative_mask = zeros(value_type, width, state_batch)
+    teacher_delta = zeros(value_type, 1, state_batch)
+    valid_state_mask = zeros(value_type, 1, state_batch)
+    teacher_top1_indices = zeros(Int, state_batch)
+    hard_negative_indices = zeros(Int, state_batch)
+    teacher_top2_indices = zeros(Int, state_batch)
+    valid_selections = 0
+    differs_from_teacher_top2 = 0
+
+    valid_indices = Int[]
+    sizehint!(valid_indices, width)
+    for slot in 1:state_batch
+        empty!(valid_indices)
+        for candidate in 1:width
+            !iszero(batch.mask[candidate, slot]) && push!(valid_indices, candidate)
+        end
+        isempty(valid_indices) && continue
+        teacher_column = @view teacher[:, slot]
+        student_column = @view q[:, slot]
+        y = _stable_argmax(teacher_column, valid_indices)
+        teacher_top1_indices[slot] = y
+        teacher_top1_mask[y, slot] = one(value_type)
+        length(valid_indices) >= 2 || continue
+
+        h = _stable_argmax(student_column, valid_indices, y)
+        teacher_top2 = _stable_argmax(teacher_column, valid_indices, y)
+        h != 0 && teacher_top2 != 0 || error(
+            "hard-negative selection failed for a multi-candidate state",
+        )
+        hard_negative_indices[slot] = h
+        teacher_top2_indices[slot] = teacher_top2
+        hard_negative_mask[h, slot] = one(value_type)
+        teacher_delta[1, slot] = teacher_column[y] - teacher_column[h]
+        valid_state_mask[1, slot] = one(value_type)
+        valid_selections += 1
+        differs_from_teacher_top2 += h != teacher_top2
+    end
+    return (;
+        teacher_top1_mask,
+        hard_negative_mask,
+        teacher_delta,
+        valid_state_mask,
+        teacher_top1_indices,
+        hard_negative_indices,
+        teacher_top2_indices,
+        valid_selections,
+        differs_from_teacher_top2,
+    )
+end
+
+function _ranking_margin_components(
+    q,
+    batch;
+    margin_mode::Union{Symbol,AbstractString}=FIXED_TEACHER_TOP2_MARGIN_MODE,
+    hard_negative=nothing,
+    hard_negative_margin_floor::Real=0.0f0,
+)
+    mode = normalize_margin_mode(margin_mode)
+    if mode === FIXED_TEACHER_TOP2_MARGIN_MODE
+        # Preserve the original dense/default operation order exactly.
+        predicted_top1 = sum(q .* batch.targets.top1_mask; dims=1)
+        predicted_top2 = sum(q .* batch.targets.top2_mask; dims=1)
+        margin = mean(_huber(
+            predicted_top1 .- predicted_top2 .- batch.targets.margin,
+        ))
+        return (;
+            margin_loss=margin,
+            raw_top_gap_loss=margin,
+            raw_student_top_gap_mean=mean(predicted_top1 .- predicted_top2),
+            raw_teacher_top_gap_mean=mean(batch.targets.margin),
+            hard_negative_valid_selections=0,
+            hard_negative_differs_from_teacher_top2=0,
+        )
+    end
+
+    hard_negative === nothing && throw(ArgumentError(
+        "student_hard_negative mode requires a stop-gradient selection",
+    ))
+    size(hard_negative.hard_negative_mask) == size(q) || throw(DimensionMismatch(
+        "hard-negative mask shape differs from Q",
+    ))
+    predicted_top1 = sum(q .* hard_negative.teacher_top1_mask; dims=1)
+    predicted_hard_negative = sum(q .* hard_negative.hard_negative_mask; dims=1)
+    required_gap = iszero(hard_negative_margin_floor) ?
+        hard_negative.teacher_delta :
+        max.(hard_negative.teacher_delta, convert(eltype(q), hard_negative_margin_floor))
+    violation = max.(
+        zero(eltype(q)),
+        required_gap .-
+            (predicted_top1 .- predicted_hard_negative),
+    )
+    margin = _masked_mean(
+        _huber(violation; delta=1.0f0),
+        hard_negative.valid_state_mask,
+    )
+    teacher_top1 = sum(q .* batch.targets.top1_mask; dims=1)
+    teacher_top2 = sum(q .* batch.targets.top2_mask; dims=1)
+    raw_top_gap = mean(_huber(
+        teacher_top1 .- teacher_top2 .- batch.targets.margin,
+    ))
+    return (;
+        margin_loss=margin,
+        raw_top_gap_loss=raw_top_gap,
+        raw_student_top_gap_mean=mean(teacher_top1 .- teacher_top2),
+        raw_teacher_top_gap_mean=mean(batch.targets.margin),
+        hard_negative_valid_selections=hard_negative.valid_selections,
+        hard_negative_differs_from_teacher_top2=
+            hard_negative.differs_from_teacher_top2,
+    )
+end
+
 function _binary_cross_entropy_with_logits(logits, labels)
     # max(x,0)-xy+log1p(exp(-abs(x))) without requiring a softplus rule.
     return max.(logits, 0.0f0) .- logits .* labels .+ log1p.(exp.(-abs.(logits)))
@@ -787,15 +972,46 @@ function _geometry_losses(output, batch, width::Int, state_batch::Int)
     )
 end
 
-"""Return every supervised loss component from one already-computed output."""
-function supervised_components(output, batch)
+"""Return every supervised loss component from one already-computed output.
+
+`objective_mode` controls composition independently of `margin_mode`, which
+only selects the ranking witness.  The legacy/default composition is exactly
+`1.0*standardized ListNet + margin_weight*margin`.  The scale-identifiable
+one-shot composition is exactly `0.0*ListNet + 1.0*raw teacher top-gap Huber`
+with Huber delta 1.0; old-Q and auxiliary terms are unchanged.
+"""
+function supervised_components(
+    output,
+    batch;
+    margin_weight::Real=MARGIN_WEIGHT,
+    margin_mode::Union{Symbol,AbstractString}=FIXED_TEACHER_TOP2_MARGIN_MODE,
+    objective_mode::Union{Symbol,AbstractString}=
+        STANDARDIZED_LISTNET_MARGIN_OBJECTIVE_MODE,
+    hard_negative=nothing,
+    hard_negative_margin_floor::Real=0.0f0,
+)
     width, state_batch = size(batch.mask)
     q = _reshape_q(output, width, state_batch)
-    listnet = _listnet_loss(q, batch.targets.teacher_z, batch.mask)
+    normalized_objective_mode = normalize_objective_mode(objective_mode)
+    normalized_margin_mode = normalize_margin_mode(margin_mode)
+    if normalized_objective_mode === RAW_TEACHER_TOP_GAP_OBJECTIVE_MODE
+        normalized_margin_mode === FIXED_TEACHER_TOP2_MARGIN_MODE || throw(
+            ArgumentError(
+                "raw_teacher_top_gap_huber requires fixed_teacher_top2 margin mode",
+            ),
+        )
+    end
+    listnet = normalized_objective_mode === RAW_TEACHER_TOP_GAP_OBJECTIVE_MODE ?
+        zero(eltype(q)) : _listnet_loss(q, batch.targets.teacher_z, batch.mask)
     old_q = _masked_mean(_huber(q .- batch.targets.teacher_q), batch.mask)
-    predicted_top1 = sum(q .* batch.targets.top1_mask; dims=1)
-    predicted_top2 = sum(q .* batch.targets.top2_mask; dims=1)
-    margin = mean(_huber(predicted_top1 .- predicted_top2 .- batch.targets.margin))
+    ranking_margin = _ranking_margin_components(
+        q,
+        batch;
+        margin_mode=normalized_margin_mode,
+        hard_negative,
+        hard_negative_margin_floor,
+    )
+    margin = ranking_margin.margin_loss
     death_logits = reshape(output.death_logit, width, state_batch)
     death = _masked_mean(
         _binary_cross_entropy_with_logits(death_logits, batch.targets.death),
@@ -803,8 +1019,17 @@ function supervised_components(output, batch)
     )
     quantile = _quantile_teacher_loss(output.quantiles, batch.targets.teacher_q, batch.mask)
     geometry = _geometry_losses(output, batch, width, state_batch)
-    loss = LISTNET_WEIGHT * listnet + OLD_Q_WEIGHT * old_q +
-           MARGIN_WEIGHT * margin + DEATH_WEIGHT * death +
+    effective_listnet_weight =
+        normalized_objective_mode === RAW_TEACHER_TOP_GAP_OBJECTIVE_MODE ?
+            0.0f0 : LISTNET_WEIGHT
+    effective_margin_weight =
+        normalized_objective_mode === RAW_TEACHER_TOP_GAP_OBJECTIVE_MODE ?
+            RAW_TEACHER_TOP_GAP_WEIGHT : Float32(margin_weight)
+    effective_raw_top_gap_weight =
+        normalized_margin_mode === FIXED_TEACHER_TOP2_MARGIN_MODE ?
+            effective_margin_weight : 0.0f0
+    loss = effective_listnet_weight * listnet + OLD_Q_WEIGHT * old_q +
+           effective_margin_weight * margin + DEATH_WEIGHT * death +
            QUANTILE_TEACHER_WEIGHT * quantile +
            GEOMETRY_WEIGHT * geometry.geometry_loss
     return (;
@@ -813,6 +1038,16 @@ function supervised_components(output, batch)
         old_q_loss=old_q,
         q_huber_loss=old_q,
         margin_loss=margin,
+        raw_top_gap_loss=ranking_margin.raw_top_gap_loss,
+        raw_student_top_gap_mean=ranking_margin.raw_student_top_gap_mean,
+        raw_teacher_top_gap_mean=ranking_margin.raw_teacher_top_gap_mean,
+        effective_listnet_weight,
+        effective_margin_weight,
+        effective_raw_top_gap_weight,
+        hard_negative_valid_selections=
+            ranking_margin.hard_negative_valid_selections,
+        hard_negative_differs_from_teacher_top2=
+            ranking_margin.hard_negative_differs_from_teacher_top2,
         death_loss=death,
         quantile_teacher_loss=quantile,
         geometry...,
@@ -821,9 +1056,28 @@ function supervised_components(output, batch)
 end
 
 """Shared fixed-shape objective for Native Zygote and Reactant/EnzymeMLIR."""
-function supervised_objective(model, ps, st, batch)
+function supervised_objective(
+    model,
+    ps,
+    st,
+    batch;
+    margin_weight::Real=MARGIN_WEIGHT,
+    margin_mode::Union{Symbol,AbstractString}=FIXED_TEACHER_TOP2_MARGIN_MODE,
+    objective_mode::Union{Symbol,AbstractString}=
+        STANDARDIZED_LISTNET_MARGIN_OBJECTIVE_MODE,
+    hard_negative=nothing,
+    hard_negative_margin_floor::Real=0.0f0,
+)
     output, next_state = model(batch.inputs, ps, st)
-    statistics = supervised_components(output, batch)
+    statistics = supervised_components(
+        output,
+        batch;
+        margin_weight,
+        margin_mode,
+        objective_mode,
+        hard_negative,
+        hard_negative_margin_floor,
+    )
     loss = statistics.composite_loss
     return loss, next_state, statistics
 end
@@ -906,18 +1160,30 @@ function evaluation_metrics(
     rows::AbstractVector{Int},
     host_batch,
     predict_batch::Function,
+    ;
+    margin_weight::Real=MARGIN_WEIGHT,
+    margin_mode::Union{Symbol,AbstractString}=FIXED_TEACHER_TOP2_MARGIN_MODE,
+    objective_mode::Union{Symbol,AbstractString}=
+        STANDARDIZED_LISTNET_MARGIN_OBJECTIVE_MODE,
+    hard_negative_margin_floor::Real=0.0f0,
 )
+    normalized_margin_mode = normalize_margin_mode(margin_mode)
+    normalized_objective_mode = normalize_objective_mode(objective_mode)
     batch_size = size(host_batch.mask, 2)
     length(rows) >= batch_size || error("evaluation rows are smaller than the fixed batch")
     usable = length(rows) - mod(length(rows), batch_size)
     usable > 0 || error("no complete evaluation batch")
     selected_rows = @view rows[1:usable]
 
-    component_names = (
+    objective_component_names = (
         :composite_loss, :listnet_loss, :old_q_loss, :q_huber_loss, :margin_loss,
+        :raw_top_gap_loss, :raw_student_top_gap_mean, :raw_teacher_top_gap_mean,
+        :effective_listnet_weight, :effective_margin_weight,
+        :effective_raw_top_gap_weight,
         :death_loss, :quantile_teacher_loss, :geometry_loss, :line_clear_loss,
         :max_height_loss, :holes_loss, :cavities_loss,
     )
+    component_names = (objective_component_names..., :diagnostic_listnet_loss)
     component_sums = Dict(name => 0.0 for name in component_names)
     top1 = Bool[]
     ndcg = Float64[]
@@ -925,16 +1191,39 @@ function evaluation_metrics(
     q_values = Float64[]
     action_margins = Float64[]
     batches = 0
+    hard_negative_valid_selections = 0
+    hard_negative_differs_from_teacher_top2 = 0
 
     for partition in Iterators.partition(selected_rows, batch_size)
         packed_rows = collect(partition)
         pack_batch!(host_batch, dataset, packed_rows)
         output = predict_batch(host_batch)
-        components = supervised_components(output, host_batch)
-        for name in component_names
+        q = Array(_reshape_q(output, size(host_batch.mask)...))
+        hard_negative = normalized_margin_mode === STUDENT_HARD_NEGATIVE_MARGIN_MODE ?
+            hard_negative_selection(q, host_batch) : nothing
+        components = supervised_components(
+            output,
+            host_batch;
+            margin_weight,
+            margin_mode=normalized_margin_mode,
+            objective_mode=normalized_objective_mode,
+            hard_negative,
+            hard_negative_margin_floor,
+        )
+        for name in objective_component_names
             component_sums[name] += Float64(getproperty(components, name))
         end
-        q = Array(_reshape_q(output, size(host_batch.mask)...))
+        # In raw-gap training mode ListNet has coefficient zero and is not part
+        # of the VJP.  Evaluation still reports this unweighted diagnostic so
+        # ranking-shape changes remain observable without reintroducing its
+        # scale-invariant gradient.
+        component_sums[:diagnostic_listnet_loss] += Float64(
+            _listnet_loss(q, host_batch.targets.teacher_z, host_batch.mask),
+        )
+        hard_negative_valid_selections +=
+            Int(components.hard_negative_valid_selections)
+        hard_negative_differs_from_teacher_top2 +=
+            Int(components.hard_negative_differs_from_teacher_top2)
         for (slot, row) in enumerate(packed_rows)
             count_actions = dataset.action_counts[row]
             prediction = @view q[1:count_actions, slot]
@@ -961,6 +1250,8 @@ function evaluation_metrics(
         q_mean=mean(q_values),
         q_std=std(q_values; corrected=false),
         action_margin=mean(action_margins),
+        hard_negative_valid_selections,
+        hard_negative_differs_from_teacher_top2,
     ))
 end
 

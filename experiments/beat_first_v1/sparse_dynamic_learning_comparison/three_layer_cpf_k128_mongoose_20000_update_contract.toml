@@ -1,0 +1,159 @@
+format_version = 1
+experiment_id = "sparse_3l_k128_mongoose_teacher_signal_cpf_20000_v1"
+purpose = "bounded learned-SimHash routing pilot on the fixed three-layer CPU-SLIDE k128 teacher-ranking task; no game-strength claim"
+hypothesis = "A learned K7/L2 SimHash overlay can improve candidate ranking and top-1 separation without collapsing neuron-bank usage or violating active-only sparse training."
+expected_mechanism = "A pending/live learned projection is trained from fixed-WTA witness pairs, atomically refreshed every 2000 updates, and used only to retrieve sparse candidates before exact raw-dot reranking."
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-CPF1-k128 plus learned SimHash overlay"
+routing_mode = "mongoose_simhash_k7_l2_v1"
+routing_policy = "mongoose-simhash-k7-l2-live-pending-bce-v1"
+base_routing_policy = "wta-collision-count-stable-id-prefilter-v1"
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+fresh_start_required = true
+resume_forbidden = true
+checkpoint_selection_forbidden = true
+checkpoint_version = 2
+total_base_parameters = 19924022
+router_parameters = 2688
+total_parameters_with_router = 19926710
+router_parameter_fraction_of_base = 0.0001349125191690714
+active_neurons_by_layer = [48, 40, 40]
+active_base_parameters = 58214
+router_active_parameter_touches_per_update = 2688
+router_touch_fraction_of_base_active_parameters = 0.046174459751949705
+learner_candidate_width = 80
+observed_max_candidates = 76
+state_batch = 1
+maximum_updates = 20000
+epochs_ceiling = 1.0
+evaluation_updates = [0, 2000, 4000, 6000, 8000, 10000, 12000, 14000, 16000, 18000, 20000]
+checkpoint_updates = [10000, 20000]
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1.0e-8
+objective_margin_mode = "fixed_teacher_top2"
+objective_margin_weight = 0.15
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 30
+
+[mongoose]
+route_dimension = 64
+bits_per_table = 7
+tables = 2
+column_normalization = false
+learning_rate = 0.0001
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1.0e-8
+tanh_beta = 1.0
+seed = 1297043015
+warmup_updates = 2000
+switch_update = 2000
+refresh_interval = 2000
+refresh_updates = [2000, 4000, 6000, 8000, 10000, 12000, 14000, 16000, 18000, 20000]
+serving_before_switch = "fixed WTA bitwise-compatible"
+serving_after_switch = "live learned SimHash index with exact raw-dot rerank"
+training_witness = "bounded fixed-WTA positive/negative witness"
+router_loss = "tanh-scaled BCE pair loss"
+pending_live_rule = "train pending every update; atomically build and validate all three live indexes before publish"
+dense_score_fallback_forbidden = true
+
+[parent_baseline]
+role = "comparison and entropy baseline only; the pilot starts from the frozen model seed and does not resume this checkpoint"
+metrics_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_teacher_signal_cpf_20000_v1/sparse_3l_20260719T135857/metrics.jsonl"
+metrics_bytes = 70674
+metrics_sha256 = "8ed7ecba6eb01e916ce85c6b7164628b3b0121696e00004c6e6d8bbb540a012d"
+checkpoint_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_teacher_signal_cpf_20000_v1/sparse_3l_20260719T135857/checkpoints/checkpoint_000020000.jls"
+checkpoint_bytes = 248680789
+checkpoint_sha256 = "0d642c446d89e5d06c482f4c260daad1f60b5a854055093175d17891c3136f3c"
+final_held_top1 = 0.228515625
+final_held_ndcg = 0.9374244614677424
+final_held_pairwise = 0.7407546814419289
+final_held_action_margin = 0.011132494546473026
+layer_normalized_entropy = [0.9780863300520932, 0.9687321438167865, 0.9658671084173591]
+layer_event_count_total = [9897960, 10124735, 10730447]
+layer_coverage = [1.0, 1.0, 1.0]
+layer_max_share = [0.0010885071267210617, 0.0009415555073787116, 0.0008631513673195534]
+
+[success_gate]
+baseline_update = 0
+final_update = 20000
+minimum_final_held_top1 = 0.25
+strictly_greater_final_held_ndcg = 0.9374244614677424
+strictly_greater_final_held_pairwise = 0.7407546814419289
+minimum_final_held_action_margin = 0.0125
+minimum_layer_normalized_entropy = [0.8802776970468839, 0.8718589294351079, 0.8692803975756232]
+maximum_router_touch_fraction_of_base_active_parameters = 0.05
+maximum_router_parameter_fraction_of_base = 0.01
+require_finite_recursive_metrics = true
+require_no_route_or_bucket_cap_failure = true
+require_prefilter_activation = false
+require_active_only_base_optimizer = true
+require_router_optimizer_restricted_to_projection_parameters = true
+require_exact_optimizer_clocks = true
+require_exact_refresh_clocks = true
+require_two_authoritative_checkpoints = true
+
+[pinned_runtime]
+julia_path = "C:/Users/fshuu/.julia/juliaup/julia-1.12.6+0.x64.w64.mingw32/bin/julia.exe"
+julia_bytes = 170952
+julia_sha256 = "4b1984610b12c9ac119340261bee08d93a0032989b0c35d20ffddaadba241043"
+julia_version = "1.12.6"
+project_path = "experiments/beat_first_v1/Project.toml"
+project_bytes = 1221
+project_sha256 = "62bbd9b624a4e2963e0382c86c8b4ff56b865c539e41ce1e8535cc7416ae4c7a"
+manifest_path = "experiments/beat_first_v1/Manifest.toml"
+manifest_bytes = 47731
+manifest_sha256 = "6ef9ed11797722e72e62d1d4e500da59d0bc14124f96344f93a14a322ec9a10a"
+
+[pinned_sources]
+teacher_training_sha256 = "c28b89c4fb48e70e788f809d82af46b841f8ca0199659c03295846c6fc31e2a7"
+entrypoint_sha256 = "41893978e984c0c696470aa15d73ae54eae01deba05e0db776a9269e25897b5d"
+module_sha256 = "8756a5f99c0f18554985fb60a2dd565300ef7c2fb67159f64ddf41a808ef36bd"
+mongoose_overlay_sha256 = "0cbd4b31740a7573380dd0737ed3a5f9544094f428fbf18e3ef89e8c64d36416"
+geometry_sha256 = "5ec92d85be3f888554c1f2700e06a1e3dc5531d25b354677bb208eb6978d3a27"
+model_sha256 = "ff94f5771d1cbb09532348b8603019c5aa3126979dfef74ac277d223a749e7ac"
+optimizer_sha256 = "a5c057e015e3b9677510faaf07e3c26ca993233e09ab9f602296fbd3299b5790"
+runtime_sha256 = "9552adefc3bad185146cc1053f6358c3f40c5e5a81a76ecbb0f3b08e6bb6be4a"
+checkpoint_sha256 = "425fd756af3b1d2f029a4f5a0241e588acb563863a5da8be6131bd3e3a661340"
+features_sha256 = "0a96497f69271bd900054be72c33c13a244b7909631b75dc95183730872197b7"
+wta_index_sha256 = "be270e8e36fe356be496e834edac1b3c6a13416fcd517a3e651319eb5b581ceb"
+training_core_sha256 = "05a8592019d302e951828035c252f3a80f5567f45a533fec82ec2c6631ca2aa6"
+focused_and_regression_tests_passed = 2436
+
+[stop_conditions]
+conditions = [
+  "trainer exits nonzero or exceeds 30 minutes",
+  "another Julia process overlaps the owned process",
+  "any pinned path, byte count, or SHA-256 differs",
+  "the output root already exists, escapes the allowed run parent, or traverses a reparse point",
+  "the run is not a fresh model initialization",
+  "variant, active widths, seeds, split, sampler order, objective, or learned-router configuration changes",
+  "the learned router is not fixed-WTA during warmup or is not live from update 2000 onward",
+  "refresh or optimizer clocks differ from the exact preregistered cadence",
+  "the bucket-entry or exact-score cap is exceeded",
+  "any metric, loss, gradient, Q value, margin, router state, or norm is non-finite",
+  "the 19.9M bank ceases to be selected-only or the router optimizer writes outside its 2,688 projection parameters",
+  "the final quality, action-margin, entropy, router-touch, or router-size gate is not met",
+  "the exact metrics/checkpoint/log/status artifact contract is not met",
+]
+
+[interpretation]
+allowed = "bounded learned-routing teacher-ranking, top-1 separation, sparse-usage entropy, selected-only 19.9M-bank training, and projection-confined router-update evidence"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+]
+validation_game_seeds_touched = false
+sealed_game_seeds_touched = false

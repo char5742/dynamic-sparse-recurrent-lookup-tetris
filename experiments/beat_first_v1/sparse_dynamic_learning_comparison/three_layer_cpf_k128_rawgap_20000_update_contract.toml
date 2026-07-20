@@ -1,0 +1,108 @@
+format_version = 1
+experiment_id = "sparse_3l_k128_rawgap_teacher_signal_cpf_20000_v1"
+purpose = "one-shot scale-identifiable raw teacher top-gap objective test after standardized ListNet ranking improved NDCG/pairwise while action separation stalled; no game-strength claim"
+hypothesis = "Removing standardized ListNet and fitting the raw teacher top-1/top-2 gap at unit weight preserves learned ranking while making Q scale identifiable and lifting the held action margin."
+expected_mechanism = "The sole ranking block becomes Huber_delta1((student_q_top1-student_q_top2)-(teacher_q_top1-teacher_q_top2)); against the margin1 causal parent, only the scale-invariant standardized ListNet contribution is removed."
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-CPF1-k128"
+routing_mode = "fixed_wta"
+routing_policy = "wta-collision-count-stable-id-prefilter-v1"
+objective_mode = "raw_teacher_top_gap_huber"
+objective_margin_mode = "fixed_teacher_top2"
+configured_objective_margin_weight = 1.0
+effective_listnet_weight = 0.0
+effective_raw_teacher_top_gap_weight = 1.0
+huber_delta = 1.0
+old_q_weight = 0.25
+death_weight = 0.10
+quantile_teacher_weight = 0.05
+geometry_weight = 0.10
+promotion_parent = "sparse_3l_k128_margin1_teacher_signal_cpf_20000_v1_retry1"
+promotion_parent_disposition = "diagnostic_only_action_margin_plateau"
+promotion_parent_metrics_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_margin1_teacher_signal_cpf_20000_v1_retry1/sparse_3l_20260719T143553/metrics.jsonl"
+promotion_parent_metrics_sha256 = "2a5149ff47a4d16053679162b71c2ea589efdd3c5a5d5a80814eb0fdf474d597"
+fresh_start_required = true
+resume_forbidden = true
+retry_forbidden = true
+one_shot_reservation_path = "D:/tetris-paper-plus/runs/beat_first_v1/.sparse_3l_k128_rawgap_teacher_signal_cpf_20000_v1.reservation.json"
+one_shot_consumed_path = "D:/tetris-paper-plus/runs/beat_first_v1/.sparse_3l_k128_rawgap_teacher_signal_cpf_20000_v1.consumed.json"
+one_shot_reservation_create_mode = "FileMode.CreateNew"
+one_shot_nonce_format = "32 lowercase hexadecimal characters"
+one_shot_consume_operation = "same-volume atomic File.Move before output-root creation"
+crash_after_one_shot_consume_burns_arm = true
+validate_only_zero_mutation = true
+checkpoint_selection_forbidden = true
+hyperparameter_tuning_forbidden = true
+checkpoint_version = 2
+total_parameters = 19924022
+active_neurons_by_layer = [48, 40, 40]
+active_parameters = 58214
+learner_candidate_width = 80
+state_batch = 1
+maximum_updates = 20000
+epochs_ceiling = 1.0
+evaluation_interval = 2000
+required_observation_updates = [0, 2000, 5000, 10000, 20000]
+checkpoint_interval = 10000
+required_checkpoint_updates = [5000, 10000, 20000]
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 30
+
+[single_variable_pivot]
+variable = "supervised objective composition"
+parent_ranking_block = "1.0 * standardized ListNet + 1.0 * fixed raw teacher top-gap Huber"
+experimental_ranking_block = "0.0 * standardized ListNet + 1.0 * fixed raw teacher top-gap Huber"
+teacher_top1_top2 = "stable descending teacher_q order over valid candidates; lowest candidate ID wins ties"
+all_other_training_model_routing_data_order_and_seed_variables = "frozen"
+
+[success_gate]
+baseline_update = 0
+final_update = 20000
+require_exact_update_5000_observation = true
+require_finite_metrics = true
+require_no_route_or_bucket_cap_failure = true
+require_prefilter_activation = true
+minimum_final_held_top1 = 0.234375
+minimum_final_held_action_margin = 0.02
+minimum_final_held_ndcg = 0.9374244614677424
+minimum_final_held_pairwise = 0.7407546814419289
+minimum_final_held_q_std = 0.15
+maximum_final_raw_top_gap_loss_exclusive = 0.023125343285737676
+minimum_layer1_bank_coverage = 1.0
+minimum_layer2_bank_coverage = 0.999
+minimum_layer3_bank_coverage = 0.999
+
+[stop_conditions]
+conditions = [
+  "trainer exits nonzero",
+  "another Julia process overlaps",
+  "the run is not a fresh initialization",
+  "the run attempts resume or retry",
+  "variant, routing, data, order, seed, optimizer, or active-only update semantics change",
+  "objective mode is not exactly raw_teacher_top_gap_huber in every metric",
+  "effective ListNet weight is not exactly 0.0 in every metric",
+  "effective raw teacher top-gap weight is not exactly 1.0 in every metric",
+  "the independent bucket-entry cap is exceeded",
+  "the exact-score cap is exceeded after prefiltering and probe reservation",
+  "any loss, gradient, Q value, raw gap, or margin is non-finite",
+  "the update-20000 success gate is not met",
+]
+
+[interpretation]
+allowed = "bounded one-shot evidence about scale-identifiable sparse teacher ranking and action separation"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+]

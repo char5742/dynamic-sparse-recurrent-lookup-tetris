@@ -1,0 +1,296 @@
+format_version = 2
+experiment_id = "sparse_3l_k128_mongoose_v2_teacher_signal_cpf_2500_v1"
+status = "FROZEN_READY_FOR_VALIDATE_ONLY_NO_LAUNCH"
+purpose = "first bounded fixed-k MONGOOSE-v2 learned-routing signal on the frozen three-layer CPU-SLIDE k128 teacher-ranking task; no game-strength claim"
+hypothesis = "After the v1 serving implementation failed before scientific evaluation, a strictly bounded 16-lane learned-SimHash query can reach the learned-routing checkpoints without changing fixed active width, selected-only training, or the teacher task."
+expected_mechanism = "Each learned logical bucket is split into deterministic neuron-ID lanes; the query traverses table-lane streams in deterministic round-robin order under global, table-implied, and lane bounds, deduplicates, applies a fixed collision shortlist, exact raw-dot reranking, and bounded no-repeat fill/probes."
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-CPF1-k128 plus bounded MONGOOSE-v2 SimHash overlay"
+routing_mode = "mongoose_simhash_k7_l2_bounded_lanes_fixed_k128_v2"
+routing_policy = "mongoose-simhash-k7-l2-bounded-lanes16-fixed-k128-live-pending-bce-v2"
+base_routing_policy = "wta-collision-count-stable-id-prefilter-v1"
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+output_root = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_mongoose_v2_teacher_signal_cpf_2500_v1"
+fresh_start_required = true
+resume_forbidden = true
+retry_forbidden = true
+checkpoint_selection_forbidden = true
+checkpoint_version = 2
+total_base_parameters = 19924022
+router_parameters = 2688
+total_parameters_with_router = 19926710
+router_parameter_fraction_of_base = 0.0001349125191690714
+active_neurons_by_layer = [48, 40, 40]
+training_exploration_slots_by_layer = [6, 5, 5]
+active_base_parameters = 58214
+router_active_parameter_touches_per_update = 2688
+router_touch_fraction_of_base_active_parameters = 0.046174459751949705
+learner_candidate_width = 80
+observed_max_candidates = 76
+state_batch = 1
+maximum_updates = 2500
+epochs_ceiling = 1.0
+evaluation_updates = [0, 2000, 2500]
+checkpoint_updates = [2000, 2500]
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1.0e-8
+objective_mode = "standardized_listnet_plus_margin"
+objective_margin_mode = "fixed_teacher_top2"
+objective_margin_weight = 0.15
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 20
+validation_game_seeds_touched = false
+sealed_game_seeds_touched = false
+
+[mongoose_v2]
+query_version = 2
+index_version = 3
+route_dimension = 64
+bits_per_table = 7
+tables = 2
+logical_buckets_per_table = 128
+load_balance_lanes_per_table = 16
+queried_table_lane_streams = 32
+column_normalization = false
+learning_rate = 0.0001
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1.0e-8
+tanh_beta = 1.0
+seed = 1297043015
+warmup_updates = 2000
+switch_update = 2000
+refresh_interval = 2000
+refresh_updates = [2000]
+serving_before_switch = "fixed WTA bitwise-compatible"
+serving_after_switch = "bounded learned SimHash v2 with fixed-k exact raw-dot rerank"
+training_witness = "bounded fixed-WTA positive/negative witness"
+router_loss = "tanh-scaled BCE pair loss"
+pending_live_rule = "train pending every update; atomically build and validate all three v2 live indexes before publish"
+lane_assignment = "splitmix-domain-separated-router-seed-layer-table-neuron-v1"
+traversal = "deterministic table-lane round-robin with stable start stream"
+deduplication = "generation-marked deterministic neuron-ID deduplication"
+shortlist_order = "exact-table-hit count descending, neuron ID ascending"
+rerank_order = "raw 64D key dot descending, exact-table-hit count descending, neuron ID ascending"
+fill_and_probe = "bounded no-repeat affine permutation"
+global_bucket_visit_caps_by_layer = [1536, 1280, 1280]
+implied_table_visit_caps_by_layer = [1536, 1280, 1280]
+lane_visit_caps_by_layer = [96, 80, 80]
+exact_score_caps_by_layer = [384, 640, 640]
+shortlist_caps_by_layer = [378, 635, 635]
+fill_probe_attempt_caps_by_layer = [42, 35, 35]
+training_probe_attempt_caps_by_layer = [48, 40, 40]
+natural_bucket_overload_is_telemetry = true
+natural_bucket_overload_is_error = false
+dense_score_fallback_forbidden = true
+fixed_wta_fallback_after_switch_forbidden = true
+dynamic_k_forbidden = true
+nnue_difference_reuse_forbidden = true
+
+[telemetry_contract]
+required_per_layer_fields = [
+  "bucket_entries_available",
+  "bucket_entries_visited",
+  "truncated_bucket_entries",
+  "overloaded",
+  "key_rows_scored",
+  "unique_rows_retrieved",
+  "prefilter_dropped_rows",
+  "fill_probe_attempts",
+  "training_probe_attempts",
+  "table_entries_available",
+  "table_entries_visited",
+  "lane_entries_available",
+  "lane_entries_visited",
+  "max_lane_entries",
+]
+table_tuple_width = 2
+lane_tuple_width = 32
+max_lane_entries_publication = "router_state, per-step accounting, and cumulative throughput mongoose_v2_lane_entry_caps; exact per-layer query limits [96,80,80] at every learned-router metric"
+require_exact_fixed_active_widths = true
+require_global_visits_within_cap = true
+require_each_table_visits_within_implied_cap = true
+require_each_overloaded_route_lane_visits_within_cap = true
+nonoverloaded_lane_rule = "below the global occupancy cap traversal is exhaustive and max_lane_entries is intentionally not applied; aggregate validation uses overloaded*lane_cap + nonoverloaded*global_cap"
+require_exact_max_lane_entries_at_learned_metrics = true
+reject_noninteger_or_coerced_cap_values = true
+require_exact_score_and_shortlist_caps = true
+require_prefilter_dropped_not_greater_than_retrieved = true
+prefilter_relation_scopes = ["update-2000 step", "update-2500 step", "both cumulative snapshots", "learned-serving cumulative phase delta"]
+require_fill_and_probe_attempts_within_cap = true
+require_available_equals_visited_plus_truncated = true
+require_overload_consistent_with_available = true
+require_overload_observed_as_telemetry_not_failure = true
+require_finite_recursive_metrics = true
+require_cumulative_v2_telemetry_at_updates = [2000, 2500]
+cumulative_required_per_layer_fields = [
+  "mongoose_v2_bucket_entries_visited",
+  "mongoose_v2_key_rows_scored",
+  "retrieved_rows",
+  "prefilter_dropped_rows",
+  "mongoose_v2_bucket_entries_available",
+  "mongoose_v2_truncated_bucket_entries",
+  "mongoose_v2_fill_probe_attempts",
+  "mongoose_v2_training_probe_attempts",
+  "mongoose_v2_overloaded_routes",
+  "mongoose_v2_table_entries_available",
+  "mongoose_v2_table_entries_visited",
+  "mongoose_v2_lane_entries_available",
+  "mongoose_v2_lane_entries_visited",
+  "mongoose_v2_bucket_entry_caps",
+  "mongoose_v2_exact_score_caps",
+  "mongoose_v2_lane_entry_caps",
+]
+require_cumulative_table_inner_width = 2
+require_cumulative_lane_inner_width = 32
+cumulative_v2_phase = "subtract the update-2000 cumulative snapshot from update 2500; validate all nonnegative deltas and caps against the corresponding candidate-count delta"
+warmup_boundary_cumulative_v2_fields_must_be_zero = true
+published_step_aggregation = "per-layer sums across the one state's valid candidate routes; existing bucket_entries/scored_rows/retrieved_rows/prefilter_dropped_rows plus mongoose_v2_* fields"
+published_cumulative_aggregation = "v2-only per-layer sums across learned-serving candidate routes, including mongoose_v2_bucket_entries_visited and mongoose_v2_key_rows_scored needed for phase-delta cap enforcement; fixed-WTA warmup contributes exact zeros and overload is a route count"
+
+[parent_baseline]
+role = "matched fixed-WTA comparison only; v2 starts from the frozen model seed and does not resume this checkpoint"
+metrics_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_teacher_signal_cpf_2500_v1/sparse_3l_20260719T134221/metrics.jsonl"
+metrics_bytes = 36712
+metrics_sha256 = "b6298c1ba512414782309e69e018f35a698f28821fe5a9681ec1acc127c9bff6"
+checkpoint_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_teacher_signal_cpf_2500_v1/sparse_3l_20260719T134221/checkpoints/checkpoint_000002500.jls"
+checkpoint_bytes = 248673984
+checkpoint_sha256 = "de9aac395fc9406f2a3c77de4fa2408ada62716155d1d1915a1aaedb62670b85"
+final_held_top1 = 0.0703125
+final_held_ndcg = 0.8440925775521915
+final_held_pairwise = 0.5407089182563002
+final_held_action_margin = 0.02595788359758444
+final_held_composite_loss = 6.333081512246281
+
+[success_gate]
+baseline_update = 0
+learned_router_updates = [2000, 2500]
+final_update = 2500
+require_nonregressing_learned_routing_signal = true
+minimum_final_held_top1 = 0.0703125
+minimum_final_held_ndcg = 0.8440925775521915
+minimum_final_held_pairwise = 0.5407089182563002
+maximum_final_held_composite_loss = 6.333081512246281
+maximum_router_touch_fraction_of_base_active_parameters = 0.05
+maximum_router_parameter_fraction_of_base = 0.01
+require_finite_recursive_metrics = true
+require_no_route_or_numerical_failure = true
+require_bounded_overload_telemetry = true
+require_active_only_base_optimizer = true
+require_router_optimizer_restricted_to_projection_parameters = true
+require_exact_optimizer_clocks = true
+require_exact_refresh_clocks = true
+require_two_authoritative_checkpoints = true
+require_latest_path_exact_final_enumerated_checkpoint = true
+require_owned_julia_exit_confirmed_before_mutex_release = true
+launch_handoff_rule = "mark launch attempted and termination unconfirmed before Start-Process; a post-spawn failure without a captured process handle must refuse explicit mutex release"
+
+[pinned_runtime]
+julia_path = "C:/Users/fshuu/.julia/juliaup/julia-1.12.6+0.x64.w64.mingw32/bin/julia.exe"
+julia_bytes = 170952
+julia_sha256 = "4b1984610b12c9ac119340261bee08d93a0032989b0c35d20ffddaadba241043"
+julia_version = "1.12.6"
+project_path = "experiments/beat_first_v1/Project.toml"
+project_bytes = 1221
+project_sha256 = "62bbd9b624a4e2963e0382c86c8b4ff56b865c539e41ce1e8535cc7416ae4c7a"
+manifest_path = "experiments/beat_first_v1/Manifest.toml"
+manifest_bytes = 47731
+manifest_sha256 = "6ef9ed11797722e72e62d1d4e500da59d0bc14124f96344f93a14a322ec9a10a"
+
+[pinned_sources]
+freeze_status = "FROZEN_AFTER_V2_INTEGRATION_TEST_AND_REAL_TEACHER_SMOKE"
+teacher_training_bytes = 140468
+teacher_training_sha256 = "e1cc8d21a8398922222aa999430a2c4fc38ee713ba9d14841c2f598f04ffb641"
+entrypoint_bytes = 149
+entrypoint_sha256 = "41893978e984c0c696470aa15d73ae54eae01deba05e0db776a9269e25897b5d"
+module_bytes = 3187
+module_sha256 = "c8d44a3f8537b44e1c129e1c2c83b39c317bdb33fb8c38dbf5e0b9b97e796cc1"
+dynamic_k_source_bytes = 28207
+dynamic_k_source_sha256 = "2ff6d17c59cc616caa90878ac3ff451fbbf8f02d61440ab49d8d1e3f6f1a5d97"
+mongoose_overlay_bytes = 92399
+mongoose_overlay_sha256 = "abe5ad0e1d63b9306d668257f77a7e8c486c0e4a21309743b8961e4b6c2ea4fb"
+geometry_bytes = 12006
+geometry_sha256 = "5ec92d85be3f888554c1f2700e06a1e3dc5531d25b354677bb208eb6978d3a27"
+model_bytes = 23135
+model_sha256 = "ff94f5771d1cbb09532348b8603019c5aa3126979dfef74ac277d223a749e7ac"
+optimizer_bytes = 20897
+optimizer_sha256 = "a5c057e015e3b9677510faaf07e3c26ca993233e09ab9f602296fbd3299b5790"
+runtime_bytes = 48536
+runtime_sha256 = "bea7e0573f71fd491f8c246a3bd59cb97c9da68483a01bac536551f53d9f2bc3"
+checkpoint_bytes = 7449
+checkpoint_sha256 = "9c8da9aece786396ac304b1ab8aa58e8c408316838effb48c4d12c25a618ccbf"
+features_bytes = 9360
+features_sha256 = "0a96497f69271bd900054be72c33c13a244b7909631b75dc95183730872197b7"
+wta_index_bytes = 24011
+wta_index_sha256 = "be270e8e36fe356be496e834edac1b3c6a13416fcd517a3e651319eb5b581ceb"
+training_core_bytes = 51813
+training_core_sha256 = "5c5dd8e51bb8480424400f309d51de73e17c6b29e1552486c065aaf9b7135217"
+v1_overlay_regression_test_bytes = 13963
+v1_overlay_regression_test_sha256 = "acb11999f1e61bf4788ddfd0afe79a4a69f5b7eb53881a6f975387421ab10c8b"
+v2_bounded_core_test_bytes = 23151
+v2_bounded_core_test_sha256 = "f51b7d6692be646cbf1f3dc544cf6c91bb4f7501abd466d9065b4e6b4955817e"
+v2_trainer_runtime_integration_test_bytes = 21353
+v2_trainer_runtime_integration_test_sha256 = "4d495bb2adabb9e1f5ae10177778c22f6c8808a2c59cab334b4210240e3f5cfa"
+base_runtime_regression_test_bytes = 37881
+base_runtime_regression_test_sha256 = "35594809d9dba6229435d3c2a99d932faee8cd108a1017680430d11a77dcb3a0"
+real_teacher_smoke_driver_bytes = 26098
+real_teacher_smoke_driver_sha256 = "47731cce38326de37f7fa3bafe4c76e1def447096518c9a94a9d6b1489795bf3"
+focused_and_regression_tests_passed = 109444
+
+[real_teacher_smoke_evidence]
+root = "C:/tmp/tetris_mongoose_v2_real_teacher_smoke_20260719T223000"
+schema = "mongoose-v2-real-teacher-two-update-smoke-v1"
+status = "PASS"
+summary_path = "C:/tmp/tetris_mongoose_v2_real_teacher_smoke_20260719T223000/summary.json"
+summary_bytes = 5018
+summary_sha256 = "197aded6320d07c97c3bf330f4513a62bfe921a3e4077509da927d23b8a795bb"
+source_closure_sha256 = "752f66fe8738561471dde37a3507bf2e4eec459541dab8996fb5f0f220bb7a2a"
+checkpoint_path = "C:/tmp/tetris_mongoose_v2_real_teacher_smoke_20260719T223000/checkpoint_000000002.jls"
+checkpoint_bytes = 249870121
+checkpoint_sha256 = "8b15558fa06b8f6ae2572079badcbf280c8b77c9186ae99f332e9a88d43e03d9"
+checkpoint_update = 2
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+driver_sha256 = "47731cce38326de37f7fa3bafe4c76e1def447096518c9a94a9d6b1489795bf3"
+exact_continuation_verified = true
+failed_smoke_root_preserved_separately = true
+
+[stop_conditions]
+conditions = [
+  "the v2 implementation and test source freeze remains unresolved",
+  "trainer exits nonzero or exceeds 20 minutes",
+  "another Julia process overlaps the owned process",
+  "any pinned path, byte count, or SHA-256 differs",
+  "the fresh output root already exists, escapes its direct run parent, or traverses a reparse point",
+  "variant, fixed active widths, seeds, split, sampler order, objective, or bounded v2 routing configuration changes",
+  "routing is not fixed-WTA during warmup or bounded MONGOOSE-v2 at updates 2000 and 2500",
+  "global, table, lane, exact-score, shortlist, fill, or training-probe telemetry exceeds its cap",
+  "max_lane_entries differs from the frozen per-layer cap, any cumulative v2 table/lane inner width is malformed, or cumulative phase-delta accounting does not close",
+  "prefilter_dropped_rows exceeds retrieved_rows and would make the effective shortlist negative",
+  "bucket overload is hidden, causes an unbounded traversal, or is treated as a scientific routing failure",
+  "any metric, loss, gradient, Q value, margin, router state, or norm is non-finite",
+  "the bank ceases to be selected-only or the router optimizer writes outside its 2688 projection parameters",
+  "dynamic-k, dense-bank scoring, fixed-WTA post-switch fallback, NNUE, resume, retry, or game-seed evaluation occurs",
+  "the exact two-checkpoint and three-metric artifact contract is not met",
+  "latest.path is not the exact enumerated update-2500 checkpoint in the authoritative run directory",
+  "owned Julia termination is not positively confirmed before the exclusive mutex is released",
+]
+
+[interpretation]
+allowed = "bounded learned-routing engineering validity and short teacher-ranking signal under fixed k128 selected-only training"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+  "dynamic-k claim",
+]

@@ -1,0 +1,90 @@
+format_version = 1
+experiment_id = "sparse_3l_k128_margin1_teacher_signal_cpf_20000_v1"
+purpose = "single-variable margin-loss pivot after the parent k128 run missed only the frozen action-margin floor; no game-strength claim"
+hypothesis = "Raising only the sparse teacher objective's effective margin weight from 0.15 to 1.0 preserves teacher ranking while lifting held action margin above 0.02."
+expected_mechanism = "A stronger top-1/top-2 margin gradient increases candidate separation without changing model geometry, routing, data order, optimizer, or evaluation gates."
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-CPF1-k128"
+routing_policy = "wta-collision-count-stable-id-prefilter-v1"
+promotion_parent = "sparse_3l_k128_teacher_signal_cpf_20000_v1"
+promotion_parent_disposition = "diagnostic_only_failed_action_margin_gate"
+promotion_parent_metrics_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_teacher_signal_cpf_20000_v1/sparse_3l_20260719T135857/metrics.jsonl"
+promotion_parent_metrics_sha256 = "8ed7ecba6eb01e916ce85c6b7164628b3b0121696e00004c6e6d8bbb540a012d"
+fresh_start_required = true
+resume_forbidden = true
+checkpoint_selection_forbidden = true
+checkpoint_version = 2
+total_parameters = 19924022
+active_neurons_by_layer = [48, 40, 40]
+active_parameters = 58214
+learner_candidate_width = 80
+state_batch = 1
+maximum_updates = 20000
+epochs_ceiling = 1.0
+evaluation_interval = 2000
+checkpoint_interval = 10000
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 20
+
+[single_variable_pivot]
+variable = "effective sparse supervised margin weight"
+parent_value = 0.15
+experimental_value = 1.0
+dense_default_value = 0.15
+all_other_training_and_model_variables = "frozen to promotion parent"
+
+[midpoint_gate]
+update = 10000
+minimum_held_top1 = 0.11
+minimum_held_ndcg = 0.88
+minimum_held_pairwise = 0.62
+maximum_held_composite_loss = 5.50
+
+[success_gate]
+baseline_update = 0
+final_update = 20000
+require_finite_metrics = true
+require_no_route_or_bucket_cap_failure = true
+require_prefilter_activation = true
+minimum_final_held_top1 = 0.15
+minimum_final_held_ndcg = 0.90
+minimum_final_held_pairwise = 0.65
+maximum_final_held_composite_loss = 5.25
+minimum_held_q_std = 0.15
+minimum_held_action_margin = 0.02
+maximum_final_three_eval_loss_rebound_fraction = 0.03
+minimum_layer1_bank_coverage = 1.0
+minimum_layer2_bank_coverage = 0.999
+minimum_layer3_bank_coverage = 0.999
+
+[stop_conditions]
+conditions = [
+  "trainer exits nonzero",
+  "another Julia process overlaps",
+  "the run is not a fresh initialization",
+  "the objective margin weight is not exactly 1.0 in every metric",
+  "the independent bucket-entry cap is exceeded",
+  "the exact-score cap is exceeded after prefiltering and probe reservation",
+  "any loss, gradient, Q value, or margin is non-finite",
+  "the update-10000 midpoint gate is not met",
+  "the update-20000 success gate is not met",
+]
+
+[interpretation]
+allowed = "bounded single-variable teacher-ranking and action-margin evidence"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+]

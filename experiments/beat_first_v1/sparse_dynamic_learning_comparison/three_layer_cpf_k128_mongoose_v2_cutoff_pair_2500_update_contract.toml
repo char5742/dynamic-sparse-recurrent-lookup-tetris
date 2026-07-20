@@ -1,0 +1,394 @@
+format_version = 3
+experiment_id = "sparse_3l_k128_mongoose_v2_cutoff_pair_teacher_signal_cpf_2500_v1"
+status = "FROZEN_READY_FOR_VALIDATE_ONLY_NO_LAUNCH"
+causal_change_id = "cutoff_boundary_v1"
+purpose = "one fresh bounded fixed-k MONGOOSE-v2 teacher-ranking signal that changes only router pair mining from the consumed easy-extrema witness to the natural fixed-WTA exploitation cutoff boundary; no game-strength claim"
+hypothesis = "The bounded v2 serving implementation is correct but its easy-extrema BCE pair is too remote from the fixed-k selection boundary. Training the same 2688 projection parameters on the natural WTA ranks k and k+1 can improve fixed-k routing without dynamic-k, dense fallback, or a larger active graph."
+expected_mechanism = "For the stable task-gradient candidate, rerun only the bounded fixed-WTA witness, retain exact-scored rows with positive collision count, exclude deterministic fills and training probes, sort by raw score descending then stable neuron ID ascending, and apply the unchanged one-pair-per-layer tanh-scaled BCE to exploitation ranks (42,35,35) versus outside ranks (43,36,36)."
+sole_causal_change = "mongoose_pair_mining_mode=fixed_wta_exploitation_cutoff_boundary_v1"
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-CPF1-k128 plus bounded MONGOOSE-v2 SimHash overlay"
+routing_mode = "mongoose_simhash_k7_l2_bounded_lanes_fixed_k128_v2"
+routing_policy = "mongoose-simhash-k7-l2-bounded-lanes16-fixed-k128-live-pending-bce-v2"
+base_routing_policy = "wta-collision-count-stable-id-prefilter-v1"
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+output_root = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_mongoose_v2_cutoff_pair_teacher_signal_cpf_2500_v1"
+fresh_start_required = true
+resume_forbidden = true
+retry_forbidden = true
+checkpoint_selection_forbidden = true
+checkpoint_version = 2
+total_base_parameters = 19924022
+router_parameters = 2688
+total_parameters_with_router = 19926710
+router_parameter_fraction_of_base = 0.0001349125191690714
+active_neurons_by_layer = [48, 40, 40]
+training_exploration_slots_by_layer = [6, 5, 5]
+natural_exploitation_widths_by_layer = [42, 35, 35]
+active_base_parameters = 58214
+router_active_parameter_touches_per_update = 2688
+router_touch_fraction_of_base_active_parameters = 0.046174459751949705
+learner_candidate_width = 80
+observed_max_candidates = 76
+state_batch = 1
+maximum_updates = 2500
+epochs_ceiling = 1.0
+evaluation_updates = [0, 2000, 2500]
+checkpoint_updates = [2000, 2500]
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1.0e-8
+objective_mode = "standardized_listnet_plus_margin"
+objective_margin_mode = "fixed_teacher_top2"
+objective_margin_weight = 0.15
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 20
+validation_game_seeds_touched = false
+sealed_game_seeds_touched = false
+
+[cutoff_pair]
+pair_mining_mode = "fixed_wta_exploitation_cutoff_boundary_v1"
+pair_mining_version = 1
+pair_mining_identity = "bounded-fixed-wta-natural-exploitation-cutoff-pair-v1"
+pair_mining_score_order = "exact-raw-score-descending-then-stable-neuron-id-ascending"
+pair_mining_eligibility = "retrieved-and-exact-scored-positive-collision-only"
+pair_mining_exclusion = "deterministic-fill-and-training-probe-collision-zero-excluded"
+pair_mining_outside_policy = "fail-closed-without-rank-k-plus-one-bounded-witness"
+pair_mining_no_bank_scan = true
+pair_mining_fail_closed = true
+exploitation_targets_by_layer = [42, 35, 35]
+positive_ranks_by_layer = [42, 35, 35]
+negative_ranks_by_layer = [43, 36, 36]
+positive_in_exploitation = [true, true, true]
+negative_in_exploitation = [false, false, false]
+pair_loss = "the unchanged one-pair-per-layer tanh-scaled BCE"
+pair_parameter_touches = 2688
+teacher_task_loss_unchanged = true
+teacher_task_loss_mode = "standardized_listnet_plus_margin"
+teacher_task_margin_mode = "fixed_teacher_top2"
+teacher_task_margin_weight = 0.15
+
+[cutoff_pair.published_metric_contract]
+metric_top_level_mode_field = "mongoose_pair_mining_mode"
+router_mode_field = "pair_mining_mode"
+router_required_policy_fields = [
+  "mongoose_pair_mining_version",
+  "mongoose_pair_mining_identity",
+  "mongoose_pair_mining_score_order",
+  "mongoose_pair_mining_eligibility",
+  "mongoose_pair_mining_exclusion",
+  "mongoose_pair_mining_outside_policy",
+  "mongoose_pair_mining_exploitation_targets",
+  "mongoose_pair_mining_no_bank_scan",
+  "mongoose_pair_mining_fail_closed",
+]
+last_step_object = "last_step.accounting.mongoose_pair"
+last_step_required_fields = [
+  "pair_mining_mode",
+  "positive_ids",
+  "negative_ids",
+  "positive_scores",
+  "negative_scores",
+  "positive_collisions",
+  "negative_collisions",
+  "cutoff_score_gaps",
+  "positive_ranks",
+  "negative_ranks",
+  "positive_in_exploitation",
+  "negative_in_exploitation",
+  "exploitation_targets",
+  "eligible_witness_rows",
+  "retrieved_rows",
+  "scored_rows",
+  "losses",
+  "positive_logits",
+  "negative_logits",
+  "pair_macs",
+  "parameter_touches",
+  "column_normalization",
+]
+require_three_layers = true
+require_distinct_positive_negative_ids = true
+require_selected_positive_collisions_at_least_one = true
+require_selected_negative_collisions_at_least_one = true
+require_positive_score_not_below_negative = true
+require_equal_score_stable_id_ascending = true
+require_nonnegative_finite_gap = true
+require_gap_recomputes_from_scores = true
+require_eligible_rows_at_least_k_plus_one = true
+require_eligible_rows_not_greater_than_retrieved_or_scored = true
+require_exact_one_pair_per_layer_bce_macs = [6300, 6300, 6300]
+require_pair_losses_and_logits_finite = true
+require_pair_bce_loss_recomputed_from_logits = true
+require_pair_parameter_touches = 2688
+require_pair_column_normalization = false
+
+[mongoose_v2]
+query_version = 2
+index_version = 3
+route_dimension = 64
+bits_per_table = 7
+tables = 2
+logical_buckets_per_table = 128
+load_balance_lanes_per_table = 16
+queried_table_lane_streams = 32
+column_normalization = false
+learning_rate = 0.0001
+beta1 = 0.9
+beta2 = 0.999
+epsilon = 1.0e-8
+tanh_beta = 1.0
+seed = 1297043015
+warmup_updates = 2000
+switch_update = 2000
+refresh_interval = 2000
+refresh_updates = [2000]
+serving_before_switch = "fixed WTA bitwise-compatible"
+serving_after_switch = "bounded learned SimHash v2 with fixed-k exact raw-dot rerank"
+lane_assignment = "splitmix-domain-separated-router-seed-layer-table-neuron-v1"
+traversal = "deterministic table-lane round-robin with stable start stream"
+deduplication = "generation-marked deterministic neuron-ID deduplication"
+shortlist_order = "exact-table-hit count descending, neuron ID ascending"
+rerank_order = "raw 64D key dot descending, exact-table-hit count descending, neuron ID ascending"
+fill_and_probe = "bounded no-repeat affine permutation"
+global_bucket_visit_caps_by_layer = [1536, 1280, 1280]
+implied_table_visit_caps_by_layer = [1536, 1280, 1280]
+lane_visit_caps_by_layer = [96, 80, 80]
+exact_score_caps_by_layer = [384, 640, 640]
+shortlist_caps_by_layer = [378, 635, 635]
+fill_probe_attempt_caps_by_layer = [42, 35, 35]
+training_probe_attempt_caps_by_layer = [48, 40, 40]
+natural_bucket_overload_is_telemetry = true
+natural_bucket_overload_is_error = false
+overload_or_score_saturation_is_performance_gate = false
+dense_score_fallback_forbidden = true
+fixed_wta_fallback_after_switch_forbidden = true
+dynamic_k_forbidden = true
+nnue_difference_reuse_forbidden = true
+
+[telemetry_contract]
+required_per_layer_fields = [
+  "bucket_entries_available",
+  "bucket_entries_visited",
+  "truncated_bucket_entries",
+  "overloaded",
+  "key_rows_scored",
+  "unique_rows_retrieved",
+  "prefilter_dropped_rows",
+  "fill_probe_attempts",
+  "training_probe_attempts",
+  "table_entries_available",
+  "table_entries_visited",
+  "lane_entries_available",
+  "lane_entries_visited",
+  "max_lane_entries",
+]
+table_tuple_width = 2
+lane_tuple_width = 32
+require_exact_fixed_active_widths = true
+require_global_visits_within_cap = true
+require_each_table_visits_within_implied_cap = true
+require_each_overloaded_route_lane_visits_within_cap = true
+nonoverloaded_lane_rule = "below the global occupancy cap traversal is exhaustive and max_lane_entries is intentionally not applied; aggregate validation uses overloaded*lane_cap + nonoverloaded*global_cap"
+require_exact_max_lane_entries_at_learned_metrics = true
+reject_noninteger_or_coerced_cap_values = true
+require_exact_score_and_shortlist_caps = true
+require_prefilter_dropped_not_greater_than_retrieved = true
+require_fill_and_probe_attempts_within_cap = true
+require_available_equals_visited_plus_truncated = true
+require_overload_consistent_with_available = true
+require_finite_recursive_metrics = true
+require_cumulative_v2_telemetry_at_updates = [2000, 2500]
+cumulative_v2_phase = "subtract update-2000 cumulative snapshot from update 2500; validate nonnegative deltas and all caps against candidate-count delta"
+warmup_boundary_cumulative_v2_fields_must_be_zero = true
+
+[telemetry_contract.inherited_exact_v2_publication]
+normative_template_contract_sha256 = "6e8402bbea3dd981cc2a7bcf503c301b11e5b8a4b4927253d08301285252a450"
+inheritance_rule = "Every exact v2 telemetry field, scope, tuple width, aggregation mapping, phase-delta closure, and cap relation below remains normative and is enforced by the byte-pinned template controller."
+cumulative_required_per_layer_fields = [
+  "mongoose_v2_bucket_entries_visited",
+  "mongoose_v2_key_rows_scored",
+  "retrieved_rows",
+  "prefilter_dropped_rows",
+  "mongoose_v2_bucket_entries_available",
+  "mongoose_v2_truncated_bucket_entries",
+  "mongoose_v2_fill_probe_attempts",
+  "mongoose_v2_training_probe_attempts",
+  "mongoose_v2_overloaded_routes",
+  "mongoose_v2_table_entries_available",
+  "mongoose_v2_table_entries_visited",
+  "mongoose_v2_lane_entries_available",
+  "mongoose_v2_lane_entries_visited",
+  "mongoose_v2_bucket_entry_caps",
+  "mongoose_v2_exact_score_caps",
+  "mongoose_v2_lane_entry_caps",
+]
+prefilter_relation_scopes = [
+  "update-2000 step",
+  "update-2500 step",
+  "both cumulative snapshots",
+  "learned-serving cumulative phase delta",
+]
+require_cumulative_table_inner_width = 2
+require_cumulative_lane_inner_width = 32
+require_warmup_boundary_exact_zero = true
+published_step_aggregation = "per-layer sums across the one state's valid candidate routes; existing bucket_entries/scored_rows/retrieved_rows/prefilter_dropped_rows plus mongoose_v2_* fields"
+published_cumulative_aggregation = "v2-only per-layer sums across learned-serving candidate routes; fixed-WTA warmup contributes exact zeros and overload is a route count"
+
+[fixed_wta_success_floor]
+role = "the only scientific performance floor; same update, task, model seed, split, sampler, fixed k128 width, and teacher objective"
+metrics_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_teacher_signal_cpf_2500_v1/sparse_3l_20260719T134221/metrics.jsonl"
+metrics_bytes = 36712
+metrics_sha256 = "b6298c1ba512414782309e69e018f35a698f28821fe5a9681ec1acc127c9bff6"
+checkpoint_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_teacher_signal_cpf_2500_v1/sparse_3l_20260719T134221/checkpoints/checkpoint_000002500.jls"
+checkpoint_bytes = 248673984
+checkpoint_sha256 = "de9aac395fc9406f2a3c77de4fa2408ada62716155d1d1915a1aaedb62670b85"
+final_held_top1 = 0.0703125
+final_held_ndcg = 0.8440925775521915
+final_held_pairwise = 0.5407089182563002
+final_held_action_margin = 0.02595788359758444
+final_held_composite_loss = 6.333081512246281
+
+[easy_extrema_v2_comparison]
+role = "comparison telemetry only; neither strength nor efficiency gate"
+experiment_id = "sparse_3l_k128_mongoose_v2_teacher_signal_cpf_2500_v1"
+pair_mining_mode = "fixed_wta_easy_extrema_v1"
+metrics_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_mongoose_v2_teacher_signal_cpf_2500_v1/sparse_3l_20260719T213725/metrics.jsonl"
+metrics_bytes = 36596
+metrics_sha256 = "e63b16a22971dc37461cb358894f82d56ef1e8729b2e41f1c2e68e52dcd153ea"
+checkpoint_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_mongoose_v2_teacher_signal_cpf_2500_v1/sparse_3l_20260719T213725/checkpoints/checkpoint_000002500.jls"
+checkpoint_bytes = 249896561
+checkpoint_sha256 = "c0b8b350be2357c39c27a4cf73fb8efba9b4403ba4de8cee57a2248166eee2af"
+final_held_top1 = 0.044921875
+final_held_ndcg = 0.8453543500019917
+final_held_pairwise = 0.5399863720930703
+final_held_composite_loss = 6.487842139322311
+learned_phase_candidates = 21941
+overloaded_routes_by_layer = [0, 21674, 14856]
+overloaded_fraction_by_layer = [0.0, 0.9878310013217264, 0.6770885556720295]
+mean_key_rows_scored_by_layer = [381.8604439177795, 638.0398341005424, 636.5574495237228]
+mean_bucket_entries_visited_by_layer = [690.1656259969919, 1270.7421266122783, 1191.6085410874618]
+interpretation = "The bounded scheduler worked, but the easy-extrema learned hash was nonselective in deeper layers and missed the fixed-WTA performance floor. These values contextualize the cutoff-pair result and must not reject a correct cutoff run merely for retaining similar occupancy."
+
+[success_gate]
+baseline_update = 0
+learned_router_updates = [2000, 2500]
+final_update = 2500
+minimum_final_held_top1 = 0.0703125
+minimum_final_held_ndcg = 0.8440925775521915
+minimum_final_held_pairwise = 0.5407089182563002
+maximum_final_held_composite_loss = 6.333081512246281
+maximum_router_touch_fraction_of_base_active_parameters = 0.05
+maximum_router_parameter_fraction_of_base = 0.01
+require_exact_cutoff_pair_policy = true
+require_exact_cutoff_pair_boundary_telemetry_at_updates = [2000, 2500]
+require_finite_recursive_metrics = true
+require_no_route_or_numerical_failure = true
+require_cap_correctness = true
+require_overload_or_score_saturation_improvement = false
+require_active_only_base_optimizer = true
+require_router_optimizer_restricted_to_projection_parameters = true
+require_exact_optimizer_clocks = true
+require_exact_refresh_clocks = true
+require_two_authoritative_checkpoints = true
+require_latest_path_exact_final_enumerated_checkpoint = true
+require_owned_julia_exit_confirmed_before_mutex_release = true
+launch_handoff_rule = "mark launch attempted and termination unconfirmed before Start-Process; a post-spawn failure without a captured process handle must refuse explicit mutex release"
+
+[template_provenance]
+derivation = "deterministic exact-count source transformation; the consumed witness-pair files are never modified"
+template_controller_path = "experiments/beat_first_v1/sparse_dynamic_learning_comparison/run_three_layer_k128_mongoose_v2_2500_controller.ps1"
+template_controller_bytes = 69232
+template_controller_sha256 = "42d2d18710edbe3431f813c57793b7d3d5b9bf1db2e7caf63ded9801c7e33d59"
+template_contract_path = "experiments/beat_first_v1/sparse_dynamic_learning_comparison/three_layer_cpf_k128_mongoose_v2_2500_update_contract.toml"
+template_contract_bytes = 15421
+template_contract_sha256 = "6e8402bbea3dd981cc2a7bcf503c301b11e5b8a4b4927253d08301285252a450"
+new_controller_path = "experiments/beat_first_v1/sparse_dynamic_learning_comparison/run_three_layer_k128_mongoose_v2_cutoff_pair_2500_controller.ps1"
+new_contract_path = "experiments/beat_first_v1/sparse_dynamic_learning_comparison/three_layer_cpf_k128_mongoose_v2_cutoff_pair_2500_update_contract.toml"
+static_parse_switch = "-StaticParseOnly"
+validate_only_forbidden_until_freeze = true
+launch_forbidden_until_freeze = true
+
+[pinned_runtime]
+julia_path = "C:/Users/fshuu/.julia/juliaup/julia-1.12.6+0.x64.w64.mingw32/bin/julia.exe"
+julia_bytes = 170952
+julia_sha256 = "4b1984610b12c9ac119340261bee08d93a0032989b0c35d20ffddaadba241043"
+julia_version = "1.12.6"
+project_path = "experiments/beat_first_v1/Project.toml"
+project_bytes = 1221
+project_sha256 = "62bbd9b624a4e2963e0382c86c8b4ff56b865c539e41ce1e8535cc7416ae4c7a"
+manifest_path = "experiments/beat_first_v1/Manifest.toml"
+manifest_bytes = 47731
+manifest_sha256 = "6ef9ed11797722e72e62d1d4e500da59d0bc14124f96344f93a14a322ec9a10a"
+
+[pinned_sources]
+freeze_status = "FROZEN_AFTER_CUTOFF_PAIR_INTEGRATION_TEST_AND_REAL_TEACHER_SMOKE"
+focused_and_regression_tests_passed = 110311
+teacher_training_path = "experiments/beat_first_v1/sparse_dynamic_3layer/teacher_training.jl"
+teacher_training_bytes = 154817
+teacher_training_sha256 = "3691b4f741bc1212a2e74f2478173f7404e6d43b58d0516bed9b4ec4da644f2b"
+cutoff_pair_test_path = "experiments/beat_first_v1/sparse_dynamic_3layer/test_mongoose_v2_cutoff_boundary_pair.jl"
+cutoff_pair_test_bytes = 9299
+cutoff_pair_test_sha256 = "4c8fbf530084614fe8d0fc7ba1719a072cab7d9f15f382fed333d195f2b00a76"
+cutoff_pair_design_path = "experiments/beat_first_v1/sparse_dynamic_3layer/MONGOOSE_V2_CUTOFF_BOUNDARY_PAIR_DESIGN.md"
+cutoff_pair_design_bytes = 2631
+cutoff_pair_design_sha256 = "d4032444c677bc4a8253af428fd0b007d2f95143ddbe3bbe808158f0c24f60eb"
+cutoff_smoke_driver_path = "experiments/beat_first_v1/sparse_dynamic_3layer/smoke_mongoose_v2_real_teacher.jl"
+cutoff_smoke_driver_bytes = 30378
+cutoff_smoke_driver_sha256 = "6b0d0e3872a0e17d28cdb27a1d2bd93ec620198f13efec39eedf8b4cd48b002d"
+
+[cutoff_real_teacher_smoke]
+root = "C:/tmp/tetris_mongoose_v2_cutoff_collision_real_teacher_smoke_20260719T234300"
+schema = "mongoose-v2-real-teacher-two-update-smoke-cutoff-v1"
+status = "PASS"
+summary_bytes = 7827
+summary_sha256 = "9e7a43db38fd3223954ce2f42b8d511248e1d89627cde91b45b85b41b579c1b9"
+source_closure_sha256 = "f3bb9ebc4f759b1e8939c3a5ae00fe636dd8034726f19bc2b0be66ac1e64a6bf"
+checkpoint_bytes = 249871141
+checkpoint_sha256 = "285589c2ff58c9c090567e1c80a22c2b03161e64cc8c3c6b4690253f68cd1a4c"
+required_top_level_pair_field = "pair_mining_mode"
+required_pair_object = "update2_pair_telemetry"
+exact_continuation_required = true
+failed_smoke_roots_must_be_preserved_separately = true
+
+[stop_conditions]
+conditions = [
+  "any implementation, test, smoke, contract, template, dataset, runtime, or comparison binding is unresolved or differs",
+  "trainer exits nonzero or exceeds 20 minutes",
+  "another Julia process overlaps the owned process",
+  "the fresh output root already exists, escapes its direct run parent, or traverses a reparse point",
+  "variant, fixed active widths, seeds, split, sampler order, task objective, bounded v2 routing, or cutoff pair-mining identity changes",
+  "the router-state policy does not publish the exact cutoff-boundary identity, natural positive-collision eligibility, fill/probe exclusion, no-bank-scan, and fail-closed rules",
+  "at update 2000 or 2500 the pair is not exactly natural exploitation rank k versus natural outside rank k+1 for all three layers",
+  "either pair member comes from deterministic fill/training probe, pair IDs coincide, eligible rows are insufficient, or raw-score/gap telemetry does not close",
+  "global, table, lane, exact-score, shortlist, fill, or training-probe telemetry violates a correctness cap",
+  "any metric, loss, gradient, Q value, margin, router state, pair score, or norm is non-finite",
+  "the bank ceases to be selected-only or the router optimizer writes outside its 2688 projection parameters",
+  "dynamic-k, dense-bank scoring, fixed-WTA post-switch fallback, NNUE, resume, retry, or game-seed evaluation occurs",
+  "final held top1, NDCG, pairwise, or composite loss misses the exact matched fixed-WTA floor",
+  "the exact two-checkpoint and three-metric artifact contract is not met",
+  "latest.path is not the exact enumerated update-2500 checkpoint in the authoritative run directory",
+  "owned Julia termination is not positively confirmed before the exclusive mutex is released",
+]
+
+[interpretation]
+allowed = "cutoff-boundary pair-mining engineering validity and short teacher-ranking signal under the unchanged bounded MONGOOSE-v2 fixed k128 active-only system"
+model_hypothesis_failure = "only a correctness-complete run that misses the frozen performance floor rejects this exact cutoff-pair 2500-update arm"
+implementation_failure = "missing natural rank k+1, malformed identity/telemetry, cap violation, source mismatch, checkpoint failure, process overlap, or numerical failure does not reject the cutoff-pair learning hypothesis"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+  "dynamic-k claim",
+  "claim that overload or score saturation alone rejects an otherwise correct cutoff-pair run",
+]

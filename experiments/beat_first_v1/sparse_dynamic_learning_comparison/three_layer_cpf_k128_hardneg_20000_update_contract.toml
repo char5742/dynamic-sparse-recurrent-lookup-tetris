@@ -1,0 +1,106 @@
+format_version = 1
+experiment_id = "sparse_3l_k128_hardneg_teacher_signal_cpf_20000_v1"
+purpose = "single-variable hard-negative objective pivot after fixed teacher-top2 margin weighting failed; no game-strength claim"
+hypothesis = "Replacing the fixed teacher-top2 margin term with a stop-gradient student hard negative improves top-1 separation while preserving sparse teacher-ranking learning."
+expected_mechanism = "Each state penalizes the strongest currently wrong student candidate instead of a teacher-fixed runner-up, directly targeting the observed top-1 error without changing the effective objective weight."
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-CPF1-k128"
+routing_policy = "wta-collision-count-stable-id-prefilter-v1"
+objective_margin_mode = "student_hard_negative"
+objective_margin_weight = 0.15
+promotion_parent = "sparse_3l_k128_margin1_teacher_signal_cpf_20000_v1_retry1"
+promotion_parent_disposition = "diagnostic_only_failed_action_margin_gate"
+promotion_parent_metrics_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_k128_margin1_teacher_signal_cpf_20000_v1_retry1/sparse_3l_20260719T143553/metrics.jsonl"
+promotion_parent_metrics_sha256 = "2a5149ff47a4d16053679162b71c2ea589efdd3c5a5d5a80814eb0fdf474d597"
+fresh_start_required = true
+resume_forbidden = true
+checkpoint_selection_forbidden = true
+checkpoint_version = 2
+total_parameters = 19924022
+active_neurons_by_layer = [48, 40, 40]
+active_parameters = 58214
+learner_candidate_width = 80
+state_batch = 1
+maximum_updates = 20000
+epochs_ceiling = 1.0
+evaluation_interval = 2000
+checkpoint_interval = 10000
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 20
+
+[single_variable_pivot]
+variable = "margin objective mode"
+parent_value = "fixed_teacher_top2"
+experimental_value = "student_hard_negative"
+effective_margin_weight = 0.15
+all_other_training_and_model_variables = "frozen to the parent k128 20000-update experiment"
+
+[hard_negative_definition]
+teacher_top1 = "argmax teacher_q over valid candidates; stable lowest candidate ID on ties"
+student_negative = "argmax student_q over valid non-teacher-top1 candidates; stable lowest candidate ID on ties; selection is stop-gradient"
+teacher_delta = "teacher_q[y] - teacher_q[h]"
+loss = "Huber_delta1(max(0, teacher_delta - (q[y] - q[h])))"
+reduction = "mean only over states with at least two valid candidates"
+replace_existing_margin = true
+dense_default_unchanged = true
+require_real_difference_from_teacher_top2 = true
+
+[midpoint_gate]
+update = 10000
+minimum_held_top1 = 0.11
+minimum_held_ndcg = 0.88
+minimum_held_pairwise = 0.62
+maximum_held_composite_loss = 5.50
+
+[success_gate]
+baseline_update = 0
+final_update = 20000
+require_finite_metrics = true
+require_no_route_or_bucket_cap_failure = true
+require_prefilter_activation = true
+require_hard_negative_selection = true
+require_difference_from_teacher_top2 = true
+minimum_final_held_top1 = 0.15
+minimum_final_held_ndcg = 0.90
+minimum_final_held_pairwise = 0.65
+maximum_final_held_composite_loss = 5.25
+minimum_held_q_std = 0.15
+minimum_held_action_margin = 0.02
+maximum_final_three_eval_loss_rebound_fraction = 0.03
+minimum_layer1_bank_coverage = 1.0
+minimum_layer2_bank_coverage = 0.999
+minimum_layer3_bank_coverage = 0.999
+
+[stop_conditions]
+conditions = [
+  "trainer exits nonzero",
+  "another Julia process overlaps",
+  "the run is not a fresh initialization",
+  "the objective margin mode is not exactly student_hard_negative in every metric",
+  "the objective margin weight is not exactly 0.15 in every metric",
+  "no held hard-negative selection differs from teacher top-2",
+  "the independent bucket-entry cap is exceeded",
+  "the exact-score cap is exceeded after prefiltering and probe reservation",
+  "any loss, gradient, Q value, or margin is non-finite",
+  "the update-10000 midpoint gate is not met",
+  "the update-20000 success gate is not met",
+]
+
+[interpretation]
+allowed = "bounded hard-negative teacher-ranking and action-margin evidence"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+]

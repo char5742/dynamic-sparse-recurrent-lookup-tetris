@@ -1,0 +1,70 @@
+format_version = 1
+experiment_id = "sparse_3l_teacher_signal_5000_v1"
+purpose = "successive-halving teacher-ranking screen; no game-strength or model-beat claim"
+hypothesis = "The 3L k64 sparse model's verified 1,000-update ranking signal develops into measurable top-1 learning by 5,000 updates."
+expected_mechanism = "Input-dependent active-only sparse layers improve top-candidate discrimination after auxiliary targets stabilize."
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-k64"
+total_parameters = 19924022
+active_neurons_by_layer = [24, 20, 20]
+learner_candidate_width = 80
+state_batch = 1
+maximum_updates = 5000
+epochs_ceiling = 1.0
+evaluation_interval = 500
+checkpoint_interval = 1000
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 15
+
+[success_gate]
+baseline_update = 0
+final_update = 5000
+require_finite_metrics = true
+require_no_route_or_bucket_cap_failure = true
+require_held_ndcg_delta = 0.025
+require_held_pairwise_delta = 0.025
+require_held_top1_delta = 0.02
+maximum_held_composite_loss_fraction = 0.90
+require_lower_held_listnet_loss = true
+require_lower_held_q_huber_loss = true
+minimum_held_q_std = 0.15
+minimum_held_action_margin = 0.02
+maximum_final_three_eval_loss_rebound_fraction = 0.02
+minimum_layer1_bank_coverage = 1.0
+minimum_layer2_bank_coverage = 0.999
+minimum_layer3_bank_coverage = 0.999
+
+[midpoint_gate]
+update = 2500
+require_held_ndcg_delta = 0.015
+require_held_pairwise_delta = 0.015
+maximum_held_composite_loss_fraction = 0.95
+
+[stop_conditions]
+conditions = [
+  "trainer exits nonzero",
+  "another Julia process overlaps",
+  "any scored-row or bucket-entry cap is exceeded",
+  "any loss, gradient, Q value, or margin is non-finite",
+  "the update-2500 midpoint gate is not met",
+  "the update-5000 success gate is not met",
+]
+
+[interpretation]
+allowed = "bounded teacher-ranking learning-signal evidence"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+]

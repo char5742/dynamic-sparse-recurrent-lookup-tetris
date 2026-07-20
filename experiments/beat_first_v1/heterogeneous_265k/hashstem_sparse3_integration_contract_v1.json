@@ -1,0 +1,156 @@
+{
+  "schema": "learned-hashstem-sparse3-integration-contract-v1",
+  "status": "UNEXECUTED_STATIC_ONLY",
+  "track": "265k_heterogeneous_system",
+  "adapter_source": "sparse_hashstem_bridge.jl",
+  "scale_gate_source": "hashstem_sparse3_k_scale_gate.jl",
+  "hashstem_source": "hashstem.jl",
+  "hashstem_master_source": "hashstem_master.jl",
+  "sparse_module_source": "../sparse_dynamic_3layer/SparseDynamic3Layer.jl",
+  "sparse_geometry_source": "../sparse_dynamic_3layer/geometry.jl",
+  "sparse_runtime_source": "../sparse_dynamic_3layer/runtime.jl",
+  "separation": {
+    "pure_cpu_sparse_model_is_unchanged": true,
+    "heterogeneous_adapter_is_a_separate_track": true,
+    "nnue_or_parent_child_reuse": false,
+    "coarse_dense_moe": false
+  },
+  "hashstem_abi": {
+    "input_shape": ["B", 559],
+    "output_shape": ["B", 256],
+    "fixed_npu_batch": 16,
+    "actual_length_cpu_tail": true,
+    "trainable_parameters": 223504,
+    "macs_per_candidate": 433546,
+    "output_ranges_one_based_inclusive": {
+      "layer_1_base_query": [1, 64],
+      "layer_2_base_query": [65, 128],
+      "layer_3_base_query": [129, 192],
+      "learned_context": [193, 214],
+      "auxiliary_supervision_subset": [193, 202],
+      "raw_next_hold_passthrough": [215, 256]
+    },
+    "single_graph_execution_semantics": {
+      "one_graph_execution_emits_all_sparse_layer_base_queries": true,
+      "one_graph_execution_emits_context_and_auxiliary_predictions": true,
+      "one_graph_execution_emits_raw_next_hold_passthrough": true,
+      "learned_context_is_jointly_conditioned_on_next_hold": true,
+      "dedicated_learned_next_hold_embedding": false,
+      "per_sparse_layer_hashstem_reinvocation": false,
+      "cpu_npu_cpu_round_trips_between_sparse_layers": 0,
+      "logical_candidate_sets_may_use_multiple_independent_b16_chunks": true
+    }
+  },
+  "cpu_sparse_path": {
+    "total_parameters": 19924022,
+    "routing_rerank_mac_cap_per_candidate": 106496,
+    "dense_fallback": false,
+    "layer_1_route_query": "hashstem_layer_1_base_query",
+    "layer_2_route_query": "hashstem_layer_2_base_query + cpu_countsketch(layer_1_selected_ids_and_activations)",
+    "layer_3_route_query": "hashstem_layer_3_base_query + cpu_countsketch(layer_2_selected_ids_and_activations)",
+    "hard_routing_and_exact_rerank_device": "P_CORE_CPU",
+    "active_only_forward_backward_optimizer": true,
+    "named_variants": {
+      "k64": {
+        "active_counts": [24, 20, 20],
+        "training_probes": [3, 2, 2],
+        "active_parameters_per_candidate": 31934,
+        "forward_macs_per_candidate": 31912,
+        "inclusive_training_macs_per_candidate": 78504
+      },
+      "k128": {
+        "active_counts": [48, 40, 40],
+        "training_probes": [6, 5, 5],
+        "active_parameters_per_candidate": 58214,
+        "forward_macs_per_candidate": 58192,
+        "inclusive_training_macs_per_candidate": 141520
+      },
+      "k256": {
+        "active_counts": [96, 80, 80],
+        "training_probes": [12, 10, 10],
+        "active_parameters_per_candidate": 110774,
+        "forward_macs_per_candidate": 110752,
+        "inclusive_training_macs_per_candidate": 267552
+      }
+    }
+  },
+  "combined_accounting": {
+    "trainable_parameters": 20147526,
+    "by_named_sparse_variant": {
+      "k64": {
+        "parameters_touched_per_candidate_when_training_both_components": 255438,
+        "learned_forward_macs_per_candidate": 465458
+      },
+      "k128": {
+        "parameters_touched_per_candidate_when_training_both_components": 281718,
+        "learned_forward_macs_per_candidate": 491738
+      },
+      "k256": {
+        "parameters_touched_per_candidate_when_training_both_components": 334278,
+        "learned_forward_macs_per_candidate": 544298
+      }
+    },
+    "routing_rerank_macs_are_reported_separately": true,
+    "packing_transfer_sync_and_countsketch_are_timed_separately": true
+  },
+  "training_and_snapshot_boundary": {
+    "npu_role": "INFERENCE_ONLY_IMMUTABLE_SNAPSHOT",
+    "npu_backward": false,
+    "master_weight_device_initial": "CPU_FP32",
+    "igpu_master_training": "FAIL_CLOSED_UNTIL_SEPARATE_1_15X_AND_CONTENTION_GATE",
+    "sparse_vjp_returns_hashstem_query_and_context_hooks": true,
+    "snapshot_refresh_requires_drain_barrier": true,
+    "cpu_teacher_checkpoint_remains_immutable_parent": true,
+    "bridge_checkpoint_is_a_fresh_composite_artifact": true,
+    "bridge_checkpoint_preserves_teacher_training_state": true,
+    "bridge_checkpoint_binds_parent_checkpoint_sha256": true
+  },
+  "forbidden_in_adapter_route_boundary": [
+    "OpenVINO invocation",
+    "NPU invocation",
+    "iGPU invocation",
+    "HashStem recomputation",
+    "per-layer accelerator callback",
+    "dense full-bank fallback",
+    "NNUE accumulator",
+    "parent-child state reuse"
+  ],
+  "promotion_requires_runtime_evidence": [
+    "Julia bridge contract and exact-geometry sparse tests pass",
+    "x496 reconstruction matches the canonical candidate adapter",
+    "HashStem CPU master forward and backward are finite",
+    "selected-only sparse VJP reaches q1 q2 q3 and context",
+    "CPU and NPU outputs satisfy the existing numeric and route-ID gate",
+    "end-to-end NPU HashStem p50 speedup is at least 1.15x and p95 does not regress",
+    "concurrent NPU use slows P-core sparse work by at most 1.10x",
+    "combined sparse and HashStem exact continuation succeeds"
+  ],
+  "primary_k_scale_gate": {
+    "baseline": "CPU HashStem plus CPU sparse k64",
+    "candidate": "NPU HashStem plus CPU sparse k128",
+    "candidate_forward_p50_must_not_exceed_baseline": true,
+    "candidate_forward_p95_must_not_exceed_baseline": true,
+    "candidate_teacher_rank_or_game_score_must_improve": true,
+    "same_sparse_bank_weights_where_shapes_overlap": true,
+    "packing_transfer_wait_and_cpu_tail_included": true,
+    "executable_three_cell_gate": [
+      "CPU HashStem plus CPU sparse k64",
+      "CPU HashStem plus CPU sparse k128",
+      "NPU HashStem plus CPU sparse k128"
+    ],
+    "raw_end_to_end_latency_distributions_required": true,
+    "raw_hashstem_component_latency_distributions_required": true,
+    "minimum_repetitions": 30,
+    "route_id_total_formula": "3 * candidate_count",
+    "action_top1_and_top2_total_formula": "timed_sample_count",
+    "quality_direction": "higher_is_better",
+    "supported_quality_metrics": [
+      "teacher_top1_agreement",
+      "teacher_ndcg",
+      "paired_dev_game_score_mean"
+    ],
+    "npu_vs_cpu_k128_hashstem_p50_speedup_minimum": 1.15,
+    "npu_vs_cpu_k128_p95_non_regression": true,
+    "exact_route_ids_action_top1_and_top2_order": true
+  }
+}

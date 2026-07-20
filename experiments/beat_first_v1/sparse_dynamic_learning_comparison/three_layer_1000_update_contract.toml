@@ -1,0 +1,52 @@
+format_version = 1
+experiment_id = "sparse_3l_teacher_signal_1000_v1"
+purpose = "bounded teacher-ranking signal screen; no game-strength or model-beat claim"
+hypothesis = "The three-layer input-dependent sparse model's positive 0-to-100 held ranking trend continues strongly enough to justify a longer sparse convergence run."
+expected_mechanism = "Three active-only sparse layers learn conditional intermediate representations while preserving roughly 20M stored parameters and low per-state active compute."
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-k64"
+total_parameters = 19924022
+active_neurons_by_layer = [24, 20, 20]
+learner_candidate_width = 80
+state_batch = 1
+maximum_updates = 1000
+epochs_ceiling = 1.0
+evaluation_interval = 100
+checkpoint_interval = 1000
+training_evaluation_states = 16
+held_evaluation_states = 32
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 10
+
+[success_gate]
+require_finite_metrics = true
+require_no_route_or_bucket_cap_failure = true
+require_held_ndcg_delta = 0.01
+require_held_pairwise_delta = 0.01
+require_held_top1_non_regression = true
+
+[stop_conditions]
+conditions = [
+  "trainer exits nonzero",
+  "another Julia process overlaps",
+  "any scored-row or bucket-entry cap is exceeded",
+  "any loss, gradient, Q value, or margin is non-finite",
+  "the update-1000 success gate is not met",
+]
+
+[interpretation]
+allowed = "bounded teacher-ranking learning-signal evidence"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-seed claim",
+  "sealed-test claim",
+]

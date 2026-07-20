@@ -1,0 +1,76 @@
+module ResidualLookupSlide
+
+using LinearAlgebra
+using Random
+
+include("geometry.jl")
+include("hash.jl")
+include("model.jl")
+include("optimizer.jl")
+include("checkpoint.jl")
+
+export RAW_VALUE_DIM,
+       RAW_SKETCH_DIM,
+       CONTEXT_DIM,
+       NEXT_HOLD_DIM,
+       CARRIER_DIM,
+       OUTPUT_DIM,
+       BLOCKS,
+       TABLES_PER_BLOCK,
+       ROWS_PER_TABLE,
+       VALUE_DIM,
+       BANK_PARAMETERS,
+       HEAD_PARAMETERS,
+       TOTAL_PARAMETERS,
+       ACTIVE_PARAMETERS,
+       INITIAL_ALPHA_LOGIT,
+       EXACT_ACCOUNTING,
+       ROUTER_SEEDS,
+       LookupAccounting,
+       ResidualLookupInput,
+       ResidualLookupModel,
+       RouteTelemetry,
+       RouteUsage,
+       LookupTape,
+       SelectedLookupVJP,
+       topology,
+       parameter_count,
+       active_parameter_count,
+       accounting,
+       assert_exact_geometry,
+       initialize_model,
+       initialize_exact_model,
+       compose_carrier,
+       compose_carrier!,
+       split_carrier_cotangent,
+       signed_fht_route!,
+       route_address,
+       flat_row_column,
+       residual_alpha,
+       record_usage!,
+       usage_summary,
+       forward,
+       forward_selected,
+       vjp_selected_parameters,
+       LOOKUP_OPTIMIZER_VERSION,
+       LookupSparseAdamWState,
+       DenseHeadAdamWState,
+       DenseAlphaAdamWState,
+       ResidualLookupOptimizerState,
+       PreparedLookupSparseAdamWStep,
+       PreparedResidualLookupOptimizerStep,
+       init_lookup_sparse_adamw,
+       init_residual_lookup_optimizer,
+       logical_decay_scale,
+       materialize_selected_columns!,
+       prepare_lookup_sparse_adamw_step,
+       commit_lookup_sparse_adamw_step!,
+       prepare_optimizer_step,
+       commit_optimizer_step!,
+       optimizer_step!,
+       RESIDUAL_LOOKUP_CHECKPOINT_FORMAT,
+       RESIDUAL_LOOKUP_CHECKPOINT_VERSION,
+       save_residual_lookup_checkpoint,
+       load_residual_lookup_checkpoint
+
+end # module

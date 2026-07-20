@@ -1,0 +1,161 @@
+{
+  "schema": "heterogeneous-265k-windows-residency-ram-evidence-contract-v1",
+  "status": "UNEXECUTED_STATIC_ONLY",
+  "scope": {
+    "matrix_cells": [
+      "H0_cpu_hashstem_cpu_sparse",
+      "H1_npu_hashstem_cpu_sparse"
+    ],
+    "purpose": "independent post-idle whole-stage CPU residency and same-window DRAM traffic evidence",
+    "not_authorized": [
+      "performance or adoption claims from this source contract",
+      "validation or sealed game seeds",
+      "point CPU samples as a whole-stage residency substitute",
+      "process I/O bytes or theoretical DIMM bandwidth as DRAM traffic"
+    ]
+  },
+  "immutable_bindings": {
+    "required_sha256_fields": [
+      "cpu_set_topology_sha256",
+      "system_contract_sha256",
+      "benchmark_contract_sha256",
+      "runner_source_sha256",
+      "provider_source_sha256",
+      "substrate_source_sha256",
+      "source_manifest_sha256",
+      "runner_result_sha256",
+      "raw_qpc_artifact_sha256",
+      "evidence_contract_sha256",
+      "producer_source_sha256"
+    ],
+    "runner_result_sha256_semantic": "SHA-256 of the immutable summary.json emitted by run_post_idle_benchmark.jl",
+    "raw_qpc_artifact_sha256_semantic": "SHA-256 of the immutable records.jsonl named and hashed by summary.json",
+    "rule": "every producer artifact repeats every digest exactly; the independent producer may not rewrite any bound artifact"
+  },
+  "etw": {
+    "artifact_schema": "heterogeneous-265k-etw-residency-evidence-v1",
+    "provider": {
+      "name": "NT Kernel Logger/SystemTraceProvider",
+      "guid": "{9e814aad-3204-11d2-9a82-006008a86939}",
+      "capture_tool": "Microsoft Windows Performance Toolkit xperf.exe",
+      "required_kernel_keywords": ["PROC_THREAD", "CSWITCH"],
+      "trace_clock": "QPC",
+      "extractor_capability": "RAW_QPC_CSWITCH_BOUNDARY_RECONSTRUCTION_V1"
+    },
+    "required_loss_counters": {
+      "events_lost": 0,
+      "buffers_lost": 0,
+      "realtime_buffers_lost": 0
+    },
+    "process_identity": [
+      "process_id",
+      "ETW process_start_qpc",
+      "run_nonce",
+      "role_manifest_sha256",
+      "assignment_readback_sha256"
+    ],
+    "thread_identity": ["thread_id", "ETW thread_start_qpc"],
+    "stage_key": ["cell_id", "repetition", "sequence", "set_id", "stage", "ordinal"],
+    "stage_interval_rule": "begin_qpc and end_qpc must exactly equal the bound records.jsonl raw interval; transformed or rounded timestamps are rejected",
+    "owner_rule": "validator hashes and parses the exact role-manifest bytes; each stage owner set must equal all manifest registrations for that role, and TIDs, registration QPCs, allowed CPU Sets and per-thread assignment/readback hashes remain pre-bound, so selecting a favorable subset after capture is forbidden",
+    "coverage_rule": "reconstruct every scheduled slice intersecting the complete stage, including the carried-in thread state before the first in-interval CSwitch and the carried-out state after the final in-interval CSwitch",
+    "processor_mapping_rule": "each CSwitch processor group/logical index maps to exactly one record in the bound GetSystemCpuSetInformation topology; CPU Set ID, core index and efficiency class must agree",
+    "fail_closed_conditions": [
+      "missing, duplicate or unexpected stage key",
+      "trace does not enclose every requested QPC interval",
+      "QPC frequency mismatch",
+      "any lost ETW event or buffer",
+      "circular overwrite, decode failure or unknown CSwitch event version",
+      "missing process/thread lifetime or boundary state",
+      "scheduled benchmark thread absent from the pre-bound role manifest",
+      "unattributed scheduled ticks",
+      "scheduled slice on a disallowed role CPU Set",
+      "processor-group or topology mapping ambiguity",
+      "same-thread reconstructed slice overlap",
+      "owner thread has no reconstructed scheduled slice"
+    ],
+    "producer_cannot_authorize_adoption": true
+  },
+  "imc": {
+    "artifact_schema": "heterogeneous-265k-imc-ram-evidence-v1",
+    "provider": {
+      "name": "Intel Processor Counter Monitor (Intel PCM)",
+      "project": "https://github.com/intel/pcm",
+      "tool": "pcm-memory.exe",
+      "windows_requirement": "Intel PCM Windows driver loaded and bound by SHA-256",
+      "raw_adapter_capability": "INTEL_PCM_RAW_IMC_RD_WR_COUNTERS_V1"
+    },
+    "availability_statement": "stock pcm-memory CSV is not sufficient for this gate because it does not itself bind raw before/after values, counter width, reset, overflow, multiplex and enabled/running time for every populated IMC channel",
+    "provenance_binding": "capture must equal externally expected SHA-256 values for the availability probe, PCM tool, Windows driver, raw adapter, role manifest, hook source, hook witness, both raw snapshots, counter inventory and counter configuration, plus the exact program generation",
+    "required_scope": "SYSTEM_WIDE_EXCLUSIVE_WINDOW",
+    "attribution": "EXCLUSIVE_HOST_WINDOW_ONLY_NOT_PROCESS_COUNTER",
+    "timed_region_binding": "hashed role manifest and timed-region hook, before/after raw snapshot hashes, counter inventory/configuration hashes, program generation, and QPC snapshot brackets enclosing the exact timed interval",
+    "channel_requirements": [
+      "unique socket/controller/channel identity",
+      "DRAM_READ_CAS and DRAM_WRITE_CAS semantics",
+      "canonical decimal-string raw before/after and delta counts",
+      "counter width between 1 and 64 bits",
+      "64 bytes per CAS count",
+      "overflow_detected=false",
+      "multiplexed=false",
+      "counter_reset_detected=false",
+      "QPC time_enabled_ticks equals time_running_ticks equals exact capture duration"
+    ],
+    "aggregate_recomputation": {
+      "read_bytes": "sum((read_after-read_before)*64) over every populated channel",
+      "write_bytes": "sum((write_after-write_before)*64) over every populated channel",
+      "bytes_per_second": "bytes*qpc_frequency/duration_qpc_ticks rounded half-up to the nearest integer"
+    },
+    "counter_guard_limit": "pre/post counter-latch guard ticks combined must be at most 0.1 percent of the exact timed region and are reported separately; larger windows fail closed",
+    "fail_closed_conditions": [
+      "raw PCM adapter absent or capability probe fails",
+      "Intel PCM tool or Windows driver absent",
+      "missing populated channel",
+      "counter value exceeds declared width",
+      "after is less than before; modulo wrap inference is forbidden",
+      "overflow, reset, multiplex, lost sample or unequal enabled/running time",
+      "unattributed counter or interfering activity in the system-wide window",
+      "QPC frequency or exact capture interval mismatch",
+      "aggregate bytes or bandwidth does not reproduce from raw counts",
+      "process I/O or theoretical bandwidth was used"
+    ],
+    "producer_cannot_authorize_adoption": true
+  },
+  "availability_probe": {
+    "source": "probe_windows_residency_ram_tools.ps1",
+    "paths_are_explicit_absolute_inputs": true,
+    "path_lookup_fallback": false,
+    "etw_checks": [
+      "xperf.exe file identity, version and SHA-256",
+      "xperf -providers kf exposes PROC_THREAD and CSWITCH",
+      "version-bound extractor emits RAW_QPC_CSWITCH_BOUNDARY_RECONSTRUCTION_V1 probe JSON"
+    ],
+    "imc_checks": [
+      "pcm-memory.exe file identity, version and SHA-256",
+      "Intel PCM raw adapter emits INTEL_PCM_RAW_IMC_RD_WR_COUNTERS_V1 probe JSON",
+      "probe JSON declares raw before/after, width, overflow, multiplex, QPC window, read/write IMC and loaded driver support"
+    ],
+    "unavailable_status": "UNAVAILABLE_FAIL_CLOSED",
+    "unavailable_decision": "INCONCLUSIVE_FAIL_CLOSED",
+    "unavailable_exit_code": 2,
+    "success_status": "AVAILABLE_PENDING_EXCLUSIVE_CAPTURE",
+    "success_authorizes_adoption": false
+  },
+  "runner_hook": {
+    "source": "windows_evidence_runtime_hook.jl",
+    "status": "UNEXECUTED_STATIC_ONLY",
+    "role_manifest_schema": "heterogeneous-265k-thread-role-manifest-v1",
+    "timed_region_schema": "heterogeneous-265k-timed-region-hook-v1",
+    "process_identity": "run nonce plus PID plus runner identity QPC; ETW must add and validate the earlier ETW process-start QPC",
+    "thread_identity": "OS TID and role-registration QPC are hashed before timed work; ETW must add thread-start QPC and prove start <= registration <= stage",
+    "counter_handshake": "a probed Intel PCM raw adapter must complete a before snapshot before timed_begin_qpc and begin an after snapshot after timed_end_qpc",
+    "configuration_rule": "before and after acknowledgements must have identical counter inventory SHA-256, configuration SHA-256 and program generation",
+    "missing_adapter_behavior": "there is no no-op controller; the timed counter handshake throws and the probe emits UNAVAILABLE_FAIL_CLOSED"
+  },
+  "acceptance": {
+    "both_independent_artifacts_required": true,
+    "etw_and_imc_bindings_must_match": true,
+    "adoption_decision_is_external_to_producers": true,
+    "missing_artifact_decision": "INCONCLUSIVE_FAIL_CLOSED"
+  }
+}

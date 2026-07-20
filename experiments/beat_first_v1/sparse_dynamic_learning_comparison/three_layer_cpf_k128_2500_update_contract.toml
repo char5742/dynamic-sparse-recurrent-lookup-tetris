@@ -1,0 +1,69 @@
+format_version = 1
+experiment_id = "sparse_3l_k128_teacher_signal_cpf_2500_v1"
+purpose = "successive-halving active-width comparison against the passed k64 CPF1 checkpoint; no game-strength claim"
+hypothesis = "Doubling the active width at fixed 19,924,022 stored parameters improves held teacher ranking enough to justify its higher active compute."
+expected_mechanism = "More input-dependent active neurons provide a richer conditional subgraph while retaining active-only forward/backward and the same cap-safe router."
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+architecture = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-CPF1-k128"
+routing_policy = "wta-collision-count-stable-id-prefilter-v1"
+comparison_baseline = "sparse_3l_teacher_signal_cpf_2500_v1"
+comparison_baseline_metrics_path = "D:/tetris-paper-plus/runs/beat_first_v1/sparse_3l_teacher_signal_cpf_2500_v1/sparse_3l_20260719T131935/metrics.jsonl"
+comparison_baseline_metrics_sha256 = "ff685ea03abdefd9dc6da0fe35152b35573903e4130faabb4074ceae1905c0c3"
+checkpoint_version = 2
+total_parameters = 19924022
+active_neurons_by_layer = [48, 40, 40]
+active_parameters = 58214
+learner_candidate_width = 80
+state_batch = 1
+maximum_updates = 2500
+epochs_ceiling = 1.0
+evaluation_interval = 500
+checkpoint_interval = 500
+training_evaluation_states = 128
+held_evaluation_states = 512
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+weight_decay = 0.0
+julia_threads = 1
+blas_threads = 1
+wall_time_limit_minutes = 15
+
+[success_gate]
+baseline_update = 0
+final_update = 2500
+require_finite_metrics = true
+require_no_route_or_bucket_cap_failure = true
+require_prefilter_activation = true
+minimum_final_held_top1 = 0.048828125
+minimum_final_held_ndcg = 0.8434740281749898
+minimum_final_held_pairwise = 0.537651329761083
+maximum_final_held_composite_loss = 6.439771521836519
+require_material_gain_one_of = [
+  "top1 >= 0.0546875",
+  "ndcg >= 0.8484740281749898",
+  "pairwise >= 0.547651329761083",
+]
+
+[stop_conditions]
+conditions = [
+  "trainer exits nonzero",
+  "another Julia process overlaps",
+  "the independent bucket-entry cap is exceeded",
+  "the exact-score cap is exceeded after prefiltering and probe reservation",
+  "any loss, gradient, Q value, or margin is non-finite",
+  "the k128 checkpoint is inferior to k64 at the paired update-2500 panel",
+  "none of the preregistered material-gain margins is reached",
+]
+
+[interpretation]
+allowed = "bounded active-width teacher-ranking comparison"
+forbidden = [
+  "game-strength claim",
+  "old-model-beat claim",
+  "validation-game-seed claim",
+  "sealed-test claim",
+]

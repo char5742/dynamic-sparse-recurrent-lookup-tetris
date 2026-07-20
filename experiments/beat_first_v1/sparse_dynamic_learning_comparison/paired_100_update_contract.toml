@@ -1,0 +1,65 @@
+format_version = 1
+comparison_id = "sparse_teacher_signal_1l3l_k64_v1"
+interpretation = "paired system-level 100-update learning-signal screen"
+architecture_only_attribution = false
+dataset_root = "D:/tetris-paper-plus/datasets/beat_first_v1/teacher_v3"
+dataset_manifest_sha256 = "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded"
+shared_objective_source = "experiments/beat_first_v1/training/core.jl"
+
+[shared]
+total_parameters = 19924022
+state_batch = 1
+learner_candidate_width = 80
+maximum_updates = 100
+epochs_ceiling = 1.0
+evaluation_interval = 25
+checkpoint_interval = 100
+training_evaluation_states = 16
+held_evaluation_states = 32
+evaluate_initial = true
+validation_fraction_fallback = 0.20
+seed = 2026071900
+model_seed = 2026071901
+split_seed = 2026071902
+sampler_seed = 2026071903
+learning_rate = 0.0001
+head_weight_decay = 0.0
+bank_weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+optimizer_epsilon = 1.0e-8
+julia_threads = 1
+blas_threads = 1
+exclusive_julia_mutex = 'Local\TetrisBeatFirstV1ExclusiveJulia'
+overlap_poll_milliseconds = 100
+required_step_evidence = ["unique_active_rows", "active_parameter_or_edge_touches", "routing_inclusive_macs", "executed_training_macs", "active_only_optimizer_writes"]
+
+[one_layer]
+identity = "Tetris-SLIDE-1L-Q20-k64"
+active_neurons = 64
+active_parameters_per_candidate = 39990
+forward_macs_per_candidate = 39968
+training_probes = 8
+bank_optimizer = "row-scalar active-event AdaGrad, zero decay"
+head_optimizer = "dense AdamW"
+wta_seed = 2026071904
+
+[three_layer]
+identity = "Tetris-SLIDE-DeepNeuronBank-Q20-B3-k64"
+active_neurons_by_layer = [24, 20, 20]
+active_parameters_per_candidate = 31934
+forward_macs_per_candidate = 31912
+training_probes_by_layer = [3, 2, 2]
+bank_optimizer = "per-element active-event AdamW, zero decay"
+head_optimizer = "dense AdamW"
+wta_seed_policy = "fixed architecture-local seeds 0x334c534800000001:0x334c534800000003"
+
+[[remaining_difference]]
+name = "sparse_bank_optimizer_family"
+material = true
+reason = "The frozen 1L trainer implements row-scalar AdaGrad while the 3L trainer implements per-element event-time AdamW. Porting either optimizer would create and require validating a new architecture/training path. This screen therefore compares the two complete sparse systems and cannot attribute a difference solely to architecture depth."
+
+[[remaining_difference]]
+name = "architecture_required_routing"
+material = true
+reason = "The 1L route has 64 active neurons and eight training probes. The 3L k64 route has active widths 24/20/20 and probes 3/2/2, with residual CountSketch routing after layer one. These are intrinsic graph differences rather than external experimental controls."

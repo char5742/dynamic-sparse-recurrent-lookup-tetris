@@ -1,0 +1,128 @@
+schema = "paired_sparse_cpu_benchmark_v1"
+status = "runnable_after_current_heavy_julia_is_idle"
+scope = "synthetic_cpu_engineering_only"
+production_models_modified = false
+game_or_dataset_inputs_used = false
+validation_or_sealed_game_seeds_used = false
+strength_or_promotion_evidence = false
+cpu_only = true
+corpus_items = 64
+corpus_order = "physical_1_to_64_cyclic_same_index_for_every_path"
+paired_order = "balanced_six_permutation_cyclic"
+paired_order_exact_balance = "all_stage_counts_multiple_of_6"
+thermal_orders = ["123", "132", "321", "213", "231", "312"]
+resource_envelope = "one_julia_thread_one_blas_thread"
+cpu_affinity = "UNPINNED"
+gather_timing_scope = "nonadditive_preallocated_copy_diagnostic"
+gathered_bytes_scope = "routing_plus_forward_parameter_reads"
+mac_label_scope = "executed_macs_are_MACs_routing_inclusive_linear_ops_add_sketch_work"
+paired_ratio_gc_scope = "all_forward_and_full_training_samples_all_three_paths"
+
+[bounds]
+default_warmup = 6
+maximum_warmup = 12
+default_forward_samples = 24
+maximum_forward_samples = 48
+default_training_samples = 24
+maximum_training_samples = 30
+default_component_samples = 18
+maximum_component_samples = 30
+required_sample_multiple = 6
+required_julia_threads = 1
+required_blas_threads = 1
+
+[models.sparse_1layer_k64]
+total_parameters = 19924022
+active_parameters = 39990
+active_edges = 39968
+forward_macs = 39968
+parameter_vjp_macs = 44096
+parameter_training_macs = 84064
+active_weight_bytes = 159960
+timing = "primary"
+
+[models.sparse_3layer_k64]
+active_counts = [24, 20, 20]
+total_parameters = 19924022
+active_parameters = 31934
+active_edges = 31912
+forward_macs = 31912
+parameter_vjp_macs = 46376
+parameter_training_macs = 78288
+sketch_accumulates = 108
+parameter_training_inclusive_macs = 78504
+active_weight_bytes = 127736
+timing = "primary"
+
+[models.sparse_3layer_k128]
+active_counts = [48, 40, 40]
+total_parameters = 19924022
+active_parameters = 58214
+active_edges = 58192
+forward_macs = 58192
+parameter_vjp_macs = 82896
+parameter_training_macs = 141088
+sketch_accumulates = 216
+parameter_training_inclusive_macs = 141520
+active_weight_bytes = 232856
+timing = "accounting_only_not_instantiated"
+
+[models.sparse_3layer_k256]
+active_counts = [96, 80, 80]
+total_parameters = 19924022
+active_parameters = 110774
+active_edges = 110752
+forward_macs = 110752
+parameter_vjp_macs = 155936
+parameter_training_macs = 266688
+sketch_accumulates = 432
+parameter_training_inclusive_macs = 267552
+active_weight_bytes = 443096
+timing = "accounting_only_not_instantiated"
+
+[models.dense_1layer_twin]
+total_parameters = 19924022
+active_parameters = 19924022
+active_edges = 19924000
+forward_macs = 19924000
+parameter_vjp_macs = 21497920
+parameter_training_macs = 41421920
+active_weight_bytes = 79696088
+timing = "benchmark_oracle"
+
+[required_reports]
+static_accounting = [
+    "total_parameters",
+    "active_parameters",
+    "active_edges",
+    "forward_macs",
+    "parameter_vjp_macs",
+    "parameter_training_macs",
+    "active_weight_bytes",
+]
+actual_per_sample = [
+    "executed_model_forward_macs",
+    "executed_parameter_vjp_macs",
+    "executed_model_training_macs",
+    "executed_routing_rerank_macs",
+    "routing_inclusive_forward_linear_ops",
+    "routing_inclusive_training_linear_ops",
+    "gross_gathered_bytes",
+    "unique_gathered_bytes",
+]
+distribution_stages = ["forward", "component_diagnostic", "full_training"]
+distribution_statistics = ["p50", "p95", "mean", "min", "max"]
+profiles = ["allocated:bytes", "observed_gc:milliseconds"]
+phases = ["routing", "materialization", "gather_copy_diagnostic", "compute", "parameter_vjp", "optimizer", "rehash"]
+paired_comparisons = [
+    "sparse_3layer_over_sparse_1layer",
+    "dense_1layer_twin_over_sparse_1layer",
+    "dense_1layer_twin_over_sparse_3layer",
+]
+
+[terminal_gates]
+paired_latency_ratios_clean = "AUTHORITATIVE_NO_TIMED_GC"
+paired_latency_ratios_contaminated = "NON_AUTHORITATIVE_TIMED_GC_OBSERVED"
+benchmark_completed_clean = "PASS"
+benchmark_completed_contaminated = "FAIL_CLOSED_TIMED_GC_OBSERVED"
+promotion_or_strength_claim = "NOT_AUTHORIZED_SYNTHETIC"

@@ -1,0 +1,176 @@
+{
+  "schema": "heterogeneous-265k-active-block-accelerator-microbench-contract-v2",
+  "status": "UNEXECUTED_STATIC_CONTRACT",
+  "scope": {
+    "evidence_class": "COMPONENT_MICROBENCH_ONLY",
+    "promotion_authority": "NONE",
+    "model_strength_evidence": false,
+    "game_score_evidence": false,
+    "nnue_or_parent_child_reuse": false,
+    "routing_search_timed": false,
+    "routing_contract": "ordered selected neuron IDs and their corresponding contiguous FP32 row blocks are immutable witness inputs; WTA/LSH search and reranking are outside this bounded component benchmark",
+    "measured_operation": "host materialization of a supplied selected block, input packing, tensor bind, transfer-inclusive submit/wait, synchronization, copied output, and selected-row dot plus SiLU",
+    "cpu_reference_policy": "a scalar FP32 implementation is used only as the numerical oracle; the vectorized NumPy selected-row implementation is the only CPU latency baseline"
+  },
+  "fixed_geometry": {
+    "batch": 16,
+    "layer_dimensions": [560, 321, 321],
+    "variants": {
+      "k64": {
+        "active_counts": [24, 20, 20],
+        "active_neurons": 64,
+        "host_to_device_bytes_per_three_call_sample": 1758848,
+        "device_to_host_bytes_per_three_call_sample": 4096
+      },
+      "k128": {
+        "active_counts": [48, 40, 40],
+        "active_neurons": 128,
+        "host_to_device_bytes_per_three_call_sample": 3440768,
+        "device_to_host_bytes_per_three_call_sample": 8192
+      },
+      "k256": {
+        "active_counts": [96, 80, 80],
+        "active_neurons": 256,
+        "host_to_device_bytes_per_three_call_sample": 6804608,
+        "device_to_host_bytes_per_three_call_sample": 16384
+      }
+    },
+    "largest_witness_blocks": {
+      "selected_rows_l1": ["N", 96, 560],
+      "selected_rows_l2": ["N", 80, 321],
+      "selected_rows_l3": ["N", 80, 321],
+      "selected_ids_l1": ["N", 96],
+      "selected_ids_l2": ["N", 80],
+      "selected_ids_l3": ["N", 80],
+      "scaled_input_l1": ["N", 560],
+      "scaled_input_l2": ["N", 321],
+      "scaled_input_l3": ["N", 321]
+    },
+    "prefix_rule": "k64 and k128 consume exact ordered prefixes of the same k256 selected-row and selected-ID witness; no rerouting or alternate support is permitted"
+  },
+  "cells": [
+    {
+      "id": "A0v2_cpu_selected_dot_silu",
+      "required_backend": "CPU",
+      "latency_implementation": "optimized vectorized NumPy einsum plus stable vectorized SiLU",
+      "numeric_oracle": "scalar FP32 ordered dot plus branch-stable SiLU",
+      "silent_fallback": "forbidden"
+    },
+    {
+      "id": "A1v2_cpu_pack_npu_active",
+      "required_backend": "OpenVINO device family exactly NPU",
+      "compile_shape": "fixed batch 16 and fixed variant/layer dimensions",
+      "silent_fallback": "forbidden; AUTO, CPU, GPU, multi-device, ambiguous multiple-NPU enumeration, a same-family substitute, and omitted execution-device receipts fail closed"
+    },
+    {
+      "id": "A2v2_cpu_pack_intel_igpu_active",
+      "required_backend": "one explicitly enumerated OpenVINO Intel integrated GPU device",
+      "compile_shape": "fixed batch 16 and fixed variant/layer dimensions",
+      "silent_fallback": "forbidden; missing or ambiguous integrated-device identity, AUTO, CPU, NPU, discrete GPU, multi-device execution, and a different same-family GPU all fail closed"
+    }
+  ],
+  "timing": {
+    "clock": "Windows QueryPerformanceCounter raw ticks plus one QueryPerformanceFrequency receipt",
+    "percentile": "nearest-rank p50 and p95 without interpolation",
+    "sample": "one batch-16 bundle containing exactly three dependent-shape layer calls; inputs are supplied independently so this component benchmark does not claim CountSketch or model end-to-end timing",
+    "required_stages": [
+      "total",
+      "host_gather",
+      "input_pack",
+      "tensor_bind",
+      "submit",
+      "wait_and_synchronize",
+      "output_copy",
+      "optimized_cpu_compute"
+    ],
+    "accelerator_transfer_accounting": "OpenVINO does not expose a portable host QPC boundary for DMA. H2D, device compute, and device-side D2H visibility are therefore inseparable inside submit plus wait; the end-to-end total includes them and exact logical FP32 bytes are reported. No kernel-only timing is an adoption input.",
+    "warmup_minimum": 3,
+    "timed_samples_minimum": 20,
+    "compile_and_first_call": "reported separately and excluded from steady percentiles",
+    "raw_timing_receipt": "one fresh JSONL row per backend, variant, and timed sample, retaining every raw stage interval"
+  },
+  "physical_call_receipts": {
+    "artifact": "fresh JSONL separate from the summary",
+    "required_for_accelerators": true,
+    "one_row_per_call": true,
+    "expected_calls_per_timed_sample": 3,
+    "required_fields": [
+      "schema",
+      "run_uuid",
+      "backend_cell",
+      "requested_device",
+      "execution_devices",
+      "full_device_name",
+      "device_type",
+      "driver_version",
+      "device_uuid",
+      "openvino_version",
+      "variant",
+      "layer",
+      "batch_index",
+      "physical_call_index",
+      "model_name",
+      "selected_block_sha256",
+      "selected_ids_sha256",
+      "input_sha256",
+      "input_shape",
+      "selected_rows_shape",
+      "output_shape",
+      "host_to_device_bytes",
+      "device_to_host_bytes",
+      "synchronization_count",
+      "submit_begin_qpc",
+      "submit_end_qpc",
+      "wait_begin_qpc",
+      "wait_end_qpc",
+      "output_sha256"
+    ]
+  },
+  "witness_policy": {
+    "npz_allow_pickle": false,
+    "sidecar_sha256_binding_required": true,
+    "accepted_split": "teacher_v3_train or synthetic_component_only",
+    "reserved_seed_free_required": true,
+    "development_validation_sealed_seed_use_forbidden": true,
+    "all_arrays_finite": true,
+    "selected_ids_unique_per_layer_and_candidate": true,
+    "selected_rows_and_ids_are_read_only": true,
+    "candidate_count": "positive multiple of 16"
+  },
+  "correctness_gates": {
+    "optimized_cpu_vs_scalar_maximum_absolute_error": 0.00001,
+    "accelerator_vs_optimized_cpu_maximum_absolute_error": 0.01,
+    "finite_outputs_required": true,
+    "output_shape_exact": true,
+    "physical_call_count_exact": true,
+    "execution_device_receipt_exact": true
+  },
+  "component_performance_gate": {
+    "accelerator_end_to_end_speedup_vs_optimized_cpu_minimum": 1.15,
+    "accelerator_p95_ratio_vs_optimized_cpu_maximum": 1.0,
+    "all_correctness_gates_required": true,
+    "interpretation": "passing authorizes only a later integrated benchmark; it does not establish sparse-model quality, HashStem value, teacher ranking quality, or game strength"
+  },
+  "unavailable_backend_policy": {
+    "status": "UNAVAILABLE_FAIL_CLOSED",
+    "exit_code": 2,
+    "artifact_required": true,
+    "rules": [
+      "CPU is never substituted for a requested accelerator",
+      "OpenVINO AUTO, HETERO and MULTI are forbidden",
+      "NPU absence or compile failure produces an unavailable receipt",
+      "without --npu-device, more than one enumerated NPU-family device is ambiguous and fails closed",
+      "the iGPU cell runs only on an explicitly identified Intel integrated GPU; absence, ambiguity, or unverifiable integration produces an unavailable receipt",
+      "the compiled EXECUTION_DEVICES entry must be the exact selected enumerated device string, not merely the same NPU/GPU family",
+      "results from an available cell may remain in the artifact but cannot erase another cell's fail-closed status"
+    ]
+  },
+  "prohibited_claims": [
+    "old model beaten",
+    "new model stronger",
+    "CPU dynamic-sparse model promoted",
+    "heterogeneous system adopted",
+    "routing accelerated",
+    "NNUE accelerated"
+  ]
+}
