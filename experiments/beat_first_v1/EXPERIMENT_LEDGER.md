@@ -622,3 +622,33 @@ game-validation seeds; game validation `8001:8008` and sealed seeds
   MONGOOSE-routing, or dynamic-sparse-learning hypothesis failure. The exact
   arm is consumed and terminal: no rescue, rerun, resume, parameter adjustment,
   checkpoint promotion, or game evaluation is authorized.
+
+## 2026-07-20 — Final EVRL held-teacher comparison against PreAct
+
+- The final corrected episodic ViT recurrent Lookup model was evaluated on the
+  exact 128-state real-teacher validation panel used by PreAct. Dataset manifest
+  SHA-256 is
+  `1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded`;
+  row-list SHA-256 is
+  `fa98e0e7aa7a1f1150ba38b57cdd6396b98aed3dc43f7176e94bf13b78554f25`.
+  Game validation and sealed seeds remained unopened.
+- At the matched 12,000-update / 48,000-state budget, PreAct best reached
+  top-1 `0.7890625`, NDCG `0.9932922`, and pairwise accuracy `0.9233594`.
+  EVRL reached `0.359375`, `0.9712681`, and `0.8202795`, respectively.
+  The accuracy hypothesis therefore failed decisively at equal state count.
+- The final EVRL update-20,000 checkpoint reached top-1 `0.375`, NDCG
+  `0.9583671`, pairwise accuracy `0.7688135`, and composite loss `3.1628645`.
+  Relative to PreAct, gaps are `-0.4140625` top-1, `-0.0349251` NDCG, and
+  `+0.5990807` composite loss.
+- Warm CPU held-panel inference was `50.19 states/s` for final EVRL versus
+  `4.19 states/s` for PreAct, a `11.97x` sparse-model throughput advantage.
+  Thus the CPU-native execution claim passed while the model-quality claim did
+  not.
+- EVRL stores 20,577,480 parameters versus PreAct's 1,481,326 (`13.89x`), so
+  the held deficit is not explained by scalar capacity. Fixed-batch
+  memorization demonstrated trainability but did not transfer to unseen-state
+  routing and full candidate-order credit assignment.
+- Reproducible evidence is in
+  `episodic_vit_recurrent_lookup/PERFORMANCE_COMPARISON_2026-07-20.md`,
+  `performance_comparison_2026-07-20.json`, and
+  `evaluate_teacher_comparison.jl`.

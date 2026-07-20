@@ -76,4 +76,6 @@ spatial and routing representations remain stable under the intended final
 evaluation protocol.
 
 See [`RESULTS_2026-07-20.md`](RESULTS_2026-07-20.md) for the exact numerical
-witnesses.
+witnesses and
+[`PERFORMANCE_COMPARISON_2026-07-20.md`](PERFORMANCE_COMPARISON_2026-07-20.md)
+for the final held-teacher comparison against PreAct.

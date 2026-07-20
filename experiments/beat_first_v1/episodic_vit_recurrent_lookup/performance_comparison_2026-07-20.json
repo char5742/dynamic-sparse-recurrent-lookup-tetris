@@ -1,0 +1,152 @@
+{
+    "evaluation_id": "teacher-held-comparison-2026-07-20",
+    "generated_at": "2026-07-20T23:19:27.066",
+    "conditions": {
+        "dataset_path": "D:\\tetris-paper-plus\\datasets\\beat_first_v1\\teacher_v3",
+        "dataset_manifest_sha256": "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded",
+        "split_seed": 2026071817,
+        "validation_subset_seed": 2026072315,
+        "validation_states": 128,
+        "validation_rows_sha256": "fa98e0e7aa7a1f1150ba38b57cdd6396b98aed3dc43f7176e94bf13b78554f25",
+        "observed_candidate_width": 76,
+        "learner_width": 80,
+        "state_batch_preact": 4,
+        "state_batch_evrl": 1,
+        "blas_threads": 1,
+        "julia_threads": 20,
+        "evaluation_repeats": 3,
+        "objective_mode": "standardized_listnet_plus_margin",
+        "margin_mode": "fixed_teacher_top2",
+        "teacher_q_and_rank_used_only_as_targets": true,
+        "candidate_independent_evaluation": true,
+        "game_validation_seeds_touched": false,
+        "game_sealed_seeds_touched": false
+    },
+    "preact": {
+        "architecture": "preact_eca",
+        "checkpoint": {
+            "path": "D:\\tetris-paper-plus\\checkpoints\\beat_first_v1\\teacherv3_preact_s_av2_b4_r1_best.jld2",
+            "bytes": 19600170,
+            "sha256": "f3e40d7b6bd3ea8aa7930b2178b537bdae37eea76cdbf089c3ba489ac99d057e"
+        },
+        "update": 12000,
+        "consumed_states": 48000,
+        "parameter_count": 1481326,
+        "metrics": {
+            "states": 128,
+            "composite_loss": 2.563783835619688,
+            "listnet_loss": 2.554378356784582,
+            "old_q_loss": 0.02879766903060954,
+            "margin_loss": 0.005634287284692618,
+            "top1_agreement": 0.7890625,
+            "ndcg": 0.9932921694681829,
+            "pairwise_accuracy": 0.9233594245135264,
+            "action_margin": 0.1233223732560873,
+            "q_mean": 5.674921976128259,
+            "q_std": 1.0352620955004537
+        },
+        "inference": {
+            "repeats": 3,
+            "states": 384,
+            "candidates": 16857,
+            "seconds": 91.5911342,
+            "states_per_second": 4.1925455269665175,
+            "candidates_per_second": 184.04619778144422,
+            "checksum": 183188.88050240278
+        }
+    },
+    "evrl_budget_matched": {
+        "architecture": "episodic_vit_recurrent_lookup",
+        "checkpoint": {
+            "path": "D:\\tetris-paper-plus\\runs\\beat_first_v1\\episodic_vit_recurrent_lookup\\evrl_spatial_lookup_fixed2_u20000_resume2000_20260720_r1\\checkpoints\\checkpoint_000012000.jls",
+            "bytes": 253663125,
+            "sha256": "a566d0e63eacddbc3e02a8e789f891fd18328953dd4fc443bdc6ac7009e5d858"
+        },
+        "update": 12000,
+        "consumed_states": 48000,
+        "parameter_count": 20577480,
+        "metrics": {
+            "states": 128,
+            "composite_loss": 2.975015145726502,
+            "listnet_loss": 2.92665475839749,
+            "old_q_loss": 0.16006542851391714,
+            "margin_loss": 0.02914160757153983,
+            "top1_agreement": 0.359375,
+            "ndcg": 0.9712681380238037,
+            "pairwise_accuracy": 0.820279468137231,
+            "action_margin": 0.049543172121047974,
+            "q_mean": 5.9202684485467065,
+            "q_std": 0.8097851783229812
+        },
+        "recurrent_depth": {
+            "mean": 2,
+            "minimum": 2,
+            "maximum": 2
+        },
+        "inference": {
+            "repeats": 3,
+            "states": 384,
+            "candidates": 16857,
+            "seconds": 7.1719014,
+            "states_per_second": 53.54228656852421,
+            "candidates_per_second": 2350.4227205354496,
+            "checksum": 99958.84177209064
+        }
+    },
+    "evrl_final": {
+        "architecture": "episodic_vit_recurrent_lookup",
+        "checkpoint": {
+            "path": "D:\\tetris-paper-plus\\runs\\beat_first_v1\\episodic_vit_recurrent_lookup\\evrl_spatial_lookup_fixed2_u20000_resume2000_20260720_r1\\checkpoints\\checkpoint_000020000.jls",
+            "bytes": 253663125,
+            "sha256": "1fc05d63154fc73e5d60367c2b19d63116a975b0a3a772899b7fd0ca382db28e"
+        },
+        "update": 20000,
+        "consumed_states": 80000,
+        "parameter_count": 20577480,
+        "metrics": {
+            "states": 128,
+            "composite_loss": 3.1628645481541753,
+            "listnet_loss": 3.0762463500723243,
+            "old_q_loss": 0.28317874905769713,
+            "margin_loss": 0.06133751165762291,
+            "top1_agreement": 0.375,
+            "ndcg": 0.9583670718726409,
+            "pairwise_accuracy": 0.76881345499582,
+            "action_margin": 0.087825458496809,
+            "q_mean": 5.745249448185991,
+            "q_std": 1.0655421439117463
+        },
+        "recurrent_depth": {
+            "mean": 2,
+            "minimum": 2,
+            "maximum": 2
+        },
+        "inference": {
+            "repeats": 3,
+            "states": 384,
+            "candidates": 16857,
+            "seconds": 7.6514017,
+            "states_per_second": 50.186882751169634,
+            "candidates_per_second": 2203.1257357720483,
+            "checksum": 97006.16379782557
+        }
+    },
+    "differences": {
+        "budget_matched_vs_preact": {
+            "top1": -0.4296875,
+            "ndcg": -0.022024031444379144,
+            "pairwise": -0.10307995637629541,
+            "action_margin": -0.07377920113503933,
+            "composite_loss": 0.4112313101068139,
+            "inference_speed_ratio": 12.770830089772288
+        },
+        "final_vs_preact": {
+            "top1": -0.4140625,
+            "ndcg": -0.034925097595541965,
+            "pairwise": -0.15454596951770638,
+            "action_margin": -0.0354969147592783,
+            "composite_loss": 0.5990807125344872,
+            "inference_speed_ratio": 11.97050394047407
+        }
+    }
+}
