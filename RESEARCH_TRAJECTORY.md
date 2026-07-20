@@ -1,0 +1,335 @@
+# 動的疎再帰ルックアップネットワーク：研究・実験軌跡
+
+最終更新: 2026-07-20
+
+この文書は、CPUネイティブな動的ニューラルネットワークを構築する
+研究について、着想、設計判断、失敗、修正、検証結果を時系列で保存する。
+成功結果だけでなく、棄却した方式と未解決事項も記録する。
+
+## 1. 研究の出発点
+
+着想は、脳の計算原理に見られる次の性質をニューラルネットワークへ
+導入することだった。
+
+- 巨大な記憶容量のうち、その瞬間に必要な一部だけが活動する。
+- 同じ回路を、問題の難しさに応じた回数だけ反復使用する。
+- 活動した経路だけが学習更新を受ける。
+- 現在入力の要素間に、入力固有の関係を形成する。
+
+この構想を計算グラフの三軸で表す。
+
+1. `G_rel(x,t)`: 入力内で誰が誰を見るか。
+2. `G_param(x,t)`: どの長期記憶・parameterを使用するか。
+3. `G_time(x)`: 何回思考を反復するか。
+
+Transformerは主として1を入力依存にする。提案モデルは、1、2、3をすべて
+入力依存にし、さらにforward、backward、optimizerの実計算量まで選択経路へ
+限定することを目標とする。
+
+## 2. 中心アーキテクチャ
+
+仮称は **Dynamic Sparse Recurrent Lookup Network (DSRLN)**、日本語では
+「動的疎再帰ルックアップネットワーク」とする。
+
+### 長期記憶
+
+LookupFFN bankを、全入力で共有される学習可能な長期記憶として使う。
+各入力・各反復は、全bankを密に計算せず、learned routeが選んだ少数行だけを
+gatherする。選択されなかった行にはbackwardもoptimizer更新も発生しない。
+
+### 短期作業記憶
+
+盤面cell、candidate、difference、next/hold、`aux37`を位置付きtokenとして
+保持する。少数のregisterを再帰的な作業状態とし、入力固有token memoryから
+必要な情報を読む。
+
+### 入力内関係
+
+全token間のdense QK行列は作らない。盤面cellは物理的なlocal-8 edgeと
+learned sparse edgeで接続し、共有Q/K/V/Oと相対位置biasを用いて更新する。
+registerからepisodic memoryへのcross-attentionも、有界候補だけを正確に
+score・softmax・gatherする。
+
+### 再帰と思考時間
+
+同じblockを反復間で共有する。hard-halting interfaceは、必要なcandidateだけを
+次stepのactive queueへ戻す。今回の20,000更新runでは、表現学習の安定性を
+先に確認するため深度を2へ固定した。
+
+### CPU実行
+
+SLIDEの固定LSHやニューロン層は採用しない。参考にするのは、使われない
+parameterへ触れず、不規則な疎実行をCPUのwork queue、SIMD、cache、RAMへ
+直接対応させるシステム思想だけである。
+
+## 3. 実験軌跡
+
+### Phase A — CPU疎実行とLookupFFN基盤
+
+初期研究では、疎なparameter routing、active-only backward、sparse optimizer、
+CPU上のWTA/Lookup実行を構築した。1層、3層、active-width k64/k128/k256、
+collision-prefilter、Mongoose系routeなどを段階的に比較した。
+
+この段階で得た重要な知見は次の通り。
+
+- 保存parameter数とactive computeは大きく分離できる。
+- FLOP削減だけではwall-clock短縮を保証しない。
+- random gather、cache、route union、gradient reduceが実時間を決める。
+- hard routeのcollapseと未選択経路への信用割当が主要な学習課題になる。
+- 成功runだけでなく、route cap超過や事前登録gate不成立もfail-closedで保存する。
+
+詳細な個別runは
+[`experiments/beat_first_v1/EXPERIMENT_LEDGER.md`](experiments/beat_first_v1/EXPERIMENT_LEDGER.md)
+に記録している。
+
+### Phase B — LookupFFN再帰とhard halting
+
+TRM、PonderNet、Universal Transformerに対応する要素を検討し、同じLookup blockを
+反復再利用する構造へ進んだ。PonderNetのように学習時に全深度を展開すると
+CPU動的学習の利点が失われるため、実sampled trajectoryだけを実行・保存する
+hard haltingを採用した。
+
+目標計算量は、概念的には次式で表せる。
+
+```text
+C(x) ~= T(x) * L * (C_route + 2 * H * K * d)
+```
+
+- 容量はtable rows `S` に比例する。
+- active computeは選択行数 `K` に比例する。
+- 思考時間は入力依存深度 `T(x)` に比例する。
+
+### Phase C — Transformerとの比較から判明した不足
+
+単一carrierと長期Lookup memoryだけでは、現在入力の要素同士を直接結び付ける
+機構が不足していた。Transformerの本質は、単にAttention層を持つことではなく、
+入力ごとに有効な情報接続グラフを形成できる点にある。
+
+そこで、長期parameter memoryとは別に、入力固有episodic memoryと複数registerを
+導入する方針へ移った。
+
+### Phase D — Dense cross-attention案の棄却
+
+初期ViT案では、283 tokenすべてとのdense cross-attentionを検討・実装した。
+しかし、全QK scoreを計算した後にtop-k maskを掛ける方式は、論理的に疎でも
+物理計算は密であり、CPU特化という研究目的に反するため棄却した。
+
+採用条件を次のように固定した。
+
+- 全token score計算を禁止する。
+- dense maskを禁止する。
+- learned hash/WTAで有界候補を直接取得する。
+- 候補tokenだけを正確にscore・softmax・gatherする。
+- 選択edgeだけをbackwardする。
+- Lookup rowだけをsparse optimizerで更新する。
+
+### Phase E — barrierless scheduler
+
+Julia学習が約15% CPUしか使っていなかったため、数学モデルを変えず実行schedulerを
+改善した。
+
+比較した構成は次の通り。
+
+| 構成 | updates/s | 判定 |
+|---|---:|---|
+| 現行static | 23.19 | 基準 |
+| barrierless、pinningなし、chunk 8 | 27.35 | 当時最速 |
+| 全core CPU Sets固定 | 18.71 | 不採用 |
+| P-coreのみ8 worker | 26.67 | 次点 |
+
+Windowsでは論理CPU番号を固定せず、必要時にはCPU Sets APIからP/E分類する。
+ただし実測ではpinningなしが最速だった。最終schedulerは、全stateのcandidateを
+flattenし、20 workerが同じglobal queueからchunk 8で取得する。P/Eへ固定担当数を
+与えず、速いworkerが自然に多く処理する。
+
+### Phase F — schedulerだけでは解決しなかったallocation
+
+初期barrierless調整後もspeedupは1.18倍に留まった。
+
+- 134 MB allocation/update
+- GC時間 約46.6%
+- backward 約61%
+- queue wait 約26%
+
+queue単体試験は合格しており、主因はqueue correctnessではなかった。候補backwardの
+Dict、一時Vector/Matrix、gradient bufferをworker-local persistent scratchへ移した。
+
+### Phase G — 最初の固定batch過学習失敗
+
+update 1,000 checkpointから同じreal-teacher 4状態を100回反復したところ、
+loss低下は約4.04%だけだった。
+
+```text
+最初10更新 loss平均  3.8233
+最後10更新 loss平均  3.6688
+最終loss              3.6416
+ListNet               3.8037 -> 3.6496
+old-Q                 0.06548 -> 0.06482
+margin                0.000894 -> 0.000971
+平均再帰深度          2.206 -> 2.192
+```
+
+同じ4状態すら十分に記憶できないため、データ多様性や通常lossの揺れでは説明できず、
+学習系の構造的失敗と判定した。
+
+### Phase H — 過学習失敗の原因
+
+調査により、構想全体ではなく、実装が「関係形成前にhard routingで情報を捨てる」
+構造になっていたことが判明した。
+
+1. cell tokenは独立生成後に固定され、cell同士で局所情報を伝播・更新しなかった。
+2. learned Q/K/V/Oが実際の主要経路で使われていなかった。
+3. registerは283 tokenからhard routeされた少数tokenだけを読んだ。
+4. 相対位置表現がなく、空間relationは選択後の少数token内に限られた。
+5. cross-attention residual scaleが`0.03 -> 0.00255`へ縮み、入力経路が消えた。
+6. 未選択tokenへ勾配がなく、初期routeの誤りを修復できなかった。
+7. Lookup各blockは単一rowを約99.5%選択し、長期記憶がcollapseした。
+8. haltingは平均約2.26 stepのまま変化しなかった。
+
+### Phase I — 空間・信用割当の修正
+
+次の修正を行った。
+
+- 各cellをlocal-8近傍へ物理的に接続する。
+- cell memory自身を各再帰stepで更新する。
+- spatial attentionへ共有learned Q/K/V/Oを導入する。
+- 3x3相対位置biasを導入する。
+- candidate tokenをcross-attentionの必須supportへ含める。
+- cross residual scaleに正の下限を設け、入力経路の消失を防ぐ。
+- memory BPTTとtokenization VJPを実装する。
+- Lookupはallocation-freeなexact top-3を使用する。
+- 表現学習を確認するまでhaltingを深度2へ固定する。
+
+240 cell x 9近傍ならedgeは約2,160であり、dense 57,600 edgeを避けながら
+CNN相当の局所伝播と入力依存attentionを両立できる。
+
+### Phase J — 修正後の固定batch gate
+
+同じreal-teacher 4状態に対する過学習gateは、修正後に明確に合格した。
+
+```text
+ListNet  3.54684  -> 0.99465
+KL       2.56241  -> 0.010223
+old-Q    1.88590  -> 0.021857
+top-1    0        -> 1
+NDCG     0.70592  -> 1
+```
+
+これにより、少なくとも現行表現・backward・optimizerがreal teacher信号を
+実用的な強さで学習できることを確認した。
+
+### Phase K — serial/barrierless厳密一致
+
+更新2,000 checkpointから、serial oracleと20-worker barrierlessを独立restoreし、
+同じ4 training rowで1更新比較した。
+
+| 比較対象 | 最大絶対差 | relative L2 |
+|---|---:|---:|
+| output | 0 | 0 |
+| loss | 0 | 0 |
+| raw VJP | 0 | 0 |
+| parameter gradient | 1.84774399e-6 | 1.64699601e-6 |
+| optimizer後parameter | 1.84401870e-7 | 2.14590685e-9 |
+
+candidate seed、深度、halting、token edge、Lookup row、active mask、sparse event、
+optimizer clock、RNG、sampler stateは完全一致した。
+
+この過程で、barrierless postphaseのdense parameter registryから、新規Attention系
+14 parameterが漏れていた重大な実装バグも発見・修正した。
+
+### Phase L — postphase allocation修正
+
+正しい34-parameter registryを有効にすると、
+`Dict{Symbol,Array{Float32}}`による配列rankの型消去が露呈した。scalar SIMD loopで
+boxingが発生し、特にcanonical `cell_bias` replayのBool reductionだけで
+約72 MB/updateを割り当てていた。
+
+配列rankを具体化するtyped helperとsingle-pass replayへ変更した。
+
+| 指標 | 修正前 | 修正後 |
+|---|---:|---:|
+| scheduler throughput | 4.24 updates/s | 19.81 updates/s |
+| allocation | 156.6 MB/update | 5.62 MB/update |
+| executor allocation | 134.5 MB/update | 3.19 MB/update |
+| 測定GC時間 | 有意 | 0 s |
+
+修正後に厳密smokeを再実行し、上記一致を確認した。
+
+### Phase M — 本学習20,000更新
+
+更新2,000 checkpointから、同一model・optimizer・sampler状態をrestoreし、
+絶対target 20,000までtraining-onlyで継続した。
+
+```text
+追加更新                    18,000
+完了時consumed states       80,000
+resume segment実時間        862.323 s
+resume segment throughput   20.8738 updates/s
+candidates/s                3,644.27
+recurrent steps/s           7,288.54
+最終step composite loss     3.46772
+最終step ListNet            3.40899
+最終step old-Q              0.186227
+最終step margin             0.0546544
+```
+
+最終checkpoint:
+
+```text
+update  20000
+bytes   253663125
+sha256  1fc05d63154fc73e5d60367c2b19d63116a975b0a3a772899b7fd0ca382db28e
+```
+
+binary checkpointとteacher datasetはGitHubへcommitしない。公開記録にはサイズと
+SHA-256だけを残す。
+
+## 4. 現在確定していること
+
+### 確認済み
+
+- spatial episodic + Lookup再帰モデルは固定batchを明確に過学習できる。
+- serialとbarrierlessは許容誤差内で同じ数学的更新を行う。
+- active-only sparse backwardとsparse optimizer clockは維持されている。
+- warm benchmarkと本学習segmentは15 updates/sの受入条件を超える。
+- 20,000更新をcheckpoint互換性を保って完走した。
+
+### まだ証明していない
+
+- held teacher panelでの最終top-1、NDCG、margin。
+- 同一state数、同一wall-clockまたは同一計算予算でのPreAct超え。
+- learned hard haltingを再導入した場合の精度・速度Pareto改善。
+- route collapseを抑えながら長期bank容量を十分利用できる最終設定。
+- game validationおよびsealed seedでの強さ。
+
+validation `8001:8008` とsealed seed `91001:91032`は未使用のままである。
+
+## 5. 次の研究段階
+
+1. 許可されたheld teacher評価で、update 20,000のtop-1、NDCG、marginを測る。
+2. PreActと完全に同じ入力、教師、state数、時間または計算予算で比較する。
+3. routing entropy、unique row利用率、popular-row集中を測る。
+4. fixed depth 2を基準に、hard haltingを段階的に再導入する。
+5. input-dependent relation、parameter path、thinking timeの三軸が、実計算量でも
+   動的であることをablationで示す。
+6. checkpointを変更せず、CPU wall-clock、RAM、allocation、GC、tail latencyを
+   Pareto評価する。
+
+## 6. 実装・記録への入口
+
+- 現行モデル:
+  [`experiments/beat_first_v1/episodic_vit_recurrent_lookup`](experiments/beat_first_v1/episodic_vit_recurrent_lookup)
+- 数値結果:
+  [`RESULTS_2026-07-20.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/RESULTS_2026-07-20.md)
+- 全実験ledger:
+  [`EXPERIMENT_LEDGER.md`](experiments/beat_first_v1/EXPERIMENT_LEDGER.md)
+- 旧DSRLN:
+  [`dynamic_sparse_recurrent_lookup`](experiments/beat_first_v1/dynamic_sparse_recurrent_lookup)
+- 旧Lookup/SLIDE CPU基盤:
+  [`residual_lookup_slide`](experiments/beat_first_v1/residual_lookup_slide)
+- 3層疎modelとrouting派生:
+  [`sparse_dynamic_3layer`](experiments/beat_first_v1/sparse_dynamic_3layer)
+- barrierless executor:
+  [`barrierless_executor.jl`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/barrierless_executor.jl)
+- correctness smoke:
+  [`barrierless_correctness_smoke.jl`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/barrierless_correctness_smoke.jl)

@@ -18,6 +18,10 @@ Earlier sparse models, routing experiments, CPU scheduler work, comparison
 harnesses, and failed experiments are retained under
 [`experiments/beat_first_v1`](experiments/beat_first_v1).
 
+The complete Japanese research narrative, including rejected designs and
+failed overfit tests, is preserved in
+[`RESEARCH_TRAJECTORY.md`](RESEARCH_TRAJECTORY.md).
+
 ## Latest verified milestone
 
 On 2026-07-20 the repaired spatial episodic model completed 20,000 optimizer
