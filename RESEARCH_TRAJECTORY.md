@@ -428,3 +428,19 @@ top-1 `0.71875`、NDCG `0.99161`を得た。from-scratch版もtop-1を初期
 全条件、速度、checkpoint witnessは
 [`DYNAMIC_RECURRENCE_ACTIVATION_2026-07-21.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/DYNAMIC_RECURRENCE_ACTIVATION_2026-07-21.md)
 に記録した。
+
+## 18. 2026-07-22 — 固定architectureの100k hyperparameter tuning
+
+architecture・入力・教師・loss構成・sampler seed・held panelを固定し、scalar
+optimizer／weight decay／routing schedule／halting係数だけを一軸ずつ変更する
+100,000-update tuningを開始した。各試行の終了後に結果を記録・pushしてから次を
+開始する。
+
+Trial 1として既存固定深度baselineを80,000から100,000へ完走した。最終heldは
+loss `2.581711`、top-1 `0.71875`、NDCG `0.991801`、pairwise `0.906227`、
+margin `0.146405`。top-1最高値は85,000時点の`0.734375`だった。80k以降の
+学習部は`626.58 s`、`31.92 updates/s`である。
+
+全試行ledgerとcheckpoint witnessは
+[`HYPERPARAMETER_TUNING_2026-07-22.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/HYPERPARAMETER_TUNING_2026-07-22.md)
+へ逐次追記する。
