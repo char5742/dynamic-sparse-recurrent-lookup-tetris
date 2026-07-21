@@ -444,3 +444,9 @@ margin `0.146405`。top-1最高値は85,000時点の`0.734375`だった。80k以
 全試行ledgerとcheckpoint witnessは
 [`HYPERPARAMETER_TUNING_2026-07-22.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/HYPERPARAMETER_TUNING_2026-07-22.md)
 へ逐次追記する。
+
+Trial 2ではattention／FFN／token／register／head LRだけを`2e-4`から
+`1.5e-4`へ下げ、同一seedでfrom-scratch 100,000更新を実施した。最終heldは
+loss `2.609035`、top-1 `0.69531`、NDCG `0.989974`、pairwise `0.896181`、
+margin `0.123212`で、Trial 1より全指標が悪化した。低LRでもtop-1振動は残り、
+単純なdense更新振幅が主因ではなかったため不採用とした。

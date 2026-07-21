@@ -79,3 +79,71 @@ metrics.jsonl sha256:
 ```
 
 Binary checkpoints and teacher data are not committed to Git.
+
+## Trial 2 — dense representation LR 0.75x
+
+This from-scratch trial changed only five dense representation learning rates
+from `2e-4` to `1.5e-4`: attention, FFN, token/visual, register, and output
+head. Bank LR remained `2e-4`, router LR `4e-4`, Lookup residual-alpha LR
+`2e-4`, dense weight decay `1e-4`, and all architecture, seed, data, loss,
+routing schedule, and fixed-depth settings matched Trial 1.
+
+### Held-panel curve
+
+| Update | Loss | Top-1 | NDCG | Pairwise | Margin |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 8.395339 | 0.21875 | 0.860435 | 0.546154 | 0.040159 |
+| 5,000 | 2.856116 | 0.53906 | 0.978386 | 0.837953 | 0.057290 |
+| 10,000 | 2.810584 | 0.51562 | 0.979042 | 0.845513 | 0.072452 |
+| 15,000 | 2.813538 | 0.50781 | 0.980807 | 0.850272 | 0.070100 |
+| 20,000 | 2.791762 | 0.54688 | 0.981539 | 0.853233 | 0.064467 |
+| 25,000 | 2.763789 | 0.53906 | 0.981845 | 0.860536 | 0.089816 |
+| 30,000 | 2.747787 | 0.54688 | 0.980351 | 0.858367 | 0.089927 |
+| 35,000 | 2.742353 | 0.53125 | 0.981982 | 0.865703 | 0.101573 |
+| 40,000 | 2.732583 | 0.52344 | 0.980848 | 0.865115 | 0.114253 |
+| 45,000 | 2.710017 | 0.53906 | 0.982928 | 0.871285 | 0.114947 |
+| 50,000 | 2.706551 | 0.54688 | 0.981505 | 0.869971 | 0.116825 |
+| 55,000 | 2.684257 | 0.59375 | 0.985780 | 0.874209 | 0.103992 |
+| 60,000 | 2.672819 | 0.59375 | 0.985924 | 0.876116 | 0.107469 |
+| 65,000 | 2.655602 | 0.64062 | 0.986628 | 0.883175 | 0.114273 |
+| 70,000 | 2.671004 | 0.58594 | 0.986522 | 0.883175 | 0.115489 |
+| 75,000 | 2.652258 | 0.66406 | 0.987261 | 0.888353 | 0.132376 |
+| 80,000 | 2.641293 | 0.65625 | 0.987924 | 0.891672 | 0.127088 |
+| 85,000 | 2.652183 | 0.66406 | 0.987357 | 0.888313 | 0.144588 |
+| 90,000 | 2.617375 | 0.67969 | 0.989205 | 0.893652 | 0.119101 |
+| 95,000 | 2.614602 | 0.65625 | 0.989280 | 0.894817 | 0.125980 |
+| 100,000 | **2.609035** | **0.69531** | **0.989974** | **0.896181** | 0.123212 |
+
+### Decision
+
+Trial 2 is rejected. Relative to the Trial-1 final checkpoint, its loss was
+`+0.027324`, top-1 `-0.023438`, NDCG `-0.001828`, pairwise accuracy
+`-0.010046`, and margin `-0.023193`. Lowering the dense LR did not remove
+top-1 oscillation: top-1 fell from `0.64062` at 65k to `0.58594` at 70k and
+from `0.66406` at 85k to `0.65625` at 95k. The intervention mainly delayed
+learning and remained behind the baseline at the equal 100k budget.
+
+The next trial restores all baseline learning rates and changes only dense
+weight decay from `1e-4` to `3e-4`. The baseline has a held/training loss gap
+at 100k, so this tests stronger regularization without slowing early updates.
+
+### Runtime and witnesses
+
+```text
+run:
+  D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_hp_dense075_fixed2_u100000_20260722_r1
+
+training time:       3,138.017562 s
+updates/s:           31.867253
+states/s:            127.469013
+average CPU:         74.8478%
+candidate CPU:       77.7877%
+
+checkpoint:
+  D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_hp_dense075_fixed2_u100000_20260722_r1\checkpoints\checkpoint_000100000.jls
+sha256: 6cac26cd4b7b88ddde9f5f4a941cd8fa5215a2a0d103e43254a989144de9e16e
+consumed real-teacher states: 400,000
+
+metrics.jsonl sha256:
+  79ec6d082692065f38b704d9c47e9705ce903da18fd33c1ed2e236e3900e1059
+```
