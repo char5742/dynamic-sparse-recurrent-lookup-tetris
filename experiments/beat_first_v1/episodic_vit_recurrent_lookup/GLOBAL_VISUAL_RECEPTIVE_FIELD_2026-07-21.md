@@ -143,3 +143,14 @@ sha256: a571db8dbb8c865a0c05a1695f58e7d9cd5db9b78475bcc759d196168c016b6e
 The binary checkpoint and teacher dataset are not committed. Machine-readable
 evaluation evidence is in
 [`visual_receptive_field_evaluation_2026-07-21.json`](visual_receptive_field_evaluation_2026-07-21.json).
+
+## Subsequent dynamic-recurrence study
+
+The fixed-depth model was later continued to update 80,000 and used for a
+controlled hard-halting activation study. Direct activation, a five-thousand
+update random-depth curriculum, halt-head reset, and dynamic training from
+scratch were all tested. Every final held-panel deterministic trajectory still
+stopped at depth two. The result isolates candidate-specific halting credit as
+the next required change; it does not invalidate the visual, episodic-memory,
+or LookupFFN body. See
+[`DYNAMIC_RECURRENCE_ACTIVATION_2026-07-21.md`](DYNAMIC_RECURRENCE_ACTIVATION_2026-07-21.md).

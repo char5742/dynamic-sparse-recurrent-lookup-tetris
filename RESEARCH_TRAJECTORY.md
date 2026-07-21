@@ -406,3 +406,25 @@ top-1 `-0.10156`、NDCG `-0.00743`で残るが、held CPU推論は`10.43x`速い
 詳細とcheckpoint hashは
 [`GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md)
 に記録した。
+
+## 17. 2026-07-21 — 動的再帰の再導入試験
+
+固定深度2で学習したupdate 80,000 checkpointから、(1) hard haltingの直接導入、
+(2) 深度2–6を5,000更新学習してからの導入、(3) halt headだけの初期化を比較した。
+さらに同じ最終architectureを、最初の5,000更新から深度2–6で学習する
+from-scratch動的modelも20,000更新まで実行した。
+
+直接導入はupdate 90,000でtop-1 `0.72656`、NDCG `0.99155`、深度curriculum版は
+top-1 `0.71875`、NDCG `0.99161`を得た。from-scratch版もtop-1を初期
+`0.21875`から`0.53906`へ改善した。しかし全方式でheld deterministic depthは
+全candidate一律2だった。halt headをprobability 0.4へ初期化すると一度は最大深度
+12へ崩れ、学習後は再び約2.4 stepへ戻った。
+
+したがって「途中導入だけ」が原因ではない。現行REINFORCEはstate-wide ranking lossを
+全candidate trajectoryへ同じ値で与えるため、candidate固有の追加1stepの価値を
+識別できない。prediction最終層を消すより、少数candidateのone-step probeで
+`loss(t) - loss(t+1)`を直接教えるhalting信用割当が次の最小修正である。
+
+全条件、速度、checkpoint witnessは
+[`DYNAMIC_RECURRENCE_ACTIVATION_2026-07-21.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/DYNAMIC_RECURRENCE_ACTIVATION_2026-07-21.md)
+に記録した。
