@@ -147,3 +147,80 @@ consumed real-teacher states: 400,000
 metrics.jsonl sha256:
   79ec6d082692065f38b704d9c47e9705ce903da18fd33c1ed2e236e3900e1059
 ```
+
+## Trial 3 — dense weight decay 3e-4
+
+This from-scratch trial restored every Trial-1 learning rate and changed only
+dense weight decay from `1e-4` to `3e-4`. Lookup-bank weight decay remained
+zero. Architecture, initialization, sampler, data order, loss, routing
+schedule, fixed depth, executor, and held panel were identical.
+
+### Held-panel curve
+
+| Update | Loss | Top-1 | NDCG | Pairwise | Margin |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 8.395339 | 0.21875 | 0.860435 | 0.546154 | 0.040159 |
+| 5,000 | 2.859876 | 0.53125 | 0.978856 | 0.841653 | 0.068698 |
+| 10,000 | 2.791346 | 0.52344 | 0.979932 | 0.850689 | 0.085665 |
+| 15,000 | 2.763028 | 0.57812 | 0.982595 | 0.861554 | 0.083727 |
+| 20,000 | 2.721600 | 0.60156 | 0.983539 | 0.867600 | 0.082771 |
+| 25,000 | 2.706555 | 0.58594 | 0.983643 | 0.870668 | 0.096921 |
+| 30,000 | 2.679362 | 0.64062 | 0.984503 | 0.876927 | 0.118946 |
+| 35,000 | 2.655379 | 0.71875 | 0.987099 | 0.882533 | 0.115824 |
+| 40,000 | 2.676071 | 0.64844 | 0.985641 | 0.878742 | 0.136712 |
+| 45,000 | 2.619821 | 0.69531 | 0.988658 | 0.886064 | 0.122701 |
+| 50,000 | 2.639295 | 0.64844 | 0.986502 | 0.885248 | 0.135180 |
+| 55,000 | 2.615425 | 0.74219 | 0.989078 | 0.889951 | 0.125065 |
+| 60,000 | 2.611532 | 0.69531 | 0.988770 | 0.890968 | 0.134419 |
+| 65,000 | 2.601829 | 0.73438 | 0.989487 | 0.896681 | 0.127673 |
+| 70,000 | 2.618289 | 0.68750 | 0.989011 | 0.894113 | 0.126324 |
+| 75,000 | 2.605750 | 0.75000 | 0.989422 | 0.897922 | 0.125464 |
+| 80,000 | 2.594070 | 0.72656 | 0.990411 | 0.900268 | 0.119268 |
+| 85,000 | 2.598925 | 0.73438 | 0.990028 | 0.900217 | 0.136233 |
+| 90,000 | **2.591153** | 0.74219 | **0.990525** | **0.901540** | 0.128988 |
+| 95,000 | 2.598547 | 0.71875 | 0.989788 | 0.900674 | **0.144499** |
+| 100,000 | 2.607862 | **0.80469** | 0.990137 | 0.898083 | 0.144283 |
+
+### Decision
+
+Trial 3 is promising for top-1 but is not a clean all-metric replacement for
+Trial 1. Its final top-1 `0.8046875` exceeds Trial 1 by `0.0859375` and the
+same-panel PreAct result `0.7890625` by `0.015625`. This is the first EVRL
+checkpoint to exceed that PreAct top-1 result under the recorded held-panel
+conditions.
+
+The continuous ranking metrics are weaker than Trial 1: final loss is
+`+0.026151`, NDCG `-0.001664`, pairwise accuracy `-0.008143`, and margin
+`-0.002122`. Across all five evaluations from 80k through 100k, Trial 3
+averages top-1 `0.74531` versus Trial 1's `0.71563`, but averages loss
+`2.59811` versus `2.58709` and NDCG `0.99018` versus `0.99120`.
+
+Therefore `3e-4` is retained as the current top-1 arm, not declared a universal
+winner. Because this held panel has now guided tuning, the PreAct crossing is
+development evidence rather than a sealed generalization claim. Game
+validation and sealed seeds remain untouched.
+
+The next trial interpolates dense weight decay to `2e-4`, retaining baseline
+learning rates. It tests whether the top-1 benefit can be preserved while
+recovering Trial-1 loss, NDCG, and pairwise accuracy.
+
+### Runtime and witnesses
+
+```text
+run:
+  D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_hp_densewd3e4_fixed2_u100000_20260722_r1
+
+training time:       3,202.446105 s
+updates/s:           31.226131
+states/s:            124.904522
+average CPU:         74.6048%
+candidate CPU:       77.3738%
+
+checkpoint:
+  D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_hp_densewd3e4_fixed2_u100000_20260722_r1\checkpoints\checkpoint_000100000.jls
+sha256: 51b008ea66041da9cfeb7b005a62e75f6d4f06a0a5a9dde94bc4c47653e51912
+consumed real-teacher states: 400,000
+
+metrics.jsonl sha256:
+  48480aabeb8a0a8e2762888dfbdb9a90d3b906a1569ae7611295d7f8e96b5440
+```

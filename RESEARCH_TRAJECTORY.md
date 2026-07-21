@@ -450,3 +450,10 @@ Trial 2ではattention／FFN／token／register／head LRだけを`2e-4`から
 loss `2.609035`、top-1 `0.69531`、NDCG `0.989974`、pairwise `0.896181`、
 margin `0.123212`で、Trial 1より全指標が悪化した。低LRでもtop-1振動は残り、
 単純なdense更新振幅が主因ではなかったため不採用とした。
+
+Trial 3ではbaseline LRを復元し、dense weight decayだけを`1e-4`から`3e-4`へ
+変更した。100,000更新の最終held top-1は`0.8046875`となり、Trial 1を
+`+0.0859375`、同panelのPreAct `0.7890625`を`+0.015625`上回った。一方で
+loss `2.607862`、NDCG `0.990137`、pairwise `0.898083`はTrial 1より悪く、
+top-1に限定された改善である。tuningに使用したheld panel上の結果であり、sealed
+generalizationの証明ではない。game validation／sealed seedは未使用である。
