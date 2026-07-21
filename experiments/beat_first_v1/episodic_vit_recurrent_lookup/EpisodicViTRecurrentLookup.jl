@@ -137,6 +137,10 @@ const MAX_RECURRENT_STEPS = SparseLookup.MAX_RECURRENT_STEPS
 const WARMUP_MAX_STEPS = SparseLookup.WARMUP_MAX_STEPS
 const BLOCKS = SparseLookup.BLOCKS
 const LOCAL_SPATIAL_NEIGHBORS = 8
+const VISUAL_CHANNELS = 3
+const VISUAL_STAGES = 5
+const VISUAL_DILATIONS = (1, 2, 4, 8, 16)
+const VISUAL_RECEPTIVE_FIELD = 1 + 2 * sum(VISUAL_DILATIONS)
 const CANDIDATE_SUPPORT_CAP = let raw = strip(get(
     ENV, "EVRL_CANDIDATE_SUPPORT_CAP", "4",
 ))
@@ -241,11 +245,18 @@ end
 mutable struct EpisodicViTLookupModel
     lookup::SparseLookup.DynamicLookupModel
 
-    # Per-cell tokens: direct [board, candidate, difference] projection plus
-    # learned absolute row/column position.  There is no convolution or sketch.
+    # Per-cell tokens retain the direct [board, candidate, difference]
+    # projection and add a deliberately small visual stem: one learned 3x3
+    # depthwise kernel per raw channel followed by a 3 -> MODEL_DIM pointwise
+    # linear map.  The stem is residual, shared over the board, and does not
+    # touch NEXT/HOLD or aux tokens.
     cell_projection::Matrix{Float32}
     cell_bias::Vector{Float32}
     cell_position::Matrix{Float32}
+    visual_depthwise::Array{Float32,4}
+    visual_channel_mix::Array{Float32,3}
+    visual_pointwise::Matrix{Float32}
+    visual_scale_logit::Vector{Float32}
 
     # Six independent HOLD/NEXT tokens and 37 independent scalar aux tokens.
     next_projection::Matrix{Float32}
@@ -255,8 +266,6 @@ mutable struct EpisodicViTLookupModel
     aux_position::Matrix{Float32}
 
     register_seed::Matrix{Float32}
-    token_router::Matrix{Float32}
-    register_router::Matrix{Float32}
 
     # Shared sparse spatial block.  Every recurrent step updates the 24x10
     # cell memory over the physically materialized 8-neighbour graph.  No
@@ -304,6 +313,17 @@ function initialize_model(rng::AbstractRNG=Xoshiro(0))
         INITIAL_HALT_PROBABILITY / (1.0f0 - INITIAL_HALT_PROBABILITY),
     )
     cell_projection = _xavier(rng, MODEL_DIM, 3)
+    visual_depthwise = zeros(Float32, 3, 3, VISUAL_CHANNELS, VISUAL_STAGES)
+    visual_channel_mix = zeros(Float32, VISUAL_CHANNELS, VISUAL_CHANNELS, VISUAL_STAGES)
+    visual_blur = Float32[1 2 1; 2 4 2; 1 2 1] ./ 16.0f0
+    @inbounds for stage in 1:VISUAL_STAGES, channel in 1:VISUAL_CHANNELS
+        visual_depthwise[:, :, channel, stage] .= visual_blur
+        visual_channel_mix[channel, channel, stage] = 1.0f0
+    end
+    visual_channel_mix .+= 0.01f0 .* randn(
+        rng, Float32, VISUAL_CHANNELS, VISUAL_CHANNELS, VISUAL_STAGES,
+    )
+    visual_pointwise = _xavier(rng, MODEL_DIM, VISUAL_CHANNELS)
     next_projection = _xavier(rng, MODEL_DIM, PIECE_TYPES)
     aux_value = randn(rng, Float32, MODEL_DIM, AUX_FEATURES) .* inv(sqrt(Float32(MODEL_DIM)))
     position_scale = 0.02f0
@@ -313,14 +333,16 @@ function initialize_model(rng::AbstractRNG=Xoshiro(0))
         cell_projection,
         zeros(Float32, MODEL_DIM),
         randn(rng, Float32, MODEL_DIM, CELL_COUNT) .* position_scale,
+        visual_depthwise,
+        visual_channel_mix,
+        visual_pointwise,
+        Float32[INITIAL_RESIDUAL_LOGIT],
         next_projection,
         zeros(Float32, MODEL_DIM),
         randn(rng, Float32, MODEL_DIM, NEXT_HOLD_TOKENS) .* position_scale,
         aux_value,
         randn(rng, Float32, MODEL_DIM, AUX_FEATURES) .* position_scale,
         register_seed,
-        _xavier(rng, EPISODIC_ROUTER_BLOCK_WIDTH, EPISODIC_ROUTER_DIM),
-        _xavier(rng, EPISODIC_ROUTER_BLOCK_WIDTH, EPISODIC_ROUTER_DIM),
         _xavier(rng, SPATIAL_PROJECTION_BLOCK_WIDTH, ATTENTION_DIM),
         _xavier(rng, SPATIAL_PROJECTION_BLOCK_WIDTH, ATTENTION_DIM),
         _xavier(rng, SPATIAL_PROJECTION_BLOCK_WIDTH, ATTENTION_DIM),
@@ -351,14 +373,16 @@ function _dense_parameters(model::EpisodicViTLookupModel)
         cell_projection=model.cell_projection,
         cell_bias=model.cell_bias,
         cell_position=model.cell_position,
+        visual_depthwise=model.visual_depthwise,
+        visual_channel_mix=model.visual_channel_mix,
+        visual_pointwise=model.visual_pointwise,
+        visual_scale_logit=model.visual_scale_logit,
         next_projection=model.next_projection,
         next_bias=model.next_bias,
         next_position=model.next_position,
         aux_value=model.aux_value,
         aux_position=model.aux_position,
         register_seed=model.register_seed,
-        token_router=model.token_router,
-        register_router=model.register_router,
         spatial_q=model.spatial_q,
         spatial_k=model.spatial_k,
         spatial_v=model.spatial_v,
@@ -392,7 +416,19 @@ function topology(model::EpisodicViTLookupModel)
     return (;
         architecture="episodic-vit-recurrent-active-lookup",
         input_contract="preact-board-candidate-difference-next-hold-aux37",
-        spatial_encoder="shared-recurrent-learned-qkvo-8-neighbour-sparse-cell-attention-no-cnn-no-countsketch",
+        spatial_encoder="light-global-receptive-field-dilated-depthwise-pointwise-visual-stack-plus-shared-recurrent-learned-qkvo-8-neighbour-sparse-cell-attention-no-countsketch",
+        visual_stem="raw3-five-stage-dilated-depthwise3x3-silu-pointwise3x3-residual-then-pointwise3-to-model-dim",
+        visual_dilations=VISUAL_DILATIONS,
+        visual_receptive_field=(VISUAL_RECEPTIVE_FIELD, VISUAL_RECEPTIVE_FIELD),
+        visual_stem_parameters=length(model.visual_depthwise) +
+            length(model.visual_channel_mix) +
+            length(model.visual_pointwise) + length(model.visual_scale_logit),
+        visual_stem_scalar_macs_per_candidate=
+            CELL_COUNT * (
+                VISUAL_STAGES * (
+                    VISUAL_CHANNELS * 9 + VISUAL_CHANNELS * VISUAL_CHANNELS
+                ) + VISUAL_CHANNELS * MODEL_DIM
+            ),
         episodic_tokens=TOKEN_COUNT,
         cell_tokens=CELL_COUNT,
         next_hold_tokens=NEXT_HOLD_TOKENS,
@@ -402,43 +438,22 @@ function topology(model::EpisodicViTLookupModel)
         attention_dim=ATTENTION_DIM,
         attention_heads=ATTENTION_HEADS,
         ffn_dim=FFN_DIM,
-        recurrent_block="shared-register-token-lookup-anchor-token-lookup-register-relation-swiglu-pooled-active-lookup",
-        episodic_router="learned-block-diagonal-sign-wta-bounded-candidate-retrieval",
-        episodic_router_tables=EPISODIC_ROUTER_TABLES,
-        episodic_router_bits=EPISODIC_ROUTER_BITS,
-        episodic_bucket_cap=EPISODIC_BUCKET_CAP,
-        episodic_root_cap=EPISODIC_ROOT_CAP,
-        episodic_candidate_cap=EPISODIC_CANDIDATE_CAP,
-        episodic_shortlist=EPISODIC_SHORTLIST,
-        episodic_attention="bounded-candidate-learned-qkvo-exact-topk-softmax-gather",
-        episodic_projected_token_occurrences_per_step=0,
-        episodic_qk_pairs_per_step=REGISTER_COUNT * EPISODIC_CANDIDATE_CAP,
-        episodic_exact_rerank_pairs_per_step=REGISTER_COUNT * EPISODIC_CANDIDATE_CAP,
-        episodic_gather_rows_per_step=REGISTER_COUNT * EPISODIC_SHORTLIST,
+        recurrent_block="shared-full-token-cross-register-self-swiglu-pooled-active-lookup",
+        episodic_router="none-full-token-cross-attention",
+        episodic_attention="shared-learned-qkvo-full-283-token-softmax",
+        episodic_projected_token_occurrences_per_step=TOKEN_COUNT,
+        episodic_qk_pairs_per_step=REGISTER_COUNT * TOKEN_COUNT,
+        episodic_exact_rerank_pairs_per_step=0,
+        episodic_gather_rows_per_step=REGISTER_COUNT * TOKEN_COUNT,
         episodic_exact_dot_scalar_macs_per_step=
-            REGISTER_COUNT * EPISODIC_CANDIDATE_CAP * MODEL_DIM,
+            REGISTER_COUNT * TOKEN_COUNT * ATTENTION_DIM,
         episodic_weighted_gather_scalar_macs_per_step=
-            REGISTER_COUNT * EPISODIC_SHORTLIST * MODEL_DIM,
-        episodic_router_scalar_macs_per_trajectory=
-            EPISODIC_ROUTER_DIM * EPISODIC_ROUTER_BLOCK_WIDTH * TOKEN_COUNT,
-        episodic_retrieval_entry_reads_upper_bound_per_step=
-            REGISTER_COUNT * (
-                EPISODIC_ROUTER_TABLES * (EPISODIC_ROUTER_BITS + 1) *
-                EPISODIC_BUCKET_CAP + EPISODIC_ROOT_CAP
-            ),
-        spatial_relation="physical-8-neighbour-relative-position-learned-qkvo-plus-bounded-routed-relations",
+            REGISTER_COUNT * TOKEN_COUNT * ATTENTION_DIM,
+        episodic_router_scalar_macs_per_trajectory=0,
+        episodic_retrieval_entry_reads_upper_bound_per_step=0,
+        spatial_relation="physical-8-neighbour-relative-position-learned-qkvo",
         spatial_local_edges_upper_bound=CELL_COUNT * LOCAL_SPATIAL_NEIGHBORS,
-        candidate_support_cap=CANDIDATE_SUPPORT_CAP,
-        spatial_anchors_per_register=SPATIAL_ANCHORS,
-        spatial_candidate_cap=SPATIAL_CANDIDATE_CAP,
-        spatial_shortlist=SPATIAL_SHORTLIST,
-        spatial_unique_anchor_upper_bound=REGISTER_COUNT * SPATIAL_ANCHORS,
-        spatial_exact_rerank_pairs_upper_bound_per_step=
-            REGISTER_COUNT * SPATIAL_ANCHORS * SPATIAL_CANDIDATE_CAP,
-        spatial_gather_rows_upper_bound_per_step=
-            REGISTER_COUNT * SPATIAL_ANCHORS * SPATIAL_SHORTLIST,
-        spatial_exact_dot_scalar_macs_upper_bound_per_step=
-            REGISTER_COUNT * SPATIAL_ANCHORS * SPATIAL_CANDIDATE_CAP * MODEL_DIM,
+        candidate_support_cap=0,
         spatial_dense_all_token_scores=0,
         long_memory_carriers_per_step=1,
         long_memory_micro_calls_per_step=BLOCKS,
@@ -455,17 +470,99 @@ function topology(model::EpisodicViTLookupModel)
     )
 end
 
+@inline function _visual_input_channel(
+    input::EpisodicCandidateInput,
+    row::Int,
+    column::Int,
+    channel::Int,
+)
+    channel == 1 && return input.board[row, column]
+    channel == 2 && return input.candidate[row, column]
+    return input.difference[row, column]
+end
+
+function _visual_stack_forward_tokens!(tokens, model, input)
+    @inbounds for column in 1:BOARD_WIDTH, row in 1:BOARD_HEIGHT
+        token = (column - 1) * BOARD_HEIGHT + row
+        for channel in 1:VISUAL_CHANNELS
+            tokens[channel, token] = _visual_input_channel(
+                input, row, column, channel,
+            )
+        end
+    end
+    source_offset = 0
+    target_offset = VISUAL_CHANNELS
+    @inbounds for stage in 1:VISUAL_STAGES
+        dilation = VISUAL_DILATIONS[stage]
+        for column in 1:BOARD_WIDTH, row in 1:BOARD_HEIGHT
+            token = (column - 1) * BOARD_HEIGHT + row
+            pre_1 = 0.0f0
+            pre_2 = 0.0f0
+            pre_3 = 0.0f0
+            for delta_column in -1:1, delta_row in -1:1
+                source_row = row + dilation * delta_row
+                source_column = column + dilation * delta_column
+                1 <= source_row <= BOARD_HEIGHT || continue
+                1 <= source_column <= BOARD_WIDTH || continue
+                source_token = (source_column - 1) * BOARD_HEIGHT + source_row
+                pre_1 = muladd(
+                    model.visual_depthwise[
+                        delta_row + 2, delta_column + 2, 1, stage,
+                    ],
+                    tokens[source_offset + 1, source_token], pre_1,
+                )
+                pre_2 = muladd(
+                    model.visual_depthwise[
+                        delta_row + 2, delta_column + 2, 2, stage,
+                    ],
+                    tokens[source_offset + 2, source_token], pre_2,
+                )
+                pre_3 = muladd(
+                    model.visual_depthwise[
+                        delta_row + 2, delta_column + 2, 3, stage,
+                    ],
+                    tokens[source_offset + 3, source_token], pre_3,
+                )
+            end
+            visual_1 = _swish(pre_1)
+            visual_2 = _swish(pre_2)
+            visual_3 = _swish(pre_3)
+            for output_channel in 1:VISUAL_CHANNELS
+                mixed = model.visual_channel_mix[output_channel, 1, stage] *
+                    visual_1 +
+                    model.visual_channel_mix[output_channel, 2, stage] *
+                    visual_2 +
+                    model.visual_channel_mix[output_channel, 3, stage] *
+                    visual_3
+                tokens[target_offset + output_channel, token] = mixed +
+                    tokens[source_offset + output_channel, token]
+            end
+        end
+        source_offset, target_offset = target_offset, source_offset
+    end
+    return source_offset
+end
+
 function _tokenize!(tokens::Matrix{Float32}, model, input::EpisodicCandidateInput)
     size(tokens) == (MODEL_DIM, TOKEN_COUNT) ||
         throw(DimensionMismatch("episodic token buffer shape changed"))
     token = 0
+    visual_offset = _visual_stack_forward_tokens!(tokens, model, input)
+    visual_alpha = _residual_scale(model.visual_scale_logit[1])
     @inbounds for column in 1:BOARD_WIDTH, row in 1:BOARD_HEIGHT
         token += 1
         board = input.board[row, column]
         candidate = input.candidate[row, column]
         difference = input.difference[row, column]
+        visual_1 = tokens[visual_offset + 1, token]
+        visual_2 = tokens[visual_offset + 2, token]
+        visual_3 = tokens[visual_offset + 3, token]
         @simd for coordinate in 1:MODEL_DIM
-            tokens[coordinate, token] = model.cell_bias[coordinate] +
+            visual = model.visual_pointwise[coordinate, 1] * visual_1 +
+                model.visual_pointwise[coordinate, 2] * visual_2 +
+                model.visual_pointwise[coordinate, 3] * visual_3
+            tokens[coordinate, token] = visual_alpha * visual +
+                model.cell_bias[coordinate] +
                 model.cell_position[coordinate, token] +
                 model.cell_projection[coordinate, 1] * board +
                 model.cell_projection[coordinate, 2] * candidate +
@@ -970,33 +1067,28 @@ struct CrossAttentionTape
     input::Matrix{Float32}
     normalized::Matrix{Float32}
     inverse_rms::Vector{Float32}
-    register_route::Matrix{Float32}
-    token_route::Matrix{Float32}
-    selected_ids::Matrix{Int16}
-    mandatory_count::Int8
     query::Matrix{Float32}
-    key::Array{Float32,3}
-    value::Array{Float32,3}
+    key::Matrix{Float32}
+    value::Matrix{Float32}
     attention_weights::Array{Float32,3}
     attention_context::Matrix{Float32}
     output::Matrix{Float32}
     alpha::Float32
 end
 
-"""Candidate-owned storage for one sparse register-to-token cross step."""
+"""Candidate-owned storage for one full register-to-token cross step.
+
+The 283 token K/V projections are materialized exactly once per recurrent
+step and shared by every register.  No candidate retrieval, hard top-k, dense
+mask, or token-routing parameter participates in this path.
+"""
 struct CrossAttentionForwardScratch
     input::Matrix{Float32}
     normalized::Matrix{Float32}
     inverse_rms::Vector{Float32}
-    register_route::Matrix{Float32}
-    token_route::Matrix{Float32}
-    candidate_ids::Matrix{Int16}
-    candidate_seen::Matrix{Bool}
-    selected_ids::Matrix{Int16}
-    selection_scores::Matrix{Float32}
     query::Matrix{Float32}
-    key::Array{Float32,3}
-    value::Array{Float32,3}
+    key::Matrix{Float32}
+    value::Matrix{Float32}
     attention_weights::Array{Float32,3}
     attention_context::Matrix{Float32}
     output::Matrix{Float32}
@@ -1008,18 +1100,10 @@ CrossAttentionForwardScratch() = CrossAttentionForwardScratch(
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
     Vector{Float32}(undef, REGISTER_COUNT),
-    Matrix{Float32}(undef, EPISODIC_ROUTER_DIM, REGISTER_COUNT),
-    Matrix{Float32}(undef, EPISODIC_ROUTER_DIM, TOKEN_COUNT),
-    Matrix{Int16}(undef, EPISODIC_CANDIDATE_CAP, REGISTER_COUNT),
-    Matrix{Bool}(undef, TOKEN_COUNT, REGISTER_COUNT),
-    Matrix{Int16}(undef, EPISODIC_SHORTLIST, REGISTER_COUNT),
-    Matrix{Float32}(undef, EPISODIC_SHORTLIST, REGISTER_COUNT),
     Matrix{Float32}(undef, ATTENTION_DIM, REGISTER_COUNT),
-    Array{Float32}(undef, ATTENTION_DIM, EPISODIC_SHORTLIST, REGISTER_COUNT),
-    Array{Float32}(undef, ATTENTION_DIM, EPISODIC_SHORTLIST, REGISTER_COUNT),
-    Array{Float32}(
-        undef, EPISODIC_SHORTLIST, REGISTER_COUNT, ATTENTION_HEADS,
-    ),
+    Matrix{Float32}(undef, ATTENTION_DIM, TOKEN_COUNT),
+    Matrix{Float32}(undef, ATTENTION_DIM, TOKEN_COUNT),
+    Array{Float32}(undef, TOKEN_COUNT, REGISTER_COUNT, ATTENTION_HEADS),
     Matrix{Float32}(undef, ATTENTION_DIM, REGISTER_COUNT),
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
@@ -1331,15 +1415,9 @@ function _attention_context!(weights, context, query, key, value)
     return context
 end
 
-function _cross_attention_forward(
-    model, registers, memory_normalized, token_route, buckets,
-    candidate_support_ids, candidate_support_count::Int,
-)
-    scratch = CrossAttentionForwardScratch()
-    copyto!(scratch.token_route, token_route)
+function _cross_attention_forward(model, registers, memory_normalized)
     return _cross_attention_forward!(
-        scratch, model, registers, memory_normalized, buckets,
-        candidate_support_ids, candidate_support_count,
+        CrossAttentionForwardScratch(), model, registers, memory_normalized,
     )
 end
 
@@ -1349,164 +1427,41 @@ function _cross_attention_forward!(
     model,
     registers,
     memory_normalized,
-    buckets,
-    candidate_support_ids,
-    candidate_support_count::Int,
 )
-    input = scratch.input
-    normalized = scratch.normalized
-    inverse_rms = scratch.inverse_rms
-    copyto!(input, registers)
-    copyto!(normalized, registers)
-    _rmsnorm_columns!(normalized, inverse_rms)
-    register_route = scratch.register_route
-    _structured_router_forward!(register_route, model.register_router, normalized)
-    candidate_ids = scratch.candidate_ids
-    _retrieve_candidates!(
-        candidate_ids, scratch.candidate_seen, buckets, register_route,
+    copyto!(scratch.input, registers)
+    copyto!(scratch.normalized, registers)
+    _rmsnorm_columns!(scratch.normalized, scratch.inverse_rms)
+
+    # Project every episodic token once.  Every register then attends the same
+    # complete, input-specific memory with exact multi-head softmax.
+    mul!(scratch.query, model.cross_q, scratch.normalized)
+    mul!(scratch.key, model.cross_k, memory_normalized)
+    mul!(scratch.value, model.cross_v, memory_normalized)
+    _attention_context!(
+        scratch.attention_weights,
+        scratch.attention_context,
+        scratch.query,
+        scratch.key,
+        scratch.value,
     )
-    selected_ids = scratch.selected_ids
-    scores = scratch.selection_scores
-    fill!(selected_ids, typemax(Int16))
-    fill!(scores, -Inf32)
-    scale = inv(sqrt(Float32(MODEL_DIM)))
-    mandatory_count = min(candidate_support_count, EPISODIC_SHORTLIST)
-    @inbounds for register in 1:REGISTER_COUNT
-        for support_index in 1:mandatory_count
-            token16 = candidate_support_ids[support_index]
-            token = Int(token16)
-            score = 0.0f0
-            @simd for coordinate in 1:MODEL_DIM
-                score = muladd(
-                    normalized[coordinate, register],
-                    memory_normalized[coordinate, token], score,
-                )
-            end
-            selected_ids[support_index, register] = token16
-            scores[support_index, register] = score * scale
-        end
-        # Exact-score the bounded retrieved set, then retain only K rows.
-        # Insertion order is deterministic: descending score, ascending token ID.
-        for candidate_index in 1:EPISODIC_CANDIDATE_CAP
-            token16 = candidate_ids[candidate_index, register]
-            token = Int(token16)
-            duplicate = false
-            for support_index in 1:mandatory_count
-                duplicate |= token16 == candidate_support_ids[support_index]
-            end
-            duplicate && continue
-            score = 0.0f0
-            @simd for coordinate in 1:MODEL_DIM
-                score = muladd(
-                    normalized[coordinate, register],
-                    memory_normalized[coordinate, token], score,
-                )
-            end
-            score *= scale
-            insertion = EPISODIC_SHORTLIST + 1
-            for shortlist_index in (mandatory_count + 1):EPISODIC_SHORTLIST
-                old_score = scores[shortlist_index, register]
-                old_token = selected_ids[shortlist_index, register]
-                if score > old_score || (score == old_score && token16 < old_token)
-                    insertion = shortlist_index
-                    break
-                end
-            end
-            if insertion <= EPISODIC_SHORTLIST
-                for shortlist_index in EPISODIC_SHORTLIST:-1:(insertion + 1)
-                    scores[shortlist_index, register] =
-                        scores[shortlist_index - 1, register]
-                    selected_ids[shortlist_index, register] =
-                        selected_ids[shortlist_index - 1, register]
-                end
-                scores[insertion, register] = score
-                selected_ids[insertion, register] = token16
-            end
-        end
-        selected_ids[end, register] != typemax(Int16) || error(
-            "episodic exact rerank failed to fill shortlist",
+    mul!(scratch.output, model.cross_o, scratch.attention_context)
+    alpha = _residual_scale(model.cross_scale_logit[1])
+    @inbounds @simd for index in eachindex(scratch.next)
+        scratch.next[index] = muladd(
+            alpha, scratch.output[index], registers[index],
         )
     end
-    query = scratch.query
-    mul!(query, model.cross_q, normalized)
-    key = scratch.key
-    value = scratch.value
-    @inbounds for register in 1:REGISTER_COUNT
-        for shortlist_index in 1:EPISODIC_SHORTLIST
-            token = Int(selected_ids[shortlist_index, register])
-            for attention_coordinate in 1:ATTENTION_DIM
-                key_value = 0.0f0
-                value_value = 0.0f0
-                @simd for coordinate in 1:MODEL_DIM
-                    memory_value = memory_normalized[coordinate, token]
-                    key_value = muladd(
-                        model.cross_k[attention_coordinate, coordinate],
-                        memory_value, key_value,
-                    )
-                    value_value = muladd(
-                        model.cross_v[attention_coordinate, coordinate],
-                        memory_value, value_value,
-                    )
-                end
-                key[attention_coordinate, shortlist_index, register] = key_value
-                value[attention_coordinate, shortlist_index, register] = value_value
-            end
-        end
-    end
-    attention_weights = scratch.attention_weights
-    attention_context = scratch.attention_context
-    fill!(attention_context, 0.0f0)
-    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
-    attention_scale = inv(sqrt(Float32(head_dim)))
-    @inbounds for register in 1:REGISTER_COUNT, head in 1:ATTENTION_HEADS
-        first_coordinate = (head - 1) * head_dim + 1
-        last_coordinate = head * head_dim
-        maximum_score = -Inf32
-        for shortlist_index in 1:EPISODIC_SHORTLIST
-            score = 0.0f0
-            @simd for coordinate in first_coordinate:last_coordinate
-                score = muladd(
-                    query[coordinate, register],
-                    key[coordinate, shortlist_index, register], score,
-                )
-            end
-            score *= attention_scale
-            attention_weights[shortlist_index, register, head] = score
-            maximum_score = max(maximum_score, score)
-        end
-        denominator = 0.0f0
-        for shortlist_index in 1:EPISODIC_SHORTLIST
-            probability = exp(
-                attention_weights[shortlist_index, register, head] - maximum_score,
-            )
-            attention_weights[shortlist_index, register, head] = probability
-            denominator += probability
-        end
-        inverse_denominator = inv(denominator)
-        for shortlist_index in 1:EPISODIC_SHORTLIST
-            probability = attention_weights[shortlist_index, register, head] *
-                inverse_denominator
-            attention_weights[shortlist_index, register, head] = probability
-            @simd for coordinate in first_coordinate:last_coordinate
-                attention_context[coordinate, register] = muladd(
-                    probability, value[coordinate, shortlist_index, register],
-                    attention_context[coordinate, register],
-                )
-            end
-        end
-    end
-    output = scratch.output
-    mul!(output, model.cross_o, attention_context)
-    alpha = _residual_scale(model.cross_scale_logit[1])
-    next = scratch.next
-    @inbounds @simd for index in eachindex(next)
-        next[index] = muladd(alpha, output[index], registers[index])
-    end
-    return next, CrossAttentionTape(
-        input, normalized, inverse_rms, register_route,
-        scratch.token_route, selected_ids,
-        Int8(mandatory_count), query, key, value,
-        attention_weights, attention_context, output, alpha,
+    return scratch.next, CrossAttentionTape(
+        scratch.input,
+        scratch.normalized,
+        scratch.inverse_rms,
+        scratch.query,
+        scratch.key,
+        scratch.value,
+        scratch.attention_weights,
+        scratch.attention_context,
+        scratch.output,
+        alpha,
     )
 end
 
@@ -1801,8 +1756,6 @@ end
 
 """Candidate-owned forward storage reused only after its backward completes."""
 struct ForwardCandidateArena
-    token_route::Matrix{Float32}
-    buckets::EpisodicBuckets
     registers::Matrix{Float32}
     steps::Vector{RecurrentStepTape}
     lookup::SparseLookup.LookupTrajectoryArena
@@ -1818,8 +1771,6 @@ function ForwardCandidateArena()
     sizehint!(steps, MAX_RECURRENT_STEPS)
     lookup = SparseLookup.LookupTrajectoryArena(MAX_RECURRENT_STEPS)
     return ForwardCandidateArena(
-        Matrix{Float32}(undef, EPISODIC_ROUTER_DIM, TOKEN_COUNT),
-        EpisodicBuckets(),
         Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
         steps,
         lookup,
@@ -1892,8 +1843,6 @@ end
 mutable struct ForwardTrajectoryState
     input::EpisodicCandidateInput
     memory::Matrix{Float32}
-    candidate_support_ids::Vector{Int16}
-    candidate_support_count::Int8
     registers::Matrix{Float32}
     steps::Vector{RecurrentStepTape}
     arena::Union{Nothing,ForwardCandidateArena}
@@ -1930,7 +1879,6 @@ function prepare_trajectory(
         throw(ArgumentError("episodic memory buffers must be supplied together"))
     memory = memory_buffer === nothing ? _tokenize(model, input) :
         _tokenize!(memory_buffer, model, input)
-    candidate_support_ids, candidate_support_count = _candidate_support(input)
     if arena === nothing
         registers = copy(model.register_seed)
         steps = RecurrentStepTape[]
@@ -1944,8 +1892,6 @@ function prepare_trajectory(
     return ForwardTrajectoryState(
         input,
         memory,
-        candidate_support_ids,
-        Int8(candidate_support_count),
         registers,
         steps,
         arena,
@@ -1986,25 +1932,11 @@ function advance_trajectory!(
         end
         value
     end
-    token_route = if state.arena === nothing
-        _structured_router_forward(model.token_router, spatial.output_normalized)
-    else
-        _structured_router_forward!(
-            cross_scratch.token_route, model.token_router,
-            spatial.output_normalized,
-        )
-    end
-    buckets = state.arena === nothing ? _build_token_buckets(token_route) :
-        _build_token_buckets!(state.arena.buckets, token_route)
     registers, cross = if state.arena === nothing
         _cross_attention_forward(
             model,
             state.registers,
             spatial.output_normalized,
-            token_route,
-            buckets,
-            state.candidate_support_ids,
-            Int(state.candidate_support_count),
         )
     else
         _cross_attention_forward!(
@@ -2012,9 +1944,6 @@ function advance_trajectory!(
             model,
             state.registers,
             spatial.output_normalized,
-            buckets,
-            state.candidate_support_ids,
-            Int(state.candidate_support_count),
         )
     end
     if state.arena === nothing
@@ -2155,6 +2084,8 @@ mutable struct BackwardScratch
     memory_gradient::Matrix{Float32}
     memory_postnorm::Matrix{Float32}
     memory_previous::Matrix{Float32}
+    visual_features::Array{Float32,3}
+    visual_cotangents::Array{Float32,3}
     memory_stamp::Vector{UInt32}
     memory_ids::Vector{Int16}
     memory_count::Int
@@ -2183,10 +2114,10 @@ function BackwardScratch()
         zeros(Float32, MODEL_DIM, REGISTER_COUNT),
         zeros(Float32, ATTENTION_DIM, REGISTER_COUNT),
         zeros(Float32, ATTENTION_DIM, REGISTER_COUNT),
-        zeros(Float32, ATTENTION_DIM, max(EPISODIC_SHORTLIST, REGISTER_COUNT)),
-        zeros(Float32, ATTENTION_DIM, max(EPISODIC_SHORTLIST, REGISTER_COUNT)),
-        zeros(Float32, max(EPISODIC_SHORTLIST, REGISTER_COUNT), REGISTER_COUNT),
-        zeros(Float32, max(EPISODIC_SHORTLIST, REGISTER_COUNT), REGISTER_COUNT),
+        zeros(Float32, ATTENTION_DIM, TOKEN_COUNT),
+        zeros(Float32, ATTENTION_DIM, TOKEN_COUNT),
+        zeros(Float32, TOKEN_COUNT, REGISTER_COUNT),
+        zeros(Float32, TOKEN_COUNT, REGISTER_COUNT),
         zeros(Float32, MODEL_DIM, REGISTER_COUNT),
         zeros(Float32, EPISODIC_ROUTER_DIM, REGISTER_COUNT),
         zeros(Float32, max(EPISODIC_SHORTLIST, REGISTER_COUNT, SPATIAL_SHORTLIST)),
@@ -2204,6 +2135,8 @@ function BackwardScratch()
         Matrix{Float32}(undef, MODEL_DIM, TOKEN_COUNT),
         Matrix{Float32}(undef, MODEL_DIM, TOKEN_COUNT),
         Matrix{Float32}(undef, MODEL_DIM, TOKEN_COUNT),
+        zeros(Float32, VISUAL_CHANNELS, CELL_COUNT, VISUAL_STAGES + 1),
+        zeros(Float32, VISUAL_CHANNELS, CELL_COUNT, VISUAL_STAGES + 1),
         zeros(UInt32, TOKEN_COUNT),
         zeros(Int16, TOKEN_COUNT),
         0,
@@ -2283,18 +2216,20 @@ function _zero_dense_gradients()
         :cell_projection => zeros(Float32, MODEL_DIM, 3),
         :cell_bias => zeros(Float32, MODEL_DIM),
         :cell_position => zeros(Float32, MODEL_DIM, CELL_COUNT),
+        :visual_depthwise => zeros(
+            Float32, 3, 3, VISUAL_CHANNELS, VISUAL_STAGES,
+        ),
+        :visual_channel_mix => zeros(
+            Float32, VISUAL_CHANNELS, VISUAL_CHANNELS, VISUAL_STAGES,
+        ),
+        :visual_pointwise => zeros(Float32, MODEL_DIM, 3),
+        :visual_scale_logit => zeros(Float32, 1),
         :next_projection => zeros(Float32, MODEL_DIM, PIECE_TYPES),
         :next_bias => zeros(Float32, MODEL_DIM),
         :next_position => zeros(Float32, MODEL_DIM, NEXT_HOLD_TOKENS),
         :aux_value => zeros(Float32, MODEL_DIM, AUX_FEATURES),
         :aux_position => zeros(Float32, MODEL_DIM, AUX_FEATURES),
         :register_seed => zeros(Float32, MODEL_DIM, REGISTER_COUNT),
-        :token_router => zeros(
-            Float32, EPISODIC_ROUTER_BLOCK_WIDTH, EPISODIC_ROUTER_DIM,
-        ),
-        :register_router => zeros(
-            Float32, EPISODIC_ROUTER_BLOCK_WIDTH, EPISODIC_ROUTER_DIM,
-        ),
         :spatial_q => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
         :spatial_k => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
         :spatial_v => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
@@ -2606,7 +2541,7 @@ function _attention_core_vjp(query, key, value, weights, context_cotangent)
 end
 
 function _cross_attention_vjp!(
-    accumulator, model, tape, memory_normalized, token_route, state_cotangent,
+    accumulator, model, tape, memory_normalized, state_cotangent,
     scratch::BackwardScratch, dinput, dmemory_normalized,
 )
     fill!(dmemory_normalized, 0.0f0)
@@ -2637,135 +2572,43 @@ function _cross_attention_vjp!(
         transpose(model.cross_o),
         output_cotangent,
     )
+    dquery = scratch.attention_dquery
+    dkey = scratch.attention_dkey
+    dvalue = scratch.attention_dvalue
+    _attention_core_vjp!(
+        dquery,
+        dkey,
+        dvalue,
+        scratch.attention_dscore,
+        scratch.attention_dweights,
+        tape.query,
+        tape.key,
+        tape.value,
+        tape.attention_weights,
+        attention_context_cotangent,
+    )
+
+    # All 283 memory tokens participate, so task gradients reach every K/V
+    # projection and every episodic token without a routing STE.
+    mul!(
+        _dgm(accumulator, :cross_q), dquery, transpose(tape.normalized),
+        1.0f0, 1.0f0,
+    )
+    mul!(
+        _dgm(accumulator, :cross_k), dkey, transpose(memory_normalized),
+        1.0f0, 1.0f0,
+    )
+    mul!(
+        _dgm(accumulator, :cross_v), dvalue, transpose(memory_normalized),
+        1.0f0, 1.0f0,
+    )
     dnormalized = scratch.dnormalized
-    dregister_route = scratch.dregister_route
-    fill!(dnormalized, 0.0f0)
-    fill!(dregister_route, 0.0f0)
-    _begin_route_gradients!(scratch)
-    router_scale = ROUTER_STE_SCALE / sqrt(Float32(EPISODIC_ROUTER_DIM))
-    dquery_total = scratch.attention_dquery
-    fill!(dquery_total, 0.0f0)
-    dkey_storage = scratch.attention_dkey
-    dvalue_storage = scratch.attention_dvalue
-    dscore_storage = scratch.attention_dscore
-    dweight_storage = scratch.attention_dweights
-    cross_k_gradient = _dgm(accumulator, :cross_k)
-    cross_v_gradient = _dgm(accumulator, :cross_v)
-    @inbounds for register in 1:REGISTER_COUNT
-        query = @view tape.query[:, register:register]
-        key = @view tape.key[:, :, register]
-        value = @view tape.value[:, :, register]
-        weights = @view tape.attention_weights[:, register:register, :]
-        context_gradient = @view attention_context_cotangent[:, register:register]
-        dquery = @view dquery_total[:, register:register]
-        dkey = @view dkey_storage[:, 1:EPISODIC_SHORTLIST]
-        dvalue = @view dvalue_storage[:, 1:EPISODIC_SHORTLIST]
-        dscore_total = @view dscore_storage[1:EPISODIC_SHORTLIST, 1:1]
-        dweights = @view dweight_storage[1:EPISODIC_SHORTLIST, 1:1]
-        _attention_core_vjp!(
-            dquery, dkey, dvalue, dscore_total, dweights,
-            query, key, value, weights, context_gradient,
-        )
-        for shortlist_index in 1:EPISODIC_SHORTLIST
-            token = Int(tape.selected_ids[shortlist_index, register])
-            for attention_coordinate in 1:ATTENTION_DIM
-                key_gradient = dkey[attention_coordinate, shortlist_index]
-                value_gradient = dvalue[attention_coordinate, shortlist_index]
-                @simd for coordinate in 1:MODEL_DIM
-                    memory_value = memory_normalized[coordinate, token]
-                    cross_k_gradient[attention_coordinate, coordinate] = muladd(
-                        key_gradient, memory_value,
-                        cross_k_gradient[attention_coordinate, coordinate],
-                    )
-                    cross_v_gradient[attention_coordinate, coordinate] = muladd(
-                        value_gradient, memory_value,
-                        cross_v_gradient[attention_coordinate, coordinate],
-                    )
-                    dmemory_normalized[coordinate, token] = muladd(
-                        model.cross_k[attention_coordinate, coordinate],
-                        key_gradient,
-                        muladd(
-                            model.cross_v[attention_coordinate, coordinate],
-                            value_gradient,
-                            dmemory_normalized[coordinate, token],
-                        ),
-                    )
-                end
-            end
-            if shortlist_index > Int(tape.mandatory_count)
-                coefficient = dscore_total[shortlist_index, 1] * router_scale
-                _touch_route_gradient!(scratch, token)
-                for coordinate in 1:EPISODIC_ROUTER_DIM
-                    dregister_route[coordinate, register] = muladd(
-                        coefficient, token_route[coordinate, token],
-                        dregister_route[coordinate, register],
-                    )
-                    scratch.route_gradient[coordinate, token] = muladd(
-                        coefficient, tape.register_route[coordinate, register],
-                        scratch.route_gradient[coordinate, token],
-                    )
-                end
-            end
-        end
-    end
-    cross_q_gradient = _dgm(accumulator, :cross_q)
-    @inbounds for attention_coordinate in 1:ATTENTION_DIM
-        for coordinate in 1:MODEL_DIM
-            gradient = 0.0f0
-            @simd for register in 1:REGISTER_COUNT
-                gradient = muladd(
-                    dquery_total[attention_coordinate, register],
-                    tape.normalized[coordinate, register],
-                    gradient,
-                )
-            end
-            cross_q_gradient[attention_coordinate, coordinate] += gradient
-        end
-    end
-    @inbounds for register in 1:REGISTER_COUNT
-        for attention_coordinate in 1:ATTENTION_DIM
-            gradient = dquery_total[attention_coordinate, register]
-            @simd for coordinate in 1:MODEL_DIM
-                dnormalized[coordinate, register] = muladd(
-                    model.cross_q[attention_coordinate, coordinate],
-                    gradient,
-                    dnormalized[coordinate, register],
-                )
-            end
-        end
-    end
-    @inbounds for register in 1:REGISTER_COUNT
-        register_input_gradient = scratch.register_input_gradient
-        fill!(register_input_gradient, 0.0f0)
-        _structured_router_selected_vjp!(
-            _dgm(accumulator, :register_router),
-            register_input_gradient,
-            model.register_router,
-            tape.normalized,
-            register,
-            @view(dregister_route[:, register]),
-        )
-        @inbounds @simd for coordinate in 1:MODEL_DIM
-            dnormalized[coordinate, register] += register_input_gradient[coordinate]
-        end
-    end
-    @inbounds for route_index in 1:scratch.route_count
-        token = Int(scratch.route_ids[route_index])
-        token_input_gradient = scratch.token_input_gradient
-        fill!(token_input_gradient, 0.0f0)
-        _structured_router_selected_vjp!(
-            _dgm(accumulator, :token_router),
-            token_input_gradient,
-            model.token_router,
-            memory_normalized,
-            token,
-            @view(scratch.route_gradient[:, token]),
-        )
-        @simd for coordinate in 1:MODEL_DIM
-            dmemory_normalized[coordinate, token] +=
-                token_input_gradient[coordinate]
-        end
-    end
+    mul!(dnormalized, transpose(model.cross_q), dquery)
+    mul!(dmemory_normalized, transpose(model.cross_k), dkey)
+    mul!(
+        dmemory_normalized, transpose(model.cross_v), dvalue,
+        1.0f0, 1.0f0,
+    )
     _rmsnorm_columns_vjp!(
         dinput, tape.normalized, tape.inverse_rms, dnormalized,
     )
@@ -2994,10 +2837,260 @@ function _rmsnorm_selected_vjp!(
     return nothing
 end
 
-function _tokenize_vjp!(accumulator, input, token_cotangents)
+function _cell_token_vjp!(
+    accumulator,
+    _model,
+    input,
+    row::Int,
+    column::Int,
+    token::Int,
+    token_cotangent,
+)
     cell_projection = _dgm(accumulator, :cell_projection)
     cell_bias = _dgv(accumulator, :cell_bias)
     cell_position = _dgm(accumulator, :cell_position)
+    board = input.board[row, column]
+    candidate = input.candidate[row, column]
+    difference = input.difference[row, column]
+    @inbounds for coordinate in 1:MODEL_DIM
+        gradient = token_cotangent[coordinate]
+        cell_bias[coordinate] += gradient
+        cell_position[coordinate, token] += gradient
+        cell_projection[coordinate, 1] = muladd(
+            gradient, board, cell_projection[coordinate, 1],
+        )
+        cell_projection[coordinate, 2] = muladd(
+            gradient, candidate, cell_projection[coordinate, 2],
+        )
+        cell_projection[coordinate, 3] = muladd(
+            gradient, difference, cell_projection[coordinate, 3],
+        )
+    end
+    return nothing
+end
+
+function _visual_stack_forward_features!(features, model, input)
+    @inbounds for column in 1:BOARD_WIDTH, row in 1:BOARD_HEIGHT
+        token = (column - 1) * BOARD_HEIGHT + row
+        for channel in 1:VISUAL_CHANNELS
+            features[channel, token, 1] = _visual_input_channel(
+                input, row, column, channel,
+            )
+        end
+    end
+    @inbounds for stage in 1:VISUAL_STAGES
+        dilation = VISUAL_DILATIONS[stage]
+        for column in 1:BOARD_WIDTH, row in 1:BOARD_HEIGHT
+            token = (column - 1) * BOARD_HEIGHT + row
+            pre_1 = 0.0f0
+            pre_2 = 0.0f0
+            pre_3 = 0.0f0
+            for delta_column in -1:1, delta_row in -1:1
+                source_row = row + dilation * delta_row
+                source_column = column + dilation * delta_column
+                1 <= source_row <= BOARD_HEIGHT || continue
+                1 <= source_column <= BOARD_WIDTH || continue
+                source_token = (source_column - 1) * BOARD_HEIGHT + source_row
+                pre_1 = muladd(
+                    model.visual_depthwise[
+                        delta_row + 2, delta_column + 2, 1, stage,
+                    ], features[1, source_token, stage], pre_1,
+                )
+                pre_2 = muladd(
+                    model.visual_depthwise[
+                        delta_row + 2, delta_column + 2, 2, stage,
+                    ], features[2, source_token, stage], pre_2,
+                )
+                pre_3 = muladd(
+                    model.visual_depthwise[
+                        delta_row + 2, delta_column + 2, 3, stage,
+                    ], features[3, source_token, stage], pre_3,
+                )
+            end
+            visual_1 = _swish(pre_1)
+            visual_2 = _swish(pre_2)
+            visual_3 = _swish(pre_3)
+            for output_channel in 1:VISUAL_CHANNELS
+                mixed = model.visual_channel_mix[output_channel, 1, stage] *
+                    visual_1 +
+                    model.visual_channel_mix[output_channel, 2, stage] *
+                    visual_2 +
+                    model.visual_channel_mix[output_channel, 3, stage] *
+                    visual_3
+                features[output_channel, token, stage + 1] = mixed +
+                    features[output_channel, token, stage]
+            end
+        end
+    end
+    return features
+end
+
+function _visual_stem_vjp!(
+    accumulator,
+    model,
+    input,
+    token_cotangents,
+    scratch::BackwardScratch,
+)
+    features = _visual_stack_forward_features!(
+        scratch.visual_features, model, input,
+    )
+    feature_cotangents = scratch.visual_cotangents
+    fill!(feature_cotangents, 0.0f0)
+    ddepthwise = accumulator.dense[:visual_depthwise]::Array{Float32,4}
+    dchannel_mix = accumulator.dense[:visual_channel_mix]::Array{Float32,3}
+    dpointwise = _dgm(accumulator, :visual_pointwise)
+    dscale = _dgv(accumulator, :visual_scale_logit)
+    final_stage = VISUAL_STAGES + 1
+    output_alpha = _residual_scale(model.visual_scale_logit[1])
+    output_scale_derivative = _residual_scale_derivative(
+        model.visual_scale_logit[1],
+    )
+    @inbounds for token in 1:CELL_COUNT
+        visual_1 = features[1, token, final_stage]
+        visual_2 = features[2, token, final_stage]
+        visual_3 = features[3, token, final_stage]
+        for coordinate in 1:MODEL_DIM
+            gradient = token_cotangents[coordinate, token]
+            visual_output = model.visual_pointwise[coordinate, 1] * visual_1 +
+                model.visual_pointwise[coordinate, 2] * visual_2 +
+                model.visual_pointwise[coordinate, 3] * visual_3
+            dscale[1] = muladd(
+                gradient, visual_output * output_scale_derivative, dscale[1],
+            )
+            scaled_gradient = output_alpha * gradient
+            dpointwise[coordinate, 1] = muladd(
+                scaled_gradient, visual_1, dpointwise[coordinate, 1],
+            )
+            dpointwise[coordinate, 2] = muladd(
+                scaled_gradient, visual_2, dpointwise[coordinate, 2],
+            )
+            dpointwise[coordinate, 3] = muladd(
+                scaled_gradient, visual_3, dpointwise[coordinate, 3],
+            )
+            feature_cotangents[1, token, final_stage] = muladd(
+                scaled_gradient, model.visual_pointwise[coordinate, 1],
+                feature_cotangents[1, token, final_stage],
+            )
+            feature_cotangents[2, token, final_stage] = muladd(
+                scaled_gradient, model.visual_pointwise[coordinate, 2],
+                feature_cotangents[2, token, final_stage],
+            )
+            feature_cotangents[3, token, final_stage] = muladd(
+                scaled_gradient, model.visual_pointwise[coordinate, 3],
+                feature_cotangents[3, token, final_stage],
+            )
+        end
+    end
+    @inbounds for stage in VISUAL_STAGES:-1:1
+        dilation = VISUAL_DILATIONS[stage]
+        for column in 1:BOARD_WIDTH, row in 1:BOARD_HEIGHT
+            token = (column - 1) * BOARD_HEIGHT + row
+            pre_1 = 0.0f0
+            pre_2 = 0.0f0
+            pre_3 = 0.0f0
+            for delta_column in -1:1, delta_row in -1:1
+                source_row = row + dilation * delta_row
+                source_column = column + dilation * delta_column
+                1 <= source_row <= BOARD_HEIGHT || continue
+                1 <= source_column <= BOARD_WIDTH || continue
+                source_token = (source_column - 1) * BOARD_HEIGHT + source_row
+                pre_1 = muladd(
+                    model.visual_depthwise[
+                        delta_row + 2, delta_column + 2, 1, stage,
+                    ], features[1, source_token, stage], pre_1,
+                )
+                pre_2 = muladd(
+                    model.visual_depthwise[
+                        delta_row + 2, delta_column + 2, 2, stage,
+                    ], features[2, source_token, stage], pre_2,
+                )
+                pre_3 = muladd(
+                    model.visual_depthwise[
+                        delta_row + 2, delta_column + 2, 3, stage,
+                    ], features[3, source_token, stage], pre_3,
+                )
+            end
+            visual_1 = _swish(pre_1)
+            visual_2 = _swish(pre_2)
+            visual_3 = _swish(pre_3)
+            dout_1 = feature_cotangents[1, token, stage + 1]
+            dout_2 = feature_cotangents[2, token, stage + 1]
+            dout_3 = feature_cotangents[3, token, stage + 1]
+            feature_cotangents[1, token, stage] += dout_1
+            feature_cotangents[2, token, stage] += dout_2
+            feature_cotangents[3, token, stage] += dout_3
+            dvisual_1 = 0.0f0
+            dvisual_2 = 0.0f0
+            dvisual_3 = 0.0f0
+            for output_channel in 1:VISUAL_CHANNELS
+                dout = output_channel == 1 ? dout_1 :
+                    output_channel == 2 ? dout_2 : dout_3
+                scaled_dout = dout
+                dchannel_mix[output_channel, 1, stage] = muladd(
+                    scaled_dout, visual_1,
+                    dchannel_mix[output_channel, 1, stage],
+                )
+                dchannel_mix[output_channel, 2, stage] = muladd(
+                    scaled_dout, visual_2,
+                    dchannel_mix[output_channel, 2, stage],
+                )
+                dchannel_mix[output_channel, 3, stage] = muladd(
+                    scaled_dout, visual_3,
+                    dchannel_mix[output_channel, 3, stage],
+                )
+                dvisual_1 = muladd(
+                    scaled_dout,
+                    model.visual_channel_mix[output_channel, 1, stage],
+                    dvisual_1,
+                )
+                dvisual_2 = muladd(
+                    scaled_dout,
+                    model.visual_channel_mix[output_channel, 2, stage],
+                    dvisual_2,
+                )
+                dvisual_3 = muladd(
+                    scaled_dout,
+                    model.visual_channel_mix[output_channel, 3, stage],
+                    dvisual_3,
+                )
+            end
+            dpre_1 = dvisual_1 * _swish_derivative(pre_1)
+            dpre_2 = dvisual_2 * _swish_derivative(pre_2)
+            dpre_3 = dvisual_3 * _swish_derivative(pre_3)
+            for delta_column in -1:1, delta_row in -1:1
+                source_row = row + dilation * delta_row
+                source_column = column + dilation * delta_column
+                1 <= source_row <= BOARD_HEIGHT || continue
+                1 <= source_column <= BOARD_WIDTH || continue
+                source_token = (source_column - 1) * BOARD_HEIGHT + source_row
+                for channel in 1:VISUAL_CHANNELS
+                    dpre = channel == 1 ? dpre_1 :
+                        channel == 2 ? dpre_2 : dpre_3
+                    kernel_row = delta_row + 2
+                    kernel_column = delta_column + 2
+                    ddepthwise[kernel_row, kernel_column, channel, stage] =
+                        muladd(
+                            dpre, features[channel, source_token, stage],
+                            ddepthwise[
+                                kernel_row, kernel_column, channel, stage,
+                            ],
+                        )
+                    feature_cotangents[channel, source_token, stage] = muladd(
+                        dpre,
+                        model.visual_depthwise[
+                            kernel_row, kernel_column, channel, stage,
+                        ],
+                        feature_cotangents[channel, source_token, stage],
+                    )
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+function _tokenize_vjp!(accumulator, model, input, token_cotangents)
     next_projection = _dgm(accumulator, :next_projection)
     next_bias = _dgv(accumulator, :next_bias)
     next_position = _dgm(accumulator, :next_position)
@@ -3007,23 +3100,10 @@ function _tokenize_vjp!(accumulator, input, token_cotangents)
         if token <= CELL_COUNT
             row = mod(token - 1, BOARD_HEIGHT) + 1
             column = div(token - 1, BOARD_HEIGHT) + 1
-            board = input.board[row, column]
-            candidate = input.candidate[row, column]
-            difference = input.difference[row, column]
-            @inbounds @simd for coordinate in 1:MODEL_DIM
-                gradient = token_cotangent[coordinate]
-                cell_bias[coordinate] += gradient
-                cell_position[coordinate, token] += gradient
-                cell_projection[coordinate, 1] = muladd(
-                    gradient, board, cell_projection[coordinate, 1],
-                )
-                cell_projection[coordinate, 2] = muladd(
-                    gradient, candidate, cell_projection[coordinate, 2],
-                )
-                cell_projection[coordinate, 3] = muladd(
-                    gradient, difference, cell_projection[coordinate, 3],
-                )
-            end
+            _cell_token_vjp!(
+                accumulator, model, input, row, column, token,
+                token_cotangent,
+            )
         elseif token <= CELL_COUNT + NEXT_HOLD_TOKENS
             queue_token = token - CELL_COUNT
             @inbounds for coordinate in 1:MODEL_DIM
@@ -3054,11 +3134,8 @@ end
 
 
 function _tokenize_vjp!(
-    accumulator, input, scratch::BackwardScratch,
+    accumulator, model, input, scratch::BackwardScratch,
 )
-    cell_projection = _dgm(accumulator, :cell_projection)
-    cell_bias = _dgv(accumulator, :cell_bias)
-    cell_position = _dgm(accumulator, :cell_position)
     next_projection = _dgm(accumulator, :next_projection)
     next_bias = _dgv(accumulator, :next_bias)
     next_position = _dgm(accumulator, :next_position)
@@ -3070,23 +3147,10 @@ function _tokenize_vjp!(
         if token <= CELL_COUNT
             row = mod(token - 1, BOARD_HEIGHT) + 1
             column = div(token - 1, BOARD_HEIGHT) + 1
-            board = input.board[row, column]
-            candidate = input.candidate[row, column]
-            difference = input.difference[row, column]
-            @simd for coordinate in 1:MODEL_DIM
-                gradient = token_cotangent[coordinate]
-                cell_bias[coordinate] += gradient
-                cell_position[coordinate, token] += gradient
-                cell_projection[coordinate, 1] = muladd(
-                    gradient, board, cell_projection[coordinate, 1],
-                )
-                cell_projection[coordinate, 2] = muladd(
-                    gradient, candidate, cell_projection[coordinate, 2],
-                )
-                cell_projection[coordinate, 3] = muladd(
-                    gradient, difference, cell_projection[coordinate, 3],
-                )
-            end
+            _cell_token_vjp!(
+                accumulator, model, input, row, column, token,
+                token_cotangent,
+            )
         elseif token <= CELL_COUNT + NEXT_HOLD_TOKENS
             queue_token = token - CELL_COUNT
             for coordinate in 1:MODEL_DIM
@@ -3122,7 +3186,9 @@ so the old shortlist-only stamp cannot describe the active token set anymore.
 This routine still preserves active-only optimiser semantics: a token column is
 marked active only when its accumulated cotangent is actually non-zero.
 """
-function _tokenize_vjp_dense!(accumulator, input, token_cotangents)
+function _tokenize_vjp_dense!(
+    accumulator, model, input, token_cotangents, scratch::BackwardScratch,
+)
     size(token_cotangents) == (MODEL_DIM, TOKEN_COUNT) ||
         throw(DimensionMismatch("recurrent memory cotangent shape changed"))
     cell_projection = _dgm(accumulator, :cell_projection)
@@ -3142,23 +3208,10 @@ function _tokenize_vjp_dense!(accumulator, input, token_cotangents)
         accumulator.active_tokens[token] = true
         if token <= CELL_COUNT
             row, column = _cell_row_column(token)
-            board = input.board[row, column]
-            candidate = input.candidate[row, column]
-            difference = input.difference[row, column]
-            @simd for coordinate in 1:MODEL_DIM
-                gradient = token_cotangents[coordinate, token]
-                cell_bias[coordinate] += gradient
-                cell_position[coordinate, token] += gradient
-                cell_projection[coordinate, 1] = muladd(
-                    gradient, board, cell_projection[coordinate, 1],
-                )
-                cell_projection[coordinate, 2] = muladd(
-                    gradient, candidate, cell_projection[coordinate, 2],
-                )
-                cell_projection[coordinate, 3] = muladd(
-                    gradient, difference, cell_projection[coordinate, 3],
-                )
-            end
+            _cell_token_vjp!(
+                accumulator, model, input, row, column, token,
+                @view(token_cotangents[:, token]),
+            )
         elseif token <= CELL_COUNT + NEXT_HOLD_TOKENS
             queue_token = token - CELL_COUNT
             for coordinate in 1:MODEL_DIM
@@ -3184,6 +3237,9 @@ function _tokenize_vjp_dense!(accumulator, input, token_cotangents)
             end
         end
     end
+    _visual_stem_vjp!(
+        accumulator, model, input, token_cotangents, scratch,
+    )
     return nothing
 end
 
@@ -3302,7 +3358,7 @@ function backward_trajectory!(
             scratch.state_b : scratch.state_a
         state_cotangent = _cross_attention_vjp!(
             accumulator, model, step.cross, step.spatial.output_normalized,
-            step.cross.token_route, state_cotangent, scratch, next_cotangent,
+            state_cotangent, scratch, next_cotangent,
             scratch.memory_postnorm,
         )
 
@@ -3331,7 +3387,9 @@ function backward_trajectory!(
     @inbounds @simd for index in eachindex(register_seed_gradient)
         register_seed_gradient[index] += state_cotangent[index]
     end
-    _tokenize_vjp_dense!(accumulator, tape.input, scratch.memory_gradient)
+    _tokenize_vjp_dense!(
+        accumulator, model, tape.input, scratch.memory_gradient, scratch,
+    )
     return nothing
 end
 
@@ -3488,6 +3546,8 @@ end
 @inline function _dense_group(name::Symbol)
     if name in (
         :cell_projection, :cell_bias, :cell_position,
+        :visual_depthwise, :visual_channel_mix, :visual_pointwise,
+        :visual_scale_logit,
         :next_projection, :next_bias, :next_position,
         :aux_value, :aux_position,
     )

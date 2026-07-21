@@ -1386,9 +1386,29 @@ function restore_checkpoint(
     hasproperty(payload.config, :hyperparameters) || error(
         "resume config lacks hyperparameters",
     )
-    payload.config.hyperparameters == hyperparameters || error(
-        "resume hyperparameters differ; scheduler-only resume forbids semantic changes",
-    )
+    if payload.config.hyperparameters != hyperparameters
+        transition_raw = strip(get(ENV, "EVRL_ENABLE_DYNAMIC_HALTING_TRANSITION", "0"))
+        transition_raw in ("0", "1") || error(
+            "EVRL_ENABLE_DYNAMIC_HALTING_TRANSITION must be 0 or 1",
+        )
+        inherited = payload.config.hyperparameters
+        inherited_halting = inherited.halting
+        requested_halting = hyperparameters.halting
+        dynamic_halting_transition = transition_raw == "1" &&
+            inherited.optimizer == hyperparameters.optimizer &&
+            inherited.routing == hyperparameters.routing &&
+            inherited.loss == hyperparameters.loss &&
+            requested_halting.warmup_updates >= inherited_halting.warmup_updates &&
+            inherited_halting.compute_price == requested_halting.compute_price &&
+            inherited_halting.policy_weight == requested_halting.policy_weight &&
+            inherited_halting.entropy_weight == requested_halting.entropy_weight &&
+            inherited_halting.fixed_depth != 0 &&
+            requested_halting.fixed_depth == 0
+        dynamic_halting_transition || error(
+            "resume hyperparameters differ; only the explicit fixed-depth-to-dynamic-halting transition is allowed",
+        )
+        @info "EVRL fixed-depth checkpoint transitions to sampled hard halting" previous_fixed_depth=inherited_halting.fixed_depth requested_fixed_depth=requested_halting.fixed_depth
+    end
     hasproperty(payload.config, :objective) || error("resume config lacks objective")
     payload.config.objective == objective_contract(hyperparameters) || error(
         "resume objective differs",
@@ -1418,6 +1438,29 @@ function restore_checkpoint(
     )
     all(state.global_step == expected_step for state in payload.optimizer.lookup.bank_states) ||
         error("resume sparse optimizer clocks differ")
+    halt_reset_raw = strip(get(ENV, "EVRL_DYNAMIC_HALT_RESET_PROBABILITY", ""))
+    if !isempty(halt_reset_raw)
+        transition_raw = strip(get(ENV, "EVRL_ENABLE_DYNAMIC_HALTING_TRANSITION", "0"))
+        inherited_halting = payload.config.hyperparameters.halting
+        requested_halting = hyperparameters.halting
+        transition_raw == "1" && inherited_halting.fixed_depth != 0 &&
+            requested_halting.fixed_depth == 0 || error(
+                "halt-head reset is allowed only during the explicit fixed-depth-to-dynamic transition",
+            )
+        reset_probability = tryparse(Float32, halt_reset_raw)
+        reset_probability !== nothing && 0.0f0 < reset_probability < 1.0f0 ||
+            error("EVRL_DYNAMIC_HALT_RESET_PROBABILITY must be strictly between zero and one")
+        fill!(payload.model.lookup.halt_weight, 0.0f0)
+        payload.model.lookup.halt_bias[1] = log(
+            reset_probability / (1.0f0 - reset_probability),
+        )
+        dense = payload.optimizer.lookup.dense
+        fill!(dense.mhalt_weight, 0.0f0)
+        fill!(dense.vhalt_weight, 0.0f0)
+        fill!(dense.mhalt_bias, 0.0f0)
+        fill!(dense.vhalt_bias, 0.0f0)
+        @info "EVRL halt head reset for recurrent-depth acquisition" reset_probability
+    end
     length(payload.optimizer.token_event_count) == Model.TOKEN_COUNT || error(
         "resume token optimizer geometry differs",
     )

@@ -1,0 +1,158 @@
+{
+    "evaluation_id": "evrl-token-routing-ablation-2026-07-21",
+    "generated_at": "2026-07-21T20:45:39.542",
+    "design_change": {
+        "removed": "283-to-64 learned hash/WTA retrieval plus exact top-16 shortlist",
+        "replacement": "all 283 token shared K/V exact register cross-attention",
+        "unchanged": [
+            "input contract",
+            "local 8-neighbour spatial attention",
+            "register self-attention and SwiGLU",
+            "LookupFFN parameter routing and active-only updates",
+            "shared recurrence and fixed depth two evaluation setting",
+            "teacher objective and optimizer semantics"
+        ]
+    },
+    "conditions": {
+        "dataset_path": "D:\\tetris-paper-plus\\datasets\\beat_first_v1\\teacher_v3",
+        "dataset_manifest_sha256": "1f63172f33f8cee17b7ada88d4f35cdfa94b8d7dd5751c8e8244008caa526ded",
+        "split_seed": 2026071817,
+        "validation_subset_seed": 2026072315,
+        "validation_states": 128,
+        "validation_rows_sha256": "fa98e0e7aa7a1f1150ba38b57cdd6396b98aed3dc43f7176e94bf13b78554f25",
+        "evaluation_repeats": 3,
+        "blas_threads": 1,
+        "julia_threads": 20,
+        "teacher_q_and_rank_used_only_as_targets": true,
+        "candidate_independent_evaluation": true,
+        "game_validation_seeds_touched": false,
+        "game_sealed_seeds_touched": false
+    },
+    "preact": {
+        "architecture": "preact_eca",
+        "checkpoint": {
+            "path": "D:\\tetris-paper-plus\\checkpoints\\beat_first_v1\\teacherv3_preact_s_av2_b4_r1_best.jld2",
+            "bytes": 19600170,
+            "sha256": "f3e40d7b6bd3ea8aa7930b2178b537bdae37eea76cdbf089c3ba489ac99d057e"
+        },
+        "update": 12000,
+        "consumed_states": 48000,
+        "parameter_count": 1481326,
+        "metrics": {
+            "states": 128,
+            "composite_loss": 2.563783835619688,
+            "listnet_loss": 2.554378356784582,
+            "old_q_loss": 0.02879766903060954,
+            "margin_loss": 0.005634287284692618,
+            "top1_agreement": 0.7890625,
+            "ndcg": 0.9932921694681829,
+            "pairwise_accuracy": 0.9233594245135264,
+            "action_margin": 0.1233223732560873,
+            "q_mean": 5.674921976128259,
+            "q_std": 1.0352620955004537
+        },
+        "inference": {
+            "repeats": 3,
+            "states": 384,
+            "candidates": 16857,
+            "seconds": 91.5911342,
+            "states_per_second": 4.1925455269665175,
+            "candidates_per_second": 184.04619778144422,
+            "checksum": 183188.88050240278
+        }
+    },
+    "routed_evrl": {
+        "architecture": "episodic_vit_recurrent_lookup",
+        "checkpoint": {
+            "path": "D:\\tetris-paper-plus\\runs\\beat_first_v1\\episodic_vit_recurrent_lookup\\evrl_spatial_lookup_fixed2_u20000_resume2000_20260720_r1\\checkpoints\\checkpoint_000012000.jls",
+            "bytes": 253663125,
+            "sha256": "a566d0e63eacddbc3e02a8e789f891fd18328953dd4fc443bdc6ac7009e5d858"
+        },
+        "update": 12000,
+        "consumed_states": 48000,
+        "parameter_count": 20577480,
+        "metrics": {
+            "states": 128,
+            "composite_loss": 2.975015145726502,
+            "listnet_loss": 2.92665475839749,
+            "old_q_loss": 0.16006542851391714,
+            "margin_loss": 0.02914160757153983,
+            "top1_agreement": 0.359375,
+            "ndcg": 0.9712681380238037,
+            "pairwise_accuracy": 0.820279468137231,
+            "action_margin": 0.049543172121047974,
+            "q_mean": 5.9202684485467065,
+            "q_std": 0.8097851783229812
+        },
+        "recurrent_depth": {
+            "mean": 2,
+            "minimum": 2,
+            "maximum": 2
+        },
+        "inference": {
+            "repeats": 3,
+            "states": 384,
+            "candidates": 16857,
+            "seconds": 7.1719014,
+            "states_per_second": 53.54228656852421,
+            "candidates_per_second": 2350.4227205354496,
+            "checksum": 99958.84177209064
+        }
+    },
+    "full_token_evrl": {
+        "architecture": "evrl-full-283-token-cross-attention",
+        "checkpoint": {
+            "path": "D:\\tetris-paper-plus\\runs\\beat_first_v1\\episodic_vit_recurrent_lookup\\evrl_full283_fixed2_u12000_20260721_r1\\checkpoints\\checkpoint_000012000.jls",
+            "bytes": 253659317,
+            "sha256": "80cc8264a03facf5ff4d0c13cde205b0763012281254362b2f15521c262a4f1c"
+        },
+        "update": 12000,
+        "consumed_states": 48000,
+        "parameter_count": 20577224,
+        "metrics": {
+            "states": 128,
+            "composite_loss": 2.8091646801913157,
+            "listnet_loss": 2.7868036846630275,
+            "old_q_loss": 0.06740399604314007,
+            "margin_loss": 0.02117194073864148,
+            "top1_agreement": 0.5625,
+            "ndcg": 0.9786742306276885,
+            "pairwise_accuracy": 0.8415183266153391,
+            "action_margin": 0.0720451045781374,
+            "q_mean": 5.850997761408377,
+            "q_std": 1.0331298885102917
+        },
+        "recurrent_depth": {
+            "mean": 2,
+            "minimum": 2,
+            "maximum": 2
+        },
+        "inference": {
+            "repeats": 3,
+            "states": 384,
+            "candidates": 16857,
+            "seconds": 8.500379200000001,
+            "states_per_second": 45.17445527606579,
+            "candidates_per_second": 1983.0880015329196,
+            "checksum": 98786.47345336154
+        }
+    },
+    "differences": {
+        "full_token_vs_routed": {
+            "top1": 0.203125,
+            "ndcg": 0.007406092603884806,
+            "pairwise": 0.021238858478108136,
+            "action_margin": 0.022501932457089424,
+            "composite_loss": -0.16585046553518623,
+            "inference_speed_ratio": 0.8437154662464939
+        },
+        "full_token_vs_preact": {
+            "top1": -0.2265625,
+            "ndcg": -0.014617938840494338,
+            "pairwise": -0.08184109789818728,
+            "action_margin": -0.051277268677949905,
+            "composite_loss": 0.24538084457162768,
+            "inference_speed_ratio": 10.774946863546978
+        }
+    }
+}

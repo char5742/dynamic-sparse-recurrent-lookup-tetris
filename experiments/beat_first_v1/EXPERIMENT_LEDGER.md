@@ -652,3 +652,20 @@ game-validation seeds; game validation `8001:8008` and sealed seeds
   `episodic_vit_recurrent_lookup/PERFORMANCE_COMPARISON_2026-07-20.md`,
   `performance_comparison_2026-07-20.json`, and
   `evaluate_teacher_comparison.jl`.
+
+## 2026-07-21 — EVRL full-token cross-attention ablation
+
+- Removed only the episodic input-token `283 -> 64 -> 16` hard router; retained
+  local spatial attention, LookupFFN routing/active updates, recurrence, input,
+  teacher objective, and optimizer semantics.
+- Serial/barrierless correctness passed on four real-teacher states.
+- Equal budget: 12,000 updates, 48,000 states, 20,577,224 parameters,
+  23.3685 updates/s.
+- Held 128-state panel: top-1 `0.56250`, NDCG `0.978674`, margin `0.072045`,
+  pairwise `0.841518`, composite loss `2.809165`, CPU `45.1745 states/s`.
+- Versus routed EVRL: top-1 `+0.203125`, NDCG `+0.007406`, margin
+  `+0.022502`, inference throughput `0.843715x`.
+- Final checkpoint SHA-256:
+  `80cc8264a03facf5ff4d0c13cde205b0763012281254362b2f15521c262a4f1c`.
+- Detailed record:
+  `episodic_vit_recurrent_lookup/TOKEN_ROUTING_ABLATION_2026-07-21.md`.
