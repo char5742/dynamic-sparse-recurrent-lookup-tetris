@@ -8,9 +8,23 @@ using Statistics
 
 const HERE = @__DIR__
 const PREACT_CHECKPOINT = raw"D:\tetris-paper-plus\checkpoints\beat_first_v1\teacherv3_preact_s_av2_b4_r1_best.jld2"
-const FULL_TOKEN_CHECKPOINT = raw"D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_full283_fixed2_u12000_20260721_r1\checkpoints\checkpoint_000012000.jls"
+const DEFAULT_FULL_TOKEN_CHECKPOINT = raw"D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_full283_fixed2_u12000_20260721_r1\checkpoints\checkpoint_000012000.jls"
+const FULL_TOKEN_CHECKPOINT = abspath(get(
+    ENV, "EVRL_EVALUATION_CHECKPOINT", DEFAULT_FULL_TOKEN_CHECKPOINT,
+))
 const ROUTED_COMPARISON = joinpath(HERE, "performance_comparison_2026-07-20.json")
-const OUTPUT_PATH = joinpath(HERE, "token_routing_ablation_2026-07-21.json")
+const OUTPUT_PATH = abspath(get(
+    ENV,
+    "EVRL_EVALUATION_OUTPUT",
+    joinpath(HERE, "token_routing_ablation_2026-07-21.json"),
+))
+const EVALUATION_ID = get(
+    ENV, "EVRL_EVALUATION_ID", "evrl-token-routing-ablation-2026-07-21",
+)
+const TARGET_ARCHITECTURE = get(
+    ENV, "EVRL_EVALUATION_ARCHITECTURE", "evrl-full-283-token-cross-attention",
+)
+const DESIGN_ADDITION = strip(get(ENV, "EVRL_EVALUATION_DESIGN_ADDITION", ""))
 const EVALUATION_REPEATS = 3
 
 for (name, value) in (
@@ -173,7 +187,7 @@ function main()
         repeats=EVALUATION_REPEATS,
     )
     full_token = (;
-        architecture="evrl-full-283-token-cross-attention",
+        architecture=TARGET_ARCHITECTURE,
         checkpoint=artifact,
         update=Int(payload.update),
         consumed_states=Int(payload.consumed_states),
@@ -185,10 +199,8 @@ function main()
 
     old = routed.evrl_budget_matched
     baseline = routed.preact
-    result = (;
-        evaluation_id="evrl-token-routing-ablation-2026-07-21",
-        generated_at=string(Dates.now()),
-        design_change=(;
+    design_change = if isempty(DESIGN_ADDITION)
+        (;
             removed="283-to-64 learned hash/WTA retrieval plus exact top-16 shortlist",
             replacement="all 283 token shared K/V exact register cross-attention",
             unchanged=(
@@ -199,7 +211,24 @@ function main()
                 "shared recurrence and fixed depth two evaluation setting",
                 "teacher objective and optimizer semantics",
             ),
-        ),
+        )
+    else
+        (;
+            added=DESIGN_ADDITION,
+            unchanged=(
+                "input contract and candidate-independent evaluation",
+                "full 283-token register cross-attention",
+                "local 8-neighbour recurrent cell attention",
+                "LookupFFN parameter routing and active-only updates",
+                "shared recurrence and fixed depth two evaluation setting",
+                "teacher objective and optimizer semantics",
+            ),
+        )
+    end
+    result = (;
+        evaluation_id=EVALUATION_ID,
+        generated_at=string(Dates.now()),
+        design_change,
         conditions=(;
             dataset_path,
             dataset_manifest_sha256=manifest_sha256,

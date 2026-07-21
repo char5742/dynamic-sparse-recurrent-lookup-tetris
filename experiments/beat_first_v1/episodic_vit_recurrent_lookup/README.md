@@ -12,16 +12,19 @@ Teacher Q values and ranks are targets only.
 The model contains:
 
 1. positioned cell, next/hold, and auxiliary episodic tokens;
-2. recurrent cell memory updated through learned physical local-8 spatial
+2. a five-stage dilated depthwise/pointwise visual residual over raw
+   board/candidate/difference channels, with a `63 x 63` receptive field that
+   covers the complete `24 x 10` board;
+3. recurrent cell memory updated through learned physical local-8 spatial
    attention with shared Q/K/V/O projections and relative 3x3 position bias;
-3. multiple recurrent registers;
-4. exact cross-attention from each register to all 283 episodic tokens, with
+4. multiple recurrent registers;
+5. exact cross-attention from each register to all 283 episodic tokens, with
    one shared K/V projection per recurrent step;
-5. learned register self-attention and SwiGLU transformation;
-6. active-only LookupFFN long-term memory;
-7. residual recurrent updates and a hard-halting interface.
+6. learned register self-attention and SwiGLU transformation;
+7. active-only LookupFFN long-term memory;
+8. residual recurrent updates and a hard-halting interface.
 
-No dense mask-after-score implementation, CNN, or CountSketch is used.  The
+No dense mask-after-score implementation or CountSketch is used.  The
 small `4 x 283` register/token score support is evaluated directly, while
 LookupFFN long-memory rows remain physically sparse in forward, backward, and
 optimizer updates.
@@ -83,3 +86,10 @@ register memory bottleneck.  At the same 12,000-update budget, full-token
 cross-attention improved top-1 from `0.35938` to `0.56250`, with CPU inference
 decreasing from `53.54` to `45.17` states/s.  See
 [`TOKEN_ROUTING_ABLATION_2026-07-21.md`](TOKEN_ROUTING_ABLATION_2026-07-21.md).
+
+The current visual extension uses dilations `1,2,4,8,16`, adds only 565
+parameters and 135,360 scalar MAC/candidate, and reaches a true `63 x 63`
+receptive field.  At 25,000 updates / 100,000 teacher states it obtained
+top-1 `0.68750`, NDCG `0.98586`, margin `0.13215`, and `43.72` held CPU
+states/s.  See
+[`GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md`](GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md).

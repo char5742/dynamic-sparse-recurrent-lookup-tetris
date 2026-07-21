@@ -380,3 +380,29 @@ to `0.56250` and NDCG from `0.97127` to `0.97867`.  CPU inference changed from
 full-token model remains below PreAct (`0.78906` top-1), but is `10.77x` faster
 on the same 128-state CPU panel.  Exact conditions and hashes are recorded in
 [`experiments/beat_first_v1/episodic_vit_recurrent_lookup/TOKEN_ROUTING_ABLATION_2026-07-21.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/TOKEN_ROUTING_ABLATION_2026-07-21.md).
+
+## 16. 2026-07-21 — 全盤面受容野を持つ軽量visual path
+
+単一3x3 depthwise filterでは受容野が局所一点に留まるため不採用とした。
+raw board/candidate/differenceの3 channelへdilation `1,2,4,8,16`の
+depthwise 3x3、SiLU、3x3 channel pointwise residualを5段適用し、最後に
+3 -> 128 pointwise projectionを既存cell tokenへ加える構成へ変更した。
+理論受容野は`63 x 63`で24x10盤面全体を包含し、左上入力から右下tokenへの
+非zero応答も実測した。
+
+追加costは565 parameters、135,360 scalar MAC/candidateである。serial対20-worker
+barrierless smokeはoutput/loss/raw VJP完全一致、worker gradient最大差
+`5.62e-6`、optimizer後state最大差`2.09e-7`で合格した。100-update warm
+benchmarkは`31.58 updates/s`、candidate CPU `76.98%`だった。
+
+12,000 updatesではheld top-1 `0.50000`、NDCG `0.97936`で、旧full-token
+12kのtop-1 `0.56250`を下回るmixed resultだった。しかし同じmodelを100,000
+teacher statesに相当する25,000 updatesまで継続すると、top-1 `0.68750`、
+NDCG `0.98586`、pairwise `0.87751`、margin `0.13215`、loss `2.66337`へ改善した。
+したがって12k時点は頭打ちではなかった。一方、no-visual 25k対照をまだ実行して
+いないため、この改善全量をvisual pathの効果とは主張しない。PreActとの差は
+top-1 `-0.10156`、NDCG `-0.00743`で残るが、held CPU推論は`10.43x`速い。
+
+詳細とcheckpoint hashは
+[`GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md)
+に記録した。
