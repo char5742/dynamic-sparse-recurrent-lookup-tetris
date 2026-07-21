@@ -224,3 +224,92 @@ consumed real-teacher states: 400,000
 metrics.jsonl sha256:
   48480aabeb8a0a8e2762888dfbdb9a90d3b906a1569ae7611295d7f8e96b5440
 ```
+
+## Trial 4 — dense weight decay 2e-4
+
+This from-scratch trial interpolated dense weight decay between the Trial-1
+baseline `1e-4` and Trial-3 top-1 arm `3e-4`. Every other parameter and all
+execution/evaluation conditions remained identical.
+
+### Held-panel curve
+
+| Update | Loss | Top-1 | NDCG | Pairwise | Margin |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 8.395339 | 0.21875 | 0.860435 | 0.546154 | 0.040159 |
+| 5,000 | 2.851713 | 0.53906 | 0.980043 | 0.840504 | 0.065302 |
+| 10,000 | 2.784460 | 0.50000 | 0.979888 | 0.846149 | 0.080127 |
+| 15,000 | 2.751044 | 0.56250 | 0.983050 | 0.860493 | 0.079198 |
+| 20,000 | 2.713456 | 0.60938 | 0.983188 | 0.865943 | 0.094645 |
+| 25,000 | 2.693339 | 0.57031 | 0.983044 | 0.870063 | 0.113391 |
+| 30,000 | 2.660621 | 0.64062 | 0.986125 | 0.880302 | 0.116080 |
+| 35,000 | 2.673281 | 0.64844 | 0.987352 | 0.883035 | 0.104091 |
+| 40,000 | 2.649686 | 0.65625 | 0.987742 | 0.884113 | 0.131746 |
+| 45,000 | 2.615869 | 0.66406 | 0.989097 | 0.889713 | 0.122493 |
+| 50,000 | 2.623402 | 0.69531 | 0.987678 | 0.889993 | 0.129680 |
+| 55,000 | 2.632644 | 0.65625 | 0.988862 | 0.891377 | 0.125231 |
+| 60,000 | 2.611868 | 0.69531 | 0.989359 | 0.894629 | 0.136155 |
+| 65,000 | 2.597276 | 0.75781 | 0.990263 | 0.899451 | 0.140998 |
+| 70,000 | 2.611061 | 0.70312 | 0.990018 | 0.898287 | 0.132355 |
+| 75,000 | 2.604669 | 0.71875 | 0.989874 | 0.901820 | 0.142173 |
+| 80,000 | 2.604071 | 0.68750 | 0.990316 | 0.902574 | 0.139390 |
+| 85,000 | **2.586791** | 0.72656 | 0.990715 | 0.904016 | **0.145932** |
+| 90,000 | 2.592309 | 0.66406 | 0.990922 | 0.905285 | 0.133420 |
+| 95,000 | 2.594969 | 0.67969 | 0.990804 | 0.904189 | 0.140677 |
+| 100,000 | 2.590257 | **0.75781** | **0.991009** | **0.906449** | 0.142959 |
+
+### Decision
+
+Trial 4 is a useful intermediate arm but is not selected over both endpoints.
+At 100k it improves Trial-1 top-1 by `0.0390625` and pairwise accuracy by
+`0.000222`, while worsening loss by `0.008546`, NDCG by `0.000792`, and margin
+by `0.003446`. Its final top-1 remains `0.046875` below Trial 3.
+
+Across 80k–100k, Trial 4 averages top-1 `0.70313`, loss `2.59368`, NDCG
+`0.99075`, and pairwise accuracy `0.90450`. This is below Trial 3's late top-1
+average `0.74531` and below Trial 1's continuous-ranking averages. Thus the
+current fixed-architecture sweep has two distinct winners:
+
+- Trial 3 (`dense WD = 3e-4`) for held top-1;
+- Trial 1 (`dense WD = 1e-4`) for held loss/NDCG and late continuous-ranking
+  stability.
+
+Trial 4 confirms a real regularization tradeoff rather than a monotonic scalar
+improvement. Further tuning on this same 128-state panel would increase
+selection bias. The next scientifically useful step is replication with a new
+permitted development panel or multiple training seeds, while continuing to
+leave game validation and sealed seeds untouched.
+
+### Runtime and witnesses
+
+```text
+run:
+  D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_hp_densewd2e4_fixed2_u100000_20260722_r1
+
+training time:       3,078.199980 s
+updates/s:           32.486518
+states/s:            129.946073
+average CPU:         74.6836%
+candidate CPU:       77.7083%
+
+checkpoint:
+  D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_hp_densewd2e4_fixed2_u100000_20260722_r1\checkpoints\checkpoint_000100000.jls
+sha256: ab913b03a0c033341e5613c63010f349382bb3736fb67e06797116be10e7a0f2
+consumed real-teacher states: 400,000
+
+metrics.jsonl sha256:
+  8add363547a9acf4cd74d18c1d2cb8611c6cedcc5385a596107b341cf794492a
+```
+
+## Sweep summary
+
+| Trial | Only changed setting | Final loss | Final top-1 | Final NDCG | Final pairwise | Final margin | Updates/s | Verdict |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| 1 | baseline | **2.581711** | 0.71875 | **0.991801** | 0.906227 | **0.146405** | 31.92 | continuous-ranking winner |
+| 2 | dense representation LR `0.75x` | 2.609035 | 0.69531 | 0.989974 | 0.896181 | 0.123212 | 31.87 | rejected |
+| 3 | dense WD `3e-4` | 2.607862 | **0.80469** | 0.990137 | 0.898083 | 0.144283 | 31.23 | top-1 winner |
+| 4 | dense WD `2e-4` | 2.590257 | 0.75781 | 0.991009 | **0.906449** | 0.142959 | **32.49** | balanced intermediate |
+
+This tuning session executed 320,000 new updates and consumed 1,280,000 new
+real-teacher state presentations: 20k to finish Trial 1 and 100k each for
+Trials 2–4. Measured training time summed to 10,045.24 seconds. All three
+from-scratch trials began from the same model seed and data order.

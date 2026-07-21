@@ -457,3 +457,9 @@ Trial 3ではbaseline LRを復元し、dense weight decayだけを`1e-4`から`3
 loss `2.607862`、NDCG `0.990137`、pairwise `0.898083`はTrial 1より悪く、
 top-1に限定された改善である。tuningに使用したheld panel上の結果であり、sealed
 generalizationの証明ではない。game validation／sealed seedは未使用である。
+
+Trial 4ではdense weight decayを中間の`2e-4`にして100,000更新した。最終heldは
+loss `2.590257`、top-1 `0.75781`、NDCG `0.991009`、pairwise `0.906449`、
+margin `0.142959`。Trial 1よりtop-1／pairwiseは高いがloss／NDCG／marginは低く、
+Trial 3のtop-1にも届かなかった。結果として、`3e-4`がheld top-1 winner、
+`1e-4` baselineがcontinuous-ranking winner、`2e-4`が中間Pareto armとなった。
