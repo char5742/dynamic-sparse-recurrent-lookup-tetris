@@ -55,8 +55,6 @@ const BARRIERLESS_DENSE_PARAMETER_NAMES = (
     :aux_value,
     :aux_position,
     :register_seed,
-    :token_router,
-    :register_router,
     :spatial_q,
     :spatial_k,
     :spatial_v,

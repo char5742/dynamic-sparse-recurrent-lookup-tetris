@@ -15,14 +15,16 @@ The model contains:
 2. recurrent cell memory updated through learned physical local-8 spatial
    attention with shared Q/K/V/O projections and relative 3x3 position bias;
 3. multiple recurrent registers;
-4. learned sparse cross-attention from registers to a bounded token shortlist;
+4. exact cross-attention from each register to all 283 episodic tokens, with
+   one shared K/V projection per recurrent step;
 5. learned register self-attention and SwiGLU transformation;
 6. active-only LookupFFN long-term memory;
 7. residual recurrent updates and a hard-halting interface.
 
-No dense all-token QK matrix, dense mask-after-score implementation, CNN, or
-CountSketch is used.  Selected token edges and selected Lookup rows alone
-participate in the physical sparse backward and optimizer update.
+No dense mask-after-score implementation, CNN, or CountSketch is used.  The
+small `4 x 283` register/token score support is evaluated directly, while
+LookupFFN long-memory rows remain physically sparse in forward, backward, and
+optimizer updates.
 
 ## CPU execution
 
@@ -60,12 +62,8 @@ rows selected per table      3
 attention dim               32
 attention heads              4
 registers                    4
-episodic shortlist          16
-episodic candidate cap      64
-candidate support cap        4
-spatial anchors              2
-spatial shortlist            2
-spatial candidate cap        3
+episodic cross support      283
+local spatial neighbours     8
 SwiGLU FFN dim              128
 fixed recurrent depth        2
 ```
@@ -79,3 +77,9 @@ See [`RESULTS_2026-07-20.md`](RESULTS_2026-07-20.md) for the exact numerical
 witnesses and
 [`PERFORMANCE_COMPARISON_2026-07-20.md`](PERFORMANCE_COMPARISON_2026-07-20.md)
 for the final held-teacher comparison against PreAct.
+
+The subsequent input-routing ablation removed the former `283 -> 64 -> 16`
+register memory bottleneck.  At the same 12,000-update budget, full-token
+cross-attention improved top-1 from `0.35938` to `0.56250`, with CPU inference
+decreasing from `53.54` to `45.17` states/s.  See
+[`TOKEN_ROUTING_ABLATION_2026-07-21.md`](TOKEN_ROUTING_ABLATION_2026-07-21.md).

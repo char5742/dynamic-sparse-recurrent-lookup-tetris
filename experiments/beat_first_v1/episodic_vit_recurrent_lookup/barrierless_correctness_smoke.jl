@@ -315,7 +315,9 @@ function _tape_token_edges(tape)
     return Tuple(begin
         cross = step.cross
         (;
-            selected_ids=_matrix_integer_tuple(cross.selected_ids),
+            support="all-episodic-tokens",
+            key_count=size(cross.key, 2),
+            attention_shape=size(cross.attention_weights),
         )
     end for step in tape.steps)
 end
@@ -669,7 +671,6 @@ function main()
     hyperparameters == barrierless_payload.config.hyperparameters || error(
         "restored hyperparameters differ",
     )
-
     serial_rows = TrainingCore.next_batch!(
         serial_sampler,
         Training.TRAINING_STATE_BATCH,
@@ -698,8 +699,17 @@ function main()
         TrainingCore.allocate_host_batch(1; max_candidates=Training.LEARNER_WIDTH)
         for _ in 1:Training.TRAINING_STATE_BATCH
     ]
+    smoke_candidate_cap = parse(Int, get(
+        ENV, "EVRL_SMOKE_CANDIDATE_CAP", string(Training.LEARNER_WIDTH),
+    ))
+    1 <= smoke_candidate_cap <= Training.LEARNER_WIDTH || error(
+        "EVRL_SMOKE_CANDIDATE_CAP is outside the learner width",
+    )
     for (batch, row) in zip(batches, serial_rows)
         TrainingCore.pack_batch!(batch, dataset, [row])
+        if smoke_candidate_cap < size(batch.mask, 1)
+            @views fill!(batch.mask[(smoke_candidate_cap + 1):end, :], 0.0f0)
+        end
     end
 
     expected_update = serial_trainer.update + 1
@@ -911,6 +921,8 @@ function main()
                 source_update=Int(serial_payload.update),
             ),
             update=expected_update,
+            states=Training.TRAINING_STATE_BATCH,
+            candidate_cap=smoke_candidate_cap,
             training_rows=Int.(serial_rows),
             training_seed_ids,
             candidate_counts=collect(serial_discrete.counts),
