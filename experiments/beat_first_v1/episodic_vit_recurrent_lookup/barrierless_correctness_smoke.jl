@@ -314,77 +314,77 @@ end
 )
 
 function _tape_token_edges(tape)
-    return Tuple(begin
+    return [begin
         cross = step.cross
         (;
             support="all-episodic-tokens",
             key_count=size(cross.key, 2),
             attention_shape=size(cross.attention_weights),
         )
-    end for step in tape.steps)
+    end for step in tape.steps]
 end
 
 function _tape_lookup_rows(tape)
-    return Tuple(Tuple(begin
+    return [[begin
         block_tape = step.lookup.blocks[block]
-        ordered_columns = Tuple(Int.(block_tape.columns))
+        ordered_columns = Int.(block_tape.columns)
         (;
-            addresses=Tuple(Int.(block_tape.addresses)),
+            addresses=Int.(block_tape.addresses),
             ordered_columns,
-            row_id_set=Tuple(sort!(unique!(collect(ordered_columns)))),
+            row_id_set=sort!(unique!(copy(ordered_columns))),
         )
-    end for block in eachindex(step.lookup.blocks)) for step in tape.steps)
+    end for block in eachindex(step.lookup.blocks)] for step in tape.steps]
 end
 
 function _discrete_snapshot(trainer, batches)
-    counts = Tuple(Training._valid_candidate_count(batch) for batch in batches)
-    candidate_seeds = Tuple(begin
+    counts = [Training._valid_candidate_count(batch) for batch in batches]
+    candidate_seeds = [begin
         workspace = trainer.scheduler.state_workspaces[state]
-        Tuple(workspace.candidate_seeds[1:counts[state]])
-    end for state in eachindex(batches))
-    forced_depths = Tuple(begin
+        copy(workspace.candidate_seeds[1:counts[state]])
+    end for state in eachindex(batches)]
+    forced_depths = [begin
         workspace = trainer.scheduler.state_workspaces[state]
-        Tuple(Int.(workspace.forced_depths[1:counts[state]]))
-    end for state in eachindex(batches))
-    realized_depths = Tuple(begin
+        Int.(workspace.forced_depths[1:counts[state]])
+    end for state in eachindex(batches)]
+    realized_depths = [begin
         workspace = trainer.scheduler.state_workspaces[state]
-        Tuple(Int.(workspace.depths[1:counts[state]]))
-    end for state in eachindex(batches))
-    hard_halting = Tuple(begin
+        Int.(workspace.depths[1:counts[state]])
+    end for state in eachindex(batches)]
+    hard_halting = [begin
         workspace = trainer.scheduler.state_workspaces[state]
-        Tuple(begin
+        [begin
             tape = workspace.tapes[candidate]
             tape === nothing && error("trajectory tape is missing")
             Int(workspace.depths[candidate]) == length(tape.steps) || error(
                 "realized depth differs from trajectory length",
             )
-            Tuple((;
+            [(;
                 stochastic=step.stochastic_decision,
                 stopped=step.stopped,
                 forced=step.forced_stop,
-            ) for step in tape.steps)
-        end for candidate in 1:counts[state])
-    end for state in eachindex(batches))
-    token_edges = Tuple(begin
+            ) for step in tape.steps]
+        end for candidate in 1:counts[state]]
+    end for state in eachindex(batches)]
+    token_edges = [begin
         workspace = trainer.scheduler.state_workspaces[state]
-        Tuple(_tape_token_edges(workspace.tapes[candidate])
-              for candidate in 1:counts[state])
-    end for state in eachindex(batches))
-    lookup_rows = Tuple(begin
+        [_tape_token_edges(workspace.tapes[candidate])
+         for candidate in 1:counts[state]]
+    end for state in eachindex(batches)]
+    lookup_rows = [begin
         workspace = trainer.scheduler.state_workspaces[state]
-        Tuple(_tape_lookup_rows(workspace.tapes[candidate])
-              for candidate in 1:counts[state])
-    end for state in eachindex(batches))
-    halt_probe_targets = Tuple(begin
+        [_tape_lookup_rows(workspace.tapes[candidate])
+         for candidate in 1:counts[state]]
+    end for state in eachindex(batches)]
+    halt_probe_targets = [begin
         workspace = trainer.scheduler.state_workspaces[state]
-        Tuple(reinterpret(UInt32, workspace.halt_probe_targets[candidate])
-              for candidate in 1:counts[state])
-    end for state in eachindex(batches))
-    halt_probe_deltas = Tuple(begin
+        [reinterpret(UInt32, workspace.halt_probe_targets[candidate])
+         for candidate in 1:counts[state]]
+    end for state in eachindex(batches)]
+    halt_probe_deltas = [begin
         workspace = trainer.scheduler.state_workspaces[state]
-        Tuple(reinterpret(UInt32, workspace.halt_probe_deltas[candidate])
-              for candidate in 1:counts[state])
-    end for state in eachindex(batches))
+        [reinterpret(UInt32, workspace.halt_probe_deltas[candidate])
+         for candidate in 1:counts[state]]
+    end for state in eachindex(batches)]
     return (;
         counts,
         candidate_seeds,
@@ -759,7 +759,12 @@ function main()
         expected_update,
         hyperparameters,
     )
-    serial_discrete = _discrete_snapshot(serial_trainer, batches)
+    # A batch-eight discrete witness contains hundreds of deeply nested
+    # trajectory tuples.  Keep it out of the coordinator closure's concrete
+    # type so Julia does not recursively specialize the entire witness.
+    serial_discrete_ref = Ref{Any}(
+        _discrete_snapshot(serial_trainer, batches),
+    )
 
     executor = barrierless_trainer.scheduler.barrierless_executor
     executor === nothing && error("barrierless executor was not attached")
@@ -771,7 +776,11 @@ function main()
             expected_update,
             hyperparameters,
         )
-        barrierless_discrete = _discrete_snapshot(barrierless_trainer, batches)
+        serial_discrete = serial_discrete_ref[]
+        barrierless_discrete_ref = Ref{Any}(
+            _discrete_snapshot(barrierless_trainer, batches),
+        )
+        barrierless_discrete = barrierless_discrete_ref[]
         route_usage_exact =
             barrierless_trainer.usage.trajectories ==
                 serial_trainer.usage.trajectories &&

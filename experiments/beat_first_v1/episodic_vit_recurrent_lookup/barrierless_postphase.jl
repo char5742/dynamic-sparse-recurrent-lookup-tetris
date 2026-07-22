@@ -798,7 +798,7 @@ function _barrierless_enqueue_optimizer_work!(runtime)
 end
 
 """
-Deterministically reduce worker-local gradients, apply the exact four-state
+Deterministically reduce worker-local gradients, apply the configured state-batch
 mean and one global clip scale, and update disjoint parameter/state groups in
 parallel.  Optimizer clocks are committed only after every parameter job ends.
 """

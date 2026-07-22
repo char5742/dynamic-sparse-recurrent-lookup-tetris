@@ -265,7 +265,13 @@ TeacherWorkspace() = TeacherWorkspace(
     fill(Float32(NaN), LEARNER_WIDTH),
 )
 
-const TRAINING_STATE_BATCH = 4
+const TRAINING_STATE_BATCH = let
+    raw = strip(get(ENV, "EVRL_STATE_BATCH", "4"))
+    value = tryparse(Int, raw)
+    value === nothing && error("EVRL_STATE_BATCH must be an integer")
+    value in (4, 8) || error("EVRL_STATE_BATCH must be 4 or 8")
+    value
+end
 const MAX_FLAT_CANDIDATES = TRAINING_STATE_BATCH * LEARNER_WIDTH
 
 struct CandidateSchedulerConfig
@@ -548,7 +554,7 @@ function _prepare_flat_jobs!(
     hyperparameters,
 )
     length(batches) == TRAINING_STATE_BATCH || error(
-        "dynamic scheduler requires the exact four-state training batch",
+        "dynamic scheduler received a state batch inconsistent with EVRL_STATE_BATCH",
     )
     scheduler = trainer.scheduler
     fixed_depth = hyperparameters.halting.fixed_depth
@@ -927,7 +933,7 @@ function _attach_barrierless_executor!(trainer::TeacherTrainer)
             active_workers=active,
             fixed_chunk_size=scheduler.config.chunk_size,
             adaptive_tail=scheduler.config.adaptive_tail,
-            queue_capacity=1024,
+            queue_capacity=max(1024, nextpow(2, 2 * MAX_FLAT_CANDIDATES)),
         )
     else
         scheduler.barrierless_executor = nothing
@@ -935,7 +941,7 @@ function _attach_barrierless_executor!(trainer::TeacherTrainer)
     return trainer
 end
 
-"""Accumulate one exact four-state update on the persistent async DAG."""
+"""Accumulate one configured state batch on the persistent async DAG."""
 function _accumulate_barrierless_batches!(
     trainer::TeacherTrainer,
     batches;
@@ -947,7 +953,7 @@ function _accumulate_barrierless_batches!(
         "barrierless execution requires zero bank decay so parameters stay read-only",
     )
     length(batches) == TRAINING_STATE_BATCH || error(
-        "barrierless execution requires the exact four-state training batch",
+        "barrierless execution received a state batch inconsistent with EVRL_STATE_BATCH",
     )
     scheduler = trainer.scheduler
     executor = scheduler.barrierless_executor
@@ -1558,7 +1564,9 @@ function restore_checkpoint(
             "resume experiment identity differs",
         )
     state_batch = Int(_property_or(payload.config, :state_batch, 0))
-    state_batch == 4 || error("resume state batch differs from exact PreAct comparison")
+    state_batch == TRAINING_STATE_BATCH || error(
+        "resume state batch differs from EVRL_STATE_BATCH",
+    )
     hasproperty(payload.config, :model) || error("resume config lacks model topology")
     payload.config.model == Model.topology(payload.model) || error(
         "resume model topology differs from the live EVRL geometry",
@@ -1827,10 +1835,12 @@ function teacher_signal_cli_main()
     resume_sha256 = strip(get(ENV, "EVRL_RESUME_SHA256", ""))
     resume_payload, resume_artifact = isempty(resume_path) ? (nothing, nothing) :
         read_checkpoint(resume_path, resume_sha256)
-    inherited_state_batch = resume_payload === nothing ? 4 :
-        Int(_property_or(resume_payload.config, :state_batch, 4))
+    inherited_state_batch = resume_payload === nothing ? TRAINING_STATE_BATCH :
+        Int(_property_or(resume_payload.config, :state_batch, TRAINING_STATE_BATCH))
     state_batch = _int_env("EVRL_STATE_BATCH", inherited_state_batch; minimum=1)
-    state_batch == 4 || error("exact PreAct comparison requires EVRL_STATE_BATCH=4")
+    state_batch == TRAINING_STATE_BATCH || error(
+        "EVRL_STATE_BATCH changed after the training module was loaded",
+    )
     evaluation_interval = _int_env("EVRL_EVAL_INTERVAL", maximum_updates; minimum=1)
     checkpoint_interval = _int_env("EVRL_CHECKPOINT_INTERVAL", maximum_updates; minimum=1)
     inherited_dataset_path = resume_payload === nothing ? DEFAULT_DATASET :

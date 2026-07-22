@@ -4,7 +4,8 @@
 
 動的再帰P1で見られたloss、top-1、平均深度の振動を、モデル全体のアーキテクチャを変えずに学習率、weight decay、state batchの調整で改善する。その前提として、同じ実teacher系列を長時間安全に学習できることを確認する。
 
-validation subsetとsealed game seedは、この作業では構築も参照もしていない。
+数値一致smokeと速度benchmarkはtraining splitだけを使用した。品質曲線には既存の
+固定teacher evaluation panelを用いたが、sealed game seedは構築も参照もしていない。
 
 ## 調整前に判明したbackwardの範囲外書込み
 
@@ -63,3 +64,71 @@ scratch容量はepisodic shortlist、register数、旧spatial shortlistの最大
 4. state batch変更は、serial/barrierlessの数値一致とcheckpoint互換性を確認できた場合だけ採用する。
 5. loss、top-1、NDCG、margin、平均深度が同時に安定する構成だけを100,000更新まで継続する。
 
+## state batch 8の数値一致と速度判定
+
+`EVRL_STATE_BATCH`を4または8から選べるようにし、workspace、flattened candidate
+capacity、barrierless state runtime、optimizer平均化係数、checkpointのstate-batch
+整合性を同じ定数から構築した。batch 8ではqueue capacityを640候補の2倍以上となる
+2,048へ自動拡張した。モデル構造、loss、optimizer semanticsは変更していない。
+
+8状態、実候補数`52, 26, 26, 51, 34, 54, 52, 53`の全328候補を使った
+`--check-bounds=yes` smokeでは次の結果を得た。
+
+| 項目 | 結果 |
+|---|---:|
+| 出力最大絶対差 | 0 |
+| loss最大絶対差 | 0 |
+| raw task VJP最大絶対差 | 0 |
+| parameter gradient最大絶対差 | 3.50922e-6 |
+| parameter gradient relative L2 | 2.21206e-6 |
+| optimizer後parameter/state最大絶対差 | 3.50643e-7 |
+| 離散経路、probe、RNG、sampler、optimizer clock | すべて一致 |
+| 判定 | 合格 |
+
+smokeの可変長trajectory witnessは、巨大な`NTuple`をclosure型へ埋め込むとJuliaの
+compiler stack overflowを起こしたため、同じ内容をheap上の可変長`Vector`として
+保持するようにした。これは診断表現だけの変更であり、学習経路には入らない。
+
+10更新warmup後の100更新benchmarkをbatch 4の修正後preflightと比較した。
+
+| state batch | updates/s | states/s | CPU使用率 | allocation/update | 判定 |
+|---:|---:|---:|---:|---:|---|
+| 4 | 15.5050 | 62.020 | 49.64% | 7.739 MB | 採用 |
+| 8 | 7.5291 | 60.233 | 56.99% | 15.426 MB | 不採用 |
+
+batch 8はCPU使用率を上げたが、state throughputを改善せず、最低15 updates/sも
+満たさなかった。大batchによる勾配分散低減の可能性より実行条件を優先し、本線は
+batch 4へ戻した。
+
+## 修正後の動的再帰20,000更新基準
+
+修正後モデルをscratchから学習し、最初の5,000更新は深度2～6のrandom-depth
+warmup、その後はcandidate-local 1-step probe付きhard haltingとした。設定は
+dense LR `2e-4`、router LR `4e-4`、halt LR `5e-5`、dense weight decay
+`1e-4`、compute price `0`、2 probes/stateである。
+
+| 更新 | held loss | held top-1 | held NDCG | held margin | held平均深度 | 区間updates/s |
+|---:|---:|---:|---:|---:|---:|---:|
+| 5,000 | 2.867476 | 0.507812 | 0.978324 | 0.099650 | 2.000 | - |
+| 10,000 | 2.810665 | 0.531250 | 0.979387 | 0.088824 | 2.107 | 15.506 |
+| 15,000 | 2.758752 | 0.523438 | 0.981218 | 0.104578 | 2.396 | 15.343 |
+| 20,000 | 2.752324 | 0.578125 | 0.982200 | 0.103318 | 3.556 | 15.592 |
+
+lossとNDCGは全評価点で改善した。top-1は15,000更新で一度小幅に下がったが、
+20,000更新では開始点より`+0.070313`上昇した。平均深度は`2.000 -> 2.107 ->
+2.396 -> 3.556`と単調に増え、評価候補によって最小2、最大12を使い分けた。
+範囲外書込み修正後は、旧P1で見られた両端への急激な深度振動を20,000更新まで
+再現していない。
+
+20,000更新checkpointは次である。
+
+```text
+run: evrl_boundsfix_p2_c0_halt5e5_lr2e4_wd1e4_u20000_20260723_b2
+checkpoint: checkpoint_000020000.jls
+sha256: 5cfa14c342acdb450911acd10b70c2a7e65c6a120d0a2e0c114834ee3bd1ff52
+teacher states: 80,000
+```
+
+この結果から、修正後の現行LR `2e-4`とweight decay `1e-4`を安定基準として採用する。
+後半の振動を抑えるため、50,000更新以降はepisodic dense学習率だけを0.5倍にする
+予定とし、それ以前のoptimizer設定は変更しない。

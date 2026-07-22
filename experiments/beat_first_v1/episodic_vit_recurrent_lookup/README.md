@@ -53,11 +53,17 @@ SwiGLU FFN dim              128
 fixed recurrent depth        2
 ```
 
-hard haltingの実装は維持しているが、20,000更新の表現学習では深度2に固定した。意図した最終評価protocolにおいて空間表現とrouting表現が安定していることを確認した後にのみ、再度有効化する。
+hard haltingはcandidate-local 1-step probeによる停止教師とともに有効である。修正後の
+20,000更新基準では、held平均深度が`2.00 -> 2.11 -> 2.40 -> 3.56`と増え、
+最小2、最大12を入力ごとに使い分けながら、held lossとNDCGを全評価点で改善した。
 
 動的学習には、候補単位の1-step probeを任意で有効にできる。sampled stopのうち有界な個数だけをprobeし、その候補のQだけを置換した後にListNetとmarginを再計算し、`L_stop - L_continue`から最終停止判断を教師あり学習する。この方式は物理的疎性を保ち、有効化時には従来のstate-wide REINFORCEによる信用割当を置き換える。詳細は[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md)を参照。
 
-完了済みの100,000更新probe試験では、stateあたり2候補をprobeした。品質と深度の釣り合いが最良だった95,000更新checkpointは、top-1 `0.73438`、NDCG `0.991345`、margin `0.14191`、held平均深度`2.19`に到達した。90,000更新では、平均深度`3.02`で試験中最高のtop-1 `0.74219`を記録した。旧state-wide halting試験の最終値を全品質指標で上回り、旧試験で生じた最終深度12への飽和も回避した。ただし学習後半の深度は依然として下限寄りである。この結果は、信用割当の改善には成功したが、適応的深度の獲得は部分的成功にとどまると記録している。
+完了済みの旧100,000更新probe試験では、stateあたり2候補をprobeした。品質と深度の
+釣り合いが最良だった95,000更新checkpointは、top-1 `0.73438`、NDCG `0.991345`、
+margin `0.14191`、held平均深度`2.19`に到達した。ただし、この試験は後に判明した
+8近傍spatial backwardの範囲外書込みを含むため、研究履歴としてのみ保持し、修正後
+モデルの最終性能根拠には使用しない。
 
 正確な数値witnessは[`RESULTS_2026-07-20.md`](RESULTS_2026-07-20.md)、PreActとの最終held-teacher比較は[`PERFORMANCE_COMPARISON_2026-07-20.md`](PERFORMANCE_COMPARISON_2026-07-20.md)を参照。
 
