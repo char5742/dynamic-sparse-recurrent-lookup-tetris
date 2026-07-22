@@ -323,3 +323,49 @@ checkpoint: checkpoint_000050000.jls
 sha256: 13a99d3dea24942e4766aaae340ed3ecf6d13448954e559845f3bd19fbee93de
 teacher states: 200,000
 ```
+
+## 50,000更新以降のepisodic LR半減
+
+50,000更新checkpointから、bank、router、lookup alpha、halt LRを維持し、attention、
+FFN、token、register、headに共通で掛かるepisodic LR scaleだけを`0.5`へ下げた。
+実効dense LRは`2e-4`から`1e-4`となる。resumeでこのschedule変更だけを許可する
+`EVRL_ENABLE_EPISODIC_LR_TRANSITION=1`を追加し、decay開始更新と係数以外が変わる場合は
+拒否する。
+
+50,001更新目でscale `0.5`を実際に適用したreal-teacher serial／barrierless
+bounds-check smokeは合格した。
+
+| 項目 | 結果 |
+|---|---:|
+| 出力最大絶対差 | 0 |
+| loss最大絶対差 | 0 |
+| raw task VJP最大絶対差 | 0 |
+| parameter gradient最大絶対差 | 2.15694e-6 |
+| parameter gradient relative L2 | 6.38261e-7 |
+| optimizer後parameter/state最大絶対差 | 2.16067e-7 |
+| 離散経路、probe、RNG、sampler、optimizer clock | すべて一致 |
+| 判定 | 合格 |
+
+最初の5,000更新では次の結果を得た。
+
+| 更新 | held loss | held top-1 | held NDCG | held pairwise | held margin | held平均深度 | 深度範囲 | 区間updates/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50,000 | 2.632145 | 0.734375 | 0.987706 | 0.884073 | 0.131590 | 4.010 | 3～12 | - |
+| 55,000 | 2.612962 | 0.718750 | 0.988942 | 0.890677 | 0.132410 | 4.287 | 2～6 | 14.776 |
+
+LR半減後はloss、NDCG、pairwise、marginが改善し、平均深度も最大側へ飽和せず中間域を
+維持した。top-1だけ`-0.015625`だが、固定128状態では2状態分の差である。品質と深度の
+目的には合う一方、5,000更新区間の集計速度が下限15を`0.224 updates/s`下回ったため、
+学習は55,000更新checkpoint保存後に自動停止した。
+
+LR係数自体はforward/backwardの演算量を変えず、最終更新の学習時間は約0.0605秒だった。
+5,000更新集計には新しいsourceの冷間JITが含まれるため、速度条件を緩めるのではなく、
+同じ55,000更新checkpointから100更新warmup後の1,000更新benchmarkを行い、定常速度が
+15 updates/s以上かを別途判定する。合格するまでは本学習を再開しない。
+
+```text
+run: evrl_boundsfix_p2_c0_halt5e5_lr2e4_half50k_wd3e4_u70000_20260723_lr1
+last checkpoint: checkpoint_000055000.jls
+sha256: 721393a555d65477e6c475e471041e509a32f4f932671628f3f7f56f59743e69
+teacher states: 220,000
+```

@@ -694,10 +694,22 @@ function main()
         "EVRL_WD_DENSE",
         string(inherited_hyperparameters.optimizer.dense_weight_decay),
     ))
+    episodic_decay_after_update = parse(Int, get(
+        ENV,
+        "EVRL_EPISODIC_LR_DECAY_AFTER",
+        string(inherited_hyperparameters.optimizer.episodic_decay_after_update),
+    ))
+    episodic_decay_factor = parse(Float32, get(
+        ENV,
+        "EVRL_EPISODIC_LR_DECAY_FACTOR",
+        string(inherited_hyperparameters.optimizer.episodic_decay_factor),
+    ))
     hyperparameters = merge(inherited_hyperparameters, (;
         optimizer=merge(inherited_hyperparameters.optimizer, (;
             halt_learning_rate,
             dense_weight_decay,
+            episodic_decay_after_update,
+            episodic_decay_factor,
         )),
         halting=merge(inherited_hyperparameters.halting, (;
             compute_price,

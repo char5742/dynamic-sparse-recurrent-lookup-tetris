@@ -614,3 +614,13 @@ continuous-ranking指標は45kから小幅に反落した。
 50k checkpointを後半LR調整の共通分岐点とし、bank、router、halt LRは維持したまま、
 attention、FFN、token、register、headに掛かる既存episodic LR scaleだけを0.5へ下げる。
 これによりアーキテクチャとtask lossを変えず、dense経路の後半更新幅だけを比較する。
+
+episodic LR scheduleの一軸遷移を実装し、50,001更新目からscale `0.5`を適用した
+serial／barrierless smokeは出力、loss、raw VJP完全一致、parameter gradient最大差
+`2.16e-6`、optimizer後state最大差`2.16e-7`で合格した。
+
+55kではloss `2.612962`、top-1 `0.718750`、NDCG `0.988942`、pairwise
+`0.890677`、margin `0.132410`、平均深度`4.287`（範囲2～6）となった。品質と深度は
+有望だが、冷間JITを含む5k区間速度が`14.776 updates/s`で下限15を僅かに下回り、
+checkpoint保存後に自動停止した。速度条件は緩めず、同じcheckpointから100更新warmup後の
+1,000更新benchmarkで定常速度を確認してから採否を決める。

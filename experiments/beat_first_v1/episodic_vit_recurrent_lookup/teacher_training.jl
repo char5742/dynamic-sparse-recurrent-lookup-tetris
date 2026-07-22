@@ -1646,9 +1646,25 @@ function restore_checkpoint(
             merge(inherited.optimizer, (;
                 dense_weight_decay=requested_normalized.optimizer.dense_weight_decay,
             )) == requested_normalized.optimizer
+        episodic_lr_transition_raw = strip(get(
+            ENV, "EVRL_ENABLE_EPISODIC_LR_TRANSITION", "0",
+        ))
+        episodic_lr_transition_raw in ("0", "1") || error(
+            "EVRL_ENABLE_EPISODIC_LR_TRANSITION must be 0 or 1",
+        )
+        episodic_lr_transition = episodic_lr_transition_raw == "1" &&
+            inherited.routing == requested_normalized.routing &&
+            inherited.loss == requested_normalized.loss &&
+            inherited.halting == requested_normalized.halting &&
+            merge(inherited.optimizer, (;
+                episodic_decay_after_update=
+                    requested_normalized.optimizer.episodic_decay_after_update,
+                episodic_decay_factor=
+                    requested_normalized.optimizer.episodic_decay_factor,
+            )) == requested_normalized.optimizer
         dynamic_halting_transition || halt_probe_transition || halt_lr_transition ||
-            dense_wd_transition || error(
-            "resume hyperparameters differ; only an explicit dynamic-halting, halt-probe, halt-LR, or dense-WD transition is allowed",
+            dense_wd_transition || episodic_lr_transition || error(
+            "resume hyperparameters differ; only an explicit dynamic-halting, halt-probe, halt-LR, dense-WD, or episodic-LR transition is allowed",
         )
         dynamic_halting_transition && @info(
             "EVRL fixed-depth checkpoint transitions to sampled hard halting",
@@ -1670,6 +1686,14 @@ function restore_checkpoint(
             "EVRL dense weight decay transition",
             previous_dense_weight_decay=inherited.optimizer.dense_weight_decay,
             requested_dense_weight_decay=requested_normalized.optimizer.dense_weight_decay,
+        )
+        episodic_lr_transition && @info(
+            "EVRL episodic learning rate transition",
+            previous_decay_after_update=inherited.optimizer.episodic_decay_after_update,
+            previous_decay_factor=inherited.optimizer.episodic_decay_factor,
+            requested_decay_after_update=
+                requested_normalized.optimizer.episodic_decay_after_update,
+            requested_decay_factor=requested_normalized.optimizer.episodic_decay_factor,
         )
     end
     hasproperty(payload.config, :objective) || error("resume config lacks objective")
