@@ -1,32 +1,22 @@
-# EVRL dynamic-recurrence activation study — 2026-07-21
+# EVRL動的再帰の有効化試験 — 2026-07-21
 
-## Question
+## 問い
 
-The global-visual, full-283-token EVRL had been trained with recurrent depth
-fixed to two. This study asked whether sampled hard halting could be enabled
-after that training, whether the halt head should be reset, or whether dynamic
-depth must be present from the beginning.
+global visual pathとfull 283-token accessを持つEVRLは、recurrent depthを2に固定して学習していた。本試験では、学習途中からsampled hard haltingを有効化できるか、halt headを初期化し直すべきか、または動的depthを最初から導入する必要があるかを検証した。
 
-The model body, prediction head, LookupFFN routing, input, teacher, ranking
-losses, candidate-independent evaluation, sparse optimizer, and real-teacher
-sampler were kept unchanged. Game validation and sealed seeds were not used.
+model body、prediction head、LookupFFN routing、入力、teacher、ranking loss、candidate独立評価、sparse optimizer、real-teacher samplerは変更していない。game validationとsealed seedも未使用である。
 
-The trainer now permits only one explicit semantic checkpoint transition when
-`EVRL_ENABLE_DYNAMIC_HALTING_TRANSITION=1`: inherited non-zero fixed depth to
-sampled hard halting. Optimizer, routing, and loss hyperparameters must remain
-identical. `EVRL_DYNAMIC_HALT_RESET_PROBABILITY` optionally resets only the
-halt weight, bias, and their Adam moments during that transition.
+trainerが許可する明示的なcheckpoint semantics変更は、`EVRL_ENABLE_DYNAMIC_HALTING_TRANSITION=1`指定時の「継承した非zero固定depthからsampled hard haltingへ」の1種類だけとした。optimizer、routing、loss hyperparameterは完全一致を必須とした。`EVRL_DYNAMIC_HALT_RESET_PROBABILITY`を指定した場合は、このtransition中にhalt weight、bias、それらのAdam momentだけを初期化する。
 
-## Fixed-depth source
+## 固定深度の親モデル
 
-The source model continued learning well beyond the earlier 25,000-update
-report. At update 75,000 its held-panel result was:
+親モデルは以前の25,000-update報告後も学習を続け、update 75,000で次のheld-panel結果を得た。
 
 | Loss | Top-1 | NDCG | Pairwise | Margin |
 |---:|---:|---:|---:|---:|
 | 2.591471 | 0.71875 | 0.990663 | 0.900622 | 0.137788 |
 
-Dynamic-transition branches started from the saved update-80,000 checkpoint:
+dynamic transitionの各branchは、保存済みupdate 80,000 checkpointから開始した。
 
 ```text
 path: D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_full283_visual_dw5_rf63_fixed2_u100000_20260721_r1\checkpoints\checkpoint_000080000.jls
@@ -34,65 +24,40 @@ sha256: 332728081d195814d7b2bcd17728fce83f92fe8a430cd62b2e936ea39d34e104
 consumed real-teacher states: 320,000
 ```
 
-## Results
+## 結果
 
-| Branch | Training intervention | Final update | Held loss | Top-1 | NDCG | Pairwise | Margin | Held deterministic depth | Training sampled depth at end | Updates/s |
+| 分岐 | 学習上の介入 | 最終更新 | Held loss | Top-1 | NDCG | Pairwise | Margin | Held決定論的深度 | 終了時の学習sampled depth | Updates/s |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Mid-training direct | enable hard halting at 80k | 90k | 2.588522 | 0.72656 | 0.991547 | 0.905774 | 0.141727 | 2 / 2 / 2 | mean 2.25, range 2–5 | 27.48 |
-| Mid-training curriculum | random depth 2–6 for 5k, then hard halting | 90k | 2.586021 | 0.71875 | 0.991611 | 0.906437 | 0.145673 | 2 / 2 / 2 | mean 2.23, range 2–4 | 28.16 after release |
-| From scratch | random depth 2–6 for first 5k, then hard halting | 20k | 2.735993 | 0.53906 | 0.983724 | 0.866709 | 0.091127 | 2 / 2 / 2 | mean 2.29, range 2–5 | 26.16 |
+| 途中から直接導入 | 80kでhard haltingを有効化 | 90k | 2.588522 | 0.72656 | 0.991547 | 0.905774 | 0.141727 | 2 / 2 / 2 | mean 2.25, range 2–5 | 27.48 |
+| 途中からcurriculum | 5kだけdepth 2–6、その後hard halting | 90k | 2.586021 | 0.71875 | 0.991611 | 0.906437 | 0.145673 | 2 / 2 / 2 | mean 2.23, range 2–4 | release後28.16 |
+| Scratch開始 | 最初の5kをdepth 2–6、その後hard halting | 20k | 2.735993 | 0.53906 | 0.983724 | 0.866709 | 0.091127 | 2 / 2 / 2 | mean 2.29, range 2–5 | 26.16 |
 
-The `2 / 2 / 2` field is held-panel mean/minimum/maximum. The curriculum
-segment itself ran at exactly mean depth 4.0 and 19.06 updates/s. It improved
-the body at deeper recurrent states, but releasing hard halting still returned
-every deterministic held example to depth two.
+`2 / 2 / 2`はheld-panelのmean／minimum／maximumを示す。curriculum区間自体は平均depth 4.0、19.06 updates/sで動作した。より深いrecurrent stateでbodyを改善したが、hard haltingを解放するとdeterministic held sampleはすべてdepth 2へ戻った。
 
-Direct mid-training activation reached its best recorded top-1 of `0.7265625`
-at updates 85,000 and 90,000. Continuing it to 95,000 reduced top-1 to
-`0.7109375`, so the 95,000 checkpoint was not adopted.
+途中から直接導入したbranchではupdate 85,000と90,000で最高top-1 `0.7265625`を得た。95,000まで続けると`0.7109375`へ低下したため、95,000 checkpointは採用しなかった。
 
-The from-scratch branch learned the ranking task normally: top-1 rose from
-`0.21875` initially to `0.50781` at 5,000 and `0.53906` at 20,000. Its failure
-to acquire deterministic variable depth therefore cannot be explained only by
-introducing recurrence late.
+from-scratch branchもランキング課題自体は正常に学習し、top-1は初期`0.21875`から5,000で`0.50781`、20,000で`0.53906`へ上昇した。したがってdeterministic variable depthを獲得できなかった原因を、動的再帰の導入時期だけでは説明できない。
 
-## Halt-head reset ablation
+## Halt-head初期化ablation
 
-Resetting only the halt head to probability `0.4` made deterministic inference
-run to the maximum depth 12 immediately, with held loss `7.0786` and top-1
-`0.328`. Training then drove sampled depth back toward approximately 2.4–2.5
-within a few thousand updates. This branch was stopped and not adopted.
+halt headだけをprobability `0.4`へ初期化すると、deterministic inferenceは即座に最大depth 12まで実行し、held loss `7.0786`、top-1 `0.328`となった。その後数千updateでtraining sampled depthは約2.4–2.5へ戻った。このbranchは停止し、不採用とした。
 
-Clearing the prediction head was not tested because it would destroy the
-already learned teacher-Q/ranking map without supplying the missing recurrent
-credit signal. The halt-only reset is the narrower version of that hypothesis,
-and it was insufficient.
+prediction headの初期化は試していない。既に学習したteacher-Q／ranking mapを破壊するだけで、不足しているrecurrent credit signalを与えないためである。halt-only resetはその仮説をより狭く検証したものだが、不十分だった。
 
-## Diagnosis
+## 診断
 
-The current policy-gradient target gives every candidate trajectory in a
-state the same realized state-level ranking loss. It does not tell a candidate
-whether one additional recurrent step improved that candidate relative to its
-competitors. The compute price consequently supplies a clean pressure toward
-early stopping, while the benefit of another step is noisy and coupled across
-the candidate list.
+当時のpolicy-gradient targetは、1つのstate内にある全candidate trajectoryへ同じ実現state-level ranking lossを与えていた。あるcandidateを追加1step進めたことが競合candidateに対して有利だったかを、そのcandidate自身へ教えていない。そのためcompute priceは早期停止への明確な圧力となる一方、追加stepの利益はnoisyでcandidate list全体に結合されていた。
 
-The evidence supports this interpretation:
+次の根拠がこの解釈を支持する。
 
-1. deeper-state curriculum improves continuous ranking metrics;
-2. stochastic training trajectories still explore depths 3–5;
-3. deterministic held inference remains depth two in every branch;
-4. halt-head reset and from-scratch training do not resolve the collapse.
+1. deeper-state curriculumはcontinuous ranking指標を改善する。
+2. stochastic training trajectoryはdepth 3–5を探索し続ける。
+3. deterministic held inferenceは全branchでdepth 2のままである。
+4. halt-head resetとfrom-scratch trainingでもcollapseは解消しない。
 
-The next intervention should therefore target halting credit assignment, not
-clear the prediction layer or replace the learned model body. A physically
-sparse option is to probe a small fraction of candidates for one extra step,
-hold the other candidate scores fixed, and supervise continuation from the
-exact change in the state ranking loss. Compute price should be reduced during
-that acquisition phase and restored only after the halt head separates useful
-and useless extra computation.
+したがって次の介入対象はprediction layerの初期化や学習済みmodel bodyの置換ではなく、haltingの信用割当である。物理的疎性を保つ方法として、少数candidateだけを追加1step probeし、他candidate scoreを固定したままstate ranking lossの正確な変化を教師にできる。compute priceはこの獲得段階では下げ、halt headが有用／無用な追加計算を分離できてから戻すべきである。
 
-## Checkpoint witnesses
+## Checkpoint検証情報
 
 ```text
 direct dynamic 85k:
@@ -108,4 +73,4 @@ from-scratch dynamic 20k:
   sha256 e2a96fb65bb8cedf68b484f409d84aa8d219bd0795e7afb4b188bbdecd1a9e31
 ```
 
-Binary checkpoints and teacher data are not committed to Git.
+binary checkpointとteacher dataはGitへcommitしていない。

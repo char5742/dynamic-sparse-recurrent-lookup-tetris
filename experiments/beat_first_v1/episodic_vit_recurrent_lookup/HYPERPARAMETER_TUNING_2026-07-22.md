@@ -1,39 +1,28 @@
-# EVRL fixed-architecture hyperparameter tuning — 2026-07-22
+# EVRL固定アーキテクチャのhyperparameter調整 — 2026-07-22
 
-> Scope correction: Trials 1--4 below are fixed-depth optimizer/regularization
-> controls.  They are valid quality baselines, but they do not tune dynamic
-> recurrence.  Recurrence-focused trials are recorded separately in
-> [`DYNAMIC_RECURRENCE_TUNING_2026-07-22.md`](DYNAMIC_RECURRENCE_TUNING_2026-07-22.md).
+> 対象範囲の訂正：以下の試験1～4は、固定深度でのoptimizerおよび正則化controlである。品質baselineとしては有効だが、動的再帰を調整した試験ではない。再帰に焦点を当てた試験は、別途[`DYNAMIC_RECURRENCE_TUNING_2026-07-22.md`](DYNAMIC_RECURRENCE_TUNING_2026-07-22.md)に記録している。
 
-## Contract
+## 固定条件
 
-All trials in this ledger keep the complete EVRL architecture fixed:
+本記録のすべての試験で、EVRLアーキテクチャ全体を固定した。
 
-- 20,577,789 parameters;
-- identical PreAct input boundary and real-teacher dataset;
-- 283-token full cross-attention and four recurrent registers;
-- five-stage dilated depthwise/pointwise visual path with `63 x 63` receptive field;
-- local-8 learned spatial Q/K/V/O relation;
-- three shared LookupFFN micro-layers, 13 tables per block, 4,096 rows per table,
-  and physical top-3 active-row updates;
-- candidate-independent evaluation, ranking objective, sampler seeds, split, and
-  128-state held panel;
-- 20-worker barrierless executor, no CPU pinning, chunk eight;
-- no game validation or sealed seed access.
+- 20,577,789 parameter
+- PreActと同一の入力境界および実teacher dataset
+- 283-token full cross-attentionと4個のrecurrent register
+- `63 x 63`受容野を持つ5段dilated depthwise/pointwise視覚経路
+- learned local-8 spatial Q/K/V/O relation
+- 共有LookupFFN micro-layer 3段、blockあたり13 table、tableあたり4,096 row、物理的top-3 active-row更新
+- candidate独立評価、ranking objective、sampler seed、split、128-state held panel
+- 20-worker barrierless executor、CPU pinningなし、chunk 8
+- game validationおよびsealed seedへはアクセスしない
 
-Only scalar optimizer, weight-decay, or routing-schedule hyperparameters
-changed in the trials below; recurrent depth remained fixed at two. Each
-accepted comparison runs to update 100,000,
-records held metrics every 5,000 updates, and is committed and pushed before
-the next trial begins.
+以下の試験で変更したのは、optimizer、weight decay、routing scheduleに関するscalar hyperparameterだけである。再帰深度は2に固定した。採用対象の比較は100,000更新まで実行し、5,000更新ごとにheld metricを記録し、次の試験を始める前にcommitおよびpushした。
 
-## Trial 1 — completed fixed-depth baseline
+## 試験1 — 固定深度baseline完了
 
-This trial completed the existing baseline from its exact update-80,000
-checkpoint to update 100,000. It is the control for subsequent from-scratch
-100,000-update tuning trials; no hyperparameter was changed.
+既存baselineの正確な80,000更新checkpointから100,000更新まで学習を継続した。後続のscratch開始100,000更新調整試験に対するcontrolであり、hyperparameterは一切変更していない。
 
-### Hyperparameters
+### Hyperparameter
 
 ```text
 bank LR       2e-4        bank weight decay    0
@@ -45,9 +34,9 @@ register LR   2e-4
 head LR       2e-4
 ```
 
-### Held-panel curve
+### Held panel推移
 
-| Update | Loss | Top-1 | NDCG | Pairwise | Margin | Segment updates/s | Segment CPU |
+| 更新 | Loss | Top-1 | NDCG | Pairwise | Margin | 区間updates/s | 区間CPU |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 80,000 | 2.596073 | 0.69531 | 0.990361 | 0.901688 | 0.133506 | — | — |
 | 85,000 | 2.591489 | **0.73438** | 0.991055 | 0.905273 | 0.134817 | 29.61 | 69.94% |
@@ -55,15 +44,9 @@ head LR       2e-4
 | 95,000 | 2.583290 | 0.70312 | 0.991298 | 0.904486 | 0.140228 | 31.57 | 74.01% |
 | 100,000 | **2.581711** | 0.71875 | **0.991801** | 0.906227 | **0.146405** | **31.92** | **74.63%** |
 
-Loss and NDCG continued to improve through update 100,000, while discrete
-top-1 peaked at update 85,000 and then oscillated. The curve is not a clean
-loss plateau, but the top-1 variance motivates a conservative learning-rate
-trial rather than a larger step size. The first tuned arm will multiply the
-dense representation LRs by `0.75` while leaving the higher router LR and bank
-LR unchanged, isolating late representation-update stability from sparse
-routing capacity.
+lossとNDCGは100,000更新まで改善を続けた一方、離散的なtop-1は85,000更新で最高値を記録した後に振動した。lossが明確にplateauしたわけではないが、top-1の分散を考えるとstep sizeを増やすのではなく、保守的なlearning-rate試験が妥当である。最初の調整armでは、sparse routing容量を担う高めのrouter LRとbank LRを維持し、dense representation LRだけを`0.75`倍する。これにより、後半の表現更新安定性を分離して評価する。
 
-### Runtime and witnesses
+### 実行時間とwitness
 
 ```text
 run:
@@ -84,19 +67,15 @@ metrics.jsonl sha256:
   e2c4e4d4f2c8a243452dd65a417e3c80c610f6dc83983b31128e0b791ee1f095
 ```
 
-Binary checkpoints and teacher data are not committed to Git.
+binary checkpointとteacherデータはGitへcommitしていない。
 
-## Trial 2 — dense representation LR 0.75x
+## 試験2 — dense representation LRを0.75倍
 
-This from-scratch trial changed only five dense representation learning rates
-from `2e-4` to `1.5e-4`: attention, FFN, token/visual, register, and output
-head. Bank LR remained `2e-4`, router LR `4e-4`, Lookup residual-alpha LR
-`2e-4`, dense weight decay `1e-4`, and all architecture, seed, data, loss,
-routing schedule, and fixed-depth settings matched Trial 1.
+scratchから開始した本試験では、attention、FFN、token/visual、register、output headという5種類のdense representation learning rateだけを`2e-4`から`1.5e-4`へ変更した。bank LRは`2e-4`、router LRは`4e-4`、Lookup residual-alpha LRは`2e-4`、dense weight decayは`1e-4`のままであり、アーキテクチャ、seed、データ、loss、routing schedule、固定深度設定はすべて試験1と同一である。
 
-### Held-panel curve
+### Held panel推移
 
-| Update | Loss | Top-1 | NDCG | Pairwise | Margin |
+| 更新 | Loss | Top-1 | NDCG | Pairwise | Margin |
 |---:|---:|---:|---:|---:|---:|
 | 0 | 8.395339 | 0.21875 | 0.860435 | 0.546154 | 0.040159 |
 | 5,000 | 2.856116 | 0.53906 | 0.978386 | 0.837953 | 0.057290 |
@@ -120,20 +99,13 @@ routing schedule, and fixed-depth settings matched Trial 1.
 | 95,000 | 2.614602 | 0.65625 | 0.989280 | 0.894817 | 0.125980 |
 | 100,000 | **2.609035** | **0.69531** | **0.989974** | **0.896181** | 0.123212 |
 
-### Decision
+### 判断
 
-Trial 2 is rejected. Relative to the Trial-1 final checkpoint, its loss was
-`+0.027324`, top-1 `-0.023438`, NDCG `-0.001828`, pairwise accuracy
-`-0.010046`, and margin `-0.023193`. Lowering the dense LR did not remove
-top-1 oscillation: top-1 fell from `0.64062` at 65k to `0.58594` at 70k and
-from `0.66406` at 85k to `0.65625` at 95k. The intervention mainly delayed
-learning and remained behind the baseline at the equal 100k budget.
+試験2は不採用とする。試験1の最終checkpointと比べて、lossは`+0.027324`、top-1は`-0.023438`、NDCGは`-0.001828`、pairwise accuracyは`-0.010046`、marginは`-0.023193`悪化した。dense LRを下げてもtop-1の振動は解消しなかった。top-1は65kの`0.64062`から70kの`0.58594`へ、85kの`0.66406`から95kの`0.65625`へ低下した。この介入は主に学習を遅らせ、同一100k予算でbaselineに追いつかなかった。
 
-The next trial restores all baseline learning rates and changes only dense
-weight decay from `1e-4` to `3e-4`. The baseline has a held/training loss gap
-at 100k, so this tests stronger regularization without slowing early updates.
+次の試験では全learning rateをbaselineへ戻し、dense weight decayだけを`1e-4`から`3e-4`へ変更する。baselineは100k時点でheld lossとtraining lossに差があるため、初期更新を遅くせず、より強い正則化を検証する。
 
-### Runtime and witnesses
+### 実行時間とwitness
 
 ```text
 run:
@@ -154,16 +126,13 @@ metrics.jsonl sha256:
   79ec6d082692065f38b704d9c47e9705ce903da18fd33c1ed2e236e3900e1059
 ```
 
-## Trial 3 — dense weight decay 3e-4
+## 試験3 — dense weight decay 3e-4
 
-This from-scratch trial restored every Trial-1 learning rate and changed only
-dense weight decay from `1e-4` to `3e-4`. Lookup-bank weight decay remained
-zero. Architecture, initialization, sampler, data order, loss, routing
-schedule, fixed depth, executor, and held panel were identical.
+scratchから開始した本試験では、試験1のlearning rateをすべて復元し、dense weight decayだけを`1e-4`から`3e-4`へ変更した。Lookup bankのweight decayは0のままである。アーキテクチャ、初期化、sampler、データ提示順、loss、routing schedule、固定深度、executor、held panelは同一である。
 
-### Held-panel curve
+### Held panel推移
 
-| Update | Loss | Top-1 | NDCG | Pairwise | Margin |
+| 更新 | Loss | Top-1 | NDCG | Pairwise | Margin |
 |---:|---:|---:|---:|---:|---:|
 | 0 | 8.395339 | 0.21875 | 0.860435 | 0.546154 | 0.040159 |
 | 5,000 | 2.859876 | 0.53125 | 0.978856 | 0.841653 | 0.068698 |
@@ -187,30 +156,17 @@ schedule, fixed depth, executor, and held panel were identical.
 | 95,000 | 2.598547 | 0.71875 | 0.989788 | 0.900674 | **0.144499** |
 | 100,000 | 2.607862 | **0.80469** | 0.990137 | 0.898083 | 0.144283 |
 
-### Decision
+### 判断
 
-Trial 3 is promising for top-1 but is not a clean all-metric replacement for
-Trial 1. Its final top-1 `0.8046875` exceeds Trial 1 by `0.0859375` and the
-same-panel PreAct result `0.7890625` by `0.015625`. This is the first EVRL
-checkpoint to exceed that PreAct top-1 result under the recorded held-panel
-conditions.
+試験3はtop-1に関して有望だが、すべてのmetricで試験1を置き換える明確な結果ではない。最終top-1 `0.8046875`は試験1を`0.0859375`上回り、同じpanelでのPreAct結果`0.7890625`も`0.015625`上回った。記録済みheld panel条件でPreActのtop-1を超えた最初のEVRL checkpointである。
 
-The continuous ranking metrics are weaker than Trial 1: final loss is
-`+0.026151`, NDCG `-0.001664`, pairwise accuracy `-0.008143`, and margin
-`-0.002122`. Across all five evaluations from 80k through 100k, Trial 3
-averages top-1 `0.74531` versus Trial 1's `0.71563`, but averages loss
-`2.59811` versus `2.58709` and NDCG `0.99018` versus `0.99120`.
+一方、連続的なranking metricは試験1より弱い。最終lossは`+0.026151`、NDCGは`-0.001664`、pairwise accuracyは`-0.008143`、marginは`-0.002122`である。80kから100kまでの5回の評価を平均すると、試験3のtop-1は`0.74531`で試験1の`0.71563`より高いが、lossは`2.59811`対`2.58709`、NDCGは`0.99018`対`0.99120`で劣る。
 
-Therefore `3e-4` is retained as the current top-1 arm, not declared a universal
-winner. Because this held panel has now guided tuning, the PreAct crossing is
-development evidence rather than a sealed generalization claim. Game
-validation and sealed seeds remain untouched.
+したがって`3e-4`は現時点のtop-1 armとして保持するが、普遍的なwinnerとはみなさない。このheld panelは既に調整判断へ利用しているため、PreAct超えは開発上のevidenceであって、sealed generalizationの主張ではない。game validationとsealed seedには触れていない。
 
-The next trial interpolates dense weight decay to `2e-4`, retaining baseline
-learning rates. It tests whether the top-1 benefit can be preserved while
-recovering Trial-1 loss, NDCG, and pairwise accuracy.
+次の試験ではdense weight decayを`2e-4`へ補間し、baseline learning rateを維持する。top-1の改善を残しつつ、試験1のloss、NDCG、pairwise accuracyを回復できるかを検証する。
 
-### Runtime and witnesses
+### 実行時間とwitness
 
 ```text
 run:
@@ -231,15 +187,13 @@ metrics.jsonl sha256:
   48480aabeb8a0a8e2762888dfbdb9a90d3b906a1569ae7611295d7f8e96b5440
 ```
 
-## Trial 4 — dense weight decay 2e-4
+## 試験4 — dense weight decay 2e-4
 
-This from-scratch trial interpolated dense weight decay between the Trial-1
-baseline `1e-4` and Trial-3 top-1 arm `3e-4`. Every other parameter and all
-execution/evaluation conditions remained identical.
+scratchから開始した本試験では、dense weight decayを試験1 baselineの`1e-4`と試験3 top-1 armの`3e-4`の中間へ設定した。それ以外のparameterおよび実行・評価条件はすべて同一である。
 
-### Held-panel curve
+### Held panel推移
 
-| Update | Loss | Top-1 | NDCG | Pairwise | Margin |
+| 更新 | Loss | Top-1 | NDCG | Pairwise | Margin |
 |---:|---:|---:|---:|---:|---:|
 | 0 | 8.395339 | 0.21875 | 0.860435 | 0.546154 | 0.040159 |
 | 5,000 | 2.851713 | 0.53906 | 0.980043 | 0.840504 | 0.065302 |
@@ -263,29 +217,18 @@ execution/evaluation conditions remained identical.
 | 95,000 | 2.594969 | 0.67969 | 0.990804 | 0.904189 | 0.140677 |
 | 100,000 | 2.590257 | **0.75781** | **0.991009** | **0.906449** | 0.142959 |
 
-### Decision
+### 判断
 
-Trial 4 is a useful intermediate arm but is not selected over both endpoints.
-At 100k it improves Trial-1 top-1 by `0.0390625` and pairwise accuracy by
-`0.000222`, while worsening loss by `0.008546`, NDCG by `0.000792`, and margin
-by `0.003446`. Its final top-1 remains `0.046875` below Trial 3.
+試験4は有用な中間armだが、両端の試験を同時に上回る結果ではない。100kでは試験1に対してtop-1を`0.0390625`、pairwise accuracyを`0.000222`改善した一方、lossは`0.008546`、NDCGは`0.000792`、marginは`0.003446`悪化した。最終top-1は試験3より`0.046875`低い。
 
-Across 80k–100k, Trial 4 averages top-1 `0.70313`, loss `2.59368`, NDCG
-`0.99075`, and pairwise accuracy `0.90450`. This is below Trial 3's late top-1
-average `0.74531` and below Trial 1's continuous-ranking averages. Thus the
-current fixed-architecture sweep has two distinct winners:
+80k～100kの平均は、top-1 `0.70313`、loss `2.59368`、NDCG `0.99075`、pairwise accuracy `0.90450`である。試験3の後半top-1平均`0.74531`および試験1の連続ranking平均を下回る。この固定アーキテクチャsweepには、現時点で異なる二つのwinnerがある。
 
-- Trial 3 (`dense WD = 3e-4`) for held top-1;
-- Trial 1 (`dense WD = 1e-4`) for held loss/NDCG and late continuous-ranking
-  stability.
+- 試験3（`dense WD = 3e-4`）：held top-1が最良
+- 試験1（`dense WD = 1e-4`）：held loss/NDCGと後半の連続ranking安定性が最良
 
-Trial 4 confirms a real regularization tradeoff rather than a monotonic scalar
-improvement. Further tuning on this same 128-state panel would increase
-selection bias. The next scientifically useful step is replication with a new
-permitted development panel or multiple training seeds, while continuing to
-leave game validation and sealed seeds untouched.
+試験4は、scalarが単調に改善するのではなく、実在する正則化trade-offを確認した。これ以上同じ128-state panelで調整すると選択biasが増える。科学的に次に有用なのは、新しい許可済みdevelopment panelまたは複数training seedによる再現であり、game validationとsealed seedには引き続き触れない。
 
-### Runtime and witnesses
+### 実行時間とwitness
 
 ```text
 run:
@@ -306,16 +249,13 @@ metrics.jsonl sha256:
   8add363547a9acf4cd74d18c1d2cb8611c6cedcc5385a596107b341cf794492a
 ```
 
-## Sweep summary
+## Sweepまとめ
 
-| Trial | Only changed setting | Final loss | Final top-1 | Final NDCG | Final pairwise | Final margin | Updates/s | Verdict |
+| 試験 | 唯一の変更点 | 最終loss | 最終top-1 | 最終NDCG | 最終pairwise | 最終margin | Updates/s | 判断 |
 |---|---|---:|---:|---:|---:|---:|---:|---|
-| 1 | baseline | **2.581711** | 0.71875 | **0.991801** | 0.906227 | **0.146405** | 31.92 | continuous-ranking winner |
-| 2 | dense representation LR `0.75x` | 2.609035 | 0.69531 | 0.989974 | 0.896181 | 0.123212 | 31.87 | rejected |
+| 1 | baseline | **2.581711** | 0.71875 | **0.991801** | 0.906227 | **0.146405** | 31.92 | 連続ranking winner |
+| 2 | dense representation LR `0.75x` | 2.609035 | 0.69531 | 0.989974 | 0.896181 | 0.123212 | 31.87 | 不採用 |
 | 3 | dense WD `3e-4` | 2.607862 | **0.80469** | 0.990137 | 0.898083 | 0.144283 | 31.23 | top-1 winner |
-| 4 | dense WD `2e-4` | 2.590257 | 0.75781 | 0.991009 | **0.906449** | 0.142959 | **32.49** | balanced intermediate |
+| 4 | dense WD `2e-4` | 2.590257 | 0.75781 | 0.991009 | **0.906449** | 0.142959 | **32.49** | 均衡した中間点 |
 
-This tuning session executed 320,000 new updates and consumed 1,280,000 new
-real-teacher state presentations: 20k to finish Trial 1 and 100k each for
-Trials 2–4. Measured training time summed to 10,045.24 seconds. All three
-from-scratch trials began from the same model seed and data order.
+この調整sessionでは、新たに320,000更新を実行し、実teacher stateを1,280,000回提示した。内訳は、試験1の完了に20k、試験2～4に各100kである。測定学習時間の合計は10,045.24秒だった。scratchから開始した3試験は、すべて同じmodel seedとデータ提示順から開始した。

@@ -1,54 +1,40 @@
-# Candidate-local one-step halting probe — 2026-07-22
+# 候補単位1-step halting probe — 2026-07-22
 
-## Decision
+## 判断
 
-The state-wide REINFORCE halting update is replaced, when probe mode is
-enabled, by physically sparse candidate-local supervision.  The architecture,
-20,577,789 parameters, input and teacher contracts, normal task loss, hard
-routing, active-only backward, sparse optimizer, checkpoint format, candidate
-RNG order, and candidate-independent scoring are unchanged.
+probe mode有効時には、state全体へ同じ符号を与えるREINFORCE型halting更新を、物理的疎性を保ったcandidate-local教師へ置き換える。アーキテクチャ、20,577,789 parameter、入力・teacher contract、通常のtask loss、hard routing、active-only backward、sparse optimizer、checkpoint形式、candidate RNG順序、candidate独立評価は変更しない。
 
-For at most `P` sampled-stop candidates per state:
+stateごとにsampled stopしたcandidateから最大`P`個を選び、次の処理を行う。
 
-1. execute exactly one additional recurrent step;
-2. replace only that candidate's scalar Q with its `t+1` Q;
-3. recompute the same ListNet plus margin ranking value;
-4. define `delta = L_stop - L_continue`;
-5. train the final halt logit toward continue when `delta > c`, otherwise stop.
+1. 追加の再帰stepを正確に1回だけ実行する
+2. そのcandidateのscalar Qだけを`t+1`のQへ置換する
+3. 同じListNetとmarginによるranking値を再計算する
+4. `delta = L_stop - L_continue`と定義する
+5. `delta > c`ならcontinue、それ以外ならstopを最終halt logitの教師とする
 
-Unprobed candidates receive no halting gradient.  The original score matrix is
-restored before task backward, so the task loss and task VJP do not depend on
-the probe.  Probe forward does not update route-usage counters and does not
-create a probe trajectory for backward.
+probeしなかったcandidateにはhalting gradientを与えない。task backwardの前に元のscore matrixを復元するため、task lossとtask VJPはprobeに依存しない。probe forwardはroute-usage counterを更新せず、backward用probe trajectoryも作成しない。
 
-Runtime controls:
+実行時設定は次のとおり。
 
 ```text
-EVRL_HALT_PROBES_PER_STATE   number of stopped candidates probed per state
-EVRL_HALT_PROBE_WEIGHT       BCE weight on the candidate-local halt target
-EVRL_COMPUTE_PRICE           continue threshold c in probe mode
+EVRL_HALT_PROBES_PER_STATE   stateごとにprobeする停止candidate数
+EVRL_HALT_PROBE_WEIGHT       candidate-local halt targetに対するBCE weight
+EVRL_COMPUTE_PRICE           probe modeでのcontinue閾値c
 EVRL_ENABLE_HALT_PROBE_TRANSITION=1
-                             explicit legacy-checkpoint transition gate
+                             旧checkpointからの明示的transition gate
 ```
 
-The default probe count is zero, preserving old checkpoint behavior.  Missing
-probe fields in a version-1 checkpoint normalize to count zero and weight one;
-the checkpoint serialization format is unchanged.
+probe数のdefaultは0であり、旧checkpointの挙動を維持する。version 1 checkpointにprobe fieldが存在しない場合は、probe数0、weight 1としてnormalizeする。checkpoint serialization形式は変更していない。
 
-## One-step primitive witness
+## 1-step primitiveのwitness
 
-A forced-depth-3 trajectory followed by `probe_one_step!` was compared with a
-normal forced-depth-4 forward on the same model and input.  Maximum output
-difference was `2.3841858e-7`, below the `2e-6` acceptance tolerance.
+強制深度3のtrajectoryに`probe_one_step!`を適用した結果を、同じmodel・入力を通常の強制深度4でforwardした結果と比較した。出力差の最大絶対値は`2.3841858e-7`で、許容値`2e-6`を下回った。
 
-## Real-teacher serial/barrierless correctness smoke
+## 実teacherによるserial/barrierless正当性smoke
 
-The production 20-worker smoke used the current 20,577,789-parameter R2
-update-10,000 checkpoint, four training states, all valid candidates (counts
-34, 53, 51, and 68), and two probes per state.  Validation rows and sealed game
-seeds were not constructed or touched.
+productionと同じ20-worker smokeでは、現行20,577,789-parameter R2の10,000更新checkpoint、4つのtraining state、その全valid candidate（34、53、51、68個）、stateあたり2 probeを使用した。validation rowおよびsealed game seedは構築も参照もしていない。
 
-Result: **pass**.
+結果：**合格**。
 
 ```text
 output max abs                         0
@@ -64,7 +50,7 @@ post-optimizer parameter max abs        4.0419400e-7
 optimizer clocks                       exact at update 10,001
 ```
 
-Checkpoint witness:
+checkpoint witness：
 
 ```text
 D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\
@@ -73,11 +59,9 @@ D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\
 sha256 3bd4140707a10cd63781bd39c65d21255ae8dbaa0ea022c78ab501b3f014041b
 ```
 
-## 100-update throughput preflight
+## 100更新throughput preflight
 
-The same checkpoint was run for 10 warmup plus 100 measured real-teacher
-updates with two probes per state, barrierless scheduling, no pinning, chunk 8,
-20 Julia workers, and BLAS threads 1.  Benchmark updates were not checkpointed.
+同じcheckpointから、warmup 10更新と測定100更新の実teacher学習を実施した。stateあたり2 probe、barrierless scheduling、pinningなし、chunk 8、Julia worker 20、BLAS thread 1である。benchmark更新のcheckpointは保存していない。
 
 ```text
 measured updates             100
@@ -92,27 +76,15 @@ minimum speed criterion      15 updates/s
 result                       pass
 ```
 
-This preflight is slower than the no-probe R1 aggregate because it executes up
-to eight exact additional recurrent steps per update and recomputes four small
-state-local ranking losses.  It remains above the explicitly accepted 15
-updates/s floor.  It is not a quality result: benchmark-only mode performed no
-new held evaluation and wrote no checkpoint.
+このpreflightがprobeなしのR1全体より遅いのは、1更新あたり最大8回のexact追加再帰stepを実行し、4つの小さなstate-local ranking lossを再計算するためである。それでも明示的に許容された下限15 updates/sを上回った。これは品質評価ではない。benchmark-only modeでは新しいheld評価を行わず、checkpointも書き出していない。
 
-## Trial status
+## 試験状況
 
-The scalar halt-LR Trial R2 was stopped at its already-complete update-10,000
-boundary when the candidate-local credit-assignment correction was specified.
-It is retained only as the immutable smoke parent above; it is not a completed
-100k tuning result.  The next full trial enables probes from the beginning of
-the dynamic training schedule rather than grafting them onto the finished R1
-policy.
+candidate-localな信用割当への訂正が指定された時点で、scalar halt-LR試験R2は、既に完了していた10,000更新境界で停止した。上記smokeの変更不能な親checkpointとしてのみ保持し、100k完了済み調整結果とはみなさない。次のfull trialでは、完了済みR1 policyへ後付けせず、動的学習scheduleの開始時点からprobeを有効にする。
 
-## Trial P1 — completed 100,000-update probe training
+## 試験P1 — 100,000更新probe学習完了
 
-P1 trained the probe-aware policy from scratch.  It kept the full architecture,
-20,577,789 parameters, real-teacher order, optimizer, task loss, hard routing,
-and executor fixed.  The only halting-credit change from Recurrence R1 was the
-candidate-local probe target described above.
+P1ではprobe-aware policyをscratchから学習した。全アーキテクチャ、20,577,789 parameter、実teacher提示順、optimizer、task loss、hard routing、executorを固定した。再帰R1から変更したhalting信用割当は、上記candidate-local probe targetだけである。
 
 ```text
 probe candidates/state       2
@@ -125,15 +97,11 @@ teacher states/update        4
 total updates/states         100,000 / 400,000
 ```
 
-The orchestration command reached its two-hour host timeout after the complete
-75,000-update checkpoint had been written.  No model error occurred.  Training
-resumed from that checkpoint with its exact optimizer, sampler, halt RNG, and
-route-usage state, and completed at update 100,000.  The initial evaluation in
-the resume run reproduced the update-75,000 metrics exactly.
+orchestration commandは75,000更新checkpointを完全に書き出した後、hostの2時間timeoutへ到達した。model errorは発生していない。そのcheckpointからoptimizer、sampler、halt RNG、route-usage stateを正確に復元して学習を再開し、100,000更新まで完了した。resume runの初期評価は75,000更新時のmetricを完全に再現した。
 
-### Held-panel and depth curve
+### Held panelと深度推移
 
-| Update | Loss | Top-1 | NDCG | Pairwise | Margin | Train depth | Held depth | Held range | Probe continue/stop |
+| 更新 | Loss | Top-1 | NDCG | Pairwise | Margin | 学習深度 | Held深度 | Held範囲 | Probe continue/stop |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 0 | 8.395339 | 0.21875 | 0.860435 | 0.546154 | 0.040159 | 2.000 | 2.000 | 2--2 | -- |
 | 5,000 | 2.840448 | 0.53125 | 0.979206 | 0.839419 | 0.105218 | 2.000 | 2.000 | 2--2 | warmup |
@@ -157,40 +125,19 @@ the resume run reproduced the update-75,000 metrics exactly.
 | 95,000 | **2.587874** | 0.73438 | **0.991345** | **0.904401** | 0.141909 | 2.205 | 2.194 | 2--12 | 3 / 5 |
 | 100,000 | 2.605494 | 0.71094 | 0.990369 | 0.902199 | **0.151411** | 2.030 | 2.011 | 2--12 | 5 / 3 |
 
-The continue/stop column is telemetry from the single update at each reporting
-boundary, not a population count over the preceding 5,000 updates.  Even this
-bounded witness demonstrates candidate-specific targets in both directions;
-the policy is no longer forced to apply one state-wide advantage sign to every
-candidate.
+continue/stop列は各reporting boundaryにおける単一updateのtelemetryであり、直前5,000更新のpopulation countではない。それでもこの有界なwitnessから、candidateごとに両方向のtargetが生成されていることが分かる。すべてのcandidateへ一つのstate-wide advantage符号を強制する状態ではなくなった。
 
-### Decision
+### 判断
 
-P1 is a positive credit-assignment result and a partial dynamic-depth result.
-The balanced checkpoint is update 95,000: it has the lowest held composite
-loss and highest held NDCG of P1 while retaining top-1 `0.73438`, pairwise
-`0.90440`, margin `0.14191`, and mean depth `2.19`.  Update 90,000 is the P1
-top-1 winner (`0.74219`, mean depth `3.02`), while update 100,000 is the margin
-winner (`0.15141`).
+P1は信用割当として成功、動的深度としては部分的成功である。品質と深度の釣り合いが最良なのは95,000更新checkpointである。P1中最低のheld composite lossと最高のheld NDCGを持ち、top-1 `0.73438`、pairwise `0.90440`、margin `0.14191`、平均深度`2.19`を維持する。90,000更新はP1のtop-1最高値（`0.74219`、平均深度`3.02`）、100,000更新はmargin最高値（`0.15141`）である。
 
-Relative to the rejected state-wide R1 final checkpoint, the P1 final improves
-loss by `0.004945`, top-1 by `0.007812`, NDCG by `0.000565`, pairwise accuracy
-by `0.002944`, and margin by `0.008825`.  More importantly, it does not end in
-R1's near-total depth-12 saturation (`11.91` mean): P1 ends at `2.01` and shows
-intermediate held means near 3--5 at multiple checkpoints.
+不採用のstate-wide R1最終checkpointと比較すると、P1最終値はlossを`0.004945`、top-1を`0.007812`、NDCGを`0.000565`、pairwise accuracyを`0.002944`、marginを`0.008825`改善した。さらに重要なのは、R1のほぼ完全な深度12飽和（平均`11.91`）で終了せず、P1は`2.01`で終了し、途中の複数checkpointでheld平均深度3～5を示した点である。
 
-This does **not** yet prove ideal adaptive computation.  P1 still oscillates,
-and its selected/final checkpoints remain biased toward the minimum depth.
-Compared with the fixed-depth Trial-1 final control, P1 update 95,000 has
-`+0.006163` loss, `+0.015625` top-1, `-0.000456` NDCG, `-0.001826` pairwise,
-and `-0.004496` margin.  It therefore supplies better candidate-local
-halting credit, not a clean all-metric quality win over fixed depth.
+ただし、これは理想的な適応計算を証明するものではない。P1には依然として振動があり、選択checkpointと最終checkpointは下限深度寄りである。固定深度試験1の最終controlと比べると、P1の95,000更新はloss `+0.006163`、top-1 `+0.015625`、NDCG `-0.000456`、pairwise `-0.001826`、margin `-0.004496`である。したがってcandidate-local halting信用割当は改善したが、固定深度に対する全metricでの明確な勝利ではない。
 
-Against the recorded PreAct panel result, P1 update 95,000 remains lower by
-`0.054688` top-1, `0.001945` NDCG, and `0.018959` pairwise accuracy, while its
-margin is higher by `0.018589` and composite loss is higher by `0.024094`.
-The held panel has guided development and is not a sealed generalization set.
+記録済みPreAct panel結果と比べると、P1の95,000更新はtop-1で`0.054688`、NDCGで`0.001945`、pairwise accuracyで`0.018959`低い。一方、marginは`0.018589`高く、composite lossは`0.024094`高い。このheld panelは開発判断に用いたもので、sealed generalization setではない。
 
-### Runtime and artifacts
+### 実行時間と成果物
 
 ```text
 aggregate training time       5,015.947635 s
@@ -219,4 +166,4 @@ resume summary sha256:
   55fede26a83af61d4d45fdc994f58f70e4c1de0b34da62a7ab546e428d6937ab
 ```
 
-Binary checkpoints and teacher data remain local and are not committed.
+binary checkpointとteacherデータはlocalに保持し、Gitへcommitしていない。

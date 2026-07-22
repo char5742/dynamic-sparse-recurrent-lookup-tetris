@@ -1,31 +1,18 @@
-# EVRL dynamic-recurrence tuning — 2026-07-22
+# EVRL動的再帰調整 — 2026-07-22
 
-## Correction and objective
+## 訂正と目的
 
-The immediately preceding 100,000-update sweep changed dense learning rates
-and weight decay while recurrent depth stayed fixed at two.  Those runs are
-valid fixed-depth controls, but they did not tune the dynamic-recurrence
-mechanism requested for this stage.  This ledger corrects that scope: every
-trial here uses sampled hard halting from scratch after a 5,000-update random
-depth curriculum, and changes one halting scalar at a time.
+直前に実施した100,000更新のsweepは、再帰深度を2に固定したままdense learning rateとweight decayを変更したものだった。これらは固定深度controlとして有効だが、この段階で求められていた動的再帰機構の調整にはなっていない。本記録ではその対象範囲を訂正する。ここに記載する試験はすべて、5,000更新のrandom-depth curriculum後にsampled hard haltingを最初から使用し、haltingに関するscalarだけを一度に一つ変更する。
 
-The architecture, 20,577,789 parameters, input contract, real-teacher data and
-order, ranking loss, LookupFFN routing, active-only backward, sparse optimizer,
-20-worker barrierless executor, held 128-state panel, and initialization seed
-remain fixed.  Game validation and sealed seeds remain untouched.
+アーキテクチャ、20,577,789 parameter、入力contract、実teacherデータと提示順、ranking loss、LookupFFN routing、active-only backward、sparse optimizer、20-worker barrierless executor、128-state held panel、初期化seedは固定した。game validationとsealed seedには触れていない。
 
-Success requires more than a good final ranking score.  Deterministic held
-depth must remain input dependent instead of saturating at the minimum or
-maximum, sampled training depth must show the same qualitative behavior, and
-the quality/compute result must remain competitive with the fixed-depth
-controls.
+成功条件は、最終ranking scoreが良いことだけではない。決定論的held深度が下限または上限に飽和せず、入力依存性を維持すること、sampled training深度にも同じ定性的挙動が現れること、品質と計算量の関係が固定深度controlに対して競争力を保つことを要求する。
 
-## Trial R1 — zero compute price
+## 試験R1 — compute priceを0へ変更
 
-### Isolated change
+### 単独変更点
 
-The prior dynamic setting used `compute_price = 0.02`.  R1 changed only this
-value to zero.  It retained:
+従来の動的設定では`compute_price = 0.02`だった。R1ではこの値だけを0へ変更し、次の条件を維持した。
 
 ```text
 warmup updates       5,000 (uniform random depth 2--6)
@@ -39,12 +26,11 @@ bank/router LR       2e-4 / 4e-4
 recurrent range      2--12
 ```
 
-This tests the narrow hypothesis that the explicit price of extra computation
-alone caused the previously observed depth-two collapse.
+これは、過去に観測した深度2へのcollapseが、追加計算に対する明示的な価格だけで発生したという限定的仮説を検証する試験である。
 
-### Held-panel and depth curve
+### Held panelと深度推移
 
-| Update | Loss | Top-1 | NDCG | Pairwise | Margin | Train depth | Held depth | Held range |
+| 更新 | Loss | Top-1 | NDCG | Pairwise | Margin | 学習深度 | Held深度 | Held範囲 |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 0 | 8.395339 | 0.21875 | 0.860435 | 0.546154 | 0.040159 | 2.000 | 2.000 | 2--2 |
 | 5,000 | 2.857160 | 0.51562 | 0.979035 | 0.840006 | 0.104091 | 2.000 | 2.000 | 2--2 |
@@ -68,33 +54,17 @@ alone caused the previously observed depth-two collapse.
 | 95,000 | 2.597807 | 0.70312 | 0.990683 | 0.898203 | 0.146593 | 2.017 | 2.031 | 2--9 |
 | 100,000 | 2.610439 | 0.70312 | 0.989804 | 0.899255 | 0.142586 | 11.955 | 11.913 | 2--12 |
 
-The critical result is the depth trajectory, not only the final checkpoint.
-The held mean moved from `5.19` at 15k to `2.03` at 20k, saturated at almost
-exactly 12 from 60k through 70k, returned to `2.05` at 75k, and ended at
-`11.91`.  Training depth followed the same extrema.  This is not useful
-input-dependent allocation; it is a high-variance policy oscillating between
-the two depth boundaries.
+決定的な結果は最終checkpointだけでなく、深度の軌跡にある。held平均深度は15kの`5.19`から20kの`2.03`へ移動し、60kから70kまではほぼ12に飽和し、75kには`2.05`へ戻り、最終的に`11.91`となった。学習時深度も同じ極値をたどった。これは有用な入力依存の計算配分ではなく、深度の両端を高分散で往復するpolicyである。
 
-### Quality and speed decision
+### 品質と速度に関する判断
 
-R1 is rejected as a dynamic-recurrence configuration.  At 100k it reached
-loss `2.610439`, top-1 `0.703125`, NDCG `0.989804`, pairwise `0.899255`, and
-margin `0.142586`.  Relative to the fixed-depth Trial-1 control, it is worse by
-`+0.028728` loss, `-0.015625` top-1, `-0.001997` NDCG, and `-0.006972`
-pairwise accuracy.  It is also `-0.085938` below the recorded PreAct top-1.
+R1は動的再帰設定として不採用とする。100kでloss `2.610439`、top-1 `0.703125`、NDCG `0.989804`、pairwise `0.899255`、margin `0.142586`を記録した。固定深度の試験1 controlと比較すると、lossは`+0.028728`、top-1は`-0.015625`、NDCGは`-0.001997`、pairwise accuracyは`-0.006972`悪化した。記録済みPreAct top-1よりも`-0.085938`低い。
 
-The run took `4,035.570673 s` for 100,000 updates (`24.779643 updates/s`),
-with average CPU `78.9237%` and candidate-region CPU `81.8531%`.  The fixed
-depth control ran at `31.9193 updates/s`; unstable deep saturation therefore
-cost about 22.4% of update throughput without improving held quality.
+100,000更新の実時間は`4,035.570673 s`で、`24.779643 updates/s`だった。平均CPU使用率は`78.9237%`、candidate区間CPU使用率は`81.8531%`である。固定深度controlは`31.9193 updates/s`だったため、不安定な深い飽和によりupdate throughputが約22.4%低下したにもかかわらず、held品質は向上しなかった。
 
-Zeroing the compute price disproves the narrow price-only hypothesis.  The
-large boundary-to-boundary oscillation instead points to an overly aggressive
-or noisy halt-policy update.  The next one-axis trial will keep R1 otherwise
-identical and reduce only halt LR from `5e-5` to `1e-5`.  No dense LR, weight
-decay, architecture, loss, or routing parameter will change.
+compute priceを0にした結果、priceだけが原因という限定的仮説は否定された。境界間を大きく往復する挙動は、halt-policy更新が過度に強いか、noiseが大きいことを示している。次の一軸試験では、R1のその他の条件を保ったままhalt LRだけを`5e-5`から`1e-5`へ下げる。dense LR、weight decay、architecture、loss、routing parameterは変更しない。
 
-### Runtime witnesses
+### 実行witness
 
 ```text
 run:
@@ -114,43 +84,20 @@ summary.json sha256:
   82b021d40bbfeca481042dbfebdf9135cbdf26531fac78923617977b4b16986f
 ```
 
-Binary checkpoints and teacher data are not committed to Git.
+binary checkpointとteacherデータはGitへcommitしていない。
 
-## Trial R2 — stopped after credit-assignment correction
+## 試験R2 — 信用割当の訂正後に中止
 
-R2 reduced only the halt learning rate from `5e-5` to `1e-5`.  It reached and
-saved update 10,000, but was not continued to 100,000.  The trial was stopped
-because scalar tuning retained the same state-wide REINFORCE target and could
-not resolve candidate-local value-of-computation credit.  Its update-10,000
-checkpoint is retained as the immutable parent for the one-step-probe
-correctness smoke, not as a completed tuning result.
+R2ではhalt learning rateだけを`5e-5`から`1e-5`へ下げ、10,000更新まで到達してcheckpointを保存したが、100,000更新までは継続しなかった。scalar調整ではstate-wide REINFORCE targetが残り、candidate単位のvalue-of-computationに対する信用割当を解決できないため試験を中止した。10,000更新checkpointは、完了済み調整結果としてではなく、1-step probe correctness smokeの変更不能な親checkpointとして保持する。
 
-The replacement is a bounded candidate-local one-step probe: replace only one
-stopped candidate's Q with its exact next-step Q, recompute ListNet plus margin,
-and supervise continue iff `L_stop - L_continue > c`.  Correctness and speed
-preflight are recorded in
-[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md).
+代替策は、有界なcandidate-local 1-step probeである。停止したcandidate一つのQだけをexact next-step Qへ置換し、ListNetとmarginを再計算し、`L_stop - L_continue > c`のときにcontinueを教師とする。正当性と速度preflightは[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md)へ記録した。
 
-## Trial P1 — candidate-local one-step probes
+## 試験P1 — candidate-local 1-step probe
 
-P1 completed 100,000 updates with two stopped-candidate probes per state,
-`c = 0`, probe BCE weight one, halt LR `5e-5`, and the same 5,000-update random
-depth curriculum used by R1.  All model, data, task-loss, optimizer, routing,
-seed, held-panel, and executor conditions remained fixed.
+P1は、stateあたり2つの停止candidateをprobeし、`c = 0`、probe BCE weight 1、halt LR `5e-5`、R1と同じ5,000更新random-depth curriculumで100,000更新を完了した。モデル、データ、task loss、optimizer、routing、seed、held panel、executor条件はすべて固定した。
 
-The best balanced checkpoint was update 95,000: loss `2.587874`, top-1
-`0.734375`, NDCG `0.991345`, pairwise `0.904401`, margin `0.141909`, and held
-mean depth `2.194`.  Top-1 peaked at `0.742188` at update 90,000 with mean
-depth `3.021`.  The final update-100,000 result was loss `2.605494`, top-1
-`0.710938`, NDCG `0.990369`, pairwise `0.902199`, margin `0.151411`, and held
-mean depth `2.011`.
+品質と深度の釣り合いが最良だったのは95,000更新checkpointで、loss `2.587874`、top-1 `0.734375`、NDCG `0.991345`、pairwise `0.904401`、margin `0.141909`、held平均深度`2.194`だった。top-1の最高値は90,000更新の`0.742188`で、平均深度は`3.021`だった。最終100,000更新では、loss `2.605494`、top-1 `0.710938`、NDCG `0.990369`、pairwise `0.902199`、margin `0.151411`、held平均深度`2.011`となった。
 
-Unlike R1, P1 produced continue and stop targets within the same reporting
-batches and did not finish in depth-12 saturation.  It improves every final
-quality metric over R1, but still oscillates and finishes close to minimum
-depth.  It is accepted as the correct sparse halting-credit mechanism, not as
-proof that the present halt policy has reached ideal input-dependent compute.
+R1と異なり、P1では同一reporting batch内にcontinue targetとstop targetの両方が現れ、最終状態も深度12へ飽和しなかった。最終品質指標はすべてR1を上回ったが、依然として振動があり、最終深度は下限に近い。この方式は正しいsparse halting信用割当機構として採用するが、現在のhalt policyが理想的な入力依存計算へ到達した証明とはみなさない。
 
-The complete 5,000-update curve, exact serial/barrierless smoke, throughput,
-checkpoint hashes, and PreAct/fixed-depth comparisons are in
-[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md).
+5,000更新ごとの完全な推移、exact serial/barrierless smoke、throughput、checkpoint hash、PreActおよび固定深度との比較は[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md)に記録している。

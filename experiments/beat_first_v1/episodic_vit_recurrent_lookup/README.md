@@ -1,61 +1,42 @@
-# Episodic ViT recurrent LookupFFN
+# エピソード記憶付きViT再帰LookupFFN
 
-This directory implements the current Dynamic Sparse Recurrent Lookup Network
-for real-teacher Tetris candidate ranking.
+このディレクトリには、実teacherによるテトリス候補順位付けを対象とした、現行の動的疎再帰Lookupネットワーク（Dynamic Sparse Recurrent Lookup Network）を実装している。
 
-## Architecture
+## アーキテクチャ
 
-Each candidate is evaluated independently from the same input fields used by
-the PreAct baseline: board, candidate, difference, next/hold, and `aux37`.
-Teacher Q values and ranks are targets only.
+各候補は、PreActベースラインと同じ入力フィールド、すなわち盤面、候補、差分、NEXT/HOLD、`aux37`から独立に評価される。teacher Q値と順位は教師信号としてのみ用いる。
 
-The model contains:
+モデルは次の要素で構成される。
 
-1. positioned cell, next/hold, and auxiliary episodic tokens;
-2. a five-stage dilated depthwise/pointwise visual residual over raw
-   board/candidate/difference channels, with a `63 x 63` receptive field that
-   covers the complete `24 x 10` board;
-3. recurrent cell memory updated through learned physical local-8 spatial
-   attention with shared Q/K/V/O projections and relative 3x3 position bias;
-4. multiple recurrent registers;
-5. exact cross-attention from each register to all 283 episodic tokens, with
-   one shared K/V projection per recurrent step;
-6. learned register self-attention and SwiGLU transformation;
-7. active-only LookupFFN long-term memory;
-8. residual recurrent updates and a hard-halting interface.
+1. 位置情報付きセルtoken、NEXT/HOLD token、補助tokenからなるエピソード記憶
+2. 生の盤面・候補・差分channelに対する5段のdilated depthwise/pointwise視覚残差経路。受容野は`63 x 63`で、`24 x 10`盤面全体を覆う
+3. 共有Q/K/V/O射影と3x3相対位置biasを備えた、物理的に疎なlearned local-8 spatial attentionによって反復更新されるセル記憶
+4. 複数の再帰register
+5. 各registerから全283個のエピソードtokenへのexact cross-attention。K/V射影は再帰stepごとに1回だけ共有計算する
+6. learned register self-attentionとSwiGLU変換
+7. active-onlyなLookupFFN長期記憶
+8. 残差再帰更新とhard halting interface
 
-No dense mask-after-score implementation or CountSketch is used.  The
-small `4 x 283` register/token score support is evaluated directly, while
-LookupFFN long-memory rows remain physically sparse in forward, backward, and
-optimizer updates.
+scoreを全要素について計算した後にdense maskをかける実装や、CountSketchは使用しない。小規模な`4 x 283`のregister/token score領域は直接評価する一方、LookupFFN長期記憶の行はforward、backward、optimizer更新のすべてで物理的疎性を維持する。
 
-## CPU execution
+## CPU実行
 
-`barrierless_executor.jl` flattens candidates from multiple states into one
-global queue.  Twenty native workers consume chunk-8 work dynamically, and
-continued candidates are compacted between recurrent steps.  BLAS uses one
-thread.  Windows CPU Sets are supported, but the verified fastest setting on
-the test machine is no pinning.
+`barrierless_executor.jl`は複数stateの候補を一つのglobal queueへflattenする。20個のnative workerがchunk 8単位で動的に仕事を取得し、継続候補は再帰step間でcompactされる。BLASのthread数は1である。Windows CPU Setsにも対応しているが、試験機で確認された最速設定はpinningなしである。
 
-`barrierless_postphase.jl` deterministically reduces worker-local dense and
-sparse gradients, applies the canonical global clip, and preserves optimizer
-clocks and checkpoint compatibility.  The serial/barrierless smoke verifies
-outputs, losses, gradients, routing choices, RNG state, optimizer telemetry,
-and post-update parameter state.
+`barrierless_postphase.jl`はworker-localなdense勾配とsparse勾配を決定論的にreduceし、標準のglobal gradient clippingを適用し、optimizer clockとcheckpoint互換性を保つ。serial/barrierless smokeでは、出力、loss、gradient、routing選択、RNG state、optimizer telemetry、更新後parameter stateの一致を検証する。
 
-## Important files
+## 主要ファイル
 
-- `EpisodicViTRecurrentLookup.jl`: model, sparse attention, recurrence, VJPs,
-  and optimizer semantics.
-- `teacher_training.jl`: real-teacher training and checkpoint lifecycle.
-- `barrierless_executor.jl`: dynamic candidate execution.
-- `barrierless_postphase.jl`: deterministic reduction and optimizer phase.
-- `barrierless_correctness_smoke.jl`: single-thread oracle comparison.
-- `bounded_mpmc_queue.jl`: bounded allocation-free Windows MPMC queue.
-- `windows_cpu_sets.jl`: runtime P/E-core discovery and optional CPU Sets.
-- `run_teacher_signal.jl`: training entry point.
+- `EpisodicViTRecurrentLookup.jl`：モデル、sparse attention、再帰、VJP、optimizer semantics
+- `teacher_training.jl`：実teacher学習とcheckpoint lifecycle
+- `barrierless_executor.jl`：動的candidate実行
+- `barrierless_postphase.jl`：決定論的reduceとoptimizer phase
+- `barrierless_correctness_smoke.jl`：single-thread oracleとの比較
+- `bounded_mpmc_queue.jl`：Windows向けbounded allocation-free MPMC queue
+- `windows_cpu_sets.jl`：実行時P/Eコア検出と、任意のCPU Sets割り当て
+- `run_teacher_signal.jl`：学習entry point
 
-## Verified production geometry
+## 検証済みproduction geometry
 
 ```text
 carrier/model dim          128
@@ -71,41 +52,14 @@ SwiGLU FFN dim              128
 fixed recurrent depth        2
 ```
 
-Hard halting remains implemented but was held at depth two for the 20,000
-update representation-learning run.  It should be re-enabled only after the
-spatial and routing representations remain stable under the intended final
-evaluation protocol.
+hard haltingの実装は維持しているが、20,000更新の表現学習では深度2に固定した。意図した最終評価protocolにおいて空間表現とrouting表現が安定していることを確認した後にのみ、再度有効化する。
 
-Dynamic training now has an optional candidate-local one-step probe path.  It
-probes only a bounded number of sampled stops, recomputes ListNet plus margin
-after replacing that candidate's Q, and supervises the final halt decision
-from `L_stop - L_continue`.  This preserves physical sparsity and replaces the
-former state-wide REINFORCE credit signal when enabled.  See
-[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md).
+動的学習には、候補単位の1-step probeを任意で有効にできる。sampled stopのうち有界な個数だけをprobeし、その候補のQだけを置換した後にListNetとmarginを再計算し、`L_stop - L_continue`から最終停止判断を教師あり学習する。この方式は物理的疎性を保ち、有効化時には従来のstate-wide REINFORCEによる信用割当を置き換える。詳細は[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md)を参照。
 
-The completed 100,000-update probe trial used two probes per state.  Its
-balanced update-95,000 checkpoint reached top-1 `0.73438`, NDCG `0.991345`,
-margin `0.14191`, and held mean depth `2.19`; update 90,000 reached the trial's
-best top-1 `0.74219` at mean depth `3.02`.  It improves every final quality
-metric over the former state-wide halting trial and avoids that trial's final
-depth-12 saturation, although depth remains biased toward the minimum late in
-training.  The report records this as a credit-assignment success and only a
-partial adaptive-depth success.
+完了済みの100,000更新probe試験では、stateあたり2候補をprobeした。品質と深度の釣り合いが最良だった95,000更新checkpointは、top-1 `0.73438`、NDCG `0.991345`、margin `0.14191`、held平均深度`2.19`に到達した。90,000更新では、平均深度`3.02`で試験中最高のtop-1 `0.74219`を記録した。旧state-wide halting試験の最終値を全品質指標で上回り、旧試験で生じた最終深度12への飽和も回避した。ただし学習後半の深度は依然として下限寄りである。この結果は、信用割当の改善には成功したが、適応的深度の獲得は部分的成功にとどまると記録している。
 
-See [`RESULTS_2026-07-20.md`](RESULTS_2026-07-20.md) for the exact numerical
-witnesses and
-[`PERFORMANCE_COMPARISON_2026-07-20.md`](PERFORMANCE_COMPARISON_2026-07-20.md)
-for the final held-teacher comparison against PreAct.
+正確な数値witnessは[`RESULTS_2026-07-20.md`](RESULTS_2026-07-20.md)、PreActとの最終held-teacher比較は[`PERFORMANCE_COMPARISON_2026-07-20.md`](PERFORMANCE_COMPARISON_2026-07-20.md)を参照。
 
-The subsequent input-routing ablation removed the former `283 -> 64 -> 16`
-register memory bottleneck.  At the same 12,000-update budget, full-token
-cross-attention improved top-1 from `0.35938` to `0.56250`, with CPU inference
-decreasing from `53.54` to `45.17` states/s.  See
-[`TOKEN_ROUTING_ABLATION_2026-07-21.md`](TOKEN_ROUTING_ABLATION_2026-07-21.md).
+その後の入力routing ablationでは、従来の`283 -> 64 -> 16`というregister memory bottleneckを撤去した。同じ12,000更新予算で、全token cross-attentionはtop-1を`0.35938`から`0.56250`へ改善した。一方、CPU推論速度は`53.54`から`45.17` states/sへ低下した。詳細は[`TOKEN_ROUTING_ABLATION_2026-07-21.md`](TOKEN_ROUTING_ABLATION_2026-07-21.md)を参照。
 
-The current visual extension uses dilations `1,2,4,8,16`, adds only 565
-parameters and 135,360 scalar MAC/candidate, and reaches a true `63 x 63`
-receptive field.  At 25,000 updates / 100,000 teacher states it obtained
-top-1 `0.68750`, NDCG `0.98586`, margin `0.13215`, and `43.72` held CPU
-states/s.  See
-[`GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md`](GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md).
+現行の視覚拡張はdilation `1,2,4,8,16`を用い、追加parameterは565、candidateあたりの追加scalar MACは135,360にすぎない。実受容野は`63 x 63`に達する。25,000更新、100,000 teacher stateで、top-1 `0.68750`、NDCG `0.98586`、margin `0.13215`、held CPU速度`43.72` states/sを得た。詳細は[`GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md`](GLOBAL_VISUAL_RECEPTIVE_FIELD_2026-07-21.md)を参照。
