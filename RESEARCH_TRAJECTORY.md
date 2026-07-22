@@ -638,3 +638,24 @@ benchmark更新は保存していない。LR半減armを採用候補として55k
 短い定常benchmarkと長い実データ区間の差を無視せず、LR半減armは一旦保留する。同じ
 50k checkpointからscale 1.0の対照を65kまで進め、区間workloadと学習率による経路変化を
 分離してから採否を決める。
+
+## 23. 2026-07-23 — 現時点の判明事項を統合
+
+8近傍spatial backwardの範囲外書込みを修正した後の試行だけを現行性能根拠として整理した。
+修正後EVRLはloss、top-1、NDCG、pairwise、marginを改善し、2～12 stepの入力依存再帰も
+獲得している。
+
+速度条件付きの現行採用点は、batch 4、dense LR `2e-4`、dense WD `3e-4`、halt LR
+`5e-5`、2 probes/stateの50,000更新checkpointである。top-1 `0.734375`、NDCG
+`0.987706`、pairwise `0.884073`、margin `0.131590`、平均深度`4.010`、速度
+`15.545 updates/s`を記録した。
+
+50k以降にepisodic dense LRだけを半減した試行は、65kでtop-1 `0.757812`、NDCG
+`0.990265`まで伸びたが、実データ10,000更新では`14.625 updates/s`となり、最低速度
+`15 updates/s`を満たさなかった。このcheckpointは品質参考として保持し、採用点にはしない。
+
+PreActの既存結果とは学習teacher state数が異なるため、現時点ではPreAct超えを主張しない。
+修正後EVRLの同一予算比較が必要である。構成、修正内容、全比較表、checkpoint hash、評価上の
+境界は
+[`CURRENT_FINDINGS_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/CURRENT_FINDINGS_2026-07-23.md)
+へ統合した。
