@@ -1,5 +1,10 @@
 # EVRL fixed-architecture hyperparameter tuning — 2026-07-22
 
+> Scope correction: Trials 1--4 below are fixed-depth optimizer/regularization
+> controls.  They are valid quality baselines, but they do not tune dynamic
+> recurrence.  Recurrence-focused trials are recorded separately in
+> [`DYNAMIC_RECURRENCE_TUNING_2026-07-22.md`](DYNAMIC_RECURRENCE_TUNING_2026-07-22.md).
+
 ## Contract
 
 All trials in this ledger keep the complete EVRL architecture fixed:
@@ -16,8 +21,9 @@ All trials in this ledger keep the complete EVRL architecture fixed:
 - 20-worker barrierless executor, no CPU pinning, chunk eight;
 - no game validation or sealed seed access.
 
-Only scalar optimizer, weight-decay, routing-schedule, or halting
-hyperparameters may change. Each accepted comparison runs to update 100,000,
+Only scalar optimizer, weight-decay, or routing-schedule hyperparameters
+changed in the trials below; recurrent depth remained fixed at two. Each
+accepted comparison runs to update 100,000,
 records held metrics every 5,000 updates, and is committed and pushed before
 the next trial begins.
 

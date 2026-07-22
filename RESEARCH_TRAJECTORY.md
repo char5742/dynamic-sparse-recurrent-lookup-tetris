@@ -463,3 +463,25 @@ loss `2.590257`、top-1 `0.75781`、NDCG `0.991009`、pairwise `0.906449`、
 margin `0.142959`。Trial 1よりtop-1／pairwiseは高いがloss／NDCG／marginは低く、
 Trial 3のtop-1にも届かなかった。結果として、`3e-4`がheld top-1 winner、
 `1e-4` baselineがcontinuous-ranking winner、`2e-4`が中間Pareto armとなった。
+
+## 19. 2026-07-22 — 動的再帰tuningへの軌道修正
+
+直前のTrials 1--4はすべてdepth 2固定であり、optimizer／weight decay対照としては
+有効だが、依頼された動的リカレント調整ではなかった。このscope誤りを明示的に訂正し、
+from-scratch sampled hard halting、最初の5,000更新をdepth 2--6 curriculumとする
+100,000-update試行へ戻した。
+
+Recurrence Trial R1では、他条件を固定してcompute priceだけを`0.02`から`0`へ変更した。
+最終heldはloss `2.610439`、top-1 `0.703125`、NDCG `0.989804`、pairwise
+`0.899255`、margin `0.142586`。実時間`4,035.57 s`、`24.78 updates/s`、CPU平均
+`78.92%`、candidate中`81.85%`だった。
+
+しかし深度は安定しなかった。held meanは15kで`5.19`、20kで`2.03`、60--70kで
+ほぼ`12`、75kで`2.05`、100kで再び`11.91`となった。training sampled depthも
+同じ両端飽和を示した。したがってcompute priceを外すだけでは入力依存の思考時間を
+獲得できず、halt policyの更新幅または分散が支配的である。R1は不採用とし、次試行は
+他条件を固定したままhalt LRだけを`5e-5`から`1e-5`へ下げる。
+
+曲線、比較、checkpoint witnessは
+[`DYNAMIC_RECURRENCE_TUNING_2026-07-22.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/DYNAMIC_RECURRENCE_TUNING_2026-07-22.md)
+に記録した。
