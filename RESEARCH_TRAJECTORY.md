@@ -679,3 +679,27 @@ LR半減armは品質上限の参考、scale 1.0対照は採用点として分離
 および
 [`CURRENT_FINDINGS_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/CURRENT_FINDINGS_2026-07-23.md)
 へ反映した。
+
+## 25. 2026-07-23 — 100k完走と予算別PreAct比較
+
+速度条件に合格した65k checkpointからアーキテクチャと学習条件を変えず、100,000更新まで
+継続した。35,000更新を1,803.908秒、`19.402 updates/s`、`77.609 states/s`で完了し、
+最低15 updates/sを維持した。
+
+85kはtop-1 `0.750000`、90kはpairwise `0.902023`、95kはloss `2.585896`、
+NDCG `0.991278`、margin `0.157540`でそれぞれ最良だった。100kではloss
+`2.601427`、top-1 `0.726562`、NDCG `0.989715`、pairwise `0.897215`へ反落した。
+したがって、90～100kを振動を伴う頭打ち域と判定し、連続順位指標の均衡がよい95kを
+速度条件付き採用checkpointとした。SHA-256は
+`622753d65e0502edd09ed4ef10ecf3270b90e7a92e7d9b2d44cb6d71d9350893`である。
+
+PreAct比較は予算軸を分離した。同じteacher state数ではPreAct 12kがEVRL 10k～15kを
+明確に上回り、sample efficiencyの優位はPreActにある。一方、EVRL 95kの累積5,817秒に
+近いPreAct 3kの約6,130秒を比較すると、EVRLがtop-1、NDCG、pairwise、lossで上回った。
+最高到達品質ではPreAct 12.75kがEVRL 95kより高い。従って実証できた主張は、
+「EVRLは同じwall-clock内の固定panel品質で上回るが、同じteacher state数と最高到達品質では
+まだPreActを超えていない」である。
+
+hard haltingは可変深度を維持したが、held平均深度は2.01～3.02を往復し、安定増加は
+示さなかった。100k時点のLookup row-load Giniも`0.966～0.970`と高い。
+次の改善対象は更新数の単純追加ではなく、Lookup routing collapseと停止信用割当である。
