@@ -423,3 +423,46 @@ last checkpoint: checkpoint_000065000.jls
 sha256: 672d73a6a5cf1c40f1fa80fd10fd28b34bdd09e3465dcaf4c24602c9181e53f2
 teacher states: 260,000
 ```
+
+## 50,000更新以降のepisodic LR維持対照
+
+LR半減による品質向上と速度低下を分離するため、同じ50,000更新checkpointから
+episodic LR scale `1.0`を維持した対照を65,000更新まで進めた。optimizer、sampler、
+RNG、teacher順序、Lookup bank、router、halt LR、loss、schedulerは半減armと同一である。
+
+初回起動ではLookup geometryの環境変数を明示しなかったため、checkpointの
+`13 tables x 4096 rows x top-3`とlive既定値の不一致を検出し、更新前に安全停止した。
+保存済みtopologyから`DSRL_CARRIER_DIM=128`、`DSRL_TABLES_PER_BLOCK=13`、
+`DSRL_WTA_CHOICES=16`、`DSRL_ROWS_PER_TABLE_LOOKUP=3`、`EVRL_REGISTERS=4`、
+`EVRL_FFN_DIM=128`を復元して再起動した。失敗した起動ではoptimizerもsamplerも進んで
+おらず、対照結果には混入していない。
+
+| 更新 | arm | held loss | held top-1 | held NDCG | held pairwise | held margin | held平均深度 | 深度範囲 | 累積区間updates/s |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50,000 | 共通起点 | 2.632145 | 0.734375 | 0.987706 | 0.884073 | 0.131590 | 4.010 | 3～12 | - |
+| 55,000 | scale 1.0 | 2.628409 | 0.695312 | 0.989086 | 0.887796 | 0.127374 | 3.527 | 2～5 | 17.969 |
+| 60,000 | scale 1.0 | 2.611488 | 0.703125 | 0.989321 | 0.888707 | 0.132685 | 2.055 | 2～7 | 16.326 |
+| 65,000 | scale 1.0 | 2.605426 | 0.742188 | 0.990088 | 0.893202 | 0.140937 | 3.217 | 2～12 | 17.122 |
+| 65,000 | scale 0.5 | 2.594471 | 0.757812 | 0.990265 | 0.896571 | 0.142645 | 2.888 | 2～12 | 14.625 |
+
+scale 1.0対照の15,000更新は876.050秒、`17.122 updates/s`、`68.489 states/s`、
+CPU平均`53.759%`、candidate中`54.478%`で完了した。速度下限15を余裕を持って満たす。
+
+65kのscale 0.5は対照比でloss `-0.010955`、top-1 `+0.015625`、NDCG
+`+0.000177`、pairwise `+0.003369`、margin `+0.001708`と全品質指標が高い。一方、
+速度は`-2.497 updates/s`で対照の`85.4%`に留まり、設定済み下限を満たさない。
+LR値はforward/backwardの演算量を直接変えないため、差は学習されたactive trajectory、
+実現深度、candidate workloadと長区間の実行揺らぎを含む結果である。
+
+scale 1.0の65kは50k比でloss `-0.026719`、top-1 `+0.007812`、NDCG
+`+0.002382`、pairwise `+0.009129`、margin `+0.009347`と全主要指標を改善した。
+したがって、品質を改善しながら速度条件も満たす現行採用checkpointを50kから
+scale 1.0の65kへ更新する。scale 0.5の65kは品質上限の参考として保持する。
+
+```text
+run: evrl_boundsfix_p2_c0_halt5e5_lr2e4_full50k_wd3e4_u65000_20260723_ctrl1
+checkpoint: checkpoint_000065000.jls
+sha256: b4675bbe17a2963e793ec6f9ff6f0300ec0e13c8f0e12974c88ef9bce20d99e8
+teacher states: 260,000
+status: complete
+```

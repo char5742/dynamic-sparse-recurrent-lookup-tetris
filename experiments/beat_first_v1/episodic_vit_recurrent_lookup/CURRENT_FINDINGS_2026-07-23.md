@@ -4,7 +4,7 @@
 
 現行EVRLは、入力内の短期関係形成、LookupFFNによる長期記憶選択、入力依存の再帰深度を一つのCPU学習系へ統合できている。8近傍spatial backwardの範囲外書込みを修正した後は、loss、top-1、NDCG、pairwise、marginが学習とともに改善し、hard haltingも2～12 stepを入力ごとに使い分けるようになった。
 
-現在の速度条件付き採用構成は、state batch 4、dense LR `2e-4`、dense weight decay `3e-4`、halt LR `5e-5`、2 probes/stateである。採用checkpointは50,000更新で、top-1 `0.734375`、NDCG `0.987706`、pairwise `0.884073`、margin `0.131590`、平均深度 `4.010`、学習速度 `15.545 updates/s`を記録した。
+現在の速度条件付き採用構成は、state batch 4、dense LR `2e-4`、dense weight decay `3e-4`、halt LR `5e-5`、2 probes/stateである。採用checkpointはepisodic LR scale `1.0`を維持した65,000更新で、top-1 `0.742188`、NDCG `0.990088`、pairwise `0.893202`、margin `0.140937`、平均深度 `3.217`、学習速度 `17.122 updates/s`を記録した。
 
 50,000更新後にepisodic dense LRだけを半減した試行は、65,000更新でtop-1 `0.757812`、NDCG `0.990265`まで伸びた。しかし実データ10,000更新の速度が`14.625 updates/s`となり、最低条件の`15 updates/s`を満たさなかった。この65,000更新checkpointは品質上の参考として保持するが、現行採用構成にはしない。
 
@@ -100,7 +100,7 @@ halt LRだけを下げても、再帰深度の振動は解消しなかった。
 | `3e-4` | 45,000 | 2.622360 | 0.718750 | 0.988368 | 0.884885 | 0.125085 | 2.131 | 15.191 |
 | `3e-4` | 50,000 | 2.632145 | 0.734375 | 0.987706 | 0.884073 | 0.131590 | 4.010 | 15.545 |
 
-WD `3e-4`は、15 updates/s以上を維持しながら品質を改善し、halt LR `1e-5`で発生した最大深度側への長時間飽和も回避した。45,000更新はloss、NDCG、pairwiseの均衡がよく、50,000更新はtop-1と入力依存深度が最良だった。後続試行の共通分岐点と採用checkpointには50,000更新を使う。
+WD `3e-4`は、15 updates/s以上を維持しながら品質を改善し、halt LR `1e-5`で発生した最大深度側への長時間飽和も回避した。45,000更新はloss、NDCG、pairwiseの均衡がよく、50,000更新はtop-1と入力依存深度が最良だった。後続試行の共通分岐点には50,000更新を使い、最終的な速度条件付き採用点は下記の65,000更新対照で更新した。
 
 ## 50,000更新後のepisodic LR半減
 
@@ -116,34 +116,38 @@ WD `3e-4`は、15 updates/s以上を維持しながら品質を改善し、halt 
 
 この試行は現時点で最高の品質を得たが、速度条件を満たさない。短いbenchmarkだけで採用せず、長い実データ区間を最終判定に使う。
 
+同じ50,000更新checkpointからepisodic LR scale `1.0`を維持した対照は、65,000更新でloss `2.605426`、top-1 `0.742188`、NDCG `0.990088`、pairwise `0.893202`、margin `0.140937`、平均深度`3.217`に到達した。15,000更新の実時間は876.050秒、`17.122 updates/s`、`68.489 states/s`、CPU平均`53.759%`、candidate中`54.478%`であり、速度条件に合格した。
+
+65,000更新のLR半減armは対照比でloss `-0.010955`、top-1 `+0.015625`、NDCG `+0.000177`、pairwise `+0.003369`、margin `+0.001708`と高品質だった。一方、速度は`14.625`対`17.122 updates/s`で、対照の`85.4%`に留まった。したがってLR半減は品質上限の参考、scale 1.0は速度条件付き採用点とする。
+
 ## 現在の採用checkpoint
 
-- run：`evrl_boundsfix_p2_c0_halt5e5_lr2e4_wd3e4_u50000_20260723_wd3`
-- 更新数：50,000
-- teacher state数：200,000
-- SHA-256：`13a99d3dea24942e4766aaae340ed3ecf6d13448954e559845f3bd19fbee93de`
-- 採用理由：品質が改善し、hard haltingが可変深度を維持し、実データ区間で`15 updates/s`以上を満たすため
+- run：`evrl_boundsfix_p2_c0_halt5e5_lr2e4_full50k_wd3e4_u65000_20260723_ctrl1`
+- 更新数：65,000
+- teacher state数：260,000
+- SHA-256：`b4675bbe17a2963e793ec6f9ff6f0300ec0e13c8f0e12974c88ef9bce20d99e8`
+- 採用理由：50kから全主要品質指標を改善し、hard haltingが2～12の可変深度を維持し、15,000更新の実データ区間で`17.122 updates/s`を満たすため
 
 参考用の65,000更新LR半減checkpointのSHA-256は`672d73a6a5cf1c40f1fa80fd10fd28b34bdd09e3465dcaf4c24602c9181e53f2`である。これは速度失格のため採用checkpointではない。
 
 ## PreActとの関係
 
-既存のPreAct記録は、48,000 teacher stateでtop-1 `0.7891`、NDCG `0.99329`、pairwise `0.92336`、margin `0.12332`、loss `2.56378`だった。修正後EVRLの採用checkpointは200,000 teacher stateを使っているため、この二つを同一予算の最終比較として扱うことはできない。
+既存のPreAct記録は、48,000 teacher stateでtop-1 `0.7891`、NDCG `0.99329`、pairwise `0.92336`、margin `0.12332`、loss `2.56378`だった。修正後EVRLの採用checkpointは260,000 teacher stateを使っているため、この二つを同一予算の最終比較として扱うことはできない。
 
-参考差分として、EVRL 50,000更新は旧PreAct記録に対してtop-1 `-0.0547`、NDCG `-0.00558`、pairwise `-0.03929`、loss `+0.06837`、margin `+0.00827`である。ただし学習予算が異なるため、これは研究上の勝敗を示す値ではない。
+参考差分として、EVRL 65,000更新は旧PreAct記録に対してtop-1 `-0.0469`、NDCG `-0.00320`、pairwise `-0.03016`、loss `+0.04165`、margin `+0.01762`である。ただし学習予算が異なるため、これは研究上の勝敗を示す値ではない。
 
 したがって現在の正確な結論は次の通りである。
 
 1. 修正後EVRLは学習可能であり、動的再帰も獲得している。
-2. dense WD `3e-4`の50,000更新が、現在の品質・速度条件を満たす採用点である。
+2. dense WD `3e-4`、episodic LR scale `1.0`の65,000更新が、現在の品質・速度条件を満たす採用点である。
 3. episodic LR半減は品質をさらに伸ばすが、長区間速度を悪化させた。
 4. PreAct超えは未証明であり、修正後モデルによる同一入力、teacher state数、評価panel、実時間または計算予算での再比較が必要である。
 
 ## 評価上の境界
 
-- validationおよびsealed game seedには触れていない。
-- チューニングには固定teacher評価panelを使っている。
-- 同じpanelを繰り返し観測しているため、上記の改善は学習挙動の証拠ではあるが、独立した汎化性能の最終証明ではない。
+- sealed game seedには触れていない。
+- チューニングには固定training teacher panel 64状態と固定validation teacher panel 128状態を繰り返し使っている。
+- validation panelを反復観測しているため、上記の改善は学習挙動と同一panel上の比較証拠ではあるが、独立した汎化性能の最終証明ではない。最終比較には未使用の評価seedまたは複数の新規固定seedが必要である。
 - 旧100,000更新試行は範囲外書込みを含むため、修正後モデルの性能根拠から除外する。
 
 詳細な各試行の推移、checkpoint遷移、smoke結果は[`TRAINING_STABILITY_TUNING_2026-07-23.md`](TRAINING_STABILITY_TUNING_2026-07-23.md)に記録している。
