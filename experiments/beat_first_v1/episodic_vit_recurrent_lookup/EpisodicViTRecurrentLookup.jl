@@ -2024,6 +2024,55 @@ function finalize_trajectory(
     return (; output, tape, depth=length(state.steps))
 end
 
+"""Evaluate exactly one counterfactual recurrent step after a sampled stop.
+
+The supplied arena and output vector are caller-owned scratch.  The original
+trajectory, its RNG history, and route-usage accounting are left untouched.
+This is the physical one-step primitive used by sparse halting probes.
+"""
+function probe_one_step!(
+    output::AbstractVector{Float32},
+    model::EpisodicViTLookupModel,
+    tape::TrajectoryTape,
+    arena::ForwardCandidateArena;
+    temperature=0.50f0,
+)
+    length(output) == OUTPUT_DIM || throw(DimensionMismatch(
+        "halting probe output shape changed",
+    ))
+    depth = length(tape.steps)
+    depth < MAX_RECURRENT_STEPS || throw(ArgumentError(
+        "cannot probe beyond the maximum recurrent depth",
+    ))
+    stopped_step = last(tape.steps)
+    stopped_step.stopped || throw(ArgumentError(
+        "halting probe requires a stopped trajectory",
+    ))
+
+    copyto!(arena.registers, stopped_step.final_registers)
+    empty!(arena.steps)
+    append!(arena.steps, tape.steps)
+    state = ForwardTrajectoryState(
+        tape.input,
+        stopped_step.spatial.output,
+        arena.registers,
+        arena.steps,
+        arena,
+        nothing,
+        Int16(depth + 1),
+        Float32(temperature),
+        false,
+        false,
+    )
+    advance_trajectory!(model, state)
+    state.stopped || error("forced one-step halting probe did not stop")
+    pooled = arena.carrier_scratch[depth + 1].pooled
+    _pool_registers!(pooled, state.registers)
+    copyto!(output, model.lookup.bias)
+    mul!(output, model.lookup.head, pooled, 1.0f0, 1.0f0)
+    return output
+end
+
 
 function forward_trajectory(
     model::EpisodicViTLookupModel,
@@ -3253,6 +3302,9 @@ function backward_trajectory!(
     compute_price=0.02f0,
     policy_weight=0.05f0,
     entropy_weight=0.001f0,
+    halt_probe_mode::Bool=false,
+    halt_probe_target=Float32(NaN),
+    halt_probe_weight=1.0f0,
     temperature=0.50f0,
     ffn_scale_contributions=nothing,
 )
@@ -3296,7 +3348,22 @@ function backward_trajectory!(
     ))
     halt_logit_gradients = scratch.halt_gradients
     fill!(halt_logit_gradients, 0.0f0)
-    if !tape.warmup_depth
+    if halt_probe_mode
+        target = Float32(halt_probe_target)
+        if isfinite(target)
+            0.0f0 <= target <= 1.0f0 || throw(ArgumentError(
+                "halting probe target must lie in [0,1]",
+            ))
+            step = last(tape.steps)
+            step.stochastic_decision && step.stopped && !step.forced_stop ||
+                error("halting probe target was attached to an ineligible stop")
+            probability = clamp(
+                step.halt_probability, 1.0f-5, 1.0f0 - 1.0f-5,
+            )
+            halt_logit_gradients[depth] = Float32(halt_probe_weight) *
+                (probability - target)
+        end
+    elseif !tape.warmup_depth
         advantage = clamp(
             Float32(realized_loss) + Float32(compute_price) * Float32(depth) -
             Float32(baseline), -8.0f0, 8.0f0,
@@ -3716,7 +3783,7 @@ export BOARD_HEIGHT, BOARD_WIDTH, CELL_COUNT, PIECE_TYPES, NEXT_HOLD_TOKENS,
        topology, usage_summary, record_usage!, ForwardCandidateArena,
        ForwardTrajectoryState,
        prepare_trajectory, advance_trajectory!, finalize_trajectory,
-       forward_trajectory,
+       probe_one_step!, forward_trajectory,
        backward_trajectory!, reset_gradients!, merge_gradients!, gradient_norm,
        scale_gradients!, optimizer_step!
 

@@ -971,7 +971,9 @@ function _barrierless_forward_step!(executor, context, flat_job::Int)
     return zero(BarrierlessJob)
 end
 
-function _barrierless_state_loss_vjp!(executor, context, state_slot::Int)
+function _barrierless_state_loss_vjp!(
+    executor, context, worker_slot::Int, state_slot::Int,
+)
     trainer = context.trainer
     scheduler = trainer.scheduler
     state = @inbounds executor.states[state_slot]
@@ -992,6 +994,15 @@ function _barrierless_state_loss_vjp!(executor, context, state_slot::Int)
     scheduler.raw_gradients[state_slot] .= raw_gradient
     scheduler.state_losses[state_slot] = loss
     count = Int(state.candidate_count)
+    halt_probe = _apply_halt_probes!(
+        trainer,
+        batch,
+        workspace,
+        state_slot,
+        context.expected_update,
+        context.hyperparameters,
+        worker_slot,
+    )
     @inbounds for candidate in 1:count
         state.depth_values[candidate] = Int(workspace.depths[candidate])
     end
@@ -1000,6 +1011,7 @@ function _barrierless_state_loss_vjp!(executor, context, state_slot::Int)
         components=_component_record(components),
         candidate_count=count,
         depths=copy(@view(state.depth_values[1:count])),
+        halt_probe,
     )
 
     # Stable depth-descending fanout.  Equal-depth candidates retain ascending
@@ -1050,6 +1062,9 @@ function _barrierless_backward!(
         compute_price=context.hyperparameters.halting.compute_price,
         policy_weight=context.hyperparameters.halting.policy_weight,
         entropy_weight=context.hyperparameters.halting.entropy_weight,
+        halt_probe_mode=context.hyperparameters.halting.probe_candidates_per_state > 0,
+        halt_probe_target=workspace.halt_probe_targets[candidate],
+        halt_probe_weight=context.hyperparameters.halting.probe_weight,
         temperature=context.temperature,
         ffn_scale_contributions,
     )
@@ -1187,7 +1202,9 @@ function _barrierless_dispatch_job!(
         continuation = _barrierless_forward_step!(executor, context, Int(job.target))
     elseif kind == BARRIERLESS_STATE_LOSS_VJP
         phase = BARRIERLESS_PHASE_LOSS_VJP
-        _barrierless_state_loss_vjp!(executor, context, Int(job.target))
+        _barrierless_state_loss_vjp!(
+            executor, context, worker_slot, Int(job.target),
+        )
     elseif kind == BARRIERLESS_BACKWARD
         phase = BARRIERLESS_PHASE_BACKWARD
         _barrierless_backward!(executor, context, worker_slot, Int(job.target))

@@ -115,3 +115,18 @@ summary.json sha256:
 ```
 
 Binary checkpoints and teacher data are not committed to Git.
+
+## Trial R2 — stopped after credit-assignment correction
+
+R2 reduced only the halt learning rate from `5e-5` to `1e-5`.  It reached and
+saved update 10,000, but was not continued to 100,000.  The trial was stopped
+because scalar tuning retained the same state-wide REINFORCE target and could
+not resolve candidate-local value-of-computation credit.  Its update-10,000
+checkpoint is retained as the immutable parent for the one-step-probe
+correctness smoke, not as a completed tuning result.
+
+The replacement is a bounded candidate-local one-step probe: replace only one
+stopped candidate's Q with its exact next-step Q, recompute ListNet plus margin,
+and supervise continue iff `L_stop - L_continue > c`.  Correctness and speed
+preflight are recorded in
+[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md).

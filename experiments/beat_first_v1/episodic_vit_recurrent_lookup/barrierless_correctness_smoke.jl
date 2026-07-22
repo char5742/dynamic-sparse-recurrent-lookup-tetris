@@ -4,7 +4,7 @@
 One-update correctness witness for the production barrierless executor.
 
 The oracle is the direct, single-worker candidate state machine.  Both sides
-are independently deserialized from the immutable update-1000 checkpoint and
+are independently deserialized from the same immutable checkpoint and
 consume the same next four *training* rows.  No validation subset or sealed
 seed is constructed by this program.
 
@@ -22,10 +22,10 @@ for (name, value) in (
     "DSRL_CARRIER_DIM" => "128",
     "DSRL_TABLES_PER_BLOCK" => "13",
     "DSRL_WTA_CHOICES" => "16",
-    "DSRL_ROWS_PER_TABLE_LOOKUP" => "1",
+    "DSRL_ROWS_PER_TABLE_LOOKUP" => "3",
     "EVRL_ATTENTION_DIM" => "32",
     "EVRL_ATTENTION_HEADS" => "4",
-    "EVRL_REGISTERS" => "2",
+    "EVRL_REGISTERS" => "4",
     "EVRL_ROUTER_TABLES" => "2",
     "EVRL_ROUTER_BITS" => "4",
     "EVRL_ROUTER_BUCKET_CAP" => "16",
@@ -34,8 +34,8 @@ for (name, value) in (
     "EVRL_SPATIAL_ANCHORS" => "2",
     "EVRL_SPATIAL_SHORTLIST" => "2",
     "EVRL_SPATIAL_CANDIDATE_CAP" => "3",
-    "EVRL_FFN_DIM" => "32",
-    "EVRL_INITIAL_HALT_PROBABILITY" => "0.8",
+    "EVRL_FFN_DIM" => "128",
+    "EVRL_INITIAL_HALT_PROBABILITY" => "0.5",
 )
     haskey(ENV, name) || (ENV[name] = value)
 end
@@ -53,9 +53,9 @@ const Training = Main.EpisodicViTRecurrentLookupTeacherTraining
 const Model = Training.Model
 const TrainingCore = Training.TrainingCore
 
-const DEFAULT_CHECKPOINT = raw"D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_routed_workspace_relation_d128_r2_a2_c3k2_wta16t13_u1000_t16_20260720_r1\checkpoints\checkpoint_000001000.jls"
+const DEFAULT_CHECKPOINT = raw"D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_recurrence_cp0_haltlr1e5_warmup5k_u100000_20260722_r2\checkpoints\checkpoint_000010000.jls"
 const DEFAULT_CHECKPOINT_SHA256 =
-    "cd745a8449c81c36c7d8ee471a9a6ac64b6670b788399c7ed1c869b68a5c5f23"
+    "3bd4140707a10cd63781bd39c65d21255ae8dbaa0ea022c78ab501b3f014041b"
 
 const OUTPUT_ATOL = 1.0e-6
 const OUTPUT_RTOL = 1.0e-6
@@ -146,7 +146,9 @@ function _training_only_split(dataset, metadata)
     )
 end
 
-function _restore_side(payload, split, manifest_sha256, scheduler::String)
+function _restore_side(
+    payload, split, manifest_sha256, scheduler::String, hyperparameters,
+)
     trainer, sampler, _ = withenv(
         "EVRL_SCHEDULER" => scheduler,
         "EVRL_CPUSET_MODE" => "none",
@@ -158,7 +160,7 @@ function _restore_side(payload, split, manifest_sha256, scheduler::String)
             split,
             payload.split_metadata,
             manifest_sha256,
-            payload.config.hyperparameters,
+            hyperparameters,
         )
     end
     optimizer = payload.config.hyperparameters.optimizer
@@ -373,6 +375,16 @@ function _discrete_snapshot(trainer, batches)
         Tuple(_tape_lookup_rows(workspace.tapes[candidate])
               for candidate in 1:counts[state])
     end for state in eachindex(batches))
+    halt_probe_targets = Tuple(begin
+        workspace = trainer.scheduler.state_workspaces[state]
+        Tuple(reinterpret(UInt32, workspace.halt_probe_targets[candidate])
+              for candidate in 1:counts[state])
+    end for state in eachindex(batches))
+    halt_probe_deltas = Tuple(begin
+        workspace = trainer.scheduler.state_workspaces[state]
+        Tuple(reinterpret(UInt32, workspace.halt_probe_deltas[candidate])
+              for candidate in 1:counts[state])
+    end for state in eachindex(batches))
     return (;
         counts,
         candidate_seeds,
@@ -381,6 +393,8 @@ function _discrete_snapshot(trainer, batches)
         hard_halting,
         token_edges,
         lookup_rows,
+        halt_probe_targets,
+        halt_probe_deltas,
     )
 end
 
@@ -652,23 +666,49 @@ function main()
     )
     manifest_sha256 = Training._sha256_file(joinpath(dataset_path, "manifest.json"))
     split = _training_only_split(dataset, serial_payload.split_metadata)
+    inherited_hyperparameters = Training._normalized_hyperparameters(
+        serial_payload.config.hyperparameters,
+    )
+    probe_candidates_per_state = parse(Int, get(
+        ENV,
+        "EVRL_HALT_PROBES_PER_STATE",
+        string(inherited_hyperparameters.halting.probe_candidates_per_state),
+    ))
+    probe_weight = parse(Float32, get(
+        ENV,
+        "EVRL_HALT_PROBE_WEIGHT",
+        string(inherited_hyperparameters.halting.probe_weight),
+    ))
+    compute_price = parse(Float32, get(
+        ENV,
+        "EVRL_COMPUTE_PRICE",
+        string(inherited_hyperparameters.halting.compute_price),
+    ))
+    hyperparameters = merge(inherited_hyperparameters, (;
+        halting=merge(inherited_hyperparameters.halting, (;
+            compute_price,
+            probe_candidates_per_state,
+            probe_weight,
+        )),
+    ))
     serial_trainer, serial_sampler = _restore_side(
         serial_payload,
         split,
         manifest_sha256,
         "serial",
+        hyperparameters,
     )
     barrierless_trainer, barrierless_sampler = _restore_side(
         barrierless_payload,
         split,
         manifest_sha256,
         "barrierless",
+        hyperparameters,
     )
     serial_trainer.update == barrierless_trainer.update || error(
         "restored update differs",
     )
-    hyperparameters = serial_payload.config.hyperparameters
-    hyperparameters == barrierless_payload.config.hyperparameters || error(
+    serial_payload.config.hyperparameters == barrierless_payload.config.hyperparameters || error(
         "restored hyperparameters differ",
     )
     serial_rows = TrainingCore.next_batch!(
@@ -759,6 +799,12 @@ function main()
                 barrierless_discrete.token_edges == serial_discrete.token_edges,
             lookup_row_id=
                 barrierless_discrete.lookup_rows == serial_discrete.lookup_rows,
+            halt_probe_target=
+                barrierless_discrete.halt_probe_targets ==
+                    serial_discrete.halt_probe_targets,
+            halt_probe_delta=
+                barrierless_discrete.halt_probe_deltas ==
+                    serial_discrete.halt_probe_deltas,
             active_token_mask=
                 barrierless_gradient.active_tokens == serial_gradient.active_tokens,
             selected_row_events=

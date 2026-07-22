@@ -485,3 +485,25 @@ Recurrence Trial R1では、他条件を固定してcompute priceだけを`0.02`
 曲線、比較、checkpoint witnessは
 [`DYNAMIC_RECURRENCE_TUNING_2026-07-22.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/DYNAMIC_RECURRENCE_TUNING_2026-07-22.md)
 に記録した。
+
+## 20. 2026-07-22 — candidate-local 1-step halting probe
+
+halt LRを下げるだけのR2は保存済みupdate 10,000境界で停止した。問題はscalarの
+大きさより、同じstate-wide ranking lossを全candidateの停止actionへ配る信用割当
+そのものだったためである。
+
+probe modeでは各stateの停止候補を最大2件だけ正確に追加1step進め、そのcandidateの
+Qだけを差し替えたListNet＋marginを再計算する。`L_stop-L_continue > c`なら
+continue、それ以外はstopを最終halt logitへBCE教師として与える。未probe candidate
+にはhalt gradientを流さず、task score／task loss／task VJPはprobe前の値を保持する。
+全深度PonderNet展開は行わない。
+
+1-step primitiveは通常のd+1 forwardと最大差`2.38e-7`で一致した。現行R2
+update-10,000 checkpointを使うreal-teacher serial/barrierless smokeではoutput、loss、
+raw VJP、probe target／deltaが完全一致し、parameter gradient最大差`4.04e-6`、
+optimizer後parameter最大差`4.04e-7`で合格した。100 measured updatesは
+`20.66 updates/s`で、最低15 updates/sを維持した。benchmark更新は保存していない。
+
+設計、正当性witness、速度preflightは
+[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/HALTING_ONE_STEP_PROBE_2026-07-22.md)
+に記録した。

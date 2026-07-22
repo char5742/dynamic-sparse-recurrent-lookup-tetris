@@ -130,6 +130,16 @@ function runtime_hyperparameters(maximum_updates::Int, payload=nothing)
         compute_price=_float32_env("EVRL_COMPUTE_PRICE", _property_or(inherited_halting, :compute_price, 0.02f0); nonnegative=true),
         policy_weight=_float32_env("EVRL_POLICY_WEIGHT", _property_or(inherited_halting, :policy_weight, 0.05f0); nonnegative=true),
         entropy_weight=_float32_env("EVRL_ENTROPY_WEIGHT", _property_or(inherited_halting, :entropy_weight, 0.001f0); nonnegative=true),
+        probe_candidates_per_state=_int_env(
+            "EVRL_HALT_PROBES_PER_STATE",
+            _property_or(inherited_halting, :probe_candidates_per_state, 0);
+            minimum=0,
+        ),
+        probe_weight=_float32_env(
+            "EVRL_HALT_PROBE_WEIGHT",
+            _property_or(inherited_halting, :probe_weight, 1.0f0);
+            nonnegative=true,
+        ),
     )
     iszero(halting.fixed_depth) ||
         Model.MIN_RECURRENT_STEPS <= halting.fixed_depth <= Model.MAX_RECURRENT_STEPS ||
@@ -181,6 +191,27 @@ function runtime_hyperparameters(maximum_updates::Int, payload=nothing)
     return (; optimizer, routing, halting, loss)
 end
 
+function _normalized_hyperparameters(value)
+    halting = value.halting
+    normalized_halting = (;
+        warmup_updates=halting.warmup_updates,
+        fixed_depth=halting.fixed_depth,
+        compute_price=halting.compute_price,
+        policy_weight=halting.policy_weight,
+        entropy_weight=halting.entropy_weight,
+        probe_candidates_per_state=_property_or(
+            halting, :probe_candidates_per_state, 0,
+        ),
+        probe_weight=Float32(_property_or(halting, :probe_weight, 1.0f0)),
+    )
+    return (;
+        optimizer=value.optimizer,
+        routing=value.routing,
+        halting=normalized_halting,
+        loss=value.loss,
+    )
+end
+
 @inline function routing_temperature(update::Int, schedule)
     progress = clamp(
         Float32(update - schedule.anneal_start_update) /
@@ -217,6 +248,8 @@ mutable struct TeacherWorkspace
     memory_buffers::Vector{Matrix{Float32}}
     inverse_rms_buffers::Vector{Vector{Float32}}
     forward_arenas::Vector{Model.ForwardCandidateArena}
+    halt_probe_targets::Vector{Float32}
+    halt_probe_deltas::Vector{Float32}
 end
 
 TeacherWorkspace() = TeacherWorkspace(
@@ -228,6 +261,8 @@ TeacherWorkspace() = TeacherWorkspace(
     [Matrix{Float32}(undef, Model.MODEL_DIM, Model.TOKEN_COUNT) for _ in 1:LEARNER_WIDTH],
     [Vector{Float32}(undef, Model.TOKEN_COUNT) for _ in 1:LEARNER_WIDTH],
     [Model.ForwardCandidateArena() for _ in 1:LEARNER_WIDTH],
+    fill(Float32(NaN), LEARNER_WIDTH),
+    fill(Float32(NaN), LEARNER_WIDTH),
 )
 
 const TRAINING_STATE_BATCH = 4
@@ -293,6 +328,8 @@ mutable struct CandidateSchedulerWorkspace
     merged_accumulator::Model.GradientAccumulator
     worker_jobs::Vector{UInt64}
     worker_chunks::Vector{UInt64}
+    probe_arenas::Vector{Model.ForwardCandidateArena}
+    probe_outputs::Vector{Vector{Float32}}
     candidate_wall_nanoseconds::UInt128
     candidate_cpu_ticks_100ns::UInt128
     barrierless_executor::Any
@@ -317,6 +354,8 @@ function CandidateSchedulerWorkspace(model)
         Model.GradientAccumulator(model),
         zeros(UInt64, Base.Threads.maxthreadid()),
         zeros(UInt64, Base.Threads.maxthreadid()),
+        [Model.ForwardCandidateArena() for _ in 1:Base.Threads.maxthreadid()],
+        [zeros(Float32, OUTPUT_DIM) for _ in 1:Base.Threads.maxthreadid()],
         UInt128(0),
         UInt128(0),
         nothing,
@@ -435,6 +474,8 @@ end
     fill!(workspace.raw, 0.0f0)
     fill!(workspace.tapes, nothing)
     fill!(workspace.depths, 0)
+    fill!(workspace.halt_probe_targets, Float32(NaN))
+    fill!(workspace.halt_probe_deltas, Float32(NaN))
     return workspace
 end
 
@@ -774,6 +815,103 @@ function _component_record(components)
     return NamedTuple{names}(Tuple(Float64(getproperty(components, name)) for name in names))
 end
 
+const Q_OUTPUT_INDEX = 1
+
+"""ListNet + margin value used only for counterfactual halting labels."""
+function _halting_ranking_loss(raw, batch, hyperparameters)
+    hard_negative = _hard_negative_selection(
+        raw, batch, hyperparameters.loss.margin_mode,
+    )
+    components = _weighted_components(
+        raw, batch, hyperparameters; hard_negative,
+    )
+    weights = hyperparameters.loss
+    return Float32(
+        weights.listnet_weight * components.listnet_loss +
+        weights.margin_weight * components.margin_loss
+    )
+end
+
+@inline function _halt_probe_eligible(tape)
+    tape === nothing && return false
+    length(tape.steps) < Model.MAX_RECURRENT_STEPS || return false
+    step = last(tape.steps)
+    return step.stochastic_decision && step.stopped && !step.forced_stop
+end
+
+"""Attach candidate-local stop labels from a physically sparse one-step probe.
+
+Only the probed candidate's scalar Q is replaced while computing the
+counterfactual ListNet + margin value.  The task output matrix is restored
+before return, so the normal task loss and VJP remain bit-for-bit independent
+of this supervision path.
+"""
+function _apply_halt_probes!(
+    trainer::TeacherTrainer,
+    batch,
+    workspace::TeacherWorkspace,
+    state_slot::Int,
+    expected_update::Int,
+    hyperparameters,
+    worker_slot::Int,
+)
+    requested = hyperparameters.halting.probe_candidates_per_state
+    requested <= 0 && return (;
+        count=0, continue_count=0, stop_count=0, mean_delta=0.0f0,
+    )
+    count = _valid_candidate_count(batch)
+    count == 0 && return (;
+        count=0, continue_count=0, stop_count=0, mean_delta=0.0f0,
+    )
+    scheduler = trainer.scheduler
+    arena = scheduler.probe_arenas[worker_slot]
+    probe_output = scheduler.probe_outputs[worker_slot]
+    stop_loss = _halting_ranking_loss(workspace.raw, batch, hyperparameters)
+    selected = 0
+    continue_count = 0
+    delta_sum = 0.0f0
+    start = mod(expected_update + 31 * state_slot - 2, count) + 1
+    @inbounds for offset in 0:(count - 1)
+        selected >= requested && break
+        candidate = mod(start + offset - 1, count) + 1
+        tape = workspace.tapes[candidate]
+        _halt_probe_eligible(tape) || continue
+        Model.probe_one_step!(
+            probe_output,
+            trainer.model,
+            tape,
+            arena;
+            temperature=routing_temperature(
+                expected_update, hyperparameters.routing,
+            ),
+        )
+        previous_q = workspace.raw[Q_OUTPUT_INDEX, candidate]
+        continue_loss = stop_loss
+        try
+            workspace.raw[Q_OUTPUT_INDEX, candidate] =
+                probe_output[Q_OUTPUT_INDEX]
+            continue_loss = _halting_ranking_loss(
+                workspace.raw, batch, hyperparameters,
+            )
+        finally
+            workspace.raw[Q_OUTPUT_INDEX, candidate] = previous_q
+        end
+        delta = stop_loss - continue_loss
+        target = delta > hyperparameters.halting.compute_price ? 0.0f0 : 1.0f0
+        workspace.halt_probe_deltas[candidate] = delta
+        workspace.halt_probe_targets[candidate] = target
+        selected += 1
+        continue_count += iszero(target)
+        delta_sum += delta
+    end
+    return (;
+        count=selected,
+        continue_count,
+        stop_count=selected - continue_count,
+        mean_delta=selected == 0 ? 0.0f0 : delta_sum / Float32(selected),
+    )
+end
+
 # Scheduling-only implementation.  It is included after the loss helpers and
 # candidate preparation API it dispatches, while remaining outside checkpoint
 # payloads.
@@ -876,11 +1014,21 @@ function _accumulate_dynamic_batches!(
         scheduler.raw_gradients[state_slot] .= raw_gradient
         scheduler.state_losses[state_slot] = loss
         count = _valid_candidate_count(batch)
+        halt_probe = _apply_halt_probes!(
+            trainer,
+            batch,
+            workspace,
+            state_slot,
+            expected_update,
+            hyperparameters,
+            1,
+        )
         state_results[state_slot] = (;
             loss,
             components=_component_record(components),
             candidate_count=count,
             depths=Int.(view(workspace.depths, 1:count)),
+            halt_probe,
         )
     end
 
@@ -901,6 +1049,9 @@ function _accumulate_dynamic_batches!(
             compute_price=hyperparameters.halting.compute_price,
             policy_weight=hyperparameters.halting.policy_weight,
             entropy_weight=hyperparameters.halting.entropy_weight,
+            halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
+            halt_probe_target=scheduler.state_workspaces[state_slot].halt_probe_targets[candidate],
+            halt_probe_weight=hyperparameters.halting.probe_weight,
             temperature,
         )
         scheduler.trajectory_states[job] = nothing
@@ -930,6 +1081,15 @@ function _accumulate_state_gradient!(
     loss, raw_gradient = _loss_output_vjp(
         raw, batch, hyperparameters; hard_negative,
     )
+    halt_probe = _apply_halt_probes!(
+        trainer,
+        batch,
+        trainer.workspace,
+        1,
+        expected_update,
+        hyperparameters,
+        1,
+    )
     temperature = routing_temperature(expected_update, hyperparameters.routing)
     local_accumulators = trainer.thread_accumulators
     _timed_candidate_region!(trainer) do
@@ -948,6 +1108,9 @@ function _accumulate_state_gradient!(
                 compute_price=hyperparameters.halting.compute_price,
                 policy_weight=hyperparameters.halting.policy_weight,
                 entropy_weight=hyperparameters.halting.entropy_weight,
+                halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
+                halt_probe_target=trainer.workspace.halt_probe_targets[1],
+                halt_probe_weight=hyperparameters.halting.probe_weight,
                 temperature,
             )
             BACKWARD_THREAD_WARMED[] = true
@@ -966,6 +1129,9 @@ function _accumulate_state_gradient!(
                 compute_price=hyperparameters.halting.compute_price,
                 policy_weight=hyperparameters.halting.policy_weight,
                 entropy_weight=hyperparameters.halting.entropy_weight,
+                halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
+                halt_probe_target=trainer.workspace.halt_probe_targets[candidate],
+                halt_probe_weight=hyperparameters.halting.probe_weight,
                 temperature,
             )
         end
@@ -983,6 +1149,9 @@ function _accumulate_state_gradient!(
                 compute_price=hyperparameters.halting.compute_price,
                 policy_weight=hyperparameters.halting.policy_weight,
                 entropy_weight=hyperparameters.halting.entropy_weight,
+                halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
+                halt_probe_target=trainer.workspace.halt_probe_targets[candidate],
+                halt_probe_weight=hyperparameters.halting.probe_weight,
                 temperature,
             )
         end
@@ -993,6 +1162,7 @@ function _accumulate_state_gradient!(
         components=_component_record(components),
         candidate_count,
         depths=Int.(view(trainer.workspace.depths, 1:candidate_count)),
+        halt_probe,
     )
 end
 
@@ -1106,6 +1276,17 @@ function train_accumulated_step!(
     end
     losses = [result.loss for result in state_results]
     depths = reduce(vcat, (result.depths for result in state_results))
+    halt_probe_count = sum(result.halt_probe.count for result in state_results)
+    halt_probe_continue_count = sum(
+        result.halt_probe.continue_count for result in state_results
+    )
+    halt_probe_stop_count = sum(
+        result.halt_probe.stop_count for result in state_results
+    )
+    halt_probe_mean_delta = halt_probe_count == 0 ? 0.0 : sum(
+        Float64(result.halt_probe.mean_delta) * result.halt_probe.count
+        for result in state_results
+    ) / halt_probe_count
     trainer.baseline = muladd(
         0.99f0,
         trainer.baseline,
@@ -1133,6 +1314,10 @@ function train_accumulated_step!(
         mean_depth=mean(depths),
         minimum_depth=minimum(depths),
         maximum_depth=maximum(depths),
+        halt_probe_count,
+        halt_probe_continue_count,
+        halt_probe_stop_count,
+        halt_probe_mean_delta,
         routing_temperature=Float64(routing_temperature(expected_update, hyperparameters.routing)),
         episodic_learning_rate_scale=Float64(episodic_lr_scale),
         baseline=Float64(trainer.baseline),
@@ -1386,12 +1571,16 @@ function restore_checkpoint(
     hasproperty(payload.config, :hyperparameters) || error(
         "resume config lacks hyperparameters",
     )
-    if payload.config.hyperparameters != hyperparameters
+    inherited_normalized = _normalized_hyperparameters(
+        payload.config.hyperparameters,
+    )
+    requested_normalized = _normalized_hyperparameters(hyperparameters)
+    if inherited_normalized != requested_normalized
         transition_raw = strip(get(ENV, "EVRL_ENABLE_DYNAMIC_HALTING_TRANSITION", "0"))
         transition_raw in ("0", "1") || error(
             "EVRL_ENABLE_DYNAMIC_HALTING_TRANSITION must be 0 or 1",
         )
-        inherited = payload.config.hyperparameters
+        inherited = inherited_normalized
         inherited_halting = inherited.halting
         requested_halting = hyperparameters.halting
         dynamic_halting_transition = transition_raw == "1" &&
@@ -1402,12 +1591,41 @@ function restore_checkpoint(
             inherited_halting.compute_price == requested_halting.compute_price &&
             inherited_halting.policy_weight == requested_halting.policy_weight &&
             inherited_halting.entropy_weight == requested_halting.entropy_weight &&
+            inherited_halting.probe_candidates_per_state ==
+                requested_halting.probe_candidates_per_state &&
+            inherited_halting.probe_weight == requested_halting.probe_weight &&
             inherited_halting.fixed_depth != 0 &&
             requested_halting.fixed_depth == 0
-        dynamic_halting_transition || error(
-            "resume hyperparameters differ; only the explicit fixed-depth-to-dynamic-halting transition is allowed",
+        probe_transition_raw = strip(get(
+            ENV, "EVRL_ENABLE_HALT_PROBE_TRANSITION", "0",
+        ))
+        probe_transition_raw in ("0", "1") || error(
+            "EVRL_ENABLE_HALT_PROBE_TRANSITION must be 0 or 1",
         )
-        @info "EVRL fixed-depth checkpoint transitions to sampled hard halting" previous_fixed_depth=inherited_halting.fixed_depth requested_fixed_depth=requested_halting.fixed_depth
+        halt_probe_transition = probe_transition_raw == "1" &&
+            inherited.optimizer == requested_normalized.optimizer &&
+            inherited.routing == requested_normalized.routing &&
+            inherited.loss == requested_normalized.loss &&
+            inherited_halting.warmup_updates == requested_halting.warmup_updates &&
+            inherited_halting.fixed_depth == requested_halting.fixed_depth &&
+            inherited_halting.policy_weight == requested_halting.policy_weight &&
+            inherited_halting.entropy_weight == requested_halting.entropy_weight &&
+            inherited_halting.probe_candidates_per_state == 0 &&
+            requested_halting.probe_candidates_per_state > 0
+        dynamic_halting_transition || halt_probe_transition || error(
+            "resume hyperparameters differ; only an explicit dynamic-halting or halt-probe transition is allowed",
+        )
+        dynamic_halting_transition && @info(
+            "EVRL fixed-depth checkpoint transitions to sampled hard halting",
+            previous_fixed_depth=inherited_halting.fixed_depth,
+            requested_fixed_depth=requested_halting.fixed_depth,
+        )
+        halt_probe_transition && @info(
+            "EVRL sampled halting transitions to sparse one-step probe supervision",
+            probes_per_state=requested_halting.probe_candidates_per_state,
+            probe_weight=requested_halting.probe_weight,
+            continue_threshold=requested_halting.compute_price,
+        )
     end
     hasproperty(payload.config, :objective) || error("resume config lacks objective")
     payload.config.objective == objective_contract(hyperparameters) || error(

@@ -76,6 +76,13 @@ update representation-learning run.  It should be re-enabled only after the
 spatial and routing representations remain stable under the intended final
 evaluation protocol.
 
+Dynamic training now has an optional candidate-local one-step probe path.  It
+probes only a bounded number of sampled stops, recomputes ListNet plus margin
+after replacing that candidate's Q, and supervises the final halt decision
+from `L_stop - L_continue`.  This preserves physical sparsity and replaces the
+former state-wide REINFORCE credit signal when enabled.  See
+[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md).
+
 See [`RESULTS_2026-07-20.md`](RESULTS_2026-07-20.md) for the exact numerical
 witnesses and
 [`PERFORMANCE_COMPARISON_2026-07-20.md`](PERFORMANCE_COMPARISON_2026-07-20.md)
