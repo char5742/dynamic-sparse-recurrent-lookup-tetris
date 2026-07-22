@@ -624,3 +624,8 @@ serial／barrierless smokeは出力、loss、raw VJP完全一致、parameter gra
 有望だが、冷間JITを含む5k区間速度が`14.776 updates/s`で下限15を僅かに下回り、
 checkpoint保存後に自動停止した。速度条件は緩めず、同じcheckpointから100更新warmup後の
 1,000更新benchmarkで定常速度を確認してから採否を決める。
+
+定常benchmarkは1,000測定更新を63.0281秒、`15.8659 updates/s`で完了し、速度条件に
+合格した。states/sは`63.4638`、CPU平均`49.16%`、candidate中`49.42%`だった。
+benchmark更新は保存していない。LR半減armを採用候補として55k checkpointから再開し、
+速度判定区間を10,000更新以上にして冷間JITの偏りを除く。
