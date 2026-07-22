@@ -184,3 +184,35 @@ run: evrl_boundsfix_p2_c0_halt1e5_lr2e4_wd1e4_u50000_20260723_hlr2
 last accepted checkpoint: checkpoint_000040000.jls
 sha256: d73a4a31bf8c12efcef16186926b6e7a09a6b9f47e60ac62f9da4fd1ec85844c
 ```
+
+## halt LR 1e-6の30,000更新比較
+
+halt方策の更新幅をさらに10分の1へ下げた場合を確認するため、同じ20,000更新
+checkpoint、同じsampler系列からhalt LRだけを`1e-6`へ変更し、30,000更新まで進めた。
+入力、teacher、task loss、probe、dense LR、router LR、weight decay、hard halting、
+optimizer stateは同一である。
+
+| 更新 | held loss | held top-1 | held NDCG | held margin | held平均深度 | 深度範囲 | 区間updates/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20,000 | 2.752324 | 0.578125 | 0.982200 | 0.103318 | 3.556 | 2～12 | - |
+| 25,000 | 2.713433 | 0.570312 | 0.981893 | 0.117283 | 2.086 | 2～12 | 15.312 |
+| 30,000 | 2.692056 | 0.632812 | 0.983332 | 0.120413 | 2.709 | 2～12 | 15.636 |
+
+25,000更新ではhalt LR `1e-5`のarmとほぼ同じ平均深度になったが、loss、top-1、
+NDCG、marginはいずれもわずかに劣った。30,000更新ではtop-1を`0.632812`まで回復し、
+平均深度も`2.709`へ増えたが、`1e-5`の同時点と比べてlossは`+0.000847`、NDCGは
+`-0.000158`、marginは`+0.004374`であり、明確な品質優位はない。
+
+また、halt LR `1e-5`も30,000更新時点では平均深度`2.647`と穏当だったにもかかわらず、
+35,000更新で`11.713`へ飽和した。このため、`1e-6`の30,000更新時点だけを根拠に
+深度安定化へ成功したとは判定しない。今回の一軸比較から、halt LRの縮小だけでは
+candidate-local probe教師の時間変動を十分に抑えられないことが分かった。batch 8も
+速度条件を満たさなかったため、次の調整はbatch 4を維持し、dense weight decayを
+一軸で比較する。
+
+```text
+run: evrl_boundsfix_p2_c0_halt1e6_lr2e4_wd1e4_u30000_20260723_hlr3
+checkpoint: checkpoint_000030000.jls
+sha256: 2525f8397e6bb60ecd58e8f4d39b3ebc14a0220da1e269aa32364d202fcad2ee
+teacher states: 120,000
+```
