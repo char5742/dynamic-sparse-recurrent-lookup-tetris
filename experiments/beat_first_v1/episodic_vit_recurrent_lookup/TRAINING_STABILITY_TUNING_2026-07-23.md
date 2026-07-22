@@ -132,3 +132,31 @@ teacher states: 80,000
 この結果から、修正後の現行LR `2e-4`とweight decay `1e-4`を安定基準として採用する。
 後半の振動を抑えるため、50,000更新以降はepisodic dense学習率だけを0.5倍にする
 予定とし、それ以前のoptimizer設定は変更しない。
+
+## 25,000更新でのhalt LR paired trial
+
+現行halt LR `5e-5`のまま20,000更新checkpointを25,000更新まで延長すると、held
+lossとmarginは改善した一方、平均深度が`3.5563`から`2.0005`へ急落した。そこで同じ
+20,000更新checkpoint、同じsampler系列から、halt LRだけを`1e-5`へ下げて5,000更新
+進めた。他のLR、weight decay、loss、probe、RNG、optimizer stateは同一である。
+
+checkpoint resumeでこの一軸変更だけを許可する`EVRL_ENABLE_HALT_LR_TRANSITION=1`を
+追加した。明示指定がない場合、またはhalt LR以外も異なる場合は従来どおりresumeを
+拒否する。transition後の全候補serial/barrierless smokeは、出力、loss、raw VJPが
+完全一致し、parameter gradient最大差`1.53e-6`、optimizer後state最大差`1.53e-7`
+で合格した。
+
+| 20k→25k arm | held loss | held top-1 | held NDCG | held margin | held平均深度 | 深度範囲 | updates/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| halt LR 5e-5 | 2.710472 | 0.578125 | 0.982187 | 0.122002 | 2.0005 | 2～3 | 15.320 |
+| halt LR 1e-5 | 2.710228 | 0.578125 | 0.981946 | 0.122518 | 2.0844 | 2～12 | 15.418 |
+
+`1e-5`はloss、margin、平均深度、速度をわずかに改善し、top-1を維持した。NDCGは
+`-0.000241`の微減である。5,000更新だけでは深度安定化の証拠として不十分なため、
+このarmを50,000更新まで延長してから最終採否を決める。
+
+```text
+run: evrl_boundsfix_p2_c0_halt1e5_lr2e4_wd1e4_u25000_20260723_hlr1
+checkpoint: checkpoint_000025000.jls
+sha256: db042e9c35ffc49e121988bc4a6b57281a2cdd38e7e06be584f029802f35c2d8
+```

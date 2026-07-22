@@ -562,3 +562,10 @@ episodic dense LRだけを0.5倍にする長期試行へ昇格する。
 詳細は
 [`TRAINING_STABILITY_TUNING_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/TRAINING_STABILITY_TUNING_2026-07-23.md)
 に記録した。
+
+20,000更新から現行halt LR `5e-5`を5,000更新延長すると、held平均深度が
+`3.5563`から`2.0005`へ急落した。同じ20,000更新checkpointからhalt LRだけを
+`1e-5`へ変更したpaired armでは、25,000更新の平均深度が`2.0844`、loss
+`2.710228`、top-1 `0.578125`、margin `0.122518`となった。対照よりloss、margin、
+深度、速度はわずかに改善し、NDCGだけ`0.000241`低下した。短区間では決着しないため、
+`1e-5` armを50,000更新まで延長する。

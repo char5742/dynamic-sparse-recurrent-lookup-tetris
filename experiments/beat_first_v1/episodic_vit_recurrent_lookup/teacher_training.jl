@@ -1620,8 +1620,21 @@ function restore_checkpoint(
             inherited_halting.entropy_weight == requested_halting.entropy_weight &&
             inherited_halting.probe_candidates_per_state == 0 &&
             requested_halting.probe_candidates_per_state > 0
-        dynamic_halting_transition || halt_probe_transition || error(
-            "resume hyperparameters differ; only an explicit dynamic-halting or halt-probe transition is allowed",
+        halt_lr_transition_raw = strip(get(
+            ENV, "EVRL_ENABLE_HALT_LR_TRANSITION", "0",
+        ))
+        halt_lr_transition_raw in ("0", "1") || error(
+            "EVRL_ENABLE_HALT_LR_TRANSITION must be 0 or 1",
+        )
+        halt_lr_transition = halt_lr_transition_raw == "1" &&
+            inherited.routing == requested_normalized.routing &&
+            inherited.loss == requested_normalized.loss &&
+            inherited.halting == requested_normalized.halting &&
+            merge(inherited.optimizer, (;
+                halt_learning_rate=requested_normalized.optimizer.halt_learning_rate,
+            )) == requested_normalized.optimizer
+        dynamic_halting_transition || halt_probe_transition || halt_lr_transition || error(
+            "resume hyperparameters differ; only an explicit dynamic-halting, halt-probe, or halt-LR transition is allowed",
         )
         dynamic_halting_transition && @info(
             "EVRL fixed-depth checkpoint transitions to sampled hard halting",
@@ -1633,6 +1646,11 @@ function restore_checkpoint(
             probes_per_state=requested_halting.probe_candidates_per_state,
             probe_weight=requested_halting.probe_weight,
             continue_threshold=requested_halting.compute_price,
+        )
+        halt_lr_transition && @info(
+            "EVRL halt learning rate transition",
+            previous_halt_learning_rate=inherited.optimizer.halt_learning_rate,
+            requested_halt_learning_rate=requested_normalized.optimizer.halt_learning_rate,
         )
     end
     hasproperty(payload.config, :objective) || error("resume config lacks objective")
