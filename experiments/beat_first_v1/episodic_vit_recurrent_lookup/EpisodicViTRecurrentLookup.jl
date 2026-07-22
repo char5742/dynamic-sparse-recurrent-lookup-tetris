@@ -2169,7 +2169,16 @@ function BackwardScratch()
         zeros(Float32, TOKEN_COUNT, REGISTER_COUNT),
         zeros(Float32, MODEL_DIM, REGISTER_COUNT),
         zeros(Float32, EPISODIC_ROUTER_DIM, REGISTER_COUNT),
-        zeros(Float32, max(EPISODIC_SHORTLIST, REGISTER_COUNT, SPATIAL_SHORTLIST)),
+        # Shared softmax VJP scratch must fit every attention support.  The
+        # physical 8-neighbour spatial path is wider than the current
+        # episodic/register shortlists; undersizing this vector silently wrote
+        # past the Julia array under @inbounds and eventually corrupted GC.
+        zeros(Float32, max(
+            EPISODIC_SHORTLIST,
+            REGISTER_COUNT,
+            SPATIAL_SHORTLIST,
+            LOCAL_SPATIAL_NEIGHBORS,
+        )),
         zeros(Float32, MODEL_DIM),
         zeros(Float32, MODEL_DIM),
         zeros(Float32, MODEL_DIM, REGISTER_COUNT),

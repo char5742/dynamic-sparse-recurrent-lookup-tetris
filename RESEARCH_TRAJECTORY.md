@@ -523,3 +523,21 @@ state-wide R1最終に対してP1最終はloss、top-1、NDCG、pairwise、margi
 「少数1-step probeは旧REINFORCEより正しい」は支持されるが、「理想的な入力依存
 computeを獲得した」とはまだ結論しない。aggregate speedは`19.936 updates/s`、
 CPU平均`59.85%`、candidate中`60.92%`で、許容下限15 updates/sを維持した。
+
+## 21. 2026-07-23 — spatial backward範囲外書込みの修正
+
+学習安定化調整の前提確認中、8近傍spatial attention backwardが長さ4の
+scratchへedge 5～8を書き込む範囲外アクセスを特定した。通常実行ではheapを徐々に
+破壊し、200～400更新後のGC access violationとして現れていた。
+
+`BackwardScratch.dweights`を全attention supportの最大値で確保するよう修正した。
+数式、入力、teacher、loss、hard halting、RNG順序、active-only backward、
+sparse optimizer、checkpoint形式は不変である。
+
+bounds-check付きserial／20-worker smokeは合格し、出力、loss、raw VJPは完全一致、
+parameter gradient最大差`4.60e-6`、optimizer後state最大差`4.60e-7`だった。
+P1 75,000更新checkpointからの1,000更新preflightも完走し、測定990更新で
+`15.505 updates/s`、allocation `7.739 MB/update`、GC時間比`0.84%`となった。
+
+過去checkpointは履歴として保持するが、修正後の最終性能根拠には使わず、LR、
+weight decay、state batchの比較は修正版からscratchでやり直す。
