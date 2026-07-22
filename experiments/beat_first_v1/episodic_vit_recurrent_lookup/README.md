@@ -83,6 +83,15 @@ from `L_stop - L_continue`.  This preserves physical sparsity and replaces the
 former state-wide REINFORCE credit signal when enabled.  See
 [`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md).
 
+The completed 100,000-update probe trial used two probes per state.  Its
+balanced update-95,000 checkpoint reached top-1 `0.73438`, NDCG `0.991345`,
+margin `0.14191`, and held mean depth `2.19`; update 90,000 reached the trial's
+best top-1 `0.74219` at mean depth `3.02`.  It improves every final quality
+metric over the former state-wide halting trial and avoids that trial's final
+depth-12 saturation, although depth remains biased toward the minimum late in
+training.  The report records this as a credit-assignment success and only a
+partial adaptive-depth success.
+
 See [`RESULTS_2026-07-20.md`](RESULTS_2026-07-20.md) for the exact numerical
 witnesses and
 [`PERFORMANCE_COMPARISON_2026-07-20.md`](PERFORMANCE_COMPARISON_2026-07-20.md)

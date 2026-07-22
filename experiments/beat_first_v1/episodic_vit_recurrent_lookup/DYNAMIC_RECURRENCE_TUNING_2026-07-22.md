@@ -130,3 +130,27 @@ stopped candidate's Q with its exact next-step Q, recompute ListNet plus margin,
 and supervise continue iff `L_stop - L_continue > c`.  Correctness and speed
 preflight are recorded in
 [`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md).
+
+## Trial P1 — candidate-local one-step probes
+
+P1 completed 100,000 updates with two stopped-candidate probes per state,
+`c = 0`, probe BCE weight one, halt LR `5e-5`, and the same 5,000-update random
+depth curriculum used by R1.  All model, data, task-loss, optimizer, routing,
+seed, held-panel, and executor conditions remained fixed.
+
+The best balanced checkpoint was update 95,000: loss `2.587874`, top-1
+`0.734375`, NDCG `0.991345`, pairwise `0.904401`, margin `0.141909`, and held
+mean depth `2.194`.  Top-1 peaked at `0.742188` at update 90,000 with mean
+depth `3.021`.  The final update-100,000 result was loss `2.605494`, top-1
+`0.710938`, NDCG `0.990369`, pairwise `0.902199`, margin `0.151411`, and held
+mean depth `2.011`.
+
+Unlike R1, P1 produced continue and stop targets within the same reporting
+batches and did not finish in depth-12 saturation.  It improves every final
+quality metric over R1, but still oscillates and finishes close to minimum
+depth.  It is accepted as the correct sparse halting-credit mechanism, not as
+proof that the present halt policy has reached ideal input-dependent compute.
+
+The complete 5,000-update curve, exact serial/barrierless smoke, throughput,
+checkpoint hashes, and PreAct/fixed-depth comparisons are in
+[`HALTING_ONE_STEP_PROBE_2026-07-22.md`](HALTING_ONE_STEP_PROBE_2026-07-22.md).

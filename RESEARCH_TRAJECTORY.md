@@ -507,3 +507,19 @@ optimizer後parameter最大差`4.04e-7`で合格した。100 measured updatesは
 設計、正当性witness、速度preflightは
 [`HALTING_ONE_STEP_PROBE_2026-07-22.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/HALTING_ONE_STEP_PROBE_2026-07-22.md)
 に記録した。
+
+続くfrom-scratch P1は2 probes/state、`c=0`、probe weight 1、halt LR
+`5e-5`のまま100,000更新（400,000 teacher-state draws）を完走した。update
+95,000がbalanced winnerで、loss `2.587874`、top-1 `0.734375`、NDCG
+`0.991345`、pairwise `0.904401`、margin `0.141909`、held mean depth
+`2.194`。top-1最高値は90,000の`0.742188`（mean depth `3.021`）、最終
+100,000はloss `2.605494`、top-1 `0.710938`、NDCG `0.990369`、margin
+`0.151411`、mean depth `2.011`だった。
+
+state-wide R1最終に対してP1最終はloss、top-1、NDCG、pairwise、marginの
+全指標を改善し、R1のheld mean depth `11.91`という最大深度飽和を解消した。
+同一batch内でもcontinue/stop probe教師が混在したため、candidate固有の信用割当は
+成立した。一方で深度は依然2--5付近を振動し、最終は最小深度寄りである。したがって
+「少数1-step probeは旧REINFORCEより正しい」は支持されるが、「理想的な入力依存
+computeを獲得した」とはまだ結論しない。aggregate speedは`19.936 updates/s`、
+CPU平均`59.85%`、candidate中`60.92%`で、許容下限15 updates/sを維持した。
