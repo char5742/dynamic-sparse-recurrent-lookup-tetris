@@ -684,7 +684,21 @@ function main()
         "EVRL_COMPUTE_PRICE",
         string(inherited_hyperparameters.halting.compute_price),
     ))
+    halt_learning_rate = parse(Float32, get(
+        ENV,
+        "EVRL_LR_HALT",
+        string(inherited_hyperparameters.optimizer.halt_learning_rate),
+    ))
+    dense_weight_decay = parse(Float32, get(
+        ENV,
+        "EVRL_WD_DENSE",
+        string(inherited_hyperparameters.optimizer.dense_weight_decay),
+    ))
     hyperparameters = merge(inherited_hyperparameters, (;
+        optimizer=merge(inherited_hyperparameters.optimizer, (;
+            halt_learning_rate,
+            dense_weight_decay,
+        )),
         halting=merge(inherited_hyperparameters.halting, (;
             compute_price,
             probe_candidates_per_state,

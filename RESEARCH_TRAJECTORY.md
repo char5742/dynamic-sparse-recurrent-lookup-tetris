@@ -584,3 +584,15 @@ loss `2.692056`、top-1 `0.632812`、NDCG `0.983332`、margin `0.120413`、
 したがって`1e-6`の短区間結果も安定化成功とは判定せず、halt LRの縮小だけでは
 深度振動を解消できないという結論にした。batch 8も実効state throughputを改善しない
 ため不採用のままとし、次はbatch 4でdense weight decayだけを比較する。
+
+dense weight decayは、同じ20,000更新checkpointとhalt LR `5e-5`を使い、`1e-4`と
+`3e-4`を30,000更新までpaired比較した。dense WDだけのresume変更を明示的に許可する
+遷移を追加し、real-teacher serial／barrierless smokeは出力、loss、raw VJP完全一致、
+parameter gradient最大差`1.53e-6`、optimizer後state最大差`1.53e-7`で合格した。
+
+30kでは`1e-4`がloss `2.692367`、top-1 `0.632812`、NDCG `0.983506`、margin
+`0.118709`、平均深度`3.372`。`3e-4`はloss `2.689768`、top-1 `0.625000`、
+NDCG `0.983862`、margin `0.117013`、平均深度`2.110`だった。`3e-4`はloss、
+NDCG、pairwiseを僅かに改善し、25kから30kの平均深度を`2.113 -> 2.110`に保ったが、
+top-1とmarginは僅かに低下した。短区間の安定性armとして保持し、40kまで延長して
+長期の品質と入力依存深度が残るかを確認する。

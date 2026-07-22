@@ -216,3 +216,50 @@ checkpoint: checkpoint_000030000.jls
 sha256: 2525f8397e6bb60ecd58e8f4d39b3ebc14a0220da1e269aa32364d202fcad2ee
 teacher states: 120,000
 ```
+
+## dense weight decay 3e-4の30,000更新比較
+
+batch 8とhalt LRの一軸比較に続き、dense weight decayだけを`1e-4`から`3e-4`へ
+変更した。比較元は同じ20,000更新checkpointであり、halt LRは両armとも`5e-5`、
+dense LRは`2e-4`である。resume時にdense weight decayだけの変更を許可する
+`EVRL_ENABLE_DENSE_WD_TRANSITION=1`を追加し、他のhyperparameterが一つでも異なる
+場合は従来どおり拒否するようにした。
+
+変更後のreal-teacher serial／barrierless bounds-check smokeは合格した。
+
+| 項目 | 結果 |
+|---|---:|
+| 出力最大絶対差 | 0 |
+| loss最大絶対差 | 0 |
+| raw task VJP最大絶対差 | 0 |
+| parameter gradient最大絶対差 | 1.52737e-6 |
+| parameter gradient relative L2 | 1.42275e-6 |
+| optimizer後parameter/state最大絶対差 | 1.52737e-7 |
+| 離散経路、probe、RNG、sampler、optimizer clock | すべて一致 |
+| 判定 | 合格 |
+
+20,000更新から30,000更新までのpaired結果は次のとおりである。
+
+| dense WD | 更新 | held loss | held top-1 | held NDCG | held pairwise | held margin | held平均深度 | 区間updates/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1e-4 | 25,000 | 2.710472 | 0.578125 | 0.982187 | 0.865256 | 0.122002 | 2.001 | 15.320 |
+| 3e-4 | 25,000 | 2.713781 | 0.570312 | 0.981433 | 0.865202 | 0.122533 | 2.113 | 15.235 |
+| 1e-4 | 30,000 | 2.692367 | 0.632812 | 0.983506 | 0.866969 | 0.118709 | 3.372 | 15.120 |
+| 3e-4 | 30,000 | 2.689768 | 0.625000 | 0.983862 | 0.867854 | 0.117013 | 2.110 | 15.532 |
+
+30,000更新では`3e-4`がlossを`0.002599`、NDCGを`0.000356`、pairwiseを
+`0.000885`改善した。一方、top-1は`0.007812`、marginは`0.001696`低い。
+平均深度は`1e-4`が`2.001 -> 3.372`と増えたのに対し、`3e-4`は`2.113 ->
+2.110`でほぼ一定だった。強いweight decayは短区間の深度振動を抑えたが、より長く
+考える能力も抑えている可能性があるため、この時点では採用を確定しない。40,000更新
+まで延長し、品質を維持したまま深度が入力依存の範囲を残すかで判定する。
+
+```text
+WD 1e-4 control run: evrl_boundsfix_p2_c0_halt5e5_lr2e4_wd1e4_u30000_20260723_b4
+checkpoint: checkpoint_000030000.jls
+sha256: 28e18aeaa92da23da916f597bb4ac3b6e0251d6dfee1fefac55e3667abba72d2
+
+WD 3e-4 run: evrl_boundsfix_p2_c0_halt5e5_lr2e4_wd3e4_u30000_20260723_wd1
+checkpoint: checkpoint_000030000.jls
+sha256: e28618f8fe9d1bbf84c2cb02f384d7c0e7c575a339a5cb8f403ec34a34baa0f8
+```

@@ -1633,8 +1633,22 @@ function restore_checkpoint(
             merge(inherited.optimizer, (;
                 halt_learning_rate=requested_normalized.optimizer.halt_learning_rate,
             )) == requested_normalized.optimizer
-        dynamic_halting_transition || halt_probe_transition || halt_lr_transition || error(
-            "resume hyperparameters differ; only an explicit dynamic-halting, halt-probe, or halt-LR transition is allowed",
+        dense_wd_transition_raw = strip(get(
+            ENV, "EVRL_ENABLE_DENSE_WD_TRANSITION", "0",
+        ))
+        dense_wd_transition_raw in ("0", "1") || error(
+            "EVRL_ENABLE_DENSE_WD_TRANSITION must be 0 or 1",
+        )
+        dense_wd_transition = dense_wd_transition_raw == "1" &&
+            inherited.routing == requested_normalized.routing &&
+            inherited.loss == requested_normalized.loss &&
+            inherited.halting == requested_normalized.halting &&
+            merge(inherited.optimizer, (;
+                dense_weight_decay=requested_normalized.optimizer.dense_weight_decay,
+            )) == requested_normalized.optimizer
+        dynamic_halting_transition || halt_probe_transition || halt_lr_transition ||
+            dense_wd_transition || error(
+            "resume hyperparameters differ; only an explicit dynamic-halting, halt-probe, halt-LR, or dense-WD transition is allowed",
         )
         dynamic_halting_transition && @info(
             "EVRL fixed-depth checkpoint transitions to sampled hard halting",
@@ -1651,6 +1665,11 @@ function restore_checkpoint(
             "EVRL halt learning rate transition",
             previous_halt_learning_rate=inherited.optimizer.halt_learning_rate,
             requested_halt_learning_rate=requested_normalized.optimizer.halt_learning_rate,
+        )
+        dense_wd_transition && @info(
+            "EVRL dense weight decay transition",
+            previous_dense_weight_decay=inherited.optimizer.dense_weight_decay,
+            requested_dense_weight_decay=requested_normalized.optimizer.dense_weight_decay,
         )
     end
     hasproperty(payload.config, :objective) || error("resume config lacks objective")
