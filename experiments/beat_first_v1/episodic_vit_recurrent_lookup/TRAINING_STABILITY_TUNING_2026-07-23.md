@@ -294,3 +294,32 @@ checkpoint: checkpoint_000040000.jls
 sha256: fdf372e068aca5c37a1915d880dbc2e3a0ca0be4c4bb9d954f9db3ed73bd17bc
 teacher states: 160,000
 ```
+
+## dense weight decay 3e-4の50,000更新基準
+
+後半のdense LRを調整する共通分岐点として、同じarmをLR `2e-4`のまま50,000更新まで
+延長した。
+
+| 更新 | held loss | held top-1 | held NDCG | held pairwise | held margin | held平均深度 | 深度範囲 | 区間updates/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 40,000 | 2.645313 | 0.671875 | 0.988018 | 0.881705 | 0.134168 | 2.178 | 2～12 | - |
+| 45,000 | 2.622360 | 0.718750 | 0.988368 | 0.884885 | 0.125085 | 2.131 | 2～12 | 15.191 |
+| 50,000 | 2.632145 | 0.734375 | 0.987706 | 0.884073 | 0.131590 | 4.010 | 3～12 | 15.545 |
+
+45,000更新ではloss、top-1、NDCGが同時に改善した。50,000更新ではtop-1と平均深度が
+さらに上昇した一方、lossは`+0.009785`、NDCGは`-0.000662`、pairwiseは
+`-0.000811`反落した。深度は最小3、最大12となり、入力依存の計算量は明確に残って
+いる。完全な頭打ちではないが、連続順位品質の反落が始まったため、50,000更新を
+後半dense LR半減の分岐点にする。
+
+次のarmはbank、router、halt LRを維持し、attention、FFN、token、register、headの
+既存episodic LR scaleだけを`1.0`から`0.5`へ変更する。これにより長期Lookup routingと
+halt方策を変えず、denseな短期・視覚・出力経路の更新幅だけを`2e-4`から`1e-4`へ
+下げる。
+
+```text
+run: evrl_boundsfix_p2_c0_halt5e5_lr2e4_wd3e4_u50000_20260723_wd3
+checkpoint: checkpoint_000050000.jls
+sha256: 13a99d3dea24942e4766aaae340ed3ecf6d13448954e559845f3bd19fbee93de
+teacher states: 200,000
+```
