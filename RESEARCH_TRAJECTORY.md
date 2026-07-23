@@ -809,3 +809,35 @@ GC占有率は`0.763%`だった。速度下限10 updates/sを維持した。
 詳細は
 [`HALTING_CONVERGENCE_REPAIR_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/HALTING_CONVERGENCE_REPAIR_2026-07-23.md)
 へ記録した。validationとsealed seedは使用していない。
+
+## 29. 2026-07-23 — 現行最終式をフルスクラッチで100k学習
+
+候補固有の各step 1-step信用割当と有界halting式を、既存60k checkpointからの短期arm
+だけでなく、初期値から共同学習した。親checkpointなしで100,000更新、400,000 teacher
+stateを正常完了した。学習本体は9,389.019秒、`10.651 updates/s`、CPU平均
+`54.255%`、candidate中`57.023%`、allocation`8.383 MB/update`、GC比率
+`0.665%`だった。最低速度10 updates/sを維持した。
+
+10k～100kの全checkpointを、SHA-256
+`c6119f75891476537f5e032ee17df213c8bf55b28ff56f69b908a56df97ec81c`
+の同じtraining-only固定128状態で再評価した。100kがloss`2.543041`、
+NDCG`0.993363`、pairwise`0.921549`で最良、top-1`0.703125`、
+margin`0.123395`だった。90kはtop-1`0.718750`で最高だった。連続順位品質を優先し、
+100kを新しい主採用checkpointとした。SHA-256は
+`2eb9a64293eb2c592830d9c25ea52969950e6440a97415a43ec093d0a77c8766`
+である。
+
+100kの決定論的深度は3～6で、深度3、4、5、6へ3,314、330、847、866 candidateが
+分布した。入力依存停止は成立した一方、50～100kの平均深度は
+`4.891 -> 3.012 -> 3.304 -> 4.496 -> 3.026 -> 3.863`と動いた。従来の最小／最大
+深度への崩壊は抑えたが、checkpoint間の平均深度は未収束である。
+
+同じ固定パネルの旧90k主採用点より、loss`0.008660`、top-1`0.031250`、
+NDCG`0.001384`、pairwise`0.008074`、margin`0.006889`改善した。既存PreAct
+12.75kに対してはlossとmarginのみ上回り、top-1、NDCG、pairwiseとsample efficiencyは
+まだ届いていない。validationとsealed seedは使用していないため、独立汎化性能の主張では
+ない。
+
+詳細は
+[`HALTING_FULLSCRATCH_100K_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/HALTING_FULLSCRATCH_100K_2026-07-23.md)
+へ記録した。
