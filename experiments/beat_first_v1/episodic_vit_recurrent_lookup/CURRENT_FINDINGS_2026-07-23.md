@@ -1,15 +1,42 @@
 # EVRL研究の現時点での判明事項
 
-## source geometryの最新変更
+## 2026-07-24追補：現行固定K=64モデルを100,000更新
 
-現行sourceは、再帰step内部のLookupFFNを3段から1段へ縮約し、24x10セルworking
-memoryへ共有3x3 depthwise convolutionを追加した。総parameter数は
+現行sourceは1段の共有LookupFFN、depthwise視覚経路、4 registerの再帰working
+memoryに加え、register別learned WTA/hashで283 tokenから固定64 tokenを直接取得する。
+正確なmulti-head cross-attentionとworking-memory writeは選択supportだけで実行し、
+全283 tokenの正規化平均を安価な常設経路として残す。総parameter数は`6,954,877`である。
+
+router LR `4e-4`を採用し、初期化からの学習系列を100,000更新、400,000 teacher stateまで
+継続した。10k以降の90,000更新は7,310.216秒、最終記録`12.3088 updates/s`、
+CPU平均`50.94%`、candidate中`53.36%`だった。steady benchmarkは
+`9.067 MB/update`、GC占有率`0.83%`である。
+
+同一training-only固定128状態で10k刻みを再評価した結果、100kがloss`2.602389`、
+pairwise`0.903184`で最良、top-1`0.617188`も同率最良だった。NDCGは90kの
+`0.989632`が最良で、100kは`0.989165`だった。平均深度は80kで`4.133`へ広がった後、
+100kで`3.026`へ戻ったため、halting方策は入力依存性を持つが安定収束していない。
+
+PreAct 12.75kとの差は、loss`+0.051484`、top-1`-0.171875`、
+NDCG`-0.005303`、pairwise`-0.027019`、margin`+0.004736`である。
+固定K64版は約7.84倍のteacher stateを使っても主要品質でPreActへ届かず、精度超えは
+未達だった。一方、記録済みPreAct`0.4894 updates/s`に対し学習throughputは約25.2倍
+だった。validationとsealed seedは使用していない。
+
+完全な構成、正当性、全10 checkpoint、SHA-256、PreAct境界は
+[`FIXED_K64_EPISODIC_ROUTING_2026-07-24.md`](FIXED_K64_EPISODIC_ROUTING_2026-07-24.md)
+に記録した。
+
+## 履歴：固定K導入前のsource geometry変更
+
+固定K routing導入前に、再帰step内部のLookupFFNを3段から1段へ縮約し、24x10セル
+working memoryへ共有3x3 depthwise convolutionを追加した。当時のparameter数は
 `20,585,982 -> 6,954,621`、全4 registerのLookup呼出しはstepあたり`12 -> 4`である。
 manual VJP有限差分とreal-teacherのserial／barrierless一致smokeは合格した。
 
-以下の100,000更新結果は、この変更直前の3-block geometryに対する確定済み研究結果で
-あり、新しい1-block geometryの学習結果ではない。旧checkpointを新geometryへ暗黙変換
-せず、新sourceはscratch本学習前である。詳細は
+直後に記録した以下の100,000更新結果は、この変更直前の3-block geometryに対する
+確定済み研究結果であり、1-block固定K64 geometryの結果ではない。旧checkpointを
+新geometryへ暗黙変換していない。詳細は
 [`SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md`](SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md)
 を参照。
 
