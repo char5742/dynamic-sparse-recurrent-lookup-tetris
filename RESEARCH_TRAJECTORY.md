@@ -873,3 +873,29 @@ channel連続SIMD kernelへしたreal-teacher scratchは120更新を完了し、
 詳細は
 [`SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md)
 へ記録した。
+
+## 31. 2026-07-23 — 単一Lookup化後の残存ボトルネックを測定
+
+新しい120更新checkpointから、checkpointを保存しない100更新warmupと100更新詳細
+benchmarkを実行した。定常速度は`14.778 updates/s`、`59.113 states/s`、
+`2,633.190 candidates/s`、`8,467.056 recurrent steps/s`だった。CPU平均
+`65.636%`、candidate中`67.024%`、allocation`6.620 MB/update`、GC比率
+`0.648%`である。
+
+executor CPU時間の約94%をforwardとbackwardが占めた。capacity-normalized worker
+時間ではbackward 41.3%、forward 30.6%、queue wait 26.3%で、gradient reduce、
+optimizer、GCはいずれも支配的ではなかった。
+
+production geometryの概算では、全283 token cross readが約2.42M MAC/step、
+working-memory reverse writeが約1.21M MAC/stepなのに対し、単一Lookupのselected-row
+gatherは約0.020M MAC/stepである。旧3-blockでも全bankを計算せず、activeな39行だけを
+読んでいたため、総parameterを3分の1へ減らしてもstep全体は3分の1にならない。
+
+旧3-block 100kの保存統計と比較すると、updates/sは`10.668 -> 14.778`で1.385倍、
+candidates/sは1.413倍、recurrent steps/sは1.475倍だった。stepあたりforward CPUは
+11.8%、backward CPUは21.6%減った。速度向上は確認できたが、全token read/write、
+そのVJP、追加DWConv、可変深度によるworker tailが残るため2倍には届かなかった。
+
+詳細は
+[`SINGLE_LOOKUP_BOTTLENECK_PROFILE_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/SINGLE_LOOKUP_BOTTLENECK_PROFILE_2026-07-23.md)
+へ記録した。
