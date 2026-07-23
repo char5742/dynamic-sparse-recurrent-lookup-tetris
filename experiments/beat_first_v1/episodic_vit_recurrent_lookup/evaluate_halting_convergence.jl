@@ -19,14 +19,14 @@ for (name, value) in (
     "EVRL_REGISTERS" => "4",
     "EVRL_ROUTER_TABLES" => "2",
     "EVRL_ROUTER_BITS" => "4",
-    "EVRL_ROUTER_BUCKET_CAP" => "16",
-    "EVRL_EPISODIC_SHORTLIST" => "4",
-    "EVRL_EPISODIC_CANDIDATE_CAP" => "16",
+    "EVRL_ROUTER_BUCKET_CAP" => "64",
+    "EVRL_EPISODIC_SHORTLIST" => "64",
+    "EVRL_EPISODIC_CANDIDATE_CAP" => "64",
     "EVRL_SPATIAL_ANCHORS" => "2",
     "EVRL_SPATIAL_SHORTLIST" => "2",
     "EVRL_SPATIAL_CANDIDATE_CAP" => "3",
     "EVRL_FFN_DIM" => "128",
-    "EVRL_INITIAL_HALT_PROBABILITY" => "0.5",
+    "EVRL_INITIAL_HALT_PROBABILITY" => "0.8",
 )
     haskey(ENV, name) || (ENV[name] = value)
 end

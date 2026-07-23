@@ -77,20 +77,11 @@ const EPISODIC_BUCKET_CAP = let raw = strip(get(ENV, "EVRL_ROUTER_BUCKET_CAP", "
     1 <= value <= 64 || throw(ArgumentError("EVRL_ROUTER_BUCKET_CAP must be in 1:64"))
     value
 end
-const EPISODIC_SHORTLIST = let raw = strip(get(ENV, "EVRL_EPISODIC_SHORTLIST", "16"))
-    value = parse(Int, raw)
-    1 <= value <= 32 || throw(ArgumentError("EVRL_EPISODIC_SHORTLIST must be in 1:32"))
-    value
-end
-const EPISODIC_CANDIDATE_CAP = let raw = strip(get(
-    ENV, "EVRL_EPISODIC_CANDIDATE_CAP", "16",
-))
-    value = parse(Int, raw)
-    EPISODIC_SHORTLIST <= value <= 64 || throw(ArgumentError(
-        "EVRL_EPISODIC_CANDIDATE_CAP must be in EVRL_EPISODIC_SHORTLIST:64",
-    ))
-    value
-end
+# Episodic read support is deliberately fixed.  There is no 64 -> 16
+# shortlist, curriculum, annealing, or inference-time change of K.
+const EPISODIC_SUPPORT = 64
+const EPISODIC_SHORTLIST = EPISODIC_SUPPORT
+const EPISODIC_CANDIDATE_CAP = EPISODIC_SUPPORT
 const SPATIAL_ANCHORS = let raw = strip(get(ENV, "EVRL_SPATIAL_ANCHORS", "2"))
     value = parse(Int, raw)
     1 <= value <= EPISODIC_SHORTLIST || throw(ArgumentError(
@@ -301,6 +292,8 @@ mutable struct EpisodicViTLookupModel
     aux_position::Matrix{Float32}
 
     register_seed::Matrix{Float32}
+    token_router::Matrix{Float32}
+    register_router::Matrix{Float32}
 
     # Shared sparse spatial block.  Every recurrent step updates the 24x10
     # cell memory over the physically materialized 8-neighbour graph.  No
@@ -401,6 +394,8 @@ function initialize_model(rng::AbstractRNG=Xoshiro(0))
         aux_value,
         randn(rng, Float32, MODEL_DIM, AUX_FEATURES) .* position_scale,
         register_seed,
+        _xavier(rng, EPISODIC_ROUTER_BLOCK_WIDTH, EPISODIC_ROUTER_DIM),
+        _xavier(rng, EPISODIC_ROUTER_BLOCK_WIDTH, EPISODIC_ROUTER_DIM),
         _xavier(rng, SPATIAL_PROJECTION_BLOCK_WIDTH, ATTENTION_DIM),
         _xavier(rng, SPATIAL_PROJECTION_BLOCK_WIDTH, ATTENTION_DIM),
         _xavier(rng, SPATIAL_PROJECTION_BLOCK_WIDTH, ATTENTION_DIM),
@@ -446,6 +441,8 @@ function _dense_parameters(model::EpisodicViTLookupModel)
         aux_value=model.aux_value,
         aux_position=model.aux_position,
         register_seed=model.register_seed,
+        token_router=model.token_router,
+        register_router=model.register_router,
         spatial_q=model.spatial_q,
         spatial_k=model.spatial_k,
         spatial_v=model.spatial_v,
@@ -506,21 +503,27 @@ function topology(model::EpisodicViTLookupModel)
         attention_dim=ATTENTION_DIM,
         attention_heads=ATTENTION_HEADS,
         ffn_dim=FFN_DIM,
-        recurrent_block="shared-cell-depthwise-spatial-attention-full-token-cross-register-self-swiglu-single-register-local-active-lookup-reverse-cross-working-memory-write",
-        episodic_router="none-full-token-cross-attention",
-        episodic_attention="shared-learned-qkvo-full-283-token-softmax",
-        episodic_projected_token_occurrences_per_step=TOKEN_COUNT,
-        episodic_qk_pairs_per_step=REGISTER_COUNT * TOKEN_COUNT,
+        recurrent_block="shared-cell-depthwise-spatial-attention-fixed-k64-wta-cross-register-self-swiglu-single-register-local-active-lookup-same-support-working-memory-write",
+        episodic_router="learned-block-wta-fixed-k64-register-specific",
+        episodic_attention="global-mean-safety-path-plus-exact-softmax-on-wta-selected-64-token-support",
+        episodic_projected_token_occurrences_per_step=
+            REGISTER_COUNT * EPISODIC_SUPPORT,
+        episodic_qk_pairs_per_step=REGISTER_COUNT * EPISODIC_SUPPORT,
         episodic_exact_rerank_pairs_per_step=0,
-        episodic_gather_rows_per_step=REGISTER_COUNT * TOKEN_COUNT,
+        episodic_gather_rows_per_step=REGISTER_COUNT * EPISODIC_SUPPORT,
         episodic_exact_dot_scalar_macs_per_step=
-            REGISTER_COUNT * TOKEN_COUNT * ATTENTION_DIM,
+            REGISTER_COUNT * EPISODIC_SUPPORT * ATTENTION_DIM,
         episodic_weighted_gather_scalar_macs_per_step=
-            REGISTER_COUNT * TOKEN_COUNT * ATTENTION_DIM,
+            REGISTER_COUNT * EPISODIC_SUPPORT * ATTENTION_DIM,
         working_memory="input-specific-recurrent-read-write-token-memory",
-        working_memory_write="register-specific-reverse-cross-attention-using-normalized-read-support",
-        episodic_router_scalar_macs_per_trajectory=0,
-        episodic_retrieval_entry_reads_upper_bound_per_step=0,
+        working_memory_write="same-selected-support-register-specific-reverse-cross-attention",
+        episodic_global_summary="unprojected-mean-of-all-283-normalized-tokens-injected-into-every-register",
+        episodic_router_scalar_macs_per_step=
+            EPISODIC_ROUTER_DIM * EPISODIC_ROUTER_BLOCK_WIDTH *
+            (TOKEN_COUNT + REGISTER_COUNT),
+        episodic_retrieval_entry_reads_upper_bound_per_step=
+            REGISTER_COUNT * EPISODIC_ROUTER_TABLES *
+            (EPISODIC_ROUTER_BITS + 1) * EPISODIC_BUCKET_CAP,
         spatial_relation="physical-8-neighbour-relative-position-learned-qkvo",
         spatial_local_edges_upper_bound=CELL_COUNT * LOCAL_SPATIAL_NEIGHBORS,
         recurrent_depthwise_kernel=(3, 3),
@@ -528,14 +531,14 @@ function topology(model::EpisodicViTLookupModel)
             length(model.recurrent_depthwise_scale_logit),
         recurrent_depthwise_scalar_macs_per_step=
             CELL_COUNT * MODEL_DIM * 9,
-        candidate_support_cap=0,
+        candidate_support_cap=EPISODIC_SUPPORT,
         spatial_dense_all_token_scores=0,
         long_memory_carriers_per_step=REGISTER_COUNT,
         long_memory_micro_calls_per_step=BLOCKS * REGISTER_COUNT,
         long_memory_register_injection="register-local-sigmoid-gated-residual",
         long_memory_compute_reduction_vs_per_register=1,
         long_memory_balance="state-local-hard-frequency-times-soft-probability-auxiliary-credit",
-        register_relation="full-model-dim-direct-normalized-dot-softmax-gather",
+        register_relation="fixed-k64-wta-support-exact-multihead-cross-attention",
         initial_halt_probability=INITIAL_HALT_PROBABILITY,
         recurrent_steps=(MIN_RECURRENT_STEPS, MAX_RECURRENT_STEPS),
         total_parameters=parameter_count(model),
@@ -1184,30 +1187,36 @@ struct CrossAttentionTape
     input::Matrix{Float32}
     normalized::Matrix{Float32}
     inverse_rms::Vector{Float32}
+    register_route::Matrix{Float32}
+    token_route::Matrix{Float32}
+    selected_ids::Matrix{Int16}
     query::Matrix{Float32}
-    key::Matrix{Float32}
-    value::Matrix{Float32}
+    key::Array{Float32,3}
+    value::Array{Float32,3}
     attention_weights::Array{Float32,3}
     attention_context::Matrix{Float32}
+    global_summary::Vector{Float32}
     output::Matrix{Float32}
     alpha::Float32
+    summary_alpha::Float32
 end
 
-"""Candidate-owned storage for one full register-to-token cross step.
-
-The 283 token K/V projections are materialized exactly once per recurrent
-step and shared by every register.  No candidate retrieval, hard top-k, dense
-mask, or token-routing parameter participates in this path.
-"""
+"""Candidate-owned storage for one fixed-K sparse episodic read step."""
 struct CrossAttentionForwardScratch
     input::Matrix{Float32}
     normalized::Matrix{Float32}
     inverse_rms::Vector{Float32}
+    register_route::Matrix{Float32}
+    token_route::Matrix{Float32}
+    selected_ids::Matrix{Int16}
+    candidate_seen::Matrix{Bool}
+    selected_memory::Array{Float32,3}
     query::Matrix{Float32}
-    key::Matrix{Float32}
-    value::Matrix{Float32}
+    key::Array{Float32,3}
+    value::Array{Float32,3}
     attention_weights::Array{Float32,3}
     attention_context::Matrix{Float32}
+    global_summary::Vector{Float32}
     output::Matrix{Float32}
     next::Matrix{Float32}
 end
@@ -1217,11 +1226,17 @@ CrossAttentionForwardScratch() = CrossAttentionForwardScratch(
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
     Vector{Float32}(undef, REGISTER_COUNT),
+    Matrix{Float32}(undef, EPISODIC_ROUTER_DIM, REGISTER_COUNT),
+    Matrix{Float32}(undef, EPISODIC_ROUTER_DIM, TOKEN_COUNT),
+    Matrix{Int16}(undef, EPISODIC_SUPPORT, REGISTER_COUNT),
+    Matrix{Bool}(undef, TOKEN_COUNT, REGISTER_COUNT),
+    Array{Float32}(undef, MODEL_DIM, EPISODIC_SUPPORT, REGISTER_COUNT),
     Matrix{Float32}(undef, ATTENTION_DIM, REGISTER_COUNT),
-    Matrix{Float32}(undef, ATTENTION_DIM, TOKEN_COUNT),
-    Matrix{Float32}(undef, ATTENTION_DIM, TOKEN_COUNT),
-    Array{Float32}(undef, TOKEN_COUNT, REGISTER_COUNT, ATTENTION_HEADS),
+    Array{Float32}(undef, ATTENTION_DIM, EPISODIC_SUPPORT, REGISTER_COUNT),
+    Array{Float32}(undef, ATTENTION_DIM, EPISODIC_SUPPORT, REGISTER_COUNT),
+    Array{Float32}(undef, EPISODIC_SUPPORT, REGISTER_COUNT, ATTENTION_HEADS),
     Matrix{Float32}(undef, ATTENTION_DIM, REGISTER_COUNT),
+    Vector{Float32}(undef, MODEL_DIM),
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
 )
@@ -1229,8 +1244,12 @@ CrossAttentionForwardScratch() = CrossAttentionForwardScratch(
 struct WorkingMemoryWriteTape
     registers::Matrix{Float32}
     value::Matrix{Float32}
+    selected_ids::Matrix{Int16}
     weights::Array{Float32,3}
     inverse_weight_sums::Matrix{Float32}
+    write_ids::Vector{Int16}
+    token_slots::Vector{Int16}
+    write_count::Int16
     context::Matrix{Float32}
     projected::Matrix{Float32}
     output::Matrix{Float32}
@@ -1240,8 +1259,12 @@ end
 struct WorkingMemoryWriteForwardScratch
     registers::Matrix{Float32}
     value::Matrix{Float32}
+    selected_ids::Matrix{Int16}
     weights::Array{Float32,3}
     inverse_weight_sums::Matrix{Float32}
+    write_ids::Vector{Int16}
+    token_slots::Vector{Int16}
+    seen::Vector{Bool}
     context::Matrix{Float32}
     projected::Matrix{Float32}
     output::Matrix{Float32}
@@ -1250,8 +1273,12 @@ end
 WorkingMemoryWriteForwardScratch() = WorkingMemoryWriteForwardScratch(
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
     Matrix{Float32}(undef, ATTENTION_DIM, REGISTER_COUNT),
-    Array{Float32}(undef, TOKEN_COUNT, REGISTER_COUNT, ATTENTION_HEADS),
+    Matrix{Int16}(undef, EPISODIC_SUPPORT, REGISTER_COUNT),
+    Array{Float32}(undef, EPISODIC_SUPPORT, REGISTER_COUNT, ATTENTION_HEADS),
     Matrix{Float32}(undef, TOKEN_COUNT, ATTENTION_HEADS),
+    Vector{Int16}(undef, TOKEN_COUNT),
+    Vector{Int16}(undef, TOKEN_COUNT),
+    falses(TOKEN_COUNT),
     Matrix{Float32}(undef, ATTENTION_DIM, TOKEN_COUNT),
     Matrix{Float32}(undef, MODEL_DIM, TOKEN_COUNT),
     Matrix{Float32}(undef, MODEL_DIM, TOKEN_COUNT),
@@ -1564,8 +1591,9 @@ function _attention_context!(weights, context, query, key, value)
 end
 
 function _cross_attention_forward(model, registers, memory_normalized)
+    scratch = CrossAttentionForwardScratch()
     return _cross_attention_forward!(
-        CrossAttentionForwardScratch(), model, registers, memory_normalized,
+        scratch, model, registers, memory_normalized, EpisodicBuckets(),
     )
 end
 
@@ -1575,41 +1603,134 @@ function _cross_attention_forward!(
     model,
     registers,
     memory_normalized,
+    buckets::EpisodicBuckets,
 )
     copyto!(scratch.input, registers)
     copyto!(scratch.normalized, registers)
     _rmsnorm_columns!(scratch.normalized, scratch.inverse_rms)
 
-    # Project every episodic token once.  Every register then attends the same
-    # complete, input-specific memory with exact multi-head softmax.
-    mul!(scratch.query, model.cross_q, scratch.normalized)
-    mul!(scratch.key, model.cross_k, memory_normalized)
-    mul!(scratch.value, model.cross_v, memory_normalized)
-    _attention_context!(
-        scratch.attention_weights,
-        scratch.attention_context,
-        scratch.query,
-        scratch.key,
-        scratch.value,
+    # The tiny learned routers scan the 283 token descriptors, but expensive
+    # K/V projection and exact QK attention are materialized only on the 64
+    # physically selected token rows for each register.
+    _structured_router_forward!(
+        scratch.token_route, model.token_router, memory_normalized,
     )
+    _structured_router_forward!(
+        scratch.register_route, model.register_router, scratch.normalized,
+    )
+    _build_token_buckets!(buckets, scratch.token_route)
+    _retrieve_candidates!(
+        scratch.selected_ids, scratch.candidate_seen, buckets,
+        scratch.register_route,
+    )
+
+    mul!(scratch.query, model.cross_q, scratch.normalized)
+    @inbounds for register in 1:REGISTER_COUNT
+        for support_index in 1:EPISODIC_SUPPORT
+            token = Int(scratch.selected_ids[support_index, register])
+            @simd for coordinate in 1:MODEL_DIM
+                scratch.selected_memory[coordinate, support_index, register] =
+                    memory_normalized[coordinate, token]
+            end
+        end
+        mul!(
+            @view(scratch.key[:, :, register]),
+            model.cross_k,
+            @view(scratch.selected_memory[:, :, register]),
+        )
+        mul!(
+            @view(scratch.value[:, :, register]),
+            model.cross_v,
+            @view(scratch.selected_memory[:, :, register]),
+        )
+    end
+    fill!(scratch.attention_context, 0.0f0)
+    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
+    attention_scale = inv(sqrt(Float32(head_dim)))
+    @inbounds for register in 1:REGISTER_COUNT, head in 1:ATTENTION_HEADS
+        first_coordinate = (head - 1) * head_dim + 1
+        last_coordinate = head * head_dim
+        maximum_score = -Inf32
+        for support_index in 1:EPISODIC_SUPPORT
+            score = 0.0f0
+            @simd for coordinate in first_coordinate:last_coordinate
+                score = muladd(
+                    scratch.query[coordinate, register],
+                    scratch.key[coordinate, support_index, register],
+                    score,
+                )
+            end
+            score *= attention_scale
+            scratch.attention_weights[support_index, register, head] = score
+            maximum_score = max(maximum_score, score)
+        end
+        denominator = 0.0f0
+        for support_index in 1:EPISODIC_SUPPORT
+            probability = exp(
+                scratch.attention_weights[support_index, register, head] -
+                maximum_score,
+            )
+            scratch.attention_weights[support_index, register, head] =
+                probability
+            denominator += probability
+        end
+        inverse_denominator = inv(denominator)
+        for support_index in 1:EPISODIC_SUPPORT
+            probability =
+                scratch.attention_weights[support_index, register, head] *
+                inverse_denominator
+            scratch.attention_weights[support_index, register, head] =
+                probability
+            @simd for coordinate in first_coordinate:last_coordinate
+                scratch.attention_context[coordinate, register] = muladd(
+                    probability,
+                    scratch.value[coordinate, support_index, register],
+                    scratch.attention_context[coordinate, register],
+                )
+            end
+        end
+    end
+
+    # An always-on O(TOKEN_COUNT*MODEL_DIM) mean path prevents hard routing
+    # from disconnecting an input token or its tokenizer parameters.
+    inverse_tokens = inv(Float32(TOKEN_COUNT))
+    fill!(scratch.global_summary, 0.0f0)
+    @inbounds for token in 1:TOKEN_COUNT
+        @simd for coordinate in 1:MODEL_DIM
+            scratch.global_summary[coordinate] = muladd(
+                inverse_tokens,
+                memory_normalized[coordinate, token],
+                scratch.global_summary[coordinate],
+            )
+        end
+    end
     mul!(scratch.output, model.cross_o, scratch.attention_context)
     alpha = _residual_scale(model.cross_scale_logit[1])
-    @inbounds @simd for index in eachindex(scratch.next)
-        scratch.next[index] = muladd(
-            alpha, scratch.output[index], registers[index],
-        )
+    summary_alpha = _residual_scale(model.relation_scale_logit[1])
+    @inbounds for register in 1:REGISTER_COUNT
+        @simd for coordinate in 1:MODEL_DIM
+            scratch.next[coordinate, register] =
+                registers[coordinate, register] +
+                alpha * scratch.output[coordinate, register] +
+                summary_alpha * scratch.global_summary[coordinate]
+        end
     end
     return scratch.next, CrossAttentionTape(
         scratch.input,
         scratch.normalized,
         scratch.inverse_rms,
+        scratch.register_route,
+        scratch.token_route,
+        scratch.selected_ids,
         scratch.query,
         scratch.key,
         scratch.value,
         scratch.attention_weights,
         scratch.attention_context,
+        scratch.global_summary,
         scratch.output,
         alpha,
+        summary_alpha,
     )
 end
 
@@ -1619,45 +1740,94 @@ function _working_memory_write_forward!(
     memory,
     registers,
     read_weights,
+    selected_ids,
 )
     copyto!(scratch.registers, registers)
+    copyto!(scratch.selected_ids, selected_ids)
     mul!(scratch.value, model.memory_write_v, registers)
-    fill!(scratch.context, 0.0f0)
-    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
-    @inbounds for head in 1:ATTENTION_HEADS
-        first_coordinate = (head - 1) * head_dim + 1
-        last_coordinate = head * head_dim
-        for token in 1:TOKEN_COUNT
-            denominator = 1.0f-8
-            for register in 1:REGISTER_COUNT
-                denominator += read_weights[token, register, head]
+    fill!(scratch.seen, false)
+    write_count = 0
+    @inbounds for register in 1:REGISTER_COUNT
+        for support_index in 1:EPISODIC_SUPPORT
+            token = Int(selected_ids[support_index, register])
+            scratch.seen[token] && continue
+            scratch.seen[token] = true
+            write_count += 1
+            scratch.write_ids[write_count] = Int16(token)
+            scratch.token_slots[token] = Int16(write_count)
+        end
+    end
+    @inbounds for write_index in 1:write_count
+        token = Int(scratch.write_ids[write_index])
+        for head in 1:ATTENTION_HEADS
+            scratch.inverse_weight_sums[token, head] = 1.0f-8
+        end
+        @simd for coordinate in 1:ATTENTION_DIM
+            scratch.context[coordinate, write_index] = 0.0f0
+        end
+    end
+    @inbounds for register in 1:REGISTER_COUNT
+        for support_index in 1:EPISODIC_SUPPORT
+            token = Int(selected_ids[support_index, register])
+            for head in 1:ATTENTION_HEADS
+                scratch.inverse_weight_sums[token, head] +=
+                    read_weights[support_index, register, head]
             end
-            inverse = inv(denominator)
-            scratch.inverse_weight_sums[token, head] = inverse
-            for register in 1:REGISTER_COUNT
-                weight = read_weights[token, register, head] * inverse
-                scratch.weights[token, register, head] = weight
+        end
+    end
+    @inbounds for write_index in 1:write_count
+        token = Int(scratch.write_ids[write_index])
+        for head in 1:ATTENTION_HEADS
+            scratch.inverse_weight_sums[token, head] =
+                inv(scratch.inverse_weight_sums[token, head])
+        end
+    end
+    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
+    @inbounds for register in 1:REGISTER_COUNT
+        for support_index in 1:EPISODIC_SUPPORT
+            token = Int(selected_ids[support_index, register])
+            write_index = Int(scratch.token_slots[token])
+            for head in 1:ATTENTION_HEADS
+                first_coordinate = (head - 1) * head_dim + 1
+                last_coordinate = head * head_dim
+                weight = read_weights[support_index, register, head] *
+                    scratch.inverse_weight_sums[token, head]
+                scratch.weights[support_index, register, head] = weight
                 @simd for coordinate in first_coordinate:last_coordinate
-                    scratch.context[coordinate, token] = muladd(
+                    scratch.context[coordinate, write_index] = muladd(
                         weight, scratch.value[coordinate, register],
-                        scratch.context[coordinate, token],
+                        scratch.context[coordinate, write_index],
                     )
                 end
             end
         end
     end
-    mul!(scratch.projected, model.memory_write_o, scratch.context)
+    mul!(
+        @view(scratch.projected[:, 1:write_count]),
+        model.memory_write_o,
+        @view(scratch.context[:, 1:write_count]),
+    )
     alpha = _residual_scale(model.memory_write_scale_logit[1])
-    @inbounds @simd for index in eachindex(scratch.output)
-        scratch.output[index] = muladd(
-            alpha, scratch.projected[index], memory[index],
-        )
+    copyto!(scratch.output, memory)
+    @inbounds for write_index in 1:write_count
+        token = Int(scratch.write_ids[write_index])
+        @simd for coordinate in 1:MODEL_DIM
+            scratch.output[coordinate, token] = muladd(
+                alpha,
+                scratch.projected[coordinate, write_index],
+                scratch.output[coordinate, token],
+            )
+        end
     end
     return scratch.output, WorkingMemoryWriteTape(
         scratch.registers,
         scratch.value,
+        scratch.selected_ids,
         scratch.weights,
         scratch.inverse_weight_sums,
+        scratch.write_ids,
+        scratch.token_slots,
+        Int16(write_count),
         scratch.context,
         scratch.projected,
         scratch.output,
@@ -1665,10 +1835,12 @@ function _working_memory_write_forward!(
     )
 end
 
-function _working_memory_write_forward(model, memory, registers, read_weights)
+function _working_memory_write_forward(
+    model, memory, registers, read_weights, selected_ids,
+)
     return _working_memory_write_forward!(
         WorkingMemoryWriteForwardScratch(), model, memory, registers,
-        read_weights,
+        read_weights, selected_ids,
     )
 end
 
@@ -1965,6 +2137,7 @@ struct ForwardCandidateArena
     registers::Matrix{Float32}
     steps::Vector{RecurrentStepTape}
     lookup::Vector{SparseLookup.LookupTrajectoryArena}
+    buckets::EpisodicBuckets
     spatial_scratch::Vector{Union{Nothing,SpatialAttentionForwardScratch}}
     cross_scratch::Vector{Union{Nothing,CrossAttentionForwardScratch}}
     self_scratch::Vector{SelfAttentionForwardScratch}
@@ -1982,6 +2155,7 @@ function ForwardCandidateArena()
         Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
         steps,
         lookup,
+        EpisodicBuckets(),
         Union{Nothing,SpatialAttentionForwardScratch}[
             step <= MIN_RECURRENT_STEPS ? SpatialAttentionForwardScratch() : nothing
             for step in 1:MAX_RECURRENT_STEPS
@@ -2206,6 +2380,7 @@ function advance_trajectory!(
             model,
             state.registers,
             spatial.output_normalized,
+            state.arena.buckets,
         )
     end
     if state.arena === nothing
@@ -2239,11 +2414,13 @@ function advance_trajectory!(
     memory, memory_write = if state.arena === nothing
         _working_memory_write_forward(
             model, memory, registers, cross.attention_weights,
+            cross.selected_ids,
         )
     else
         _working_memory_write_forward!(
             state.arena.memory_write_scratch[step_index],
             model, memory, registers, cross.attention_weights,
+            cross.selected_ids,
         )
     end
     # A fixed monotone hazard prior prevents tiny global bias changes around
@@ -2605,6 +2782,12 @@ function _zero_dense_gradients()
         :aux_value => zeros(Float32, MODEL_DIM, AUX_FEATURES),
         :aux_position => zeros(Float32, MODEL_DIM, AUX_FEATURES),
         :register_seed => zeros(Float32, MODEL_DIM, REGISTER_COUNT),
+        :token_router => zeros(
+            Float32, EPISODIC_ROUTER_BLOCK_WIDTH, EPISODIC_ROUTER_DIM,
+        ),
+        :register_router => zeros(
+            Float32, EPISODIC_ROUTER_BLOCK_WIDTH, EPISODIC_ROUTER_DIM,
+        ),
         :spatial_q => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
         :spatial_k => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
         :spatial_v => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
@@ -2989,6 +3172,19 @@ function _cross_attention_vjp!(
     _dgv(accumulator, :cross_scale_logit)[1] +=
         dot(state_cotangent, tape.output) *
         _residual_scale_derivative(model.cross_scale_logit[1])
+    summary_projection = 0.0f0
+    @inbounds for register in 1:REGISTER_COUNT
+        @simd for coordinate in 1:MODEL_DIM
+            summary_projection = muladd(
+                state_cotangent[coordinate, register],
+                tape.global_summary[coordinate],
+                summary_projection,
+            )
+        end
+    end
+    _dgv(accumulator, :relation_scale_logit)[1] +=
+        summary_projection *
+        _residual_scale_derivative(model.relation_scale_logit[1])
     output_cotangent = scratch.context_cotangent
     @inbounds @simd for index in eachindex(output_cotangent)
         output_cotangent[index] = tape.alpha * state_cotangent[index]
@@ -3013,44 +3209,137 @@ function _cross_attention_vjp!(
         transpose(model.cross_o),
         output_cotangent,
     )
-    dquery = scratch.attention_dquery
-    dkey = scratch.attention_dkey
-    dvalue = scratch.attention_dvalue
-    _attention_core_vjp!(
-        dquery,
-        dkey,
-        dvalue,
-        scratch.attention_dscore,
-        scratch.attention_dweights,
-        tape.query,
-        tape.key,
-        tape.value,
-        tape.attention_weights,
-        attention_context_cotangent,
-        external_dweights,
-    )
-
-    # All 283 memory tokens participate, so task gradients reach every K/V
-    # projection and every episodic token without a routing STE.
-    mul!(
-        _dgm(accumulator, :cross_q), dquery, transpose(tape.normalized),
-        1.0f0, 1.0f0,
-    )
-    mul!(
-        _dgm(accumulator, :cross_k), dkey, transpose(memory_normalized),
-        1.0f0, 1.0f0,
-    )
-    mul!(
-        _dgm(accumulator, :cross_v), dvalue, transpose(memory_normalized),
-        1.0f0, 1.0f0,
-    )
     dnormalized = scratch.dnormalized
-    mul!(dnormalized, transpose(model.cross_q), dquery)
-    mul!(dmemory_normalized, transpose(model.cross_k), dkey)
+    dregister_route = scratch.dregister_route
+    fill!(dnormalized, 0.0f0)
+    fill!(dregister_route, 0.0f0)
+    _begin_route_gradients!(scratch)
+    dquery_total = scratch.attention_dquery
+    fill!(dquery_total, 0.0f0)
+    dkey_storage = scratch.attention_dkey
+    dvalue_storage = scratch.attention_dvalue
+    dscore_storage = scratch.attention_dscore
+    dweight_storage = scratch.attention_dweights
+    cross_k_gradient = _dgm(accumulator, :cross_k)
+    cross_v_gradient = _dgm(accumulator, :cross_v)
+    router_scale = ROUTER_STE_SCALE / sqrt(Float32(EPISODIC_ROUTER_DIM))
+    @inbounds for register in 1:REGISTER_COUNT
+        query = @view tape.query[:, register:register]
+        key = @view tape.key[:, :, register]
+        value = @view tape.value[:, :, register]
+        weights = @view tape.attention_weights[:, register:register, :]
+        context_gradient =
+            @view attention_context_cotangent[:, register:register]
+        dquery = @view dquery_total[:, register:register]
+        dkey = @view dkey_storage[:, 1:EPISODIC_SUPPORT]
+        dvalue = @view dvalue_storage[:, 1:EPISODIC_SUPPORT]
+        dscore_total = @view dscore_storage[1:EPISODIC_SUPPORT, 1:1]
+        dweights = @view dweight_storage[1:EPISODIC_SUPPORT, 1:1]
+        external = external_dweights === nothing ? nothing :
+            @view external_dweights[
+                1:EPISODIC_SUPPORT, register:register, :,
+            ]
+        _attention_core_vjp!(
+            dquery, dkey, dvalue, dscore_total, dweights,
+            query, key, value, weights, context_gradient, external,
+        )
+        selected_memory =
+            @view scratch.spatial_projection_input[:, 1:EPISODIC_SUPPORT]
+        for support_index in 1:EPISODIC_SUPPORT
+            token = Int(tape.selected_ids[support_index, register])
+            @simd for coordinate in 1:MODEL_DIM
+                selected_memory[coordinate, support_index] =
+                    memory_normalized[coordinate, token]
+            end
+        end
+        mul!(
+            cross_k_gradient, dkey, transpose(selected_memory),
+            1.0f0, 1.0f0,
+        )
+        mul!(
+            cross_v_gradient, dvalue, transpose(selected_memory),
+            1.0f0, 1.0f0,
+        )
+        selected_gradient =
+            @view scratch.spatial_dprojected[:, 1:EPISODIC_SUPPORT]
+        mul!(selected_gradient, transpose(model.cross_k), dkey)
+        mul!(
+            selected_gradient, transpose(model.cross_v), dvalue,
+            1.0f0, 1.0f0,
+        )
+        for support_index in 1:EPISODIC_SUPPORT
+            token = Int(tape.selected_ids[support_index, register])
+            @simd for coordinate in 1:MODEL_DIM
+                dmemory_normalized[coordinate, token] +=
+                    selected_gradient[coordinate, support_index]
+            end
+            coefficient = dscore_total[support_index, 1] * router_scale
+            _touch_route_gradient!(scratch, token)
+            for route in 1:EPISODIC_ROUTER_DIM
+                dregister_route[route, register] = muladd(
+                    coefficient, tape.token_route[route, token],
+                    dregister_route[route, register],
+                )
+                scratch.route_gradient[route, token] = muladd(
+                    coefficient, tape.register_route[route, register],
+                    scratch.route_gradient[route, token],
+                )
+            end
+        end
+    end
     mul!(
-        dmemory_normalized, transpose(model.cross_v), dvalue,
-        1.0f0, 1.0f0,
+        _dgm(accumulator, :cross_q),
+        dquery_total,
+        transpose(tape.normalized),
+        1.0f0,
+        1.0f0,
     )
+    mul!(dnormalized, transpose(model.cross_q), dquery_total)
+    @inbounds for register in 1:REGISTER_COUNT
+        fill!(scratch.register_input_gradient, 0.0f0)
+        _structured_router_selected_vjp!(
+            _dgm(accumulator, :register_router),
+            scratch.register_input_gradient,
+            model.register_router,
+            tape.normalized,
+            register,
+            @view(dregister_route[:, register]),
+        )
+        @simd for coordinate in 1:MODEL_DIM
+            dnormalized[coordinate, register] +=
+                scratch.register_input_gradient[coordinate]
+        end
+    end
+    @inbounds for route_index in 1:scratch.route_count
+        token = Int(scratch.route_ids[route_index])
+        fill!(scratch.token_input_gradient, 0.0f0)
+        _structured_router_selected_vjp!(
+            _dgm(accumulator, :token_router),
+            scratch.token_input_gradient,
+            model.token_router,
+            memory_normalized,
+            token,
+            @view(scratch.route_gradient[:, token]),
+        )
+        @simd for coordinate in 1:MODEL_DIM
+            dmemory_normalized[coordinate, token] +=
+                scratch.token_input_gradient[coordinate]
+        end
+    end
+
+    # Dense only in the cheap mean path: every token receives the same
+    # summary cotangent, so a routing miss can still be repaired by learning.
+    inverse_tokens = inv(Float32(TOKEN_COUNT))
+    @inbounds for coordinate in 1:MODEL_DIM
+        summary_gradient = 0.0f0
+        @simd for register in 1:REGISTER_COUNT
+            summary_gradient += state_cotangent[coordinate, register]
+        end
+        summary_gradient *= tape.summary_alpha * inverse_tokens
+        @simd for token in 1:TOKEN_COUNT
+            dmemory_normalized[coordinate, token] += summary_gradient
+        end
+    end
     _rmsnorm_columns_vjp!(
         dinput, tape.normalized, tape.inverse_rms, dnormalized,
     )
@@ -3068,56 +3357,91 @@ function _working_memory_write_vjp!(
     state_cotangent,
     scratch::BackwardScratch,
 )
+    write_count = Int(tape.write_count)
+    scale_projection = 0.0f0
+    @inbounds for write_index in 1:write_count
+        token = Int(tape.write_ids[write_index])
+        @simd for coordinate in 1:MODEL_DIM
+            scale_projection = muladd(
+                memory_cotangent[coordinate, token],
+                tape.projected[coordinate, write_index],
+                scale_projection,
+            )
+        end
+    end
     _dgv(accumulator, :memory_write_scale_logit)[1] +=
-        dot(memory_cotangent, tape.projected) *
+        scale_projection *
         _residual_scale_derivative(model.memory_write_scale_logit[1])
-
     dprojected = scratch.memory_previous
-    @inbounds @simd for index in eachindex(dprojected)
-        dprojected[index] = tape.alpha * memory_cotangent[index]
+    @inbounds for write_index in 1:write_count
+        token = Int(tape.write_ids[write_index])
+        @simd for coordinate in 1:MODEL_DIM
+            dprojected[coordinate, write_index] =
+                tape.alpha * memory_cotangent[coordinate, token]
+        end
     end
     mul!(
         _dgm(accumulator, :memory_write_o),
-        dprojected,
-        transpose(tape.context),
+        @view(dprojected[:, 1:write_count]),
+        transpose(@view(tape.context[:, 1:write_count])),
         1.0f0,
         1.0f0,
     )
     dcontext = scratch.memory_write_dcontext
-    mul!(dcontext, transpose(model.memory_write_o), dprojected)
+    mul!(
+        @view(dcontext[:, 1:write_count]),
+        transpose(model.memory_write_o),
+        @view(dprojected[:, 1:write_count]),
+    )
     dvalue = scratch.memory_write_dvalue
     fill!(dvalue, 0.0f0)
     external = scratch.attention_external_dweights
-    fill!(external, 0.0f0)
+    fill!(@view(external[1:EPISODIC_SUPPORT, :, :]), 0.0f0)
+    token_projection = scratch.attention_dscore
+    @inbounds for write_index in 1:write_count
+        token = Int(tape.write_ids[write_index])
+        for head in 1:ATTENTION_HEADS
+            token_projection[token, head] = 0.0f0
+        end
+    end
     head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
-    @inbounds for head in 1:ATTENTION_HEADS
-        first_coordinate = (head - 1) * head_dim + 1
-        last_coordinate = head * head_dim
-        for token in 1:TOKEN_COUNT
-            projection = 0.0f0
-            for register in 1:REGISTER_COUNT
+    @inbounds for register in 1:REGISTER_COUNT
+        for support_index in 1:EPISODIC_SUPPORT
+            token = Int(tape.selected_ids[support_index, register])
+            write_index = Int(tape.token_slots[token])
+            for head in 1:ATTENTION_HEADS
+                first_coordinate = (head - 1) * head_dim + 1
+                last_coordinate = head * head_dim
                 dweight = 0.0f0
                 @simd for coordinate in first_coordinate:last_coordinate
                     dweight = muladd(
-                        dcontext[coordinate, token],
+                        dcontext[coordinate, write_index],
                         tape.value[coordinate, register],
                         dweight,
                     )
                     dvalue[coordinate, register] = muladd(
-                        tape.weights[token, register, head],
-                        dcontext[coordinate, token],
+                        tape.weights[support_index, register, head],
+                        dcontext[coordinate, write_index],
                         dvalue[coordinate, register],
                     )
                 end
-                external[token, register, head] = dweight
-                projection = muladd(
-                    tape.weights[token, register, head], dweight, projection,
+                external[support_index, register, head] = dweight
+                token_projection[token, head] = muladd(
+                    tape.weights[support_index, register, head],
+                    dweight,
+                    token_projection[token, head],
                 )
             end
-            inverse = tape.inverse_weight_sums[token, head]
-            for register in 1:REGISTER_COUNT
-                external[token, register, head] = inverse * (
-                    external[token, register, head] - projection
+        end
+    end
+    @inbounds for register in 1:REGISTER_COUNT
+        for support_index in 1:EPISODIC_SUPPORT
+            token = Int(tape.selected_ids[support_index, register])
+            for head in 1:ATTENTION_HEADS
+                external[support_index, register, head] =
+                    tape.inverse_weight_sums[token, head] * (
+                    external[support_index, register, head] -
+                    token_projection[token, head]
                 )
             end
         end
@@ -4146,6 +4470,8 @@ end
         return :token
     elseif name in (:register_seed, :lookup_register_gate)
         return :register
+    elseif name in (:token_router, :register_router)
+        return :router
     elseif name in (:ffn_gate, :ffn_up, :ffn_down, :ffn_scale_logit)
         return :ffn
     else
@@ -4251,6 +4577,7 @@ function optimizer_step!(
         group = _dense_group(name)
         learning_rate = group === :token ? token_learning_rate :
             group === :register ? register_learning_rate :
+            group === :router ? router_learning_rate :
             group === :ffn ? ffn_learning_rate : attention_learning_rate
         token_offset = _token_column_offset(name)
         if token_offset >= 0
@@ -4298,7 +4625,8 @@ export BOARD_HEIGHT, BOARD_WIDTH, CELL_COUNT, PIECE_TYPES, NEXT_HOLD_TOKENS,
        ATTENTION_HEADS, REGISTER_COUNT, FFN_DIM, INITIAL_HALT_PROBABILITY,
        EPISODIC_ROUTER_TABLES,
        EPISODIC_ROUTER_BITS, EPISODIC_ROUTER_DIM, EPISODIC_BUCKET_CAP,
-       EPISODIC_ROOT_CAP, EPISODIC_CANDIDATE_CAP, EPISODIC_SHORTLIST,
+       EPISODIC_ROOT_CAP, EPISODIC_SUPPORT, EPISODIC_CANDIDATE_CAP,
+       EPISODIC_SHORTLIST,
        SPATIAL_ANCHORS, SPATIAL_CANDIDATE_CAP, SPATIAL_SHORTLIST,
        MIN_RECURRENT_STEPS,
        MAX_RECURRENT_STEPS, WARMUP_MAX_STEPS, EpisodicCandidateInput,

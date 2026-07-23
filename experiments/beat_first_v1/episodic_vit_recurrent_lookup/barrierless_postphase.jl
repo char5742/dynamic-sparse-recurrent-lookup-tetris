@@ -59,6 +59,8 @@ const BARRIERLESS_DENSE_PARAMETER_NAMES = (
     :aux_value,
     :aux_position,
     :register_seed,
+    :token_router,
+    :register_router,
     :spatial_q,
     :spatial_k,
     :spatial_v,
@@ -564,6 +566,7 @@ function _barrierless_optimize_dense_parameter!(
     group = Model._dense_group(name)
     learning_rate = group === :token ? opt.token_learning_rate * lr_scale :
         group === :register ? opt.register_learning_rate * lr_scale :
+        group === :router ? opt.router_learning_rate * lr_scale :
         group === :ffn ? opt.ffn_learning_rate * lr_scale :
         opt.attention_learning_rate * lr_scale
     token_offset = Model._token_column_offset(name)

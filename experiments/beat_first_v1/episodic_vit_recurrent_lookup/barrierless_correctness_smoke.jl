@@ -28,14 +28,14 @@ for (name, value) in (
     "EVRL_REGISTERS" => "4",
     "EVRL_ROUTER_TABLES" => "2",
     "EVRL_ROUTER_BITS" => "4",
-    "EVRL_ROUTER_BUCKET_CAP" => "16",
-    "EVRL_EPISODIC_SHORTLIST" => "4",
-    "EVRL_EPISODIC_CANDIDATE_CAP" => "16",
+    "EVRL_ROUTER_BUCKET_CAP" => "64",
+    "EVRL_EPISODIC_SHORTLIST" => "64",
+    "EVRL_EPISODIC_CANDIDATE_CAP" => "64",
     "EVRL_SPATIAL_ANCHORS" => "2",
     "EVRL_SPATIAL_SHORTLIST" => "2",
     "EVRL_SPATIAL_CANDIDATE_CAP" => "3",
     "EVRL_FFN_DIM" => "128",
-    "EVRL_INITIAL_HALT_PROBABILITY" => "0.5",
+    "EVRL_INITIAL_HALT_PROBABILITY" => "0.8",
 )
     haskey(ENV, name) || (ENV[name] = value)
 end
@@ -53,9 +53,9 @@ const Training = Main.EpisodicViTRecurrentLookupTeacherTraining
 const Model = Training.Model
 const TrainingCore = Training.TrainingCore
 
-const DEFAULT_CHECKPOINT = raw"D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_recurrence_cp0_haltlr1e5_warmup5k_u100000_20260722_r2\checkpoints\checkpoint_000010000.jls"
+const DEFAULT_CHECKPOINT = raw"D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_fixed_k64_wta_mean_wm_u10000_20260723\checkpoints\checkpoint_000010000.jls"
 const DEFAULT_CHECKPOINT_SHA256 =
-    "3bd4140707a10cd63781bd39c65d21255ae8dbaa0ea022c78ab501b3f014041b"
+    "c834611e07cec1743658cea90118253406c45bdb5b5c8db625259229df89906a"
 
 const OUTPUT_ATOL = 1.0e-6
 const OUTPUT_RTOL = 1.0e-6
@@ -317,9 +317,15 @@ function _tape_token_edges(tape)
     return [begin
         cross = step.cross
         (;
-            support="all-episodic-tokens",
+            support="fixed-k64-register-specific",
+            selected_ids=_matrix_integer_tuple(cross.selected_ids),
             key_count=size(cross.key, 2),
             attention_shape=size(cross.attention_weights),
+            write_ids=Tuple(Int.(@view(
+                step.memory_write.write_ids[
+                    1:Int(step.memory_write.write_count)
+                ],
+            ))),
         )
     end for step in tape.steps]
 end
