@@ -1,6 +1,25 @@
 # EVRL研究の現時点での判明事項
 
-## 結論
+## 最新追補：4つの根本問題を修正した100,000更新
+
+本書の従来の性能表は、長期記憶をregister間でpoolし、episodic memoryが読取り専用で、
+Lookup collapseとhalting信用割当が未解決だった構成の履歴である。その後、次を修正した。
+
+1. state-localなhard頻度とsoft確率によるLookup anti-collapse credit
+2. 4 registerそれぞれの独立した長期記憶routing
+3. 更新後registerから283 tokenへ戻す書込み可能なworking memory
+4. 全trajectoryのpolicy gradientに少数one-step probeを加算するhalting信用割当
+
+新構成はfrom-scratchで100,000更新、400,000 teacher stateを完走した。Lookup Giniは
+`0.187～0.193`、coverageは`99.7～99.9%`、register間address相違率は`99.90%`、
+working-memory write RMSは`0.384`となった。速度は`11.332 updates/s`、GC占有率は
+`0.667%`で、今回許可された最低速度`10 updates/s`を上回った。
+
+validationとsealed seedは使用していない。詳細、正当性smoke、固定batch過学習、最終
+checkpointは[`ROOT_CAUSE_REPAIR_100K_2026-07-23.md`](ROOT_CAUSE_REPAIR_100K_2026-07-23.md)
+に記録した。以下は改修前構成の比較履歴として保持する。
+
+## 改修前構成の結論
 
 現行EVRLは、入力内の短期関係形成、LookupFFNによる長期記憶選択、入力依存の再帰深度を一つのCPU学習系へ統合できている。8近傍spatial backwardの範囲外書込みを修正した後は、loss、top-1、NDCG、pairwise、marginが学習とともに改善し、hard haltingも2～12 stepを入力ごとに使い分けるようになった。
 
@@ -10,7 +29,7 @@
 
 PreActに対する結論は予算軸で異なる。同じteacher state数ではPreActが明確に優位であり、sample efficiencyのPreAct超えは実証できていない。一方、既存ログからほぼ同じ学習実時間を比較するとEVRLが同一panel上の全主要順位指標で優位だった。したがって現時点で実証できたのはwall-clock throughput上の優位であり、最終的な独立汎化性能のPreAct超えではない。
 
-## 現行アーキテクチャ
+## 改修前アーキテクチャ
 
 各候補はPreActと同じ盤面、候補、差分、NEXT/HOLD、`aux37`だけから独立に評価する。teacher Q値と順位は教師信号にのみ使う。
 
@@ -149,7 +168,7 @@ episodic LR scale `1.0`を維持し、モデル、入力、teacher、loss、opti
 
 85kはtop-1、90kはpairwise、95kはloss、NDCG、marginが最良だった。100kでは複数指標が同時に反落したため、90～100kは単調改善ではなく振動を伴う頭打ち域と判定する。平均深度も`2.013～3.020`を往復しており、入力依存停止は残るが、深度が安定して増える学習にはなっていない。
 
-Lookup row利用も未解決である。100k時点の各blockのrow-load Giniは`0.966～0.970`と高く、容量利用は強く偏っている。これは物理的疎性の結果だけではなく、長期記憶routingのcollapseがなお残ることを示す診断値である。
+この改修前構成ではLookup row利用が未解決だった。100k時点の各blockのrow-load Giniは`0.966～0.970`と高く、容量利用は強く偏っていた。後続の根本修正後100kではGiniが`0.187～0.193`へ低下し、このcollapseは解消した。
 
 ## PreActとの関係
 
@@ -167,7 +186,7 @@ wall-clockでは逆になる。EVRL 95kの累積学習時間は5,817秒だった
 2. dense WD `3e-4`、episodic LR scale `1.0`の95,000更新が、現在の品質・速度条件を満たす採用点である。
 3. episodic LR半減は同一65k比較では品質を伸ばしたが、長区間速度を悪化させた。
 4. 同一teacher state数と到達品質ではPreActが優位、ほぼ同一wall-clockではEVRLが優位だった。
-5. 90～100kは振動を伴う頭打ち域であり、単に更新数を増やすよりrouting collapseと深度信用割当の改善が次の課題である。
+5. 改修前構成の90～100kは振動を伴う頭打ち域であり、そこで特定したrouting collapseと深度信用割当は後続の根本修正で改善した。
 
 ## 評価上の境界
 

@@ -703,3 +703,39 @@ PreAct比較は予算軸を分離した。同じteacher state数ではPreAct 12k
 hard haltingは可変深度を維持したが、held平均深度は2.01～3.02を往復し、安定増加は
 示さなかった。100k時点のLookup row-load Giniも`0.966～0.970`と高い。
 次の改善対象は更新数の単純追加ではなく、Lookup routing collapseと停止信用割当である。
+
+## 26. 2026-07-23 — Lookup・register・working memory・haltingの根本修正
+
+前節で特定した問題を局所的な係数調整ではなく、信用割当とmemory dataflowから修正した。
+
+- Lookup routerへstate-local hard頻度とsoft確率を組み合わせたanti-collapse勾配を追加した。
+- 平均registerから1本だけ長期記憶を引く経路を廃止し、4 registerが共有bankを独立routing
+  するようにした。
+- cross-attentionのread supportを再利用し、更新後registerを283 tokenへ書き戻す
+  working-memory writeを追加した。
+- one-step probeがpolicy gradientを置換していた実装を修正し、全trajectoryの
+  stop/continue creditへprobe BCEを加算するようにした。
+
+real-teacher serial／barrierless smokeは出力、loss、raw VJPが完全一致し、parameter
+gradient最大差`3.91e-7`、optimizer後parameter最大差`3.91e-8`で合格した。同じ4状態を
+100回反復する過学習試験では、最初10更新から最後10更新へのloss低下が旧構成の`4.04%`
+から`42.07%`へ改善した。
+
+from-scratch 100,000更新は8,959.066秒で完了した。学習速度`11.332 updates/s`、
+allocation`7.355 MB/update`、GC`59.792秒`、GC占有率`0.667%`だった。許容下限
+`10 updates/s`を維持した。
+
+100k累積のLookup coverageは各block`99.7～99.9%`、row-load Giniは`0.187～0.193`
+だった。改修前のcoverage`26.9～30.1%`、Gini`0.966～0.970`から大幅に改善した。
+training split内の実trajectoryでは、register間Lookup address相違率`99.90%`、
+cross-attention argmax相違率`89.72%`、working-memory write RMS`0.384`を確認した。
+
+training-only固定128状態はloss`2.55998`、top-1`0.671875`、NDCG`0.991213`、
+pairwise`0.908830`、margin`0.137023`、平均深度`4.880`、深度範囲`3～12`だった。
+validationとsealed seedは使用していないため、これは独立汎化性能の主張ではない。
+
+100k checkpointのSHA-256は
+`3def11e92a8af52267f178e25bb59881731a53278dffe1d53dd98fb599b38f61`である。完全な条件と
+診断値は
+[`ROOT_CAUSE_REPAIR_100K_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/ROOT_CAUSE_REPAIR_100K_2026-07-23.md)
+へ記録した。

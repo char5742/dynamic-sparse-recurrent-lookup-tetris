@@ -118,6 +118,11 @@ function runtime_hyperparameters(maximum_updates::Int, payload=nothing)
         end_temperature=_float32_env("EVRL_ROUTE_TEMP_END", _property_or(inherited_routing, :end_temperature, 0.25f0)),
         anneal_start_update=_int_env("EVRL_ROUTE_ANNEAL_START", _property_or(inherited_routing, :anneal_start_update, 0)),
         anneal_end_update=_int_env("EVRL_ROUTE_ANNEAL_END", _property_or(inherited_routing, :anneal_end_update, maximum_updates); minimum=1),
+        balance_weight=_float32_env(
+            "EVRL_ROUTE_BALANCE_WEIGHT",
+            _property_or(inherited_routing, :balance_weight, 0.05f0);
+            nonnegative=true,
+        ),
     )
     routing.anneal_end_update > routing.anneal_start_update || error("routing anneal interval is empty")
     halting = (;
@@ -204,9 +209,17 @@ function _normalized_hyperparameters(value)
         ),
         probe_weight=Float32(_property_or(halting, :probe_weight, 1.0f0)),
     )
+    routing = value.routing
+    normalized_routing = (;
+        start_temperature=routing.start_temperature,
+        end_temperature=routing.end_temperature,
+        anneal_start_update=routing.anneal_start_update,
+        anneal_end_update=routing.anneal_end_update,
+        balance_weight=Float32(_property_or(routing, :balance_weight, 0.0f0)),
+    )
     return (;
         optimizer=value.optimizer,
-        routing=value.routing,
+        routing=normalized_routing,
         halting=normalized_halting,
         loss=value.loss,
     )
@@ -250,6 +263,7 @@ mutable struct TeacherWorkspace
     forward_arenas::Vector{Model.ForwardCandidateArena}
     halt_probe_targets::Vector{Float32}
     halt_probe_deltas::Vector{Float32}
+    lookup_balance_stats::Model.LookupBalanceStats
 end
 
 TeacherWorkspace() = TeacherWorkspace(
@@ -263,6 +277,7 @@ TeacherWorkspace() = TeacherWorkspace(
     [Model.ForwardCandidateArena() for _ in 1:LEARNER_WIDTH],
     fill(Float32(NaN), LEARNER_WIDTH),
     fill(Float32(NaN), LEARNER_WIDTH),
+    Model.LookupBalanceStats(),
 )
 
 const TRAINING_STATE_BATCH = let
@@ -1020,6 +1035,9 @@ function _accumulate_dynamic_batches!(
         scheduler.raw_gradients[state_slot] .= raw_gradient
         scheduler.state_losses[state_slot] = loss
         count = _valid_candidate_count(batch)
+        Model.lookup_balance_stats!(
+            workspace.lookup_balance_stats, workspace.tapes, count,
+        )
         halt_probe = _apply_halt_probes!(
             trainer,
             batch,
@@ -1058,6 +1076,8 @@ function _accumulate_dynamic_batches!(
             halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
             halt_probe_target=scheduler.state_workspaces[state_slot].halt_probe_targets[candidate],
             halt_probe_weight=hyperparameters.halting.probe_weight,
+            lookup_balance_stats=scheduler.state_workspaces[state_slot].lookup_balance_stats,
+            lookup_balance_weight=hyperparameters.routing.balance_weight,
             temperature,
         )
         scheduler.trajectory_states[job] = nothing
@@ -1086,6 +1106,11 @@ function _accumulate_state_gradient!(
     )
     loss, raw_gradient = _loss_output_vjp(
         raw, batch, hyperparameters; hard_negative,
+    )
+    Model.lookup_balance_stats!(
+        trainer.workspace.lookup_balance_stats,
+        trainer.workspace.tapes,
+        candidate_count,
     )
     halt_probe = _apply_halt_probes!(
         trainer,
@@ -1117,6 +1142,8 @@ function _accumulate_state_gradient!(
                 halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
                 halt_probe_target=trainer.workspace.halt_probe_targets[1],
                 halt_probe_weight=hyperparameters.halting.probe_weight,
+                lookup_balance_stats=trainer.workspace.lookup_balance_stats,
+                lookup_balance_weight=hyperparameters.routing.balance_weight,
                 temperature,
             )
             BACKWARD_THREAD_WARMED[] = true
@@ -1138,6 +1165,8 @@ function _accumulate_state_gradient!(
                 halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
                 halt_probe_target=trainer.workspace.halt_probe_targets[candidate],
                 halt_probe_weight=hyperparameters.halting.probe_weight,
+                lookup_balance_stats=trainer.workspace.lookup_balance_stats,
+                lookup_balance_weight=hyperparameters.routing.balance_weight,
                 temperature,
             )
         end
@@ -1158,6 +1187,8 @@ function _accumulate_state_gradient!(
                 halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
                 halt_probe_target=trainer.workspace.halt_probe_targets[candidate],
                 halt_probe_weight=hyperparameters.halting.probe_weight,
+                lookup_balance_stats=trainer.workspace.lookup_balance_stats,
+                lookup_balance_weight=hyperparameters.routing.balance_weight,
                 temperature,
             )
         end

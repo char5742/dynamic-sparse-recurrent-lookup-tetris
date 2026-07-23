@@ -284,6 +284,14 @@ mutable struct EpisodicViTLookupModel
     cross_scale_logit::Vector{Float32}
     relation_scale_logit::Vector{Float32}
 
+    # Reverse cross-attention write path.  The register-specific read support
+    # is reused to write the updated register state back into the sample-local
+    # episodic memory, making it a true recurrent working memory rather than a
+    # read-only encoder cache.
+    memory_write_v::Matrix{Float32}
+    memory_write_o::Matrix{Float32}
+    memory_write_scale_logit::Vector{Float32}
+
     self_q::Matrix{Float32}
     self_k::Matrix{Float32}
     self_v::Matrix{Float32}
@@ -295,9 +303,9 @@ mutable struct EpisodicViTLookupModel
     ffn_down::Matrix{Float32}
     ffn_scale_logit::Vector{Float32}
 
-    # One pooled long-memory carrier is evaluated per recurrent step.  Its
-    # residual is injected into every register through an independent scalar
-    # gate, so long-memory work no longer scales with REGISTER_COUNT.
+    # Every register retrieves its own long-memory trajectory from the shared
+    # LookupFFN banks.  The banks remain parameter-shared, but neither the
+    # address path nor the retrieved residual is pooled across registers.
     lookup_register_gate::Vector{Float32}
 end
 
@@ -356,6 +364,9 @@ function initialize_model(rng::AbstractRNG=Xoshiro(0))
         Float32[INITIAL_RESIDUAL_LOGIT],
         Float32[INITIAL_RESIDUAL_LOGIT],
         _xavier(rng, ATTENTION_DIM, MODEL_DIM),
+        _xavier(rng, MODEL_DIM, ATTENTION_DIM),
+        Float32[INITIAL_RESIDUAL_LOGIT],
+        _xavier(rng, ATTENTION_DIM, MODEL_DIM),
         _xavier(rng, ATTENTION_DIM, MODEL_DIM),
         _xavier(rng, ATTENTION_DIM, MODEL_DIM),
         _xavier(rng, MODEL_DIM, ATTENTION_DIM),
@@ -395,6 +406,9 @@ function _dense_parameters(model::EpisodicViTLookupModel)
         cross_o=model.cross_o,
         cross_scale_logit=model.cross_scale_logit,
         relation_scale_logit=model.relation_scale_logit,
+        memory_write_v=model.memory_write_v,
+        memory_write_o=model.memory_write_o,
+        memory_write_scale_logit=model.memory_write_scale_logit,
         self_q=model.self_q,
         self_k=model.self_k,
         self_v=model.self_v,
@@ -438,7 +452,7 @@ function topology(model::EpisodicViTLookupModel)
         attention_dim=ATTENTION_DIM,
         attention_heads=ATTENTION_HEADS,
         ffn_dim=FFN_DIM,
-        recurrent_block="shared-full-token-cross-register-self-swiglu-pooled-active-lookup",
+        recurrent_block="shared-full-token-cross-register-self-swiglu-register-local-active-lookup-reverse-cross-working-memory-write",
         episodic_router="none-full-token-cross-attention",
         episodic_attention="shared-learned-qkvo-full-283-token-softmax",
         episodic_projected_token_occurrences_per_step=TOKEN_COUNT,
@@ -449,23 +463,26 @@ function topology(model::EpisodicViTLookupModel)
             REGISTER_COUNT * TOKEN_COUNT * ATTENTION_DIM,
         episodic_weighted_gather_scalar_macs_per_step=
             REGISTER_COUNT * TOKEN_COUNT * ATTENTION_DIM,
+        working_memory="input-specific-recurrent-read-write-token-memory",
+        working_memory_write="register-specific-reverse-cross-attention-using-normalized-read-support",
         episodic_router_scalar_macs_per_trajectory=0,
         episodic_retrieval_entry_reads_upper_bound_per_step=0,
         spatial_relation="physical-8-neighbour-relative-position-learned-qkvo",
         spatial_local_edges_upper_bound=CELL_COUNT * LOCAL_SPATIAL_NEIGHBORS,
         candidate_support_cap=0,
         spatial_dense_all_token_scores=0,
-        long_memory_carriers_per_step=1,
-        long_memory_micro_calls_per_step=BLOCKS,
-        long_memory_register_injection="mean-carrier-sigmoid-gated-broadcast-residual",
-        long_memory_compute_reduction_vs_per_register=REGISTER_COUNT,
+        long_memory_carriers_per_step=REGISTER_COUNT,
+        long_memory_micro_calls_per_step=BLOCKS * REGISTER_COUNT,
+        long_memory_register_injection="register-local-sigmoid-gated-residual",
+        long_memory_compute_reduction_vs_per_register=1,
+        long_memory_balance="state-local-hard-frequency-times-soft-probability-auxiliary-credit",
         register_relation="full-model-dim-direct-normalized-dot-softmax-gather",
         initial_halt_probability=INITIAL_HALT_PROBABILITY,
         recurrent_steps=(MIN_RECURRENT_STEPS, MAX_RECURRENT_STEPS),
         total_parameters=parameter_count(model),
         sparse_lookup=SparseLookup.topology(model.lookup),
         sparse_update="selected-bank-rows-only-lazy-adamw",
-        halting="sampled-hard-hazard",
+        halting="sampled-hard-hazard-policy-gradient-plus-sparse-one-step-probe-credit",
         candidate_evaluation="independent",
     )
 end
@@ -1109,6 +1126,37 @@ CrossAttentionForwardScratch() = CrossAttentionForwardScratch(
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
 )
 
+struct WorkingMemoryWriteTape
+    registers::Matrix{Float32}
+    value::Matrix{Float32}
+    weights::Array{Float32,3}
+    inverse_weight_sums::Matrix{Float32}
+    context::Matrix{Float32}
+    projected::Matrix{Float32}
+    output::Matrix{Float32}
+    alpha::Float32
+end
+
+struct WorkingMemoryWriteForwardScratch
+    registers::Matrix{Float32}
+    value::Matrix{Float32}
+    weights::Array{Float32,3}
+    inverse_weight_sums::Matrix{Float32}
+    context::Matrix{Float32}
+    projected::Matrix{Float32}
+    output::Matrix{Float32}
+end
+
+WorkingMemoryWriteForwardScratch() = WorkingMemoryWriteForwardScratch(
+    Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
+    Matrix{Float32}(undef, ATTENTION_DIM, REGISTER_COUNT),
+    Array{Float32}(undef, TOKEN_COUNT, REGISTER_COUNT, ATTENTION_HEADS),
+    Matrix{Float32}(undef, TOKEN_COUNT, ATTENTION_HEADS),
+    Matrix{Float32}(undef, ATTENTION_DIM, TOKEN_COUNT),
+    Matrix{Float32}(undef, MODEL_DIM, TOKEN_COUNT),
+    Matrix{Float32}(undef, MODEL_DIM, TOKEN_COUNT),
+)
+
 struct EpisodicBuckets
     entries::Matrix{Vector{Int16}}
     root::Vector{Int16}
@@ -1465,6 +1513,65 @@ function _cross_attention_forward!(
     )
 end
 
+function _working_memory_write_forward!(
+    scratch::WorkingMemoryWriteForwardScratch,
+    model,
+    memory,
+    registers,
+    read_weights,
+)
+    copyto!(scratch.registers, registers)
+    mul!(scratch.value, model.memory_write_v, registers)
+    fill!(scratch.context, 0.0f0)
+    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
+    @inbounds for head in 1:ATTENTION_HEADS
+        first_coordinate = (head - 1) * head_dim + 1
+        last_coordinate = head * head_dim
+        for token in 1:TOKEN_COUNT
+            denominator = 1.0f-8
+            for register in 1:REGISTER_COUNT
+                denominator += read_weights[token, register, head]
+            end
+            inverse = inv(denominator)
+            scratch.inverse_weight_sums[token, head] = inverse
+            for register in 1:REGISTER_COUNT
+                weight = read_weights[token, register, head] * inverse
+                scratch.weights[token, register, head] = weight
+                @simd for coordinate in first_coordinate:last_coordinate
+                    scratch.context[coordinate, token] = muladd(
+                        weight, scratch.value[coordinate, register],
+                        scratch.context[coordinate, token],
+                    )
+                end
+            end
+        end
+    end
+    mul!(scratch.projected, model.memory_write_o, scratch.context)
+    alpha = _residual_scale(model.memory_write_scale_logit[1])
+    @inbounds @simd for index in eachindex(scratch.output)
+        scratch.output[index] = muladd(
+            alpha, scratch.projected[index], memory[index],
+        )
+    end
+    return scratch.output, WorkingMemoryWriteTape(
+        scratch.registers,
+        scratch.value,
+        scratch.weights,
+        scratch.inverse_weight_sums,
+        scratch.context,
+        scratch.projected,
+        scratch.output,
+        alpha,
+    )
+end
+
+function _working_memory_write_forward(model, memory, registers, read_weights)
+    return _working_memory_write_forward!(
+        WorkingMemoryWriteForwardScratch(), model, memory, registers,
+        read_weights,
+    )
+end
+
 function _self_attention_forward(model, registers)
     normalized, inverse_rms = _rmsnorm_columns(registers)
     query = model.self_q * normalized
@@ -1609,53 +1716,59 @@ function _pool_registers!(pooled, registers)
 end
 
 struct CarrierLookupTape
-    blocks::Vector{SparseLookup.LookupMicroTape}
-    residual::Vector{Float32}
+    blocks::Matrix{SparseLookup.LookupMicroTape}
+    residual::Matrix{Float32}
     gates::Vector{Float32}
 end
 
 
 struct CarrierLookupForwardScratch
-    blocks::Vector{SparseLookup.LookupMicroTape}
+    blocks::Matrix{SparseLookup.LookupMicroTape}
     pooled::Vector{Float32}
-    residual::Vector{Float32}
+    residual::Matrix{Float32}
     gates::Vector{Float32}
     next::Matrix{Float32}
 end
 
 
 function CarrierLookupForwardScratch(
-    arena::SparseLookup.LookupTrajectoryArena,
+    arenas::Vector{SparseLookup.LookupTrajectoryArena},
     step_index::Int,
 )
+    length(arenas) == REGISTER_COUNT || throw(DimensionMismatch(
+        "one Lookup trajectory arena is required per register",
+    ))
     return CarrierLookupForwardScratch(
-        [SparseLookup.lookup_micro_tape(arena, step_index, block)
-         for block in 1:BLOCKS],
+        [SparseLookup.lookup_micro_tape(arenas[register], step_index, block)
+         for block in 1:BLOCKS, register in 1:REGISTER_COUNT],
         Vector{Float32}(undef, MODEL_DIM),
-        Vector{Float32}(undef, MODEL_DIM),
+        Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
         Vector{Float32}(undef, REGISTER_COUNT),
         Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
     )
 end
 
 function _lookup_carrier_forward(model, registers, temperature, materialize)
-    pooled = _pool_registers(registers)
-    state = copy(pooled)
-    block_tapes = Vector{SparseLookup.LookupMicroTape}(undef, BLOCKS)
-    @inbounds for block in 1:BLOCKS
-        state, block_tapes[block] = SparseLookup._lookup_micro_forward(
-            model.lookup, state, block, temperature, materialize,
-        )
-    end
-    residual = state .- pooled
+    block_tapes = Matrix{SparseLookup.LookupMicroTape}(
+        undef, BLOCKS, REGISTER_COUNT,
+    )
+    residual = Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT)
     gates = Vector{Float32}(undef, REGISTER_COUNT)
     output = copy(registers)
     @inbounds for register in 1:REGISTER_COUNT
+        state = copy(@view(registers[:, register]))
+        for block in 1:BLOCKS
+            state, block_tapes[block, register] = SparseLookup._lookup_micro_forward(
+                model.lookup, state, block, temperature, materialize,
+            )
+        end
         gate = _sigmoid(model.lookup_register_gate[register])
         gates[register] = gate
         @simd for coordinate in 1:MODEL_DIM
+            residual[coordinate, register] =
+                state[coordinate] - registers[coordinate, register]
             output[coordinate, register] = muladd(
-                gate, residual[coordinate], output[coordinate, register],
+                gate, residual[coordinate, register], output[coordinate, register],
             )
         end
     end
@@ -1667,32 +1780,30 @@ function _lookup_carrier_forward(
     registers,
     temperature,
     materialize,
-    arena::SparseLookup.LookupTrajectoryArena,
+    arenas::Vector{SparseLookup.LookupTrajectoryArena},
     step_index::Int,
 )
-    pooled = _pool_registers(registers)
-    state = copy(pooled)
-    block_tapes = Vector{SparseLookup.LookupMicroTape}(undef, BLOCKS)
-    @inbounds for block in 1:BLOCKS
-        state, block_tapes[block] = SparseLookup.lookup_micro_forward!(
-            arena,
-            model.lookup,
-            state,
-            step_index,
-            block,
-            temperature,
-            materialize,
-        )
-    end
-    residual = state .- pooled
+    block_tapes = Matrix{SparseLookup.LookupMicroTape}(
+        undef, BLOCKS, REGISTER_COUNT,
+    )
+    residual = Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT)
     gates = Vector{Float32}(undef, REGISTER_COUNT)
     output = copy(registers)
     @inbounds for register in 1:REGISTER_COUNT
+        state = copy(@view(registers[:, register]))
+        for block in 1:BLOCKS
+            state, block_tapes[block, register] = SparseLookup.lookup_micro_forward!(
+                arenas[register], model.lookup, state, step_index, block,
+                temperature, materialize,
+            )
+        end
         gate = _sigmoid(model.lookup_register_gate[register])
         gates[register] = gate
         @simd for coordinate in 1:MODEL_DIM
+            residual[coordinate, register] =
+                state[coordinate] - registers[coordinate, register]
             output[coordinate, register] = muladd(
-                gate, residual[coordinate], output[coordinate, register],
+                gate, residual[coordinate, register], output[coordinate, register],
             )
         end
     end
@@ -1706,35 +1817,29 @@ function _lookup_carrier_forward!(
     registers,
     temperature,
     materialize,
-    arena::SparseLookup.LookupTrajectoryArena,
+    arenas::Vector{SparseLookup.LookupTrajectoryArena},
     step_index::Int,
 )
-    pooled = _pool_registers!(scratch.pooled, registers)
-    state = pooled
-    @inbounds for block in 1:BLOCKS
-        state, tape = SparseLookup.lookup_micro_forward!(
-            arena,
-            model.lookup,
-            state,
-            step_index,
-            block,
-            temperature,
-            materialize,
-        )
-        tape === scratch.blocks[block] || error("candidate lookup tape changed")
-    end
     residual = scratch.residual
-    @inbounds @simd for coordinate in eachindex(residual)
-        residual[coordinate] = state[coordinate] - pooled[coordinate]
-    end
     output = scratch.next
     copyto!(output, registers)
     @inbounds for register in 1:REGISTER_COUNT
+        state = @view registers[:, register]
+        for block in 1:BLOCKS
+            state, tape = SparseLookup.lookup_micro_forward!(
+                arenas[register], model.lookup, state, step_index, block,
+                temperature, materialize,
+            )
+            tape === scratch.blocks[block, register] ||
+                error("candidate register lookup tape changed")
+        end
         gate = _sigmoid(model.lookup_register_gate[register])
         scratch.gates[register] = gate
         @simd for coordinate in 1:MODEL_DIM
+            residual[coordinate, register] =
+                state[coordinate] - registers[coordinate, register]
             output[coordinate, register] = muladd(
-                gate, residual[coordinate], output[coordinate, register],
+                gate, residual[coordinate, register], output[coordinate, register],
             )
         end
     end
@@ -1747,6 +1852,7 @@ struct RecurrentStepTape
     self::SelfAttentionTape
     swiglu::SwiGLUTape
     lookup::CarrierLookupTape
+    memory_write::WorkingMemoryWriteTape
     final_registers::Matrix{Float32}
     halt_probability::Float32
     stochastic_decision::Bool
@@ -1758,18 +1864,20 @@ end
 struct ForwardCandidateArena
     registers::Matrix{Float32}
     steps::Vector{RecurrentStepTape}
-    lookup::SparseLookup.LookupTrajectoryArena
+    lookup::Vector{SparseLookup.LookupTrajectoryArena}
     spatial_scratch::Vector{Union{Nothing,SpatialAttentionForwardScratch}}
     cross_scratch::Vector{Union{Nothing,CrossAttentionForwardScratch}}
     self_scratch::Vector{SelfAttentionForwardScratch}
     swiglu_scratch::Vector{SwiGLUForwardScratch}
     carrier_scratch::Vector{CarrierLookupForwardScratch}
+    memory_write_scratch::Vector{WorkingMemoryWriteForwardScratch}
 end
 
 function ForwardCandidateArena()
     steps = RecurrentStepTape[]
     sizehint!(steps, MAX_RECURRENT_STEPS)
-    lookup = SparseLookup.LookupTrajectoryArena(MAX_RECURRENT_STEPS)
+    lookup = [SparseLookup.LookupTrajectoryArena(MAX_RECURRENT_STEPS)
+              for _ in 1:REGISTER_COUNT]
     return ForwardCandidateArena(
         Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
         steps,
@@ -1786,6 +1894,7 @@ function ForwardCandidateArena()
         [SwiGLUForwardScratch() for _ in 1:MAX_RECURRENT_STEPS],
         [CarrierLookupForwardScratch(lookup, step)
          for step in 1:MAX_RECURRENT_STEPS],
+        [WorkingMemoryWriteForwardScratch() for _ in 1:MAX_RECURRENT_STEPS],
     )
 end
 
@@ -1804,6 +1913,57 @@ mutable struct RouteUsage
 end
 RouteUsage() = RouteUsage(SparseLookup.RouteUsage(), 0, 0)
 
+mutable struct LookupBalanceStats
+    hard_frequencies::Array{Float32,4}
+    observations::Vector{Int32}
+end
+
+LookupBalanceStats() = LookupBalanceStats(
+    zeros(
+        Float32,
+        SparseLookup.WTA_CHOICES,
+        SparseLookup.WTA_DIGITS,
+        SparseLookup.TABLES_PER_BLOCK,
+        BLOCKS,
+    ),
+    zeros(Int32, BLOCKS),
+)
+
+function lookup_balance_stats!(
+    stats::LookupBalanceStats,
+    tapes,
+    candidate_count::Int,
+)
+    fill!(stats.hard_frequencies, 0.0f0)
+    fill!(stats.observations, 0)
+    @inbounds for candidate in 1:candidate_count
+        trajectory = tapes[candidate]
+        trajectory === nothing && error("lookup balance saw a missing trajectory")
+        for step in trajectory.steps, block in 1:BLOCKS, register in 1:REGISTER_COUNT
+            micro = step.lookup.blocks[block, register]
+            stats.observations[block] += 1
+            for table in 1:SparseLookup.TABLES_PER_BLOCK
+                primary_slot = SparseLookup._lookup_slot(1, table)
+                for digit in 1:SparseLookup.WTA_DIGITS
+                    choice = Int(micro.winner_choices[digit, primary_slot])
+                    stats.hard_frequencies[choice, digit, table, block] += 1.0f0
+                end
+            end
+        end
+    end
+    @inbounds for block in 1:BLOCKS
+        count = Int(stats.observations[block])
+        count > 0 || continue
+        inverse = inv(Float32(count))
+        for table in 1:SparseLookup.TABLES_PER_BLOCK,
+                digit in 1:SparseLookup.WTA_DIGITS,
+                choice in 1:SparseLookup.WTA_CHOICES
+            stats.hard_frequencies[choice, digit, table, block] *= inverse
+        end
+    end
+    return stats
+end
+
 function _record_usage!(usage::RouteUsage, steps)
     usage.trajectories += 1
     usage.recurrent_steps += UInt64(length(steps))
@@ -1811,12 +1971,14 @@ function _record_usage!(usage::RouteUsage, steps)
     sparse.trajectories += 1
     sparse.recurrent_steps += UInt64(length(steps))
     @inbounds for step in steps, block in 1:BLOCKS
-        sparse.block_visits[block] += 1
-        tape = step.lookup.blocks[block]
-        for table in 1:SparseLookup.TABLES_PER_BLOCK
-            for lookup in 1:SparseLookup.ROWS_PER_TABLE_LOOKUP
-                slot = SparseLookup._lookup_slot(lookup, table)
-                sparse.counts[Int(tape.addresses[slot]), table, block] += 1
+        sparse.block_visits[block] += REGISTER_COUNT
+        for register in 1:REGISTER_COUNT
+            tape = step.lookup.blocks[block, register]
+            for table in 1:SparseLookup.TABLES_PER_BLOCK
+                for lookup in 1:SparseLookup.ROWS_PER_TABLE_LOOKUP
+                    slot = SparseLookup._lookup_slot(lookup, table)
+                    sparse.counts[Int(tape.addresses[slot]), table, block] += 1
+                end
             end
         end
     end
@@ -1974,6 +2136,16 @@ function advance_trajectory!(
         pooled = _pool_registers!(carrier_scratch.pooled, registers)
         final_registers = registers
     end
+    memory, memory_write = if state.arena === nothing
+        _working_memory_write_forward(
+            model, memory, registers, cross.attention_weights,
+        )
+    else
+        _working_memory_write_forward!(
+            state.arena.memory_write_scratch[step_index],
+            model, memory, registers, cross.attention_weights,
+        )
+    end
     halt_probability = _sigmoid(
         model.lookup.halt_bias[1] + dot(model.lookup.halt_weight, pooled),
     )
@@ -1989,7 +2161,8 @@ function advance_trajectory!(
              rand(state.rng) < halt_probability
          end : halt_probability >= 0.50f0))
     push!(state.steps, RecurrentStepTape(
-        spatial, cross, self, swiglu, lookup, final_registers, halt_probability,
+        spatial, cross, self, swiglu, lookup, memory_write, final_registers,
+        halt_probability,
         stochastic, stopped, forced_stop,
     ))
     state.memory = memory
@@ -2054,7 +2227,7 @@ function probe_one_step!(
     append!(arena.steps, tape.steps)
     state = ForwardTrajectoryState(
         tape.input,
-        stopped_step.spatial.output,
+        stopped_step.memory_write.output,
         arena.registers,
         arena.steps,
         arena,
@@ -2116,6 +2289,10 @@ mutable struct BackwardScratch
     attention_dvalue::Matrix{Float32}
     attention_dscore::Matrix{Float32}
     attention_dweights::Matrix{Float32}
+    attention_external_dweights::Array{Float32,3}
+    memory_write_dcontext::Matrix{Float32}
+    memory_write_dvalue::Matrix{Float32}
+    memory_write_dregisters::Matrix{Float32}
     dnormalized::Matrix{Float32}
     dregister_route::Matrix{Float32}
     dweights::Vector{Float32}
@@ -2167,6 +2344,10 @@ function BackwardScratch()
         zeros(Float32, ATTENTION_DIM, TOKEN_COUNT),
         zeros(Float32, TOKEN_COUNT, REGISTER_COUNT),
         zeros(Float32, TOKEN_COUNT, REGISTER_COUNT),
+        zeros(Float32, TOKEN_COUNT, REGISTER_COUNT, ATTENTION_HEADS),
+        zeros(Float32, ATTENTION_DIM, TOKEN_COUNT),
+        zeros(Float32, ATTENTION_DIM, REGISTER_COUNT),
+        zeros(Float32, MODEL_DIM, REGISTER_COUNT),
         zeros(Float32, MODEL_DIM, REGISTER_COUNT),
         zeros(Float32, EPISODIC_ROUTER_DIM, REGISTER_COUNT),
         # Shared softmax VJP scratch must fit every attention support.  The
@@ -2300,6 +2481,9 @@ function _zero_dense_gradients()
         :cross_o => zeros(Float32, MODEL_DIM, ATTENTION_DIM),
         :cross_scale_logit => zeros(Float32, 1),
         :relation_scale_logit => zeros(Float32, 1),
+        :memory_write_v => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
+        :memory_write_o => zeros(Float32, MODEL_DIM, ATTENTION_DIM),
+        :memory_write_scale_logit => zeros(Float32, 1),
         :self_q => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
         :self_k => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
         :self_v => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
@@ -2521,6 +2705,7 @@ end
 function _attention_core_vjp!(
     dquery, dkey, dvalue, dscore_total, dweights,
     query, key, value, weights, context_cotangent,
+    external_dweights=nothing,
 )
     queries = size(query, 2)
     keys = size(key, 2)
@@ -2558,6 +2743,11 @@ function _attention_core_vjp!(
                         context_cotangent[coordinate, query_index],
                         dvalue[coordinate, key_index],
                     )
+                end
+                if external_dweights !== nothing
+                    value_gradient += external_dweights[
+                        key_index, query_index, head,
+                    ]
                 end
                 dweights[key_index, query_index] = value_gradient
                 projection = muladd(
@@ -2601,6 +2791,7 @@ end
 function _cross_attention_vjp!(
     accumulator, model, tape, memory_normalized, state_cotangent,
     scratch::BackwardScratch, dinput, dmemory_normalized,
+    external_dweights=nothing,
 )
     fill!(dmemory_normalized, 0.0f0)
     _dgv(accumulator, :cross_scale_logit)[1] +=
@@ -2644,6 +2835,7 @@ function _cross_attention_vjp!(
         tape.value,
         tape.attention_weights,
         attention_context_cotangent,
+        external_dweights,
     )
 
     # All 283 memory tokens participate, so task gradients reach every K/V
@@ -2674,6 +2866,83 @@ function _cross_attention_vjp!(
         dinput[index] += state_cotangent[index]
     end
     return dinput
+end
+
+function _working_memory_write_vjp!(
+    accumulator,
+    model,
+    tape::WorkingMemoryWriteTape,
+    memory_cotangent,
+    state_cotangent,
+    scratch::BackwardScratch,
+)
+    _dgv(accumulator, :memory_write_scale_logit)[1] +=
+        dot(memory_cotangent, tape.projected) *
+        _residual_scale_derivative(model.memory_write_scale_logit[1])
+
+    dprojected = scratch.memory_previous
+    @inbounds @simd for index in eachindex(dprojected)
+        dprojected[index] = tape.alpha * memory_cotangent[index]
+    end
+    mul!(
+        _dgm(accumulator, :memory_write_o),
+        dprojected,
+        transpose(tape.context),
+        1.0f0,
+        1.0f0,
+    )
+    dcontext = scratch.memory_write_dcontext
+    mul!(dcontext, transpose(model.memory_write_o), dprojected)
+    dvalue = scratch.memory_write_dvalue
+    fill!(dvalue, 0.0f0)
+    external = scratch.attention_external_dweights
+    fill!(external, 0.0f0)
+    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
+    @inbounds for head in 1:ATTENTION_HEADS
+        first_coordinate = (head - 1) * head_dim + 1
+        last_coordinate = head * head_dim
+        for token in 1:TOKEN_COUNT
+            projection = 0.0f0
+            for register in 1:REGISTER_COUNT
+                dweight = 0.0f0
+                @simd for coordinate in first_coordinate:last_coordinate
+                    dweight = muladd(
+                        dcontext[coordinate, token],
+                        tape.value[coordinate, register],
+                        dweight,
+                    )
+                    dvalue[coordinate, register] = muladd(
+                        tape.weights[token, register, head],
+                        dcontext[coordinate, token],
+                        dvalue[coordinate, register],
+                    )
+                end
+                external[token, register, head] = dweight
+                projection = muladd(
+                    tape.weights[token, register, head], dweight, projection,
+                )
+            end
+            inverse = tape.inverse_weight_sums[token, head]
+            for register in 1:REGISTER_COUNT
+                external[token, register, head] = inverse * (
+                    external[token, register, head] - projection
+                )
+            end
+        end
+    end
+    mul!(
+        _dgm(accumulator, :memory_write_v),
+        dvalue,
+        transpose(tape.registers),
+        1.0f0,
+        1.0f0,
+    )
+    dregisters = scratch.memory_write_dregisters
+    mul!(dregisters, transpose(model.memory_write_v), dvalue)
+    @inbounds @simd for index in eachindex(state_cotangent)
+        state_cotangent[index] += dregisters[index]
+    end
+    return external
 end
 
 function _self_attention_vjp!(
@@ -2836,39 +3105,41 @@ end
 function _lookup_carrier_vjp!(
     accumulator, model, tape, state_cotangent, temperature,
     scratch::BackwardScratch, dinput,
+    balance_stats=nothing,
+    balance_weight::Float32=0.0f0,
 )
-    # Direct register residual path is exact.  Only the pooled carrier traverses
-    # the three active-only long-memory blocks.
+    # The direct residual and every LookupFFN trajectory are register-local.
+    # Parameters are shared, so gradients accumulate into the same sparse bank
+    # rows without pooling the credit signal between registers.
     copyto!(dinput, state_cotangent)
-    residual_cotangent = scratch.residual_cotangent
-    fill!(residual_cotangent, 0.0f0)
     gate_gradient = _dgv(accumulator, :lookup_register_gate)
     @inbounds for register in 1:REGISTER_COUNT
         gate = tape.gates[register]
         register_cotangent = @view state_cotangent[:, register]
-        gate_gradient[register] += dot(register_cotangent, tape.residual) *
+        gate_gradient[register] += dot(
+            register_cotangent, @view(tape.residual[:, register]),
+        ) *
             gate * (1.0f0 - gate)
+        carrier_cotangent = scratch.residual_cotangent
         @simd for coordinate in 1:MODEL_DIM
-            residual_cotangent[coordinate] = muladd(
-                gate, register_cotangent[coordinate],
-                residual_cotangent[coordinate],
+            carrier_cotangent[coordinate] = gate * register_cotangent[coordinate]
+        end
+        lookup_input_cotangent = carrier_cotangent
+        for block in BLOCKS:-1:1
+            lookup_input_cotangent = SparseLookup._lookup_micro_vjp!(
+                accumulator.lookup, model.lookup, tape.blocks[block, register],
+                block, lookup_input_cotangent, Float32(temperature),
+                balance_stats === nothing ? nothing :
+                    balance_stats.hard_frequencies,
+                balance_stats === nothing ? 0 :
+                    Int(balance_stats.observations[block]),
+                balance_weight,
             )
         end
-    end
-    carrier_cotangent = residual_cotangent
-    @inbounds for block in BLOCKS:-1:1
-        carrier_cotangent = SparseLookup._lookup_micro_vjp!(
-            accumulator.lookup, model.lookup, tape.blocks[block], block,
-            carrier_cotangent, Float32(temperature),
-        )
-    end
-    inverse_count = inv(Float32(REGISTER_COUNT))
-    @inbounds for register in 1:REGISTER_COUNT
         @simd for coordinate in 1:MODEL_DIM
-            # residual = lookup(pool(registers)) - pool(registers)
-            dinput[coordinate, register] += inverse_count * (
-                carrier_cotangent[coordinate] - residual_cotangent[coordinate]
-            )
+            # output = input + gate * (lookup(input) - input)
+            dinput[coordinate, register] +=
+                lookup_input_cotangent[coordinate] - carrier_cotangent[coordinate]
         end
     end
     return dinput
@@ -3316,6 +3587,8 @@ function backward_trajectory!(
     halt_probe_weight=1.0f0,
     temperature=0.50f0,
     ffn_scale_contributions=nothing,
+    lookup_balance_stats=nothing,
+    lookup_balance_weight=0.0f0,
 )
     scratch = accumulator.backward_scratch
     length(output_cotangent) == OUTPUT_DIM || throw(DimensionMismatch(
@@ -3357,22 +3630,10 @@ function backward_trajectory!(
     ))
     halt_logit_gradients = scratch.halt_gradients
     fill!(halt_logit_gradients, 0.0f0)
-    if halt_probe_mode
-        target = Float32(halt_probe_target)
-        if isfinite(target)
-            0.0f0 <= target <= 1.0f0 || throw(ArgumentError(
-                "halting probe target must lie in [0,1]",
-            ))
-            step = last(tape.steps)
-            step.stochastic_decision && step.stopped && !step.forced_stop ||
-                error("halting probe target was attached to an ineligible stop")
-            probability = clamp(
-                step.halt_probability, 1.0f-5, 1.0f0 - 1.0f-5,
-            )
-            halt_logit_gradients[depth] = Float32(halt_probe_weight) *
-                (probability - target)
-        end
-    elseif !tape.warmup_depth
+    # Sparse one-step probes supplement the trajectory policy gradient; they
+    # must not replace it.  Replacing it previously left every non-probed stop
+    # and every earlier continue decision without any halting credit.
+    if !tape.warmup_depth
         advantage = clamp(
             Float32(realized_loss) + Float32(compute_price) * Float32(depth) -
             Float32(baseline), -8.0f0, 8.0f0,
@@ -3388,6 +3649,22 @@ function backward_trajectory!(
                 advantage * action_gradient + entropy_gradient
         end
     end
+    if halt_probe_mode
+        target = Float32(halt_probe_target)
+        if isfinite(target)
+            0.0f0 <= target <= 1.0f0 || throw(ArgumentError(
+                "halting probe target must lie in [0,1]",
+            ))
+            step = last(tape.steps)
+            step.stochastic_decision && step.stopped && !step.forced_stop ||
+                error("halting probe target was attached to an ineligible stop")
+            probability = clamp(
+                step.halt_probability, 1.0f-5, 1.0f0 - 1.0f-5,
+            )
+            halt_logit_gradients[depth] += Float32(halt_probe_weight) *
+                (probability - target)
+        end
+    end
 
     # `memory_gradient` is the raw-memory cotangent arriving from the future
     # recurrent step.  Cross attention first produces a cotangent for the
@@ -3396,6 +3673,14 @@ function backward_trajectory!(
     fill!(scratch.memory_gradient, 0.0f0)
     for step_index in depth:-1:1
         step = tape.steps[step_index]
+        external_cross_dweights = _working_memory_write_vjp!(
+            accumulator,
+            model,
+            step.memory_write,
+            scratch.memory_gradient,
+            state_cotangent,
+            scratch,
+        )
         halt_gradient = halt_logit_gradients[step_index]
         if !iszero(halt_gradient)
             step_pooled = _pool_registers!(scratch.pooled, step.final_registers)
@@ -3417,6 +3702,7 @@ function backward_trajectory!(
         state_cotangent = _lookup_carrier_vjp!(
             accumulator, model, step.lookup, state_cotangent,
             Float32(temperature), scratch, next_cotangent,
+            lookup_balance_stats, Float32(lookup_balance_weight),
         )
         next_cotangent = state_cotangent === scratch.state_a ?
             scratch.state_b : scratch.state_a
@@ -3436,6 +3722,7 @@ function backward_trajectory!(
             accumulator, model, step.cross, step.spatial.output_normalized,
             state_cotangent, scratch, next_cotangent,
             scratch.memory_postnorm,
+            external_cross_dweights,
         )
 
         # Cross reads the RMS-normalized post-spatial memory.  Convert that
@@ -3787,7 +4074,8 @@ export BOARD_HEIGHT, BOARD_WIDTH, CELL_COUNT, PIECE_TYPES, NEXT_HOLD_TOKENS,
        MIN_RECURRENT_STEPS,
        MAX_RECURRENT_STEPS, WARMUP_MAX_STEPS, EpisodicCandidateInput,
        EpisodicViTLookupModel, Optimizer, TrajectoryTape, GradientAccumulator,
-       RouteUsage, candidate_input, initialize_model, initialize_optimizer,
+       RouteUsage, LookupBalanceStats, lookup_balance_stats!, candidate_input,
+       initialize_model, initialize_optimizer,
        configure_bank_optimizer!, materialize_selected_columns!, parameter_count,
        topology, usage_summary, record_usage!, ForwardCandidateArena,
        ForwardTrajectoryState,

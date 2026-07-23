@@ -1,5 +1,13 @@
 # 候補単位1-step halting probe — 2026-07-22
 
+> **2026-07-23追補**：本書はprobe-only信用割当を試した時点の履歴である。その後、
+> probeが有効な場合にtrajectory policy gradientを完全に置換すると、未probe stopと
+> それ以前のcontinue判断へhalting gradientが届かないことが判明した。現行実装は全
+> stochastic stop/continueへpolicy gradientとentropy gradientを与え、少数probe BCEを
+> 対象candidateの最終stopへ加算する。最新結果は
+> [`ROOT_CAUSE_REPAIR_100K_2026-07-23.md`](ROOT_CAUSE_REPAIR_100K_2026-07-23.md)
+> を参照すること。
+
 ## 判断
 
 probe mode有効時には、state全体へ同じ符号を与えるREINFORCE型halting更新を、物理的疎性を保ったcandidate-local教師へ置き換える。アーキテクチャ、20,577,789 parameter、入力・teacher contract、通常のtask loss、hard routing、active-only backward、sparse optimizer、checkpoint形式、candidate RNG順序、candidate独立評価は変更しない。

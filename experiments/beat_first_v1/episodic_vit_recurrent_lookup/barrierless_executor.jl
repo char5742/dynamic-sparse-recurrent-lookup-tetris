@@ -994,6 +994,9 @@ function _barrierless_state_loss_vjp!(
     scheduler.raw_gradients[state_slot] .= raw_gradient
     scheduler.state_losses[state_slot] = loss
     count = Int(state.candidate_count)
+    Model.lookup_balance_stats!(
+        workspace.lookup_balance_stats, workspace.tapes, count,
+    )
     halt_probe = _apply_halt_probes!(
         trainer,
         batch,
@@ -1065,6 +1068,8 @@ function _barrierless_backward!(
         halt_probe_mode=context.hyperparameters.halting.probe_candidates_per_state > 0,
         halt_probe_target=workspace.halt_probe_targets[candidate],
         halt_probe_weight=context.hyperparameters.halting.probe_weight,
+        lookup_balance_stats=workspace.lookup_balance_stats,
+        lookup_balance_weight=context.hyperparameters.routing.balance_weight,
         temperature=context.temperature,
         ffn_scale_contributions,
     )

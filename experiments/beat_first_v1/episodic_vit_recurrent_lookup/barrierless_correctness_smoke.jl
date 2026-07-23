@@ -325,15 +325,16 @@ function _tape_token_edges(tape)
 end
 
 function _tape_lookup_rows(tape)
-    return [[begin
-        block_tape = step.lookup.blocks[block]
+    return [[[begin
+        block_tape = step.lookup.blocks[block, register]
         ordered_columns = Int.(block_tape.columns)
         (;
             addresses=Int.(block_tape.addresses),
             ordered_columns,
             row_id_set=sort!(unique!(copy(ordered_columns))),
         )
-    end for block in eachindex(step.lookup.blocks)] for step in tape.steps]
+    end for register in axes(step.lookup.blocks, 2)]
+    for block in axes(step.lookup.blocks, 1)] for step in tape.steps]
 end
 
 function _discrete_snapshot(trainer, batches)

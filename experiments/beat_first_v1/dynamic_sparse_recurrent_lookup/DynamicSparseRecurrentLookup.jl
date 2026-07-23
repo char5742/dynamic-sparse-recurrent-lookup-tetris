@@ -1039,6 +1039,9 @@ end
 function _lookup_micro_vjp!(
     accumulator, model, tape, block, state_cotangent, temperature,
     scratch::LookupVJPScratch,
+    balance_frequencies=nothing,
+    balance_observations::Int=0,
+    balance_weight::Float32=0.0f0,
 )
     dvalue = scratch.dvalue
     dvalue .= tape.alpha .* state_cotangent
@@ -1072,6 +1075,32 @@ function _lookup_micro_vjp!(
             end
         end
     end
+    if balance_frequencies !== nothing && balance_observations > 0 &&
+            balance_weight > 0.0f0
+        coefficient = balance_weight * Float32(WTA_CHOICES) /
+            Float32(balance_observations) / Float32(temperature)
+        @inbounds for table in 1:TABLES_PER_BLOCK, digit in 1:WTA_DIGITS
+            frequency_projection = 0.0f0
+            for choice in 1:WTA_CHOICES
+                frequency_projection = muladd(
+                    tape.digit_probabilities[choice, digit, table],
+                    balance_frequencies[choice, digit, table, block],
+                    frequency_projection,
+                )
+            end
+            for choice in 1:WTA_CHOICES
+                probability = tape.digit_probabilities[choice, digit, table]
+                dlogit = coefficient * probability * (
+                    balance_frequencies[choice, digit, table, block] -
+                    frequency_projection
+                )
+                coordinate = SparseEngine._wta_coordinate(
+                    block, table, digit, choice,
+                )
+                droute[coordinate] += dlogit
+            end
+        end
+    end
     dnormalized = _bh4_vjp!(
         accumulator.dbh4[block], model.bh4_diagonals[block],
         tape.bh4_inputs, droute, scratch.bh4_current,
@@ -1091,10 +1120,16 @@ end
 """Existing call shape; uses the accumulator's preallocated thread-local scratch."""
 function _lookup_micro_vjp!(
     accumulator, model, tape, block, state_cotangent, temperature,
+    balance_frequencies=nothing,
+    balance_observations::Int=0,
+    balance_weight::Float32=0.0f0,
 )
     return _lookup_micro_vjp!(
         accumulator, model, tape, block, state_cotangent, temperature,
         accumulator.vjp_scratch,
+        balance_frequencies,
+        balance_observations,
+        balance_weight,
     )
 end
 
