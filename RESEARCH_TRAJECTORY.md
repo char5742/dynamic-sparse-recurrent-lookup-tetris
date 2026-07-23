@@ -755,6 +755,15 @@ loss`2.559976`、NDCG`0.991213`、pairwise`0.908830`へ反落した。
 この結果から、完走時点の100,000更新を自動採用せず、総合順位品質が最良の90,000更新を
 主採用checkpointとした。SHA-256は
 `3ea19a64fd72521c1e679c53b348525194214db3073e0937e8e515c864e28c71`である。
+
+推移は三段階に分かれた。10～30kは平均深度約2のままlossと全順位指標が急改善した。
+30～60kは緩やかな改善とtop-1停滞、60～70kは平均深度`2.820 -> 4.273`を伴う第2の
+改善だった。70～100kでは平均深度が`4.273 -> 2.000 -> 3.027 -> 4.880`と振動し、
+90kで総合最良に達した後、100kはmarginだけを伸ばしてloss、NDCG、pairwiseが反落した。
+一方、Lookup平均Giniは`0.426669 -> 0.190199`へ全期間で単調低下し、coverageは
+`85.15% -> 99.82%`へ単調上昇した。後半の振動はLookup collapse再発ではなく、task loss
+内の複数目的とhalting方策の相互作用による可能性が高い。
+
 全checkpointの結果と採用規則は
 [`ROOTFIX_CHECKPOINT_SWEEP_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/ROOTFIX_CHECKPOINT_SWEEP_2026-07-23.md)
 へ記録した。
