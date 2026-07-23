@@ -135,6 +135,34 @@ end
 const MIN_RECURRENT_STEPS = SparseLookup.MIN_RECURRENT_STEPS
 const MAX_RECURRENT_STEPS = SparseLookup.MAX_RECURRENT_STEPS
 const WARMUP_MAX_STEPS = SparseLookup.WARMUP_MAX_STEPS
+const HALT_DEPTH_PRIOR_SLOPE = let raw = strip(get(
+    ENV, "EVRL_HALT_DEPTH_PRIOR_SLOPE", "0.5",
+))
+    value = parse(Float32, raw)
+    isfinite(value) && value >= 0.0f0 || throw(ArgumentError(
+        "EVRL_HALT_DEPTH_PRIOR_SLOPE must be finite and nonnegative",
+    ))
+    value
+end
+const HALT_DEPTH_PRIOR_CENTER = let raw = strip(get(
+    ENV, "EVRL_HALT_DEPTH_PRIOR_CENTER", "4.0",
+))
+    value = parse(Float32, raw)
+    Float32(MIN_RECURRENT_STEPS) <= value <= Float32(MAX_RECURRENT_STEPS) ||
+        throw(ArgumentError(
+            "EVRL_HALT_DEPTH_PRIOR_CENTER must lie inside the recurrent bounds",
+        ))
+    value
+end
+const HALT_RESIDUAL_LOGIT_SCALE = let raw = strip(get(
+    ENV, "EVRL_HALT_RESIDUAL_LOGIT_SCALE", "0.75",
+))
+    value = parse(Float32, raw)
+    isfinite(value) && value >= 0.0f0 || throw(ArgumentError(
+        "EVRL_HALT_RESIDUAL_LOGIT_SCALE must be finite and nonnegative",
+    ))
+    value
+end
 const BLOCKS = SparseLookup.BLOCKS
 const LOCAL_SPATIAL_NEIGHBORS = 8
 const VISUAL_CHANNELS = 3
@@ -2146,9 +2174,17 @@ function advance_trajectory!(
             model, memory, registers, cross.attention_weights,
         )
     end
-    halt_probability = _sigmoid(
-        model.lookup.halt_bias[1] + dot(model.lookup.halt_weight, pooled),
-    )
+    # A fixed monotone hazard prior prevents tiny global bias changes around
+    # logit zero from flipping the entire panel between the minimum and maximum
+    # depth.  The learned head remains candidate-specific and learns only the
+    # residual evidence for stopping earlier or later than the prior centre.
+    learned_halt_logit = model.lookup.halt_bias[1] +
+        dot(model.lookup.halt_weight, pooled)
+    halt_logit =
+        HALT_DEPTH_PRIOR_SLOPE *
+            (Float32(step_index) - HALT_DEPTH_PRIOR_CENTER) +
+        HALT_RESIDUAL_LOGIT_SCALE * tanh(learned_halt_logit)
+    halt_probability = _sigmoid(halt_logit)
     forced_depth = iszero(state.forced_depth) ? nothing : Int(state.forced_depth)
     forced_stop = step_index == MAX_RECURRENT_STEPS ||
         (forced_depth !== nothing && step_index == forced_depth)
@@ -2244,6 +2280,34 @@ function probe_one_step!(
     copyto!(output, model.lookup.bias)
     mul!(output, model.lookup.head, pooled, 1.0f0, 1.0f0)
     return output
+end
+
+"""Return one scalar head output from an already materialized recurrent step."""
+function trajectory_step_output(
+    model::EpisodicViTLookupModel,
+    tape::TrajectoryTape,
+    step_index::Int,
+    output_index::Int,
+)
+    1 <= step_index <= length(tape.steps) || throw(BoundsError(
+        tape.steps, step_index,
+    ))
+    1 <= output_index <= OUTPUT_DIM || throw(BoundsError(
+        model.lookup.bias, output_index,
+    ))
+    registers = tape.steps[step_index].final_registers
+    value = model.lookup.bias[output_index]
+    inverse_registers = inv(Float32(REGISTER_COUNT))
+    @inbounds for register in 1:REGISTER_COUNT
+        @simd for coordinate in 1:MODEL_DIM
+            value = muladd(
+                model.lookup.head[output_index, coordinate] * inverse_registers,
+                registers[coordinate, register],
+                value,
+            )
+        end
+    end
+    return value
 end
 
 
@@ -3584,7 +3648,9 @@ function backward_trajectory!(
     entropy_weight=0.001f0,
     halt_probe_mode::Bool=false,
     halt_probe_target=Float32(NaN),
+    halt_trace_targets=nothing,
     halt_probe_weight=1.0f0,
+    unprobed_policy_scale=0.10f0,
     temperature=0.50f0,
     ffn_scale_contributions=nothing,
     lookup_balance_stats=nothing,
@@ -3630,14 +3696,25 @@ function backward_trajectory!(
     ))
     halt_logit_gradients = scratch.halt_gradients
     fill!(halt_logit_gradients, 0.0f0)
-    # Sparse one-step probes supplement the trajectory policy gradient; they
-    # must not replace it.  Replacing it previously left every non-probed stop
-    # and every earlier continue decision without any halting credit.
+    has_trace_credit = false
+    if halt_trace_targets !== nothing
+        length(halt_trace_targets) >= depth || throw(DimensionMismatch(
+            "halting trace target storage is shorter than trajectory depth",
+        ))
+        @inbounds for step_index in 1:depth
+            has_trace_credit |= isfinite(Float32(halt_trace_targets[step_index]))
+        end
+    end
+    # The terminal state loss is a high-variance fallback for trajectories that
+    # were not selected for a sparse counterfactual probe.  Once exact
+    # candidate-local trace targets exist, it must not compete with them.
     if !tape.warmup_depth
         advantage = clamp(
             Float32(realized_loss) + Float32(compute_price) * Float32(depth) -
             Float32(baseline), -8.0f0, 8.0f0,
         )
+        fallback_scale = has_trace_credit ? 0.0f0 :
+            Float32(unprobed_policy_scale)
         @inbounds for step_index in 1:depth
             step = tape.steps[step_index]
             step.stochastic_decision || continue
@@ -3645,11 +3722,29 @@ function backward_trajectory!(
             action_gradient = step.stopped ? 1.0f0 - probability : -probability
             entropy_gradient = -Float32(entropy_weight) * probability *
                 (1.0f0 - probability) * log((1.0f0 - probability) / probability)
-            halt_logit_gradients[step_index] = Float32(policy_weight) *
-                advantage * action_gradient + entropy_gradient
+            halt_logit_gradients[step_index] =
+                fallback_scale * Float32(policy_weight) *
+                    advantage * action_gradient + entropy_gradient
         end
     end
-    if halt_probe_mode
+    if halt_probe_mode && halt_trace_targets !== nothing
+        @inbounds for step_index in 1:depth
+            target = Float32(halt_trace_targets[step_index])
+            isfinite(target) || continue
+            0.0f0 <= target <= 1.0f0 || throw(ArgumentError(
+                "halting trace target must lie in [0,1]",
+            ))
+            step = tape.steps[step_index]
+            step.stochastic_decision || error(
+                "halting trace target was attached to a forced decision",
+            )
+            probability = clamp(
+                step.halt_probability, 1.0f-5, 1.0f0 - 1.0f-5,
+            )
+            halt_logit_gradients[step_index] +=
+                Float32(halt_probe_weight) * (probability - target)
+        end
+    elseif halt_probe_mode
         target = Float32(halt_probe_target)
         if isfinite(target)
             0.0f0 <= target <= 1.0f0 || throw(ArgumentError(
@@ -3684,14 +3779,20 @@ function backward_trajectory!(
         halt_gradient = halt_logit_gradients[step_index]
         if !iszero(halt_gradient)
             step_pooled = _pool_registers!(scratch.pooled, step.final_registers)
-            accumulator.lookup.dhalt_bias[1] += halt_gradient
+            learned_halt_logit = model.lookup.halt_bias[1] +
+                dot(model.lookup.halt_weight, step_pooled)
+            learned_tanh = tanh(learned_halt_logit)
+            learned_halt_gradient = halt_gradient *
+                HALT_RESIDUAL_LOGIT_SCALE *
+                (1.0f0 - learned_tanh * learned_tanh)
+            accumulator.lookup.dhalt_bias[1] += learned_halt_gradient
             @inbounds @simd for coordinate in 1:MODEL_DIM
                 accumulator.lookup.dhalt_weight[coordinate] = muladd(
-                    halt_gradient, step_pooled[coordinate],
+                    learned_halt_gradient, step_pooled[coordinate],
                     accumulator.lookup.dhalt_weight[coordinate],
                 )
-                gradient = model.lookup.halt_weight[coordinate] * halt_gradient /
-                    Float32(REGISTER_COUNT)
+                gradient = model.lookup.halt_weight[coordinate] *
+                    learned_halt_gradient / Float32(REGISTER_COUNT)
                 for register in 1:REGISTER_COUNT
                     state_cotangent[coordinate, register] += gradient
                 end
@@ -4080,7 +4181,7 @@ export BOARD_HEIGHT, BOARD_WIDTH, CELL_COUNT, PIECE_TYPES, NEXT_HOLD_TOKENS,
        topology, usage_summary, record_usage!, ForwardCandidateArena,
        ForwardTrajectoryState,
        prepare_trajectory, advance_trajectory!, finalize_trajectory,
-       probe_one_step!, forward_trajectory,
+       probe_one_step!, trajectory_step_output, forward_trajectory,
        backward_trajectory!, reset_gradients!, merge_gradients!, gradient_norm,
        scale_gradients!, optimizer_step!
 

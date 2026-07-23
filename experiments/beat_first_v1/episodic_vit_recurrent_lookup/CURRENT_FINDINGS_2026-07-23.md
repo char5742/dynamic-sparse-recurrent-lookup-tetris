@@ -1,5 +1,37 @@
 # EVRL研究の現時点での判明事項
 
+## 最新追補：haltingを収束させた
+
+根本修正版100kの10k刻み再評価では、平均深度が60～100kで
+`2.820 -> 4.273 -> 2.000 -> 3.027 -> 4.880`と振動した。原因は、同じterminal
+lossをtrajectory中の全stop／continueへ与える高分散な信用割当と、learned halt logitが
+停止境界を無制限に移動できたことだった。
+
+最終実装では、少数の1-step probe候補について各再帰stepのQだけを差し替え、同じ
+ListNetとmarginから候補固有の`L_stop - L_continue`教師を作る。probe済み
+trajectoryではterminal REINFORCEを重ねない。停止式は次のように有界化した。
+
+```text
+halt_logit = 0.5 * (step - 4) + 0.75 * tanh(learned_logit)
+```
+
+halt LRは60k以降`1e-6`、entropyは20kまでに0とする。同じ60k checkpointから20k
+更新した結果、65/70/75/80kのtraining-only固定128状態の平均深度は
+`3.001、3.066、3.006、3.036`となった。旧方式の同区間振幅`2.127`に対して
+`0.065`、96.9%減である。NDCGは`0.991098 -> 0.991465`、pairwiseは
+`0.906943 -> 0.911968`へ改善した。
+
+20k更新速度は`11.184 updates/s`、GC占有率は`0.763%`だった。最終式で既存90kを
+再評価するとloss`2.551701`、top-1`0.671875`、NDCG`0.991979`、pairwise
+`0.913475`、平均深度`4.004`、範囲4～5だった。品質最良のため、主採用checkpointは
+90k、SHA-256
+`3ea19a64fd72521c1e679c53b348525194214db3073e0937e8e515c864e28c71`
+を維持する。
+
+validationとsealed seedは使用していない。完全な原因、失敗arm、数値一致smoke、全推移は
+[`HALTING_CONVERGENCE_REPAIR_2026-07-23.md`](HALTING_CONVERGENCE_REPAIR_2026-07-23.md)
+に記録した。
+
 ## 最新追補：4つの根本問題を修正した100,000更新
 
 本書の従来の性能表は、長期記憶をregister間でpoolし、episodic memoryが読取り専用で、

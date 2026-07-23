@@ -145,7 +145,46 @@ function runtime_hyperparameters(maximum_updates::Int, payload=nothing)
             _property_or(inherited_halting, :probe_weight, 1.0f0);
             nonnegative=true,
         ),
+        probe_target_temperature=_float32_env(
+            "EVRL_HALT_TARGET_TEMPERATURE",
+            _property_or(inherited_halting, :probe_target_temperature, 5.0f-4),
+        ),
+        unprobed_policy_scale=_float32_env(
+            "EVRL_HALT_UNPROBED_POLICY_SCALE",
+            _property_or(inherited_halting, :unprobed_policy_scale, 0.10f0);
+            nonnegative=true,
+        ),
+        entropy_anneal_end_update=_int_env(
+            "EVRL_HALT_ENTROPY_ANNEAL_END",
+            _property_or(inherited_halting, :entropy_anneal_end_update, 20_000);
+            minimum=1,
+        ),
+        learning_rate_decay_start_update=_int_env(
+            "EVRL_HALT_LR_DECAY_START",
+            _property_or(inherited_halting, :learning_rate_decay_start_update, 20_000);
+            minimum=0,
+        ),
+        learning_rate_decay_end_update=_int_env(
+            "EVRL_HALT_LR_DECAY_END",
+            _property_or(inherited_halting, :learning_rate_decay_end_update, 60_000);
+            minimum=1,
+        ),
+        minimum_learning_rate_scale=_float32_env(
+            "EVRL_HALT_LR_MIN_SCALE",
+            _property_or(inherited_halting, :minimum_learning_rate_scale, 0.02f0);
+            nonnegative=true,
+        ),
+        depth_prior_slope=Model.HALT_DEPTH_PRIOR_SLOPE,
+        depth_prior_center=Model.HALT_DEPTH_PRIOR_CENTER,
+        residual_logit_scale=Model.HALT_RESIDUAL_LOGIT_SCALE,
     )
+    halting.unprobed_policy_scale <= 1.0f0 ||
+        error("EVRL_HALT_UNPROBED_POLICY_SCALE must be in [0,1]")
+    halting.minimum_learning_rate_scale <= 1.0f0 ||
+        error("EVRL_HALT_LR_MIN_SCALE must be in [0,1]")
+    halting.learning_rate_decay_end_update >
+        halting.learning_rate_decay_start_update ||
+        error("EVRL halt learning-rate decay interval is empty")
     iszero(halting.fixed_depth) ||
         Model.MIN_RECURRENT_STEPS <= halting.fixed_depth <= Model.MAX_RECURRENT_STEPS ||
         error("EVRL_FIXED_DEPTH must be zero or inside the recurrent bounds")
@@ -208,6 +247,33 @@ function _normalized_hyperparameters(value)
             halting, :probe_candidates_per_state, 0,
         ),
         probe_weight=Float32(_property_or(halting, :probe_weight, 1.0f0)),
+        probe_target_temperature=Float32(_property_or(
+            halting, :probe_target_temperature, 5.0f-4,
+        )),
+        unprobed_policy_scale=Float32(_property_or(
+            halting, :unprobed_policy_scale, 0.10f0,
+        )),
+        entropy_anneal_end_update=Int(_property_or(
+            halting, :entropy_anneal_end_update, 20_000,
+        )),
+        learning_rate_decay_start_update=Int(_property_or(
+            halting, :learning_rate_decay_start_update, 20_000,
+        )),
+        learning_rate_decay_end_update=Int(_property_or(
+            halting, :learning_rate_decay_end_update, 60_000,
+        )),
+        minimum_learning_rate_scale=Float32(_property_or(
+            halting, :minimum_learning_rate_scale, 0.02f0,
+        )),
+        depth_prior_slope=Float32(_property_or(
+            halting, :depth_prior_slope, Model.HALT_DEPTH_PRIOR_SLOPE,
+        )),
+        depth_prior_center=Float32(_property_or(
+            halting, :depth_prior_center, Model.HALT_DEPTH_PRIOR_CENTER,
+        )),
+        residual_logit_scale=Float32(_property_or(
+            halting, :residual_logit_scale, Model.HALT_RESIDUAL_LOGIT_SCALE,
+        )),
     )
     routing = value.routing
     normalized_routing = (;
@@ -223,6 +289,32 @@ function _normalized_hyperparameters(value)
         halting=normalized_halting,
         loss=value.loss,
     )
+end
+
+@inline function halting_entropy_weight(update::Int, halting)
+    end_update = max(halting.entropy_anneal_end_update, 1)
+    progress = clamp(Float32(update) / Float32(end_update), 0.0f0, 1.0f0)
+    return halting.entropy_weight * (1.0f0 - progress)
+end
+
+@inline function halting_learning_rate(update::Int, hyperparameters)
+    halting = hyperparameters.halting
+    optimizer = hyperparameters.optimizer
+    start_update = halting.learning_rate_decay_start_update
+    end_update = halting.learning_rate_decay_end_update
+    if update <= start_update
+        return optimizer.halt_learning_rate
+    end
+    progress = clamp(
+        Float32(update - start_update) /
+            Float32(max(end_update - start_update, 1)),
+        0.0f0,
+        1.0f0,
+    )
+    cosine = 0.5f0 * (1.0f0 + cos(Float32(pi) * progress))
+    scale = halting.minimum_learning_rate_scale +
+        (1.0f0 - halting.minimum_learning_rate_scale) * cosine
+    return optimizer.halt_learning_rate * scale
 end
 
 @inline function routing_temperature(update::Int, schedule)
@@ -263,6 +355,7 @@ mutable struct TeacherWorkspace
     forward_arenas::Vector{Model.ForwardCandidateArena}
     halt_probe_targets::Vector{Float32}
     halt_probe_deltas::Vector{Float32}
+    halt_trace_targets::Matrix{Float32}
     lookup_balance_stats::Model.LookupBalanceStats
 end
 
@@ -277,6 +370,7 @@ TeacherWorkspace() = TeacherWorkspace(
     [Model.ForwardCandidateArena() for _ in 1:LEARNER_WIDTH],
     fill(Float32(NaN), LEARNER_WIDTH),
     fill(Float32(NaN), LEARNER_WIDTH),
+    fill(Float32(NaN), Model.MAX_RECURRENT_STEPS, LEARNER_WIDTH),
     Model.LookupBalanceStats(),
 )
 
@@ -497,6 +591,7 @@ end
     fill!(workspace.depths, 0)
     fill!(workspace.halt_probe_targets, Float32(NaN))
     fill!(workspace.halt_probe_deltas, Float32(NaN))
+    fill!(workspace.halt_trace_targets, Float32(NaN))
     return workspace
 end
 
@@ -860,6 +955,33 @@ end
     return step.stochastic_decision && step.stopped && !step.forced_stop
 end
 
+@inline function _halting_soft_stop_target(
+    delta::Float32,
+    threshold::Float32,
+    temperature::Float32,
+)
+    logit = clamp((threshold - delta) / temperature, -12.0f0, 12.0f0)
+    return inv(1.0f0 + exp(-logit))
+end
+
+@inline function _ranking_loss_with_candidate_q!(
+    raw,
+    batch,
+    hyperparameters,
+    candidate::Int,
+    candidate_q::Float32,
+)
+    previous_q = raw[Q_OUTPUT_INDEX, candidate]
+    value = 0.0f0
+    try
+        raw[Q_OUTPUT_INDEX, candidate] = candidate_q
+        value = _halting_ranking_loss(raw, batch, hyperparameters)
+    finally
+        raw[Q_OUTPUT_INDEX, candidate] = previous_q
+    end
+    return value
+end
+
 """Attach candidate-local stop labels from a physically sparse one-step probe.
 
 Only the probed candidate's scalar Q is replaced while computing the
@@ -879,10 +1001,14 @@ function _apply_halt_probes!(
     requested = hyperparameters.halting.probe_candidates_per_state
     requested <= 0 && return (;
         count=0, continue_count=0, stop_count=0, mean_delta=0.0f0,
+        trace_count=0, mean_trace_target=0.0f0,
+        mean_trace_confidence=0.0f0,
     )
     count = _valid_candidate_count(batch)
     count == 0 && return (;
         count=0, continue_count=0, stop_count=0, mean_delta=0.0f0,
+        trace_count=0, mean_trace_target=0.0f0,
+        mean_trace_confidence=0.0f0,
     )
     scheduler = trainer.scheduler
     arena = scheduler.probe_arenas[worker_slot]
@@ -891,6 +1017,11 @@ function _apply_halt_probes!(
     selected = 0
     continue_count = 0
     delta_sum = 0.0f0
+    trace_count = 0
+    trace_target_sum = 0.0f0
+    trace_confidence_sum = 0.0f0
+    target_temperature =
+        hyperparameters.halting.probe_target_temperature
     start = mod(expected_update + 31 * state_slot - 2, count) + 1
     @inbounds for offset in 0:(count - 1)
         selected >= requested && break
@@ -906,23 +1037,49 @@ function _apply_halt_probes!(
                 expected_update, hyperparameters.routing,
             ),
         )
-        previous_q = workspace.raw[Q_OUTPUT_INDEX, candidate]
-        continue_loss = stop_loss
-        try
-            workspace.raw[Q_OUTPUT_INDEX, candidate] =
-                probe_output[Q_OUTPUT_INDEX]
-            continue_loss = _halting_ranking_loss(
-                workspace.raw, batch, hyperparameters,
-            )
-        finally
-            workspace.raw[Q_OUTPUT_INDEX, candidate] = previous_q
-        end
+        continue_loss = _ranking_loss_with_candidate_q!(
+            workspace.raw,
+            batch,
+            hyperparameters,
+            candidate,
+            probe_output[Q_OUTPUT_INDEX],
+        )
         delta = stop_loss - continue_loss
-        target = delta > hyperparameters.halting.compute_price ? 0.0f0 : 1.0f0
+        depth = length(tape.steps)
+        @inbounds for step_index in 1:depth
+            step = tape.steps[step_index]
+            step.stochastic_decision || continue
+            step_delta = if step_index == depth
+                delta
+            else
+                early_q = Model.trajectory_step_output(
+                    trainer.model, tape, step_index, Q_OUTPUT_INDEX,
+                )
+                early_stop_loss = _ranking_loss_with_candidate_q!(
+                    workspace.raw,
+                    batch,
+                    hyperparameters,
+                    candidate,
+                    early_q,
+                )
+                early_stop_loss - stop_loss
+            end
+            extra_steps = step_index == depth ? 1 : depth - step_index
+            threshold = hyperparameters.halting.compute_price *
+                Float32(extra_steps)
+            step_target = _halting_soft_stop_target(
+                step_delta, threshold, target_temperature,
+            )
+            workspace.halt_trace_targets[step_index, candidate] = step_target
+            trace_count += 1
+            trace_target_sum += step_target
+            trace_confidence_sum += abs(2.0f0 * step_target - 1.0f0)
+        end
+        target = workspace.halt_trace_targets[depth, candidate]
         workspace.halt_probe_deltas[candidate] = delta
         workspace.halt_probe_targets[candidate] = target
         selected += 1
-        continue_count += iszero(target)
+        continue_count += target < 0.5f0
         delta_sum += delta
     end
     return (;
@@ -930,6 +1087,11 @@ function _apply_halt_probes!(
         continue_count,
         stop_count=selected - continue_count,
         mean_delta=selected == 0 ? 0.0f0 : delta_sum / Float32(selected),
+        trace_count,
+        mean_trace_target=trace_count == 0 ? 0.0f0 :
+            trace_target_sum / Float32(trace_count),
+        mean_trace_confidence=trace_count == 0 ? 0.0f0 :
+            trace_confidence_sum / Float32(trace_count),
     )
 end
 
@@ -1072,10 +1234,16 @@ function _accumulate_dynamic_batches!(
             baseline,
             compute_price=hyperparameters.halting.compute_price,
             policy_weight=hyperparameters.halting.policy_weight,
-            entropy_weight=hyperparameters.halting.entropy_weight,
+            entropy_weight=halting_entropy_weight(
+                expected_update, hyperparameters.halting,
+            ),
             halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
             halt_probe_target=scheduler.state_workspaces[state_slot].halt_probe_targets[candidate],
+            halt_trace_targets=@view(
+                scheduler.state_workspaces[state_slot].halt_trace_targets[:, candidate]
+            ),
             halt_probe_weight=hyperparameters.halting.probe_weight,
+            unprobed_policy_scale=hyperparameters.halting.unprobed_policy_scale,
             lookup_balance_stats=scheduler.state_workspaces[state_slot].lookup_balance_stats,
             lookup_balance_weight=hyperparameters.routing.balance_weight,
             temperature,
@@ -1138,10 +1306,16 @@ function _accumulate_state_gradient!(
                 baseline,
                 compute_price=hyperparameters.halting.compute_price,
                 policy_weight=hyperparameters.halting.policy_weight,
-                entropy_weight=hyperparameters.halting.entropy_weight,
+                entropy_weight=halting_entropy_weight(
+                    expected_update, hyperparameters.halting,
+                ),
                 halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
                 halt_probe_target=trainer.workspace.halt_probe_targets[1],
+                halt_trace_targets=@view(
+                    trainer.workspace.halt_trace_targets[:, 1]
+                ),
                 halt_probe_weight=hyperparameters.halting.probe_weight,
+                unprobed_policy_scale=hyperparameters.halting.unprobed_policy_scale,
                 lookup_balance_stats=trainer.workspace.lookup_balance_stats,
                 lookup_balance_weight=hyperparameters.routing.balance_weight,
                 temperature,
@@ -1161,10 +1335,16 @@ function _accumulate_state_gradient!(
                 baseline,
                 compute_price=hyperparameters.halting.compute_price,
                 policy_weight=hyperparameters.halting.policy_weight,
-                entropy_weight=hyperparameters.halting.entropy_weight,
+                entropy_weight=halting_entropy_weight(
+                    expected_update, hyperparameters.halting,
+                ),
                 halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
                 halt_probe_target=trainer.workspace.halt_probe_targets[candidate],
+                halt_trace_targets=@view(
+                    trainer.workspace.halt_trace_targets[:, candidate]
+                ),
                 halt_probe_weight=hyperparameters.halting.probe_weight,
+                unprobed_policy_scale=hyperparameters.halting.unprobed_policy_scale,
                 lookup_balance_stats=trainer.workspace.lookup_balance_stats,
                 lookup_balance_weight=hyperparameters.routing.balance_weight,
                 temperature,
@@ -1183,10 +1363,16 @@ function _accumulate_state_gradient!(
                 baseline,
                 compute_price=hyperparameters.halting.compute_price,
                 policy_weight=hyperparameters.halting.policy_weight,
-                entropy_weight=hyperparameters.halting.entropy_weight,
+                entropy_weight=halting_entropy_weight(
+                    expected_update, hyperparameters.halting,
+                ),
                 halt_probe_mode=hyperparameters.halting.probe_candidates_per_state > 0,
                 halt_probe_target=trainer.workspace.halt_probe_targets[candidate],
+                halt_trace_targets=@view(
+                    trainer.workspace.halt_trace_targets[:, candidate]
+                ),
                 halt_probe_weight=hyperparameters.halting.probe_weight,
+                unprobed_policy_scale=hyperparameters.halting.unprobed_policy_scale,
                 lookup_balance_stats=trainer.workspace.lookup_balance_stats,
                 lookup_balance_weight=hyperparameters.routing.balance_weight,
                 temperature,
@@ -1297,7 +1483,9 @@ function train_accumulated_step!(
             token_learning_rate=opt.token_learning_rate * episodic_lr_scale,
             register_learning_rate=opt.register_learning_rate * episodic_lr_scale,
             head_learning_rate=opt.head_learning_rate * episodic_lr_scale,
-            halt_learning_rate=opt.halt_learning_rate,
+            halt_learning_rate=halting_learning_rate(
+                expected_update, hyperparameters,
+            ),
             dense_weight_decay=opt.dense_weight_decay,
         )
     end
@@ -1324,6 +1512,19 @@ function train_accumulated_step!(
         Float64(result.halt_probe.mean_delta) * result.halt_probe.count
         for result in state_results
     ) / halt_probe_count
+    halt_trace_count = sum(
+        result.halt_probe.trace_count for result in state_results
+    )
+    halt_trace_mean_target = halt_trace_count == 0 ? 0.0 : sum(
+        Float64(result.halt_probe.mean_trace_target) *
+            result.halt_probe.trace_count
+        for result in state_results
+    ) / halt_trace_count
+    halt_trace_mean_confidence = halt_trace_count == 0 ? 0.0 : sum(
+        Float64(result.halt_probe.mean_trace_confidence) *
+            result.halt_probe.trace_count
+        for result in state_results
+    ) / halt_trace_count
     trainer.baseline = muladd(
         0.99f0,
         trainer.baseline,
@@ -1355,6 +1556,15 @@ function train_accumulated_step!(
         halt_probe_continue_count,
         halt_probe_stop_count,
         halt_probe_mean_delta,
+        halt_trace_count,
+        halt_trace_mean_target,
+        halt_trace_mean_confidence,
+        halt_entropy_weight=Float64(halting_entropy_weight(
+            expected_update, hyperparameters.halting,
+        )),
+        halt_learning_rate=Float64(halting_learning_rate(
+            expected_update, hyperparameters,
+        )),
         routing_temperature=Float64(routing_temperature(expected_update, hyperparameters.routing)),
         episodic_learning_rate_scale=Float64(episodic_lr_scale),
         baseline=Float64(trainer.baseline),

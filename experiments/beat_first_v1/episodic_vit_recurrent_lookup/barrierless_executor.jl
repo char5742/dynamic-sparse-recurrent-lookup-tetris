@@ -1064,10 +1064,15 @@ function _barrierless_backward!(
         baseline=context.baseline,
         compute_price=context.hyperparameters.halting.compute_price,
         policy_weight=context.hyperparameters.halting.policy_weight,
-        entropy_weight=context.hyperparameters.halting.entropy_weight,
+        entropy_weight=halting_entropy_weight(
+            context.expected_update, context.hyperparameters.halting,
+        ),
         halt_probe_mode=context.hyperparameters.halting.probe_candidates_per_state > 0,
         halt_probe_target=workspace.halt_probe_targets[candidate],
+        halt_trace_targets=@view(workspace.halt_trace_targets[:, candidate]),
         halt_probe_weight=context.hyperparameters.halting.probe_weight,
+        unprobed_policy_scale=
+            context.hyperparameters.halting.unprobed_policy_scale,
         lookup_balance_stats=workspace.lookup_balance_stats,
         lookup_balance_weight=context.hyperparameters.routing.balance_weight,
         temperature=context.temperature,

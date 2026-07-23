@@ -386,6 +386,13 @@ function _discrete_snapshot(trainer, batches)
         [reinterpret(UInt32, workspace.halt_probe_deltas[candidate])
          for candidate in 1:counts[state]]
     end for state in eachindex(batches)]
+    halt_trace_targets = [begin
+        workspace = trainer.scheduler.state_workspaces[state]
+        [copy(reinterpret(
+            UInt32,
+            @view(workspace.halt_trace_targets[:, candidate]),
+        )) for candidate in 1:counts[state]]
+    end for state in eachindex(batches)]
     return (;
         counts,
         candidate_seeds,
@@ -396,6 +403,7 @@ function _discrete_snapshot(trainer, batches)
         lookup_rows,
         halt_probe_targets,
         halt_probe_deltas,
+        halt_trace_targets,
     )
 end
 
@@ -841,6 +849,9 @@ function main()
             halt_probe_delta=
                 barrierless_discrete.halt_probe_deltas ==
                     serial_discrete.halt_probe_deltas,
+            halt_trace_target=
+                barrierless_discrete.halt_trace_targets ==
+                    serial_discrete.halt_trace_targets,
             active_token_mask=
                 barrierless_gradient.active_tokens == serial_gradient.active_tokens,
             selected_row_events=

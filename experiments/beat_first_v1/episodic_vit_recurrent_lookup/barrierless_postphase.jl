@@ -513,19 +513,21 @@ function _barrierless_optimize_lookup_head!(runtime, trainer, opt, lr_scale)
     return nothing
 end
 
-function _barrierless_optimize_lookup_halt!(runtime, trainer, opt)
+function _barrierless_optimize_lookup_halt!(
+    runtime, trainer, opt, learning_rate,
+)
     model = trainer.model.lookup
     state = trainer.optimizer.lookup.dense
     gradient = trainer.scheduler.merged_accumulator.lookup
     kwargs = _barrierless_sparse_adam_kwargs(opt)
     Model.SparseLookup._adam_update!(
         model.halt_weight, state.mhalt_weight, state.vhalt_weight,
-        gradient.dhalt_weight, runtime.next_step, opt.halt_learning_rate;
+        gradient.dhalt_weight, runtime.next_step, learning_rate;
         kwargs...,
     )
     Model.SparseLookup._adam_update!(
         model.halt_bias, state.mhalt_bias, state.vhalt_bias,
-        gradient.dhalt_bias, runtime.next_step, opt.halt_learning_rate;
+        gradient.dhalt_bias, runtime.next_step, learning_rate;
         kwargs...,
     )
     return nothing
@@ -623,7 +625,14 @@ function _barrierless_dispatch_post_work!(
     elseif opcode == BARRIERLESS_POST_OPTIMIZE_LOOKUP_HEAD
         _barrierless_optimize_lookup_head!(runtime, trainer, opt, lr_scale)
     elseif opcode == BARRIERLESS_POST_OPTIMIZE_LOOKUP_HALT
-        _barrierless_optimize_lookup_halt!(runtime, trainer, opt)
+        _barrierless_optimize_lookup_halt!(
+            runtime,
+            trainer,
+            opt,
+            halting_learning_rate(
+                context.expected_update, context.hyperparameters,
+            ),
+        )
     elseif opcode == BARRIERLESS_POST_OPTIMIZE_LOOKUP_REINJECT
         _barrierless_optimize_lookup_reinject!(runtime, trainer, opt, lr_scale)
     elseif opcode == BARRIERLESS_POST_OPTIMIZE_DENSE

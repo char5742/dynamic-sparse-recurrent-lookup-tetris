@@ -767,3 +767,45 @@ loss`2.559976`、NDCG`0.991213`、pairwise`0.908830`へ反落した。
 全checkpointの結果と採用規則は
 [`ROOTFIX_CHECKPOINT_SWEEP_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/ROOTFIX_CHECKPOINT_SWEEP_2026-07-23.md)
 へ記録した。
+
+## 28. 2026-07-23 — halting信用割当を収束させた
+
+根本修正版の60～100kで平均深度が`2.820 -> 4.273 -> 2.000 -> 3.027 ->
+4.880`と振動した原因を、trajectory全体へ同じterminal lossを与える高分散な信用割当と
+特定した。悪いtrajectoryでは途中のcontinueと最後のstopが同時に抑制され、halt logitが
+0付近にある多数候補がglobal biasの小変化だけで一斉に反転していた。
+
+既存の物理的に疎な1-step probeを拡張し、probe候補について既に保存済みの各step Qだけを
+差し替え、同じListNetとmargin lossを再計算した。これにより最終stopだけでなく、先行する
+全stochastic continueへ候補固有の`L_stop - L_continue`教師を与えた。probe済み
+trajectoryでは高分散なterminal REINFORCEを重ねず、未probe trajectoryだけ0.1倍の
+fallbackを残した。
+
+最初にstep 4中心の単調hazard priorを加えたが、無制限のlearned residualがpriorを
+上書きし、20k更新後も平均深度が`3.182 -> 3.413 -> 2.006 -> 4.133`と振動した。
+このarmは不採用とした。
+
+最終版では
+`halt_logit = 0.5 * (step - 4) + 0.75 * tanh(learned_logit)`とし、halt LRを
+60k以降`1e-6`へ収束させた。real-teacher serial／barrierless smokeは出力、loss、
+raw VJPが完全一致し、parameter gradient最大差`1.47e-6`、optimizer後parameter
+最大差`1.94e-5`で合格した。
+
+同じ60k checkpointから20k更新すると、固定training-only 128状態の平均深度は
+65/70/75/80kで`3.001、3.066、3.006、3.036`となった。振幅`0.065`は不採用armの
+`2.127`から96.9%減少した。決定論的深度は3～6、学習時の確率的深度は最終batchで
+2～9だった。NDCGは`0.991098 -> 0.991465`、pairwiseは
+`0.906943 -> 0.911968`へ改善した。
+
+20k更新は1,788.273秒、`11.184 updates/s`で、allocationは`8.620 MB/update`、
+GC占有率は`0.763%`だった。速度下限10 updates/sを維持した。
+
+最終halting式で既存90kも再評価し、loss`2.551701`、top-1`0.671875`、NDCG
+`0.991979`、pairwise`0.913475`、平均深度`4.004`、範囲4～5を得た。収束arm75kより
+総合品質が高いため、主採用checkpointは90k、SHA-256
+`3ea19a64fd72521c1e679c53b348525194214db3073e0937e8e515c864e28c71`
+を維持した。
+
+詳細は
+[`HALTING_CONVERGENCE_REPAIR_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/HALTING_CONVERGENCE_REPAIR_2026-07-23.md)
+へ記録した。validationとsealed seedは使用していない。
