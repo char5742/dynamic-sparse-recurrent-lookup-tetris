@@ -65,6 +65,8 @@ const BARRIERLESS_DENSE_PARAMETER_NAMES = (
     :spatial_o,
     :spatial_relative_bias,
     :spatial_scale_logit,
+    :recurrent_depthwise,
+    :recurrent_depthwise_scale_logit,
     :cross_q,
     :cross_k,
     :cross_v,
@@ -86,7 +88,8 @@ const BARRIERLESS_DENSE_PARAMETER_NAMES = (
     :lookup_register_gate,
 )
 
-const BARRIERLESS_LOOKUP_GRADIENT_COUNT = 9
+const BARRIERLESS_LOOKUP_GRADIENT_COUNT =
+    Model.SparseLookup.BLOCKS + 6
 
 mutable struct BarrierlessPostRuntime
     complete::Base.Threads.Atomic{UInt32}
@@ -94,7 +97,7 @@ mutable struct BarrierlessPostRuntime
     works::Vector{BarrierlessPostWork}
     jobs::Vector{BarrierlessJob}
     work_count::Int
-    row_ids::NTuple{3,Vector{Int32}}
+    row_ids::NTuple{Model.SparseLookup.BLOCKS,Vector{Int32}}
     worker_row_scratch::Vector{Vector{Int32}}
     scale::Float32
     next_step::UInt64
@@ -255,15 +258,15 @@ end
 
 @inline function _barrierless_lookup_gradient(accumulator, index::Int)
     lookup = accumulator.lookup
-    index == 1 && return lookup.dbh4[1]
-    index == 2 && return lookup.dbh4[2]
-    index == 3 && return lookup.dbh4[3]
-    index == 4 && return lookup.dalpha_logits
-    index == 5 && return lookup.dhead
-    index == 6 && return lookup.dbias
-    index == 7 && return lookup.dhalt_weight
-    index == 8 && return lookup.dhalt_bias
-    index == 9 && return lookup.dreinject_logit
+    blocks = Model.SparseLookup.BLOCKS
+    index <= blocks && return lookup.dbh4[index]
+    offset = index - blocks
+    offset == 1 && return lookup.dalpha_logits
+    offset == 2 && return lookup.dhead
+    offset == 3 && return lookup.dbias
+    offset == 4 && return lookup.dhalt_weight
+    offset == 5 && return lookup.dhalt_bias
+    offset == 6 && return lookup.dreinject_logit
     throw(BoundsError("lookup gradient", index))
 end
 

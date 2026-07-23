@@ -4,6 +4,10 @@ using LinearAlgebra
 using Random
 
 if !isdefined(Main, :DynamicSparseRecurrentLookup)
+    # EVRL is one recurrent block.  Repetition belongs to the outer adaptive
+    # recurrence, so one macro step must not contain another three-deep Lookup
+    # stack.
+    ENV["DSRL_BLOCKS"] = "1"
     Base.include(
         Main,
         joinpath(
@@ -14,6 +18,9 @@ if !isdefined(Main, :DynamicSparseRecurrentLookup)
 end
 const SparseLookup = Main.DynamicSparseRecurrentLookup
 const SparseEngine = Main.ResidualLookupSlide
+SparseLookup.BLOCKS == 1 || error(
+    "EVRL requires DSRL_BLOCKS=1; start it in a fresh Julia process",
+)
 
 # This module deliberately defines its input boundary independently of the
 # historical sparse-feature adapters.  These are exactly the five tensors read
@@ -305,6 +312,12 @@ mutable struct EpisodicViTLookupModel
     spatial_relative_bias::Array{Float32,3}
     spatial_scale_logit::Vector{Float32}
 
+    # A shared 3x3 depthwise mixer runs on the recurrent 24x10 cell working
+    # memory.  Reapplying the outer block grows its receptive field without
+    # adding another LookupFFN call inside one reasoning step.
+    recurrent_depthwise::Array{Float32,3}
+    recurrent_depthwise_scale_logit::Vector{Float32}
+
     cross_q::Matrix{Float32}
     cross_k::Matrix{Float32}
     cross_v::Matrix{Float32}
@@ -360,6 +373,15 @@ function initialize_model(rng::AbstractRNG=Xoshiro(0))
         rng, Float32, VISUAL_CHANNELS, VISUAL_CHANNELS, VISUAL_STAGES,
     )
     visual_pointwise = _xavier(rng, MODEL_DIM, VISUAL_CHANNELS)
+    recurrent_depthwise = zeros(Float32, MODEL_DIM, 3, 3)
+    recurrent_blur = Float32[1 2 1; 2 4 2; 1 2 1] ./ 16.0f0
+    @inbounds for kernel_column in 1:3, kernel_row in 1:3
+        @simd for coordinate in 1:MODEL_DIM
+            recurrent_depthwise[
+                coordinate, kernel_row, kernel_column,
+            ] = recurrent_blur[kernel_row, kernel_column]
+        end
+    end
     next_projection = _xavier(rng, MODEL_DIM, PIECE_TYPES)
     aux_value = randn(rng, Float32, MODEL_DIM, AUX_FEATURES) .* inv(sqrt(Float32(MODEL_DIM)))
     position_scale = 0.02f0
@@ -384,6 +406,8 @@ function initialize_model(rng::AbstractRNG=Xoshiro(0))
         _xavier(rng, SPATIAL_PROJECTION_BLOCK_WIDTH, ATTENTION_DIM),
         _xavier(rng, SPATIAL_PROJECTION_BLOCK_WIDTH, ATTENTION_DIM),
         zeros(Float32, 3, 3, ATTENTION_HEADS),
+        Float32[INITIAL_RESIDUAL_LOGIT],
+        recurrent_depthwise,
         Float32[INITIAL_RESIDUAL_LOGIT],
         _xavier(rng, ATTENTION_DIM, MODEL_DIM),
         _xavier(rng, ATTENTION_DIM, MODEL_DIM),
@@ -428,6 +452,8 @@ function _dense_parameters(model::EpisodicViTLookupModel)
         spatial_o=model.spatial_o,
         spatial_relative_bias=model.spatial_relative_bias,
         spatial_scale_logit=model.spatial_scale_logit,
+        recurrent_depthwise=model.recurrent_depthwise,
+        recurrent_depthwise_scale_logit=model.recurrent_depthwise_scale_logit,
         cross_q=model.cross_q,
         cross_k=model.cross_k,
         cross_v=model.cross_v,
@@ -458,7 +484,7 @@ function topology(model::EpisodicViTLookupModel)
     return (;
         architecture="episodic-vit-recurrent-active-lookup",
         input_contract="preact-board-candidate-difference-next-hold-aux37",
-        spatial_encoder="light-global-receptive-field-dilated-depthwise-pointwise-visual-stack-plus-shared-recurrent-learned-qkvo-8-neighbour-sparse-cell-attention-no-countsketch",
+        spatial_encoder="light-global-receptive-field-dilated-depthwise-pointwise-visual-stack-plus-shared-recurrent-3x3-depthwise-and-learned-qkvo-8-neighbour-sparse-cell-attention-no-countsketch",
         visual_stem="raw3-five-stage-dilated-depthwise3x3-silu-pointwise3x3-residual-then-pointwise3-to-model-dim",
         visual_dilations=VISUAL_DILATIONS,
         visual_receptive_field=(VISUAL_RECEPTIVE_FIELD, VISUAL_RECEPTIVE_FIELD),
@@ -480,7 +506,7 @@ function topology(model::EpisodicViTLookupModel)
         attention_dim=ATTENTION_DIM,
         attention_heads=ATTENTION_HEADS,
         ffn_dim=FFN_DIM,
-        recurrent_block="shared-full-token-cross-register-self-swiglu-register-local-active-lookup-reverse-cross-working-memory-write",
+        recurrent_block="shared-cell-depthwise-spatial-attention-full-token-cross-register-self-swiglu-single-register-local-active-lookup-reverse-cross-working-memory-write",
         episodic_router="none-full-token-cross-attention",
         episodic_attention="shared-learned-qkvo-full-283-token-softmax",
         episodic_projected_token_occurrences_per_step=TOKEN_COUNT,
@@ -497,6 +523,11 @@ function topology(model::EpisodicViTLookupModel)
         episodic_retrieval_entry_reads_upper_bound_per_step=0,
         spatial_relation="physical-8-neighbour-relative-position-learned-qkvo",
         spatial_local_edges_upper_bound=CELL_COUNT * LOCAL_SPATIAL_NEIGHBORS,
+        recurrent_depthwise_kernel=(3, 3),
+        recurrent_depthwise_parameters=length(model.recurrent_depthwise) +
+            length(model.recurrent_depthwise_scale_logit),
+        recurrent_depthwise_scalar_macs_per_step=
+            CELL_COUNT * MODEL_DIM * 9,
         candidate_support_cap=0,
         spatial_dense_all_token_scores=0,
         long_memory_carriers_per_step=REGISTER_COUNT,
@@ -950,6 +981,7 @@ struct SpatialAttentionTape
     output_normalized::Matrix{Float32}
     output_inverse_rms::Vector{Float32}
     alpha::Float32
+    depthwise_alpha::Float32
 end
 
 mutable struct SpatialAttentionForwardScratch
@@ -1011,6 +1043,37 @@ function _local_neighbor_ids()
 end
 
 const LOCAL_NEIGHBOR_IDS, LOCAL_NEIGHBOR_COUNTS = _local_neighbor_ids()
+
+function _recurrent_depthwise_add!(
+    output,
+    normalized,
+    kernels,
+    alpha::Float32,
+)
+    @inbounds for token in 1:CELL_COUNT
+        row, column = _cell_row_column(token)
+        for delta_column in -1:1, delta_row in -1:1
+            source_row = row + delta_row
+            source_column = column + delta_column
+            1 <= source_row <= BOARD_HEIGHT || continue
+            1 <= source_column <= BOARD_WIDTH || continue
+            source_token =
+                (source_column - 1) * BOARD_HEIGHT + source_row
+            kernel_row = delta_row + 2
+            kernel_column = delta_column + 2
+            @simd for coordinate in 1:MODEL_DIM
+                output[coordinate, token] = muladd(
+                    alpha * kernels[
+                        coordinate, kernel_row, kernel_column,
+                    ],
+                    normalized[coordinate, source_token],
+                    output[coordinate, token],
+                )
+            end
+        end
+    end
+    return output
+end
 
 function _spatial_attention_forward!(scratch::SpatialAttentionForwardScratch,
                                      model, memory)
@@ -1090,6 +1153,14 @@ function _spatial_attention_forward!(scratch::SpatialAttentionForwardScratch,
             )
         end
     end
+    depthwise_alpha =
+        _residual_scale(model.recurrent_depthwise_scale_logit[1])
+    _recurrent_depthwise_add!(
+        output,
+        normalized,
+        model.recurrent_depthwise,
+        depthwise_alpha,
+    )
     output_normalized = scratch.output_normalized
     copyto!(output_normalized, output)
     output_inverse_rms = scratch.output_inverse_rms
@@ -1098,6 +1169,7 @@ function _spatial_attention_forward!(scratch::SpatialAttentionForwardScratch,
         normalized, inverse_rms, query, key, value,
         LOCAL_NEIGHBOR_IDS, LOCAL_NEIGHBOR_COUNTS, weights, context,
         projected, output, output_normalized, output_inverse_rms, alpha,
+        depthwise_alpha,
     )
 end
 
@@ -2539,6 +2611,8 @@ function _zero_dense_gradients()
         :spatial_o => zeros(Float32, MODEL_DIM, ATTENTION_DIM),
         :spatial_relative_bias => zeros(Float32, 3, 3, ATTENTION_HEADS),
         :spatial_scale_logit => zeros(Float32, 1),
+        :recurrent_depthwise => zeros(Float32, MODEL_DIM, 3, 3),
+        :recurrent_depthwise_scale_logit => zeros(Float32, 1),
         :cross_q => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
         :cross_k => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
         :cross_v => zeros(Float32, ATTENTION_DIM, MODEL_DIM),
@@ -2751,6 +2825,60 @@ function _spatial_attention_vjp!(
         dvalue,
     )
     dnormalized .+= projection_input_gradient
+
+    # The recurrent depthwise path is a parallel residual on the same
+    # RMS-normalized cell memory.  Its VJP remains local to physical 3x3
+    # neighbours and therefore never materializes a dense cell-pair matrix.
+    depthwise_gradient =
+        accumulator.dense[:recurrent_depthwise]::Array{Float32,3}
+    depthwise_scale_gradient = 0.0f0
+    depthwise_alpha = tape.depthwise_alpha
+    @inbounds for token in 1:CELL_COUNT
+        row, column = _cell_row_column(token)
+        for delta_column in -1:1, delta_row in -1:1
+            source_row = row + delta_row
+            source_column = column + delta_column
+            1 <= source_row <= BOARD_HEIGHT || continue
+            1 <= source_column <= BOARD_WIDTH || continue
+            source_token =
+                (source_column - 1) * BOARD_HEIGHT + source_row
+            kernel_row = delta_row + 2
+            kernel_column = delta_column + 2
+            @simd for coordinate in 1:MODEL_DIM
+                gradient = output_cotangent[coordinate, token]
+                scaled_gradient = depthwise_alpha * gradient
+                source_value = tape.normalized[coordinate, source_token]
+                kernel = model.recurrent_depthwise[
+                    coordinate, kernel_row, kernel_column,
+                ]
+                depthwise_gradient[
+                    coordinate, kernel_row, kernel_column,
+                ] = muladd(
+                    scaled_gradient,
+                    source_value,
+                    depthwise_gradient[
+                        coordinate, kernel_row, kernel_column,
+                    ],
+                )
+                dnormalized[coordinate, source_token] = muladd(
+                    scaled_gradient,
+                    kernel,
+                    dnormalized[coordinate, source_token],
+                )
+                depthwise_scale_gradient = muladd(
+                    gradient * kernel,
+                    source_value,
+                    depthwise_scale_gradient,
+                )
+            end
+        end
+    end
+    _dgv(accumulator, :recurrent_depthwise_scale_logit)[1] +=
+        depthwise_scale_gradient *
+        _residual_scale_derivative(
+            model.recurrent_depthwise_scale_logit[1],
+        )
+
     _rmsnorm_columns_vjp!(
         projection_input_gradient,
         cell_normalized,

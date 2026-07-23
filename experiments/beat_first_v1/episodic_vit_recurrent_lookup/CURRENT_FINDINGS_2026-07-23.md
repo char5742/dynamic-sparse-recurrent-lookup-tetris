@@ -1,5 +1,18 @@
 # EVRL研究の現時点での判明事項
 
+## source geometryの最新変更
+
+現行sourceは、再帰step内部のLookupFFNを3段から1段へ縮約し、24x10セルworking
+memoryへ共有3x3 depthwise convolutionを追加した。総parameter数は
+`20,585,982 -> 6,954,621`、全4 registerのLookup呼出しはstepあたり`12 -> 4`である。
+manual VJP有限差分とreal-teacherのserial／barrierless一致smokeは合格した。
+
+以下の100,000更新結果は、この変更直前の3-block geometryに対する確定済み研究結果で
+あり、新しい1-block geometryの学習結果ではない。旧checkpointを新geometryへ暗黙変換
+せず、新sourceはscratch本学習前である。詳細は
+[`SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md`](SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md)
+を参照。
+
 ## 最新追補：現行最終式をフルスクラッチで100,000更新
 
 候補固有の各step 1-step信用割当と有界halting式を、既存checkpointからの短期armだけで

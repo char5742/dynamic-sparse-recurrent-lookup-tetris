@@ -841,3 +841,35 @@ NDCG`0.001384`、pairwise`0.008074`、margin`0.006889`改善した。既存PreAc
 詳細は
 [`HALTING_FULLSCRATCH_100K_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/HALTING_FULLSCRATCH_100K_2026-07-23.md)
 へ記録した。
+
+## 30. 2026-07-23 — 再帰step内を単一Lookup＋セルDWConvへ縮約
+
+外側で同じblockを入力依存回数だけ再帰するにもかかわらず、旧EVRLは各step・各registerで
+LookupFFNを3段直列に実行していた。内部Lookup深度を廃止し、EVRLのLookup blockを1個へ
+縮約した。代わりに、入力固有の24x10セルworking memoryへ共有3x3 depthwise
+convolutionを各再帰stepで適用する。register数、全283 token cross-attention、
+SwiGLU、register別long-memory routing、working-memory書込み、hard halting、
+1-step probe、active-only backward、sparse optimizerは変更していない。
+
+production geometryの総parameter数は`20,585,982 -> 6,954,621`となり、
+13,631,361、66.22%減少した。全4 registerのLookup micro-callはstepあたり
+`12 -> 4`、追加DWConvは1,153 parameter、276,480 scalar MAC/stepである。同じ
+DWConv kernelをstep間共有するため、物理的な受容野は実行した思考回数に応じて広がる。
+
+DWConv kernelとresidual scaleのmanual VJPを有限差分で検証し、8/8 testが合格した。
+channel連続SIMD kernelへしたreal-teacher scratchは120更新を完了し、20更新warmup後の
+100更新で7.723秒、`12.949 updates/s`、CPU平均`66.707%`、candidate中
+`68.352%`だった。素朴な非連続kernel配置の同じsmokeは`10.107 updates/s`であり、
+数学モデルを変えないmemory layout修正で1.281倍になった。
+
+同checkpointからserialとbarrierlessを同一4状態で比較し、output、loss、raw VJPは
+完全一致した。parameter gradient最大差は`1.10e-6`、optimizer後state最大差は
+`1.10e-7`で、routing、halting、RNG、optimizer clockも全てexactだった。
+
+旧3-block 100k checkpointは新geometryへ暗黙変換せず研究履歴として保持する。今回の
+120更新は実装確認であり性能評価には使わない。新構成の収束性能はscratch本学習後に
+別途比較する。validation評価とsealed seedは使用していない。
+
+詳細は
+[`SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md)
+へ記録した。

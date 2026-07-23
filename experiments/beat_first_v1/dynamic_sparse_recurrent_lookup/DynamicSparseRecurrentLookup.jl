@@ -10,7 +10,13 @@ const SparseEngine = Main.ResidualLookupSlide
 
 const CARRIER_DIM = SparseEngine.CARRIER_DIM
 const OUTPUT_DIM = SparseEngine.OUTPUT_DIM
-const BLOCKS = 3
+const BLOCKS = let raw = strip(get(ENV, "DSRL_BLOCKS", "3"))
+    value = parse(Int, raw)
+    1 <= value <= 3 || throw(ArgumentError(
+        "DSRL_BLOCKS must be in 1:3",
+    ))
+    value
+end
 const TABLES_PER_BLOCK = let raw = strip(get(ENV, "DSRL_TABLES_PER_BLOCK", "76"))
     value = parse(Int, raw)
     1 <= value <= 512 || throw(ArgumentError(
@@ -72,8 +78,8 @@ const INITIAL_REINJECT_LOGIT = log(0.10f0 / 0.90f0)
 end
 
 mutable struct DynamicLookupModel
-    banks::NTuple{3,Matrix{Float32}}
-    bh4_diagonals::NTuple{3,Matrix{Float32}}
+    banks::NTuple{BLOCKS,Matrix{Float32}}
+    bh4_diagonals::NTuple{BLOCKS,Matrix{Float32}}
     alpha_logits::Vector{Float32}
     head::Matrix{Float32}
     bias::Vector{Float32}
@@ -114,7 +120,9 @@ end
 function topology(model::DynamicLookupModel)
     return (;
         architecture="dynamic-sparse-recurrent-lookup-network",
-        recurrent_body="three-weight-shared-learned-lookupffn-micro-layers",
+        recurrent_body=BLOCKS == 1 ?
+            "single-learned-lookupffn-layer-per-recurrent-step" :
+            "$(BLOCKS)-learned-lookupffn-layers-per-recurrent-step",
         router=ROWS_PER_TABLE_LOOKUP == 1 ?
             "learned-bh4-hard-wta-weighted-selected-row" :
             "learned-bh4-hard-wta-weighted-top$(ROWS_PER_TABLE_LOOKUP)-selected-rows",
@@ -311,7 +319,7 @@ end
 struct RecurrentStepTape
     previous_state::Vector{Float32}
     reinjected_state::Vector{Float32}
-    blocks::NTuple{3,LookupMicroTape}
+    blocks::NTuple{BLOCKS,LookupMicroTape}
     final_state::Vector{Float32}
     halt_probability::Float32
     stochastic_decision::Bool
@@ -889,7 +897,7 @@ function forward_trajectory(model, input; rng=nothing, training=false, forced_de
         for block in 1:BLOCKS
             state, blocks_buffer[block] = _lookup_micro_forward(model, state, block, temperature, materialize)
         end
-        block_tapes = (blocks_buffer[1], blocks_buffer[2], blocks_buffer[3])
+        block_tapes = ntuple(block -> blocks_buffer[block], BLOCKS)
         halt_logit = model.halt_bias[1] + dot(model.halt_weight, state)
         halt_probability = _sigmoid(halt_logit)
         forced_stop = step_index == MAX_RECURRENT_STEPS ||
@@ -937,9 +945,9 @@ LookupVJPScratch() = LookupVJPScratch(
 )
 
 mutable struct GradientAccumulator
-    bank_gradients::NTuple{3,Dict{Int32,Vector{Float32}}}
-    bank_gradient_pool::NTuple{3,Vector{Vector{Float32}}}
-    dbh4::NTuple{3,Matrix{Float32}}
+    bank_gradients::NTuple{BLOCKS,Dict{Int32,Vector{Float32}}}
+    bank_gradient_pool::NTuple{BLOCKS,Vector{Vector{Float32}}}
+    dbh4::NTuple{BLOCKS,Matrix{Float32}}
     dalpha_logits::Vector{Float32}
     dhead::Matrix{Float32}
     dbias::Vector{Float32}
@@ -1185,7 +1193,8 @@ function backward_trajectory!(accumulator, model, tape, output_cotangent;
 end
 
 mutable struct DenseAdamState
-    mbh4::NTuple{3,Matrix{Float32}}; vbh4::NTuple{3,Matrix{Float32}}
+    mbh4::NTuple{BLOCKS,Matrix{Float32}}
+    vbh4::NTuple{BLOCKS,Matrix{Float32}}
     malpha::Vector{Float32}; valpha::Vector{Float32}
     mhead::Matrix{Float32}; vhead::Matrix{Float32}
     mbias::Vector{Float32}; vbias::Vector{Float32}
@@ -1207,7 +1216,7 @@ function DenseAdamState(model)
 end
 
 mutable struct DynamicLookupOptimizer
-    bank_states::NTuple{3,SparseEngine.LookupSparseAdamWState}
+    bank_states::NTuple{BLOCKS,SparseEngine.LookupSparseAdamWState}
     dense::DenseAdamState
     step::UInt64
 end
