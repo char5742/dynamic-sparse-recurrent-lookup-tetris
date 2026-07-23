@@ -25,7 +25,7 @@ include(joinpath(@__DIR__, "EpisodicViTRecurrentLookup.jl"))
 const Model = Main.EpisodicViTRecurrentLookup
 BLAS.set_num_threads(1)
 
-@testset "fixed K64 episodic lookup" begin
+@testset "fixed K=$(Model.EPISODIC_SUPPORT) episodic lookup" begin
     rng = Xoshiro(0x4b3634455049534f)
     model = Model.initialize_model(rng)
     input = Model.EpisodicCandidateInput(

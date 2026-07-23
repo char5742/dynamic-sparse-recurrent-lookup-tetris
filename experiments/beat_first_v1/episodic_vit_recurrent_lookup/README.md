@@ -40,6 +40,13 @@ loss`2.858829`、top-1`0.453125`、NDCG`0.974179`、pairwise`0.834829`、
 最終batchでは深度2～9、probe教師continue 4／stop 4となった。追加9,000更新の速度は
 `11.4605 updates/s`で、固定K64版に許容した最低10 updates/sを満たした。
 
+固定supportをK=64、80、88、96、128で比較した結果、K=96は短期NDCGとpairwiseを
+わずかに改善したが、5,000更新で`9.90695 updates/s`まで低下した。K=80と88は
+順位品質、K=128は速度が基準未達だったため、production既定値はK=64を維持する。
+詳細は
+[`FIXED_K_SUPPORT_TUNING_2026-07-24.md`](FIXED_K_SUPPORT_TUNING_2026-07-24.md)
+を参照。
+
 ## アーキテクチャ
 
 各候補は、PreActベースラインと同じ入力フィールド、すなわち盤面、候補、差分、NEXT/HOLD、`aux37`から独立に評価される。teacher Q値と順位は教師信号としてのみ用いる。
@@ -89,6 +96,7 @@ working-memory write、各VJPは選択された64 token接続に限定する。L
 - `SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md`：3段Lookupから単一Lookup＋反復DWConvへの移行とsmoke結果
 - `SINGLE_LOOKUP_BOTTLENECK_PROFILE_2026-07-23.md`：単一Lookup化後のphase別速度、演算内訳、残存ボトルネック
 - `FIXED_K64_EPISODIC_ROUTING_2026-07-24.md`：固定K64の疎いepisodic read/write、数値一致、速度、学習率比較
+- `FIXED_K_SUPPORT_TUNING_2026-07-24.md`：固定K=64/80/88/96/128の同一条件比較と採否
 
 ## 検証済みproduction geometry
 

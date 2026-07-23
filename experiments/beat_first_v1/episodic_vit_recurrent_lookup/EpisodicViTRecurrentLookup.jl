@@ -77,9 +77,19 @@ const EPISODIC_BUCKET_CAP = let raw = strip(get(ENV, "EVRL_ROUTER_BUCKET_CAP", "
     1 <= value <= 64 || throw(ArgumentError("EVRL_ROUTER_BUCKET_CAP must be in 1:64"))
     value
 end
-# Episodic read support is deliberately fixed.  There is no 64 -> 16
-# shortlist, curriculum, annealing, or inference-time change of K.
-const EPISODIC_SUPPORT = 64
+# Episodic read support is fixed for the lifetime of one model/run.  The
+# environment variable exists only for controlled architecture tuning; there
+# is no within-run shortlist, curriculum, annealing, or inference-time change
+# of K.
+const EPISODIC_SUPPORT = let raw = strip(get(
+    ENV, "EVRL_EPISODIC_SUPPORT", "64",
+))
+    value = parse(Int, raw)
+    16 <= value <= TOKEN_COUNT || throw(ArgumentError(
+        "EVRL_EPISODIC_SUPPORT must be in 16:TOKEN_COUNT",
+    ))
+    value
+end
 const EPISODIC_SHORTLIST = EPISODIC_SUPPORT
 const EPISODIC_CANDIDATE_CAP = EPISODIC_SUPPORT
 const SPATIAL_ANCHORS = let raw = strip(get(ENV, "EVRL_SPATIAL_ANCHORS", "2"))
@@ -503,9 +513,9 @@ function topology(model::EpisodicViTLookupModel)
         attention_dim=ATTENTION_DIM,
         attention_heads=ATTENTION_HEADS,
         ffn_dim=FFN_DIM,
-        recurrent_block="shared-cell-depthwise-spatial-attention-fixed-k64-wta-cross-register-self-swiglu-single-register-local-active-lookup-same-support-working-memory-write",
-        episodic_router="learned-block-wta-fixed-k64-register-specific",
-        episodic_attention="global-mean-safety-path-plus-exact-softmax-on-wta-selected-64-token-support",
+        recurrent_block="shared-cell-depthwise-spatial-attention-fixed-k$(EPISODIC_SUPPORT)-wta-cross-register-self-swiglu-single-register-local-active-lookup-same-support-working-memory-write",
+        episodic_router="learned-block-wta-fixed-k$(EPISODIC_SUPPORT)-register-specific",
+        episodic_attention="global-mean-safety-path-plus-exact-softmax-on-wta-selected-$(EPISODIC_SUPPORT)-token-support",
         episodic_projected_token_occurrences_per_step=
             REGISTER_COUNT * EPISODIC_SUPPORT,
         episodic_qk_pairs_per_step=REGISTER_COUNT * EPISODIC_SUPPORT,
@@ -538,7 +548,7 @@ function topology(model::EpisodicViTLookupModel)
         long_memory_register_injection="register-local-sigmoid-gated-residual",
         long_memory_compute_reduction_vs_per_register=1,
         long_memory_balance="state-local-hard-frequency-times-soft-probability-auxiliary-credit",
-        register_relation="fixed-k64-wta-support-exact-multihead-cross-attention",
+        register_relation="fixed-k$(EPISODIC_SUPPORT)-wta-support-exact-multihead-cross-attention",
         initial_halt_probability=INITIAL_HALT_PROBABILITY,
         recurrent_steps=(MIN_RECURRENT_STEPS, MAX_RECURRENT_STEPS),
         total_parameters=parameter_count(model),
@@ -1610,7 +1620,7 @@ function _cross_attention_forward!(
     _rmsnorm_columns!(scratch.normalized, scratch.inverse_rms)
 
     # The tiny learned routers scan the 283 token descriptors, but expensive
-    # K/V projection and exact QK attention are materialized only on the 64
+    # K/V projection and exact QK attention are materialized only on the fixed
     # physically selected token rows for each register.
     _structured_router_forward!(
         scratch.token_route, model.token_router, memory_normalized,

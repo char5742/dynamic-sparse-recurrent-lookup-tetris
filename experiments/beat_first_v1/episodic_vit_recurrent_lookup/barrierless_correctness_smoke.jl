@@ -317,7 +317,7 @@ function _tape_token_edges(tape)
     return [begin
         cross = step.cross
         (;
-            support="fixed-k64-register-specific",
+            support="fixed-k$(Model.EPISODIC_SUPPORT)-register-specific",
             selected_ids=_matrix_integer_tuple(cross.selected_ids),
             key_count=size(cross.key, 2),
             attention_shape=size(cross.attention_weights),

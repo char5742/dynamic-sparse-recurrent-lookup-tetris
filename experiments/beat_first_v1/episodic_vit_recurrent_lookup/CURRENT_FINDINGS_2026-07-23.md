@@ -295,3 +295,22 @@ wall-clockでは逆になる。EVRL 95kの累積学習時間は5,817秒だった
 - 旧100,000更新試行は範囲外書込みを含むため、修正後モデルの性能根拠から除外する。
 
 詳細な各試行の推移、checkpoint遷移、smoke結果は[`TRAINING_STABILITY_TUNING_2026-07-23.md`](TRAINING_STABILITY_TUNING_2026-07-23.md)に記録している。
+
+## 2026-07-24追記：単一Lookup版の固定support調整
+
+現行の単一Lookup＋再帰depthwise版で、episodic cross-attentionの固定supportだけを
+K=64、80、88、96、128へ変えて比較した。未指定時はK=64のままであり、run中の
+curriculumや推論時のK変更は行わない。
+
+1,000更新ではK=96がNDCG`0.956662`、pairwise`0.775232`でK=64をわずかに上回った。
+しかし5,000更新のsteady速度は`9.90695 updates/s`となり、最低10 updates/sを下回った。
+K=80と88はK=64より順位品質が低く、K=128は`9.612 updates/s`だった。
+
+したがってproduction設定は固定K=64を維持する。K=64の100,000更新はloss
+`2.602389`、top-1`0.617188`、NDCG`0.989165`、pairwise`0.903184`であり、
+PreAct最高品質には未到達である。support拡大だけを解決策には採用しない。
+
+詳細は
+[`FIXED_K_SUPPORT_TUNING_2026-07-24.md`](FIXED_K_SUPPORT_TUNING_2026-07-24.md)
+に記録した。今回の評価もtraining-only固定128状態だけを使用し、validation rowと
+sealed seedには触れていない。
