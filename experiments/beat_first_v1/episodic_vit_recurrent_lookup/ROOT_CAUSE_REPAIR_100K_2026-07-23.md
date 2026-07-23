@@ -206,12 +206,30 @@ training split内の固定128状態で測定した。
 これはtraining split内の診断値である。validationを見ないという今回の条件を守ったため、
 旧held panelやPreActとの差は本報告では計算しない。
 
+### 10,000更新刻みの事後選択
+
+追加学習なしで10,000～100,000更新の全10 checkpointを、同じtraining-only固定128状態
+で再評価した。最小composite loss、最高top-1同率、最高pairwiseを同時に得た90,000更新を
+主採用checkpointへ変更した。
+
+| checkpoint | loss | top-1 | NDCG | pairwise | margin | 平均深度 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 90,000 | **2.551617** | **0.671875** | **0.991901** | **0.913689** | 0.116655 | 3.027 |
+| 100,000 | 2.559976 | **0.671875** | 0.991213 | 0.908830 | **0.137023** | 4.880 |
+
+100,000更新はmarginだけは高いが、loss、NDCG、pairwiseが90,000更新より悪かった。
+全checkpointと指標別最高点は
+[`ROOTFIX_CHECKPOINT_SWEEP_2026-07-23.md`](ROOTFIX_CHECKPOINT_SWEEP_2026-07-23.md)
+へ記録した。
+
 ## 保存物
 
 - checkpoint：`D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\evrl_rootfix_register_memory_halt_u100000_20260723\checkpoints\checkpoint_000100000.jls`
 - checkpoint SHA-256：`3def11e92a8af52267f178e25bb59881731a53278dffe1d53dd98fb599b38f61`
 - checkpoint size：253,765,189 bytes
 - summary：同run directoryの`summary.json`
+- 主採用checkpoint：同run directoryの`checkpoints\checkpoint_000090000.jls`
+- 主採用checkpoint SHA-256：`3ea19a64fd72521c1e679c53b348525194214db3073e0937e8e515c864e28c71`
 
 ## 残る境界
 
