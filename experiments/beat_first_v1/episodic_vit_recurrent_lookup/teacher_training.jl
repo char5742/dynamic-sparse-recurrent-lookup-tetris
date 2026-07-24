@@ -387,6 +387,7 @@ struct CandidateSchedulerConfig
     mode::Symbol
     cpuset_mode::Symbol
     chunk_size::Int
+    backward_chunk_size::Int
     adaptive_tail::Bool
     active_workers::Int
     detected_workers::Int
@@ -405,6 +406,12 @@ function candidate_scheduler_config()
     )
     chunk_size = _int_env("EVRL_QUEUE_CHUNK", 8; minimum=1)
     chunk_size in (8, 16, 32) || error("EVRL_QUEUE_CHUNK must be 8, 16, or 32")
+    backward_chunk_size = _int_env(
+        "EVRL_BACKWARD_QUEUE_CHUNK", 2; minimum=1,
+    )
+    backward_chunk_size in (1, 2, 4, 8) || error(
+        "EVRL_BACKWARD_QUEUE_CHUNK must be 1, 2, 4, or 8",
+    )
     adaptive_raw = strip(get(ENV, "EVRL_ADAPTIVE_TAIL", "0"))
     adaptive_raw in ("0", "1") || error("EVRL_ADAPTIVE_TAIL must be 0 or 1")
     adaptive_tail = adaptive_raw == "1"
@@ -423,7 +430,7 @@ function candidate_scheduler_config()
     end
     CpuSets.configure_worker_bindings(cpuset_mode, active_workers, topology)
     return CandidateSchedulerConfig(
-        mode, cpuset_mode, chunk_size, adaptive_tail,
+        mode, cpuset_mode, chunk_size, backward_chunk_size, adaptive_tail,
         active_workers, detected_workers, topology,
     )
 end
@@ -1109,6 +1116,7 @@ function _attach_barrierless_executor!(trainer::TeacherTrainer)
             trainer.thread_accumulators[1:active];
             active_workers=active,
             fixed_chunk_size=scheduler.config.chunk_size,
+            backward_chunk_size=scheduler.config.backward_chunk_size,
             adaptive_tail=scheduler.config.adaptive_tail,
             queue_capacity=max(1024, nextpow(2, 2 * MAX_FLAT_CANDIDATES)),
         )
@@ -1809,9 +1817,53 @@ function restore_checkpoint(
         "resume state batch differs from EVRL_STATE_BATCH",
     )
     hasproperty(payload.config, :model) || error("resume config lacks model topology")
-    payload.config.model == Model.topology(payload.model) || error(
-        "resume model topology differs from the live EVRL geometry",
-    )
+    recorded_topology = payload.config.model
+    live_topology = Model.topology(payload.model)
+    topology_matches = recorded_topology == live_topology
+    if !topology_matches
+        execution_mode_fields = Set((
+            :register_attention_projection,
+            :spatial_relation_mode,
+            :spatial_relation,
+            :spatial_local_edges_upper_bound,
+        ))
+        without_execution_modes = topology -> Dict(
+            name => getproperty(topology, name)
+            for name in propertynames(topology)
+            if !(name in execution_mode_fields)
+        )
+        geometry_matches =
+            without_execution_modes(recorded_topology) ==
+            without_execution_modes(live_topology)
+        recorded_projection = hasproperty(
+            recorded_topology, :register_attention_projection,
+        ) ? Symbol(recorded_topology.register_attention_projection) : :dense
+        projection_transition_raw = strip(get(
+            ENV, "EVRL_ENABLE_REGISTER_PROJECTION_TRANSITION", "0",
+        ))
+        projection_transition_raw in ("0", "1") || error(
+            "EVRL_ENABLE_REGISTER_PROJECTION_TRANSITION must be 0 or 1",
+        )
+        recorded_spatial = hasproperty(
+            recorded_topology, :spatial_relation_mode,
+        ) ? Symbol(recorded_topology.spatial_relation_mode) :
+            :attention_depthwise
+        spatial_transition_raw = strip(get(
+            ENV, "EVRL_ENABLE_SPATIAL_RELATION_TRANSITION", "0",
+        ))
+        spatial_transition_raw in ("0", "1") || error(
+            "EVRL_ENABLE_SPATIAL_RELATION_TRANSITION must be 0 or 1",
+        )
+        projection_compatible =
+            recorded_projection === Model.REGISTER_ATTENTION_PROJECTION ||
+            projection_transition_raw == "1"
+        spatial_compatible =
+            recorded_spatial === Model.SPATIAL_RELATION_MODE ||
+            spatial_transition_raw == "1"
+        geometry_matches && projection_compatible && spatial_compatible || error(
+            "resume model topology differs from the live EVRL geometry",
+        )
+    end
     hasproperty(payload.config, :total_parameter_count) || error(
         "resume config lacks total parameter count",
     )
@@ -1903,9 +1955,34 @@ function restore_checkpoint(
                 episodic_decay_factor=
                     requested_normalized.optimizer.episodic_decay_factor,
             )) == requested_normalized.optimizer
+        lookup_lr_transition_raw = strip(get(
+            ENV, "EVRL_ENABLE_LOOKUP_LR_TRANSITION", "0",
+        ))
+        lookup_lr_transition_raw in ("0", "1") || error(
+            "EVRL_ENABLE_LOOKUP_LR_TRANSITION must be 0 or 1",
+        )
+        lookup_lr_transition = lookup_lr_transition_raw == "1" &&
+            inherited.routing == requested_normalized.routing &&
+            inherited.loss == requested_normalized.loss &&
+            inherited.halting == requested_normalized.halting &&
+            requested_normalized.optimizer.bank_learning_rate <=
+                inherited.optimizer.bank_learning_rate &&
+            requested_normalized.optimizer.router_learning_rate <=
+                inherited.optimizer.router_learning_rate &&
+            requested_normalized.optimizer.lookup_alpha_learning_rate <=
+                inherited.optimizer.lookup_alpha_learning_rate &&
+            merge(inherited.optimizer, (;
+                bank_learning_rate=
+                    requested_normalized.optimizer.bank_learning_rate,
+                router_learning_rate=
+                    requested_normalized.optimizer.router_learning_rate,
+                lookup_alpha_learning_rate=
+                    requested_normalized.optimizer.lookup_alpha_learning_rate,
+            )) == requested_normalized.optimizer
         dynamic_halting_transition || halt_probe_transition || halt_lr_transition ||
-            dense_wd_transition || episodic_lr_transition || error(
-            "resume hyperparameters differ; only an explicit dynamic-halting, halt-probe, halt-LR, dense-WD, or episodic-LR transition is allowed",
+            dense_wd_transition || episodic_lr_transition ||
+            lookup_lr_transition || error(
+            "resume hyperparameters differ; only an explicit dynamic-halting, halt-probe, halt-LR, dense-WD, episodic-LR, or Lookup-LR transition is allowed",
         )
         dynamic_halting_transition && @info(
             "EVRL fixed-depth checkpoint transitions to sampled hard halting",
@@ -1935,6 +2012,19 @@ function restore_checkpoint(
             requested_decay_after_update=
                 requested_normalized.optimizer.episodic_decay_after_update,
             requested_decay_factor=requested_normalized.optimizer.episodic_decay_factor,
+        )
+        lookup_lr_transition && @info(
+            "EVRL Lookup learning rate transition",
+            previous_bank_learning_rate=inherited.optimizer.bank_learning_rate,
+            requested_bank_learning_rate=
+                requested_normalized.optimizer.bank_learning_rate,
+            previous_router_learning_rate=inherited.optimizer.router_learning_rate,
+            requested_router_learning_rate=
+                requested_normalized.optimizer.router_learning_rate,
+            previous_lookup_alpha_learning_rate=
+                inherited.optimizer.lookup_alpha_learning_rate,
+            requested_lookup_alpha_learning_rate=
+                requested_normalized.optimizer.lookup_alpha_learning_rate,
         )
     end
     hasproperty(payload.config, :objective) || error("resume config lacks objective")
@@ -2280,6 +2370,8 @@ function teacher_signal_cli_main()
             mode=trainer.scheduler.config.mode,
             cpuset_mode=trainer.scheduler.config.cpuset_mode,
             chunk_size=trainer.scheduler.config.chunk_size,
+            backward_chunk_size=
+                trainer.scheduler.config.backward_chunk_size,
             adaptive_tail=trainer.scheduler.config.adaptive_tail,
             active_workers=trainer.scheduler.config.active_workers,
             julia_default_workers=Base.Threads.nthreads(:default),
@@ -2330,6 +2422,36 @@ function teacher_signal_cli_main()
 
     stopped_for_throughput = Ref(false)
     sampled_allocation_profile = Ref{Any}(nothing)
+    cpu_profile_enabled =
+        benchmark_only && strip(get(ENV, "EVRL_CPU_PROFILE", "0")) == "1"
+    cpu_profile_started = Ref(false)
+    function start_cpu_profile!()
+        cpu_profile_enabled || return
+        cpu_profile_started[] && return
+        Profile.clear()
+        Profile.init(; delay=0.001)
+        Profile.start_timer(true)
+        cpu_profile_started[] = true
+        return
+    end
+    function finish_cpu_profile!()
+        cpu_profile_started[] || return
+        Profile.stop_timer()
+        open(joinpath(run_dir, "cpu_profile_flat.txt"), "w") do io
+            Profile.print(
+                io;
+                format=:flat,
+                C=true,
+                combine=true,
+                sortedby=:count,
+                mincount=5,
+                noisefloor=2.0,
+            )
+        end
+        Profile.clear()
+        cpu_profile_started[] = false
+        return
+    end
     training_driver = function (_executor)
         if _executor isa BarrierlessExecutor
             reset_barrierless_benchmark_statistics!(
@@ -2337,6 +2459,7 @@ function teacher_signal_cli_main()
             )
         end
         local_last_step = nothing
+        benchmark_only && benchmark_warmup_updates == 0 && start_cpu_profile!()
         while trainer.update < maximum_updates
             pack_measurement = nothing
             if detailed_benchmark && _executor isa BarrierlessExecutor
@@ -2407,6 +2530,9 @@ function teacher_signal_cli_main()
                         _executor; enabled=true,
                     )
                 end
+                Model.SUBPHASE_PROFILE_ENABLED &&
+                    Model.reset_subphase_profile!()
+                start_cpu_profile!()
             end
             trainer.update % 100 == 0 && @info(
                 "Episodic ViT recurrent Lookup progress",
@@ -2466,6 +2592,7 @@ function teacher_signal_cli_main()
                 end
             end
         end
+        finish_cpu_profile!()
         return local_last_step
     end
     last_step = if trainer.scheduler.config.mode === :barrierless
@@ -2491,6 +2618,8 @@ function teacher_signal_cli_main()
                 trainer.scheduler.barrierless_executor,
                 sampled_allocation_profile=sampled_allocation_profile[],
             ) : nothing,
+        subphase_profile=Model.SUBPHASE_PROFILE_ENABLED ?
+            Model.subphase_profile_summary() : nothing,
         measured_updates=trainer.timed_updates - segment_start.timed_updates,
         target_update=maximum_updates,
         stopped_for_throughput=stopped_for_throughput[],

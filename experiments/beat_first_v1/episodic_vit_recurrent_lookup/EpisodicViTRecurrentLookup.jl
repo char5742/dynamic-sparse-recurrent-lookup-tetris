@@ -34,12 +34,68 @@ const NEXT_HOLD_TOKENS = 6
 const AUX_FEATURES = 37
 const TOKEN_COUNT = CELL_COUNT + NEXT_HOLD_TOKENS + AUX_FEATURES
 const OUTPUT_DIM = 22
+const SUBPHASE_PROFILE_ENABLED =
+    strip(get(ENV, "EVRL_SUBPHASE_PROFILE", "0")) == "1"
+const SUBPHASE_LABELS = (
+    "forward_spatial",
+    "forward_cross",
+    "forward_self",
+    "forward_swiglu",
+    "forward_lookup",
+    "forward_memory_write",
+    "backward_memory_write",
+    "backward_lookup",
+    "backward_swiglu",
+    "backward_self",
+    "backward_cross",
+    "backward_postnorm",
+    "backward_spatial",
+    "backward_tokenize",
+)
+const SUBPHASE_NANOSECONDS =
+    zeros(UInt64, length(SUBPHASE_LABELS), 64)
+const SUBPHASE_CALLS =
+    zeros(UInt64, length(SUBPHASE_LABELS), 64)
+
+macro subphase(index, expression)
+    quote
+        if SUBPHASE_PROFILE_ENABLED
+            local started = time_ns()
+            local result = $(esc(expression))
+            local worker = Threads.threadid()
+            @inbounds begin
+                SUBPHASE_NANOSECONDS[$index, worker] += time_ns() - started
+                SUBPHASE_CALLS[$index, worker] += 1
+            end
+            result
+        else
+            $(esc(expression))
+        end
+    end
+end
+
+function reset_subphase_profile!()
+    fill!(SUBPHASE_NANOSECONDS, 0)
+    fill!(SUBPHASE_CALLS, 0)
+    return nothing
+end
+
+function subphase_profile_summary()
+    return [
+        (;
+            name=SUBPHASE_LABELS[index],
+            seconds=Float64(sum(@view SUBPHASE_NANOSECONDS[index, :])) / 1.0e9,
+            calls=Int(sum(@view SUBPHASE_CALLS[index, :])),
+        )
+        for index in eachindex(SUBPHASE_LABELS)
+    ]
+end
 
 const MODEL_DIM = SparseLookup.CARRIER_DIM
 const ATTENTION_DIM = let raw = strip(get(ENV, "EVRL_ATTENTION_DIM", "32"))
     value = parse(Int, raw)
-    32 <= value <= MODEL_DIM || throw(ArgumentError(
-        "EVRL_ATTENTION_DIM must be in 32:MODEL_DIM",
+    16 <= value <= MODEL_DIM || throw(ArgumentError(
+        "EVRL_ATTENTION_DIM must be in 16:MODEL_DIM",
     ))
     value
 end
@@ -52,6 +108,22 @@ const ATTENTION_HEADS = let raw = strip(get(ENV, "EVRL_ATTENTION_HEADS", "4"))
         "EVRL_ATTENTION_DIM must be divisible by EVRL_ATTENTION_HEADS",
     ))
     value
+end
+const REGISTER_ATTENTION_PROJECTION = let raw = lowercase(strip(get(
+    ENV, "EVRL_REGISTER_ATTENTION_PROJECTION", "dense",
+)))
+    raw in ("dense", "structured") || throw(ArgumentError(
+        "EVRL_REGISTER_ATTENTION_PROJECTION must be dense or structured",
+    ))
+    Symbol(raw)
+end
+const SPATIAL_RELATION_MODE = let raw = lowercase(strip(get(
+    ENV, "EVRL_SPATIAL_RELATION_MODE", "attention_depthwise",
+)))
+    raw in ("attention_depthwise", "depthwise_only") || throw(ArgumentError(
+        "EVRL_SPATIAL_RELATION_MODE must be attention_depthwise or depthwise_only",
+    ))
+    Symbol(raw)
 end
 const SPATIAL_PROJECTION_BLOCK_WIDTH = cld(MODEL_DIM, ATTENTION_DIM)
 const REGISTER_COUNT = let raw = strip(get(ENV, "EVRL_REGISTERS", "8"))
@@ -92,6 +164,9 @@ const EPISODIC_SUPPORT = let raw = strip(get(
 end
 const EPISODIC_SHORTLIST = EPISODIC_SUPPORT
 const EPISODIC_CANDIDATE_CAP = EPISODIC_SUPPORT
+const MAX_EPISODIC_UNION = min(
+    TOKEN_COUNT, EPISODIC_SUPPORT * REGISTER_COUNT,
+)
 const SPATIAL_ANCHORS = let raw = strip(get(ENV, "EVRL_SPATIAL_ANCHORS", "2"))
     value = parse(Int, raw)
     1 <= value <= EPISODIC_SHORTLIST || throw(ArgumentError(
@@ -512,6 +587,8 @@ function topology(model::EpisodicViTLookupModel)
         model_dim=MODEL_DIM,
         attention_dim=ATTENTION_DIM,
         attention_heads=ATTENTION_HEADS,
+        register_attention_projection=String(REGISTER_ATTENTION_PROJECTION),
+        spatial_relation_mode=String(SPATIAL_RELATION_MODE),
         ffn_dim=FFN_DIM,
         recurrent_block="shared-cell-depthwise-spatial-attention-fixed-k$(EPISODIC_SUPPORT)-wta-cross-register-self-swiglu-single-register-local-active-lookup-same-support-working-memory-write",
         episodic_router="learned-block-wta-fixed-k$(EPISODIC_SUPPORT)-register-specific",
@@ -534,8 +611,12 @@ function topology(model::EpisodicViTLookupModel)
         episodic_retrieval_entry_reads_upper_bound_per_step=
             REGISTER_COUNT * EPISODIC_ROUTER_TABLES *
             (EPISODIC_ROUTER_BITS + 1) * EPISODIC_BUCKET_CAP,
-        spatial_relation="physical-8-neighbour-relative-position-learned-qkvo",
-        spatial_local_edges_upper_bound=CELL_COUNT * LOCAL_SPATIAL_NEIGHBORS,
+        spatial_relation=SPATIAL_RELATION_MODE === :attention_depthwise ?
+            "physical-8-neighbour-relative-position-learned-qkvo" :
+            "physical-3x3-learned-depthwise",
+        spatial_local_edges_upper_bound=SPATIAL_RELATION_MODE ===
+            :attention_depthwise ? CELL_COUNT * LOCAL_SPATIAL_NEIGHBORS :
+            CELL_COUNT * 9,
         recurrent_depthwise_kernel=(3, 3),
         recurrent_depthwise_parameters=length(model.recurrent_depthwise) +
             length(model.recurrent_depthwise_scale_logit),
@@ -879,6 +960,59 @@ function _structured_attention_forward!(output, weights, input)
     return output
 end
 
+"""Fused form of three independent structured Q/K/V projections.
+
+Each result preserves the coordinate accumulation order of
+`_structured_attention_forward!`; only the common cell/input traversal is
+shared.
+"""
+function _structured_attention_qkv_forward!(
+    query, key, value, query_weights, key_weights, value_weights, input,
+)
+    expected = (ATTENTION_DIM, size(input, 2))
+    size(query) == expected || throw(DimensionMismatch(
+        "structured attention query shape changed",
+    ))
+    size(key) == expected || throw(DimensionMismatch(
+        "structured attention key shape changed",
+    ))
+    size(value) == expected || throw(DimensionMismatch(
+        "structured attention value shape changed",
+    ))
+    @inbounds for route in 1:ATTENTION_DIM
+        first_coordinate = (route - 1) * SPATIAL_PROJECTION_BLOCK_WIDTH + 1
+        last_coordinate = min(route * SPATIAL_PROJECTION_BLOCK_WIDTH, MODEL_DIM)
+        for column in axes(input, 2)
+            query_value = 0.0f0
+            key_value = 0.0f0
+            value_value = 0.0f0
+            @simd for coordinate in first_coordinate:last_coordinate
+                local_coordinate = coordinate - first_coordinate + 1
+                input_value = input[coordinate, column]
+                query_value = muladd(
+                    query_weights[local_coordinate, route],
+                    input_value,
+                    query_value,
+                )
+                key_value = muladd(
+                    key_weights[local_coordinate, route],
+                    input_value,
+                    key_value,
+                )
+                value_value = muladd(
+                    value_weights[local_coordinate, route],
+                    input_value,
+                    value_value,
+                )
+            end
+            query[route, column] = query_value
+            key[route, column] = key_value
+            value[route, column] = value_value
+        end
+    end
+    return query, key, value
+end
+
 """Learned block-structured ATTENTION_DIM -> MODEL_DIM expansion."""
 function _structured_attention_expand!(output, weights, input)
     size(input, 1) == ATTENTION_DIM ||
@@ -922,6 +1056,206 @@ function _structured_attention_vjp!(
                     input_gradient[coordinate, column],
                 )
             end
+        end
+    end
+    return input_gradient
+end
+
+"""Fused exact VJP for the three spatial structured Q/K/V projections."""
+function _structured_attention_qkv_vjp!(
+    query_weight_gradient,
+    key_weight_gradient,
+    value_weight_gradient,
+    input_gradient,
+    query_weights,
+    key_weights,
+    value_weights,
+    input,
+    query_cotangent,
+    key_cotangent,
+    value_cotangent,
+)
+    fill!(input_gradient, 0.0f0)
+    @inbounds for route in 1:ATTENTION_DIM
+        first_coordinate = (route - 1) * SPATIAL_PROJECTION_BLOCK_WIDTH + 1
+        last_coordinate = min(route * SPATIAL_PROJECTION_BLOCK_WIDTH, MODEL_DIM)
+        for column in axes(input, 2)
+            query_gradient = query_cotangent[route, column]
+            key_gradient = key_cotangent[route, column]
+            value_gradient = value_cotangent[route, column]
+            @simd for coordinate in first_coordinate:last_coordinate
+                local_coordinate = coordinate - first_coordinate + 1
+                input_value = input[coordinate, column]
+                query_weight_gradient[local_coordinate, route] = muladd(
+                    query_gradient,
+                    input_value,
+                    query_weight_gradient[local_coordinate, route],
+                )
+                key_weight_gradient[local_coordinate, route] = muladd(
+                    key_gradient,
+                    input_value,
+                    key_weight_gradient[local_coordinate, route],
+                )
+                value_weight_gradient[local_coordinate, route] = muladd(
+                    value_gradient,
+                    input_value,
+                    value_weight_gradient[local_coordinate, route],
+                )
+                result = muladd(
+                    query_weights[local_coordinate, route],
+                    query_gradient,
+                    0.0f0,
+                )
+                result += key_weights[local_coordinate, route] * key_gradient
+                result += value_weights[local_coordinate, route] * value_gradient
+                input_gradient[coordinate, column] = result
+            end
+        end
+    end
+    return input_gradient
+end
+
+"""Block-structured projection using the corresponding entries of a dense matrix.
+
+This keeps checkpoint shapes stable while allowing a controlled transition to
+the CPU-native relation operator.  Every model coordinate belongs to exactly
+one attention coordinate, so no input coordinate is discarded.
+"""
+function _register_attention_forward!(output, weights, input)
+    if REGISTER_ATTENTION_PROJECTION === :dense
+        mul!(output, weights, input)
+        return output
+    end
+    size(weights) == (ATTENTION_DIM, MODEL_DIM) || throw(DimensionMismatch(
+        "register attention projection weight shape changed",
+    ))
+    @inbounds for route in 1:ATTENTION_DIM
+        first_coordinate = (route - 1) * SPATIAL_PROJECTION_BLOCK_WIDTH + 1
+        last_coordinate = min(route * SPATIAL_PROJECTION_BLOCK_WIDTH, MODEL_DIM)
+        for column in axes(input, 2)
+            result = 0.0f0
+            @simd for coordinate in first_coordinate:last_coordinate
+                result = muladd(
+                    weights[route, coordinate],
+                    input[coordinate, column],
+                    result,
+                )
+            end
+            output[route, column] = result
+        end
+    end
+    return output
+end
+
+function _register_attention_expand!(output, weights, input)
+    if REGISTER_ATTENTION_PROJECTION === :dense
+        mul!(output, weights, input)
+        return output
+    end
+    size(weights) == (MODEL_DIM, ATTENTION_DIM) || throw(DimensionMismatch(
+        "register attention expansion weight shape changed",
+    ))
+    @inbounds for route in 1:ATTENTION_DIM
+        first_coordinate = (route - 1) * SPATIAL_PROJECTION_BLOCK_WIDTH + 1
+        last_coordinate = min(route * SPATIAL_PROJECTION_BLOCK_WIDTH, MODEL_DIM)
+        for column in axes(input, 2)
+            route_value = input[route, column]
+            @simd for coordinate in first_coordinate:last_coordinate
+                output[coordinate, column] =
+                    weights[coordinate, route] * route_value
+            end
+        end
+    end
+    return output
+end
+
+function _register_attention_vjp!(
+    weight_gradient,
+    input_gradient,
+    weights,
+    input,
+    output_cotangent;
+    accumulate_input::Bool=false,
+)
+    if REGISTER_ATTENTION_PROJECTION === :dense
+        mul!(
+            weight_gradient,
+            output_cotangent,
+            transpose(input),
+            1.0f0,
+            1.0f0,
+        )
+        mul!(
+            input_gradient,
+            transpose(weights),
+            output_cotangent,
+            1.0f0,
+            accumulate_input ? 1.0f0 : 0.0f0,
+        )
+        return input_gradient
+    end
+    accumulate_input || fill!(input_gradient, 0.0f0)
+    @inbounds for route in 1:ATTENTION_DIM
+        first_coordinate = (route - 1) * SPATIAL_PROJECTION_BLOCK_WIDTH + 1
+        last_coordinate = min(route * SPATIAL_PROJECTION_BLOCK_WIDTH, MODEL_DIM)
+        for column in axes(input, 2)
+            gradient = output_cotangent[route, column]
+            @simd for coordinate in first_coordinate:last_coordinate
+                weight_gradient[route, coordinate] = muladd(
+                    gradient,
+                    input[coordinate, column],
+                    weight_gradient[route, coordinate],
+                )
+                input_gradient[coordinate, column] = muladd(
+                    weights[route, coordinate],
+                    gradient,
+                    input_gradient[coordinate, column],
+                )
+            end
+        end
+    end
+    return input_gradient
+end
+
+function _register_attention_expand_vjp!(
+    weight_gradient,
+    input_gradient,
+    weights,
+    input,
+    output_cotangent,
+)
+    if REGISTER_ATTENTION_PROJECTION === :dense
+        mul!(
+            weight_gradient,
+            output_cotangent,
+            transpose(input),
+            1.0f0,
+            1.0f0,
+        )
+        mul!(input_gradient, transpose(weights), output_cotangent)
+        return input_gradient
+    end
+    fill!(input_gradient, 0.0f0)
+    @inbounds for route in 1:ATTENTION_DIM
+        first_coordinate = (route - 1) * SPATIAL_PROJECTION_BLOCK_WIDTH + 1
+        last_coordinate = min(route * SPATIAL_PROJECTION_BLOCK_WIDTH, MODEL_DIM)
+        for column in axes(input, 2)
+            route_value = input[route, column]
+            route_gradient = 0.0f0
+            @simd for coordinate in first_coordinate:last_coordinate
+                gradient = output_cotangent[coordinate, column]
+                weight_gradient[coordinate, route] = muladd(
+                    gradient,
+                    route_value,
+                    weight_gradient[coordinate, route],
+                )
+                route_gradient = muladd(
+                    weights[coordinate, route],
+                    gradient,
+                    route_gradient,
+                )
+            end
+            input_gradient[route, column] = route_gradient
         end
     end
     return input_gradient
@@ -1101,69 +1435,92 @@ function _spatial_attention_forward!(scratch::SpatialAttentionForwardScratch,
     query = scratch.query
     key = scratch.key
     value = scratch.value
-    _structured_attention_forward!(query, model.spatial_q, cell_normalized)
-    _structured_attention_forward!(key, model.spatial_k, cell_normalized)
-    _structured_attention_forward!(value, model.spatial_v, cell_normalized)
     weights = scratch.weights
-    fill!(weights, 0.0f0)
     context = scratch.context
-    fill!(context, 0.0f0)
-    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
-    scale = inv(sqrt(Float32(head_dim)))
-    @inbounds for token in 1:CELL_COUNT
-        row, column = _cell_row_column(token)
-        count = Int(LOCAL_NEIGHBOR_COUNTS[token])
-        for head in 1:ATTENTION_HEADS
-            first_coordinate = (head - 1) * head_dim + 1
-            last_coordinate = head * head_dim
-            maximum_score = -Inf32
-            for edge in 1:count
-                neighbor = Int(LOCAL_NEIGHBOR_IDS[edge, token])
-                neighbor_row, neighbor_column = _cell_row_column(neighbor)
-                score = 0.0f0
-                @simd for coordinate in first_coordinate:last_coordinate
-                    score = muladd(
-                        query[coordinate, token], key[coordinate, neighbor], score,
-                    )
+    projected = scratch.projected
+    alpha = SPATIAL_RELATION_MODE === :attention_depthwise ?
+        _residual_scale(model.spatial_scale_logit[1]) : 0.0f0
+    if SPATIAL_RELATION_MODE === :attention_depthwise
+        _structured_attention_qkv_forward!(
+            query,
+            key,
+            value,
+            model.spatial_q,
+            model.spatial_k,
+            model.spatial_v,
+            cell_normalized,
+        )
+        fill!(weights, 0.0f0)
+        fill!(context, 0.0f0)
+        head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
+        scale = inv(sqrt(Float32(head_dim)))
+        @inbounds for token in 1:CELL_COUNT
+            row, column = _cell_row_column(token)
+            count = Int(LOCAL_NEIGHBOR_COUNTS[token])
+            for head in 1:ATTENTION_HEADS
+                first_coordinate = (head - 1) * head_dim + 1
+                last_coordinate = head * head_dim
+                maximum_score = -Inf32
+                for edge in 1:count
+                    neighbor = Int(LOCAL_NEIGHBOR_IDS[edge, token])
+                    neighbor_row, neighbor_column =
+                        _cell_row_column(neighbor)
+                    score = 0.0f0
+                    @simd for coordinate in
+                            first_coordinate:last_coordinate
+                        score = muladd(
+                            query[coordinate, token],
+                            key[coordinate, neighbor],
+                            score,
+                        )
+                    end
+                    score = score * scale + model.spatial_relative_bias[
+                        neighbor_row - row + 2,
+                        neighbor_column - column + 2,
+                        head,
+                    ]
+                    weights[edge, token, head] = score
+                    maximum_score = max(maximum_score, score)
                 end
-                score = score * scale + model.spatial_relative_bias[
-                    neighbor_row - row + 2,
-                    neighbor_column - column + 2,
-                    head,
-                ]
-                weights[edge, token, head] = score
-                maximum_score = max(maximum_score, score)
-            end
-            denominator = 0.0f0
-            for edge in 1:count
-                probability = exp(weights[edge, token, head] - maximum_score)
-                weights[edge, token, head] = probability
-                denominator += probability
-            end
-            inverse_denominator = inv(denominator)
-            for edge in 1:count
-                probability = weights[edge, token, head] * inverse_denominator
-                weights[edge, token, head] = probability
-                neighbor = Int(LOCAL_NEIGHBOR_IDS[edge, token])
-                @simd for coordinate in first_coordinate:last_coordinate
-                    context[coordinate, token] = muladd(
-                        probability, value[coordinate, neighbor],
-                        context[coordinate, token],
-                    )
+                denominator = 0.0f0
+                for edge in 1:count
+                    probability =
+                        exp(weights[edge, token, head] - maximum_score)
+                    weights[edge, token, head] = probability
+                    denominator += probability
+                end
+                inverse_denominator = inv(denominator)
+                for edge in 1:count
+                    probability =
+                        weights[edge, token, head] * inverse_denominator
+                    weights[edge, token, head] = probability
+                    neighbor = Int(LOCAL_NEIGHBOR_IDS[edge, token])
+                    @simd for coordinate in
+                            first_coordinate:last_coordinate
+                        context[coordinate, token] = muladd(
+                            probability,
+                            value[coordinate, neighbor],
+                            context[coordinate, token],
+                        )
+                    end
                 end
             end
         end
+        _structured_attention_expand!(
+            projected, model.spatial_o, context,
+        )
     end
-    projected = scratch.projected
-    _structured_attention_expand!(projected, model.spatial_o, context)
     output = scratch.output
     copyto!(output, memory)
-    alpha = _residual_scale(model.spatial_scale_logit[1])
-    @inbounds for token in 1:CELL_COUNT
-        @simd for coordinate in 1:MODEL_DIM
-            output[coordinate, token] = muladd(
-                alpha, projected[coordinate, token], output[coordinate, token],
-            )
+    if SPATIAL_RELATION_MODE === :attention_depthwise
+        @inbounds for token in 1:CELL_COUNT
+            @simd for coordinate in 1:MODEL_DIM
+                output[coordinate, token] = muladd(
+                    alpha,
+                    projected[coordinate, token],
+                    output[coordinate, token],
+                )
+            end
         end
     end
     depthwise_alpha =
@@ -1200,6 +1557,9 @@ struct CrossAttentionTape
     register_route::Matrix{Float32}
     token_route::Matrix{Float32}
     selected_ids::Matrix{Int16}
+    support_slots::Matrix{Int16}
+    union_ids::Vector{Int16}
+    union_count::Int16
     query::Matrix{Float32}
     key::Array{Float32,3}
     value::Array{Float32,3}
@@ -1220,7 +1580,13 @@ struct CrossAttentionForwardScratch
     token_route::Matrix{Float32}
     selected_ids::Matrix{Int16}
     candidate_seen::Matrix{Bool}
-    selected_memory::Array{Float32,3}
+    union_seen::Vector{Bool}
+    union_ids::Vector{Int16}
+    token_slots::Vector{Int16}
+    support_slots::Matrix{Int16}
+    union_memory::Matrix{Float32}
+    union_key::Matrix{Float32}
+    union_value::Matrix{Float32}
     query::Matrix{Float32}
     key::Array{Float32,3}
     value::Array{Float32,3}
@@ -1240,7 +1606,13 @@ CrossAttentionForwardScratch() = CrossAttentionForwardScratch(
     Matrix{Float32}(undef, EPISODIC_ROUTER_DIM, TOKEN_COUNT),
     Matrix{Int16}(undef, EPISODIC_SUPPORT, REGISTER_COUNT),
     Matrix{Bool}(undef, TOKEN_COUNT, REGISTER_COUNT),
-    Array{Float32}(undef, MODEL_DIM, EPISODIC_SUPPORT, REGISTER_COUNT),
+    falses(TOKEN_COUNT),
+    Vector{Int16}(undef, MAX_EPISODIC_UNION),
+    Vector{Int16}(undef, TOKEN_COUNT),
+    Matrix{Int16}(undef, EPISODIC_SUPPORT, REGISTER_COUNT),
+    Matrix{Float32}(undef, MODEL_DIM, MAX_EPISODIC_UNION),
+    Matrix{Float32}(undef, ATTENTION_DIM, MAX_EPISODIC_UNION),
+    Matrix{Float32}(undef, ATTENTION_DIM, MAX_EPISODIC_UNION),
     Matrix{Float32}(undef, ATTENTION_DIM, REGISTER_COUNT),
     Array{Float32}(undef, ATTENTION_DIM, EPISODIC_SUPPORT, REGISTER_COUNT),
     Array{Float32}(undef, ATTENTION_DIM, EPISODIC_SUPPORT, REGISTER_COUNT),
@@ -1254,6 +1626,7 @@ CrossAttentionForwardScratch() = CrossAttentionForwardScratch(
 struct WorkingMemoryWriteTape
     registers::Matrix{Float32}
     value::Matrix{Float32}
+    basis::Array{Float32,3}
     selected_ids::Matrix{Int16}
     weights::Array{Float32,3}
     inverse_weight_sums::Matrix{Float32}
@@ -1269,6 +1642,7 @@ end
 struct WorkingMemoryWriteForwardScratch
     registers::Matrix{Float32}
     value::Matrix{Float32}
+    basis::Array{Float32,3}
     selected_ids::Matrix{Int16}
     weights::Array{Float32,3}
     inverse_weight_sums::Matrix{Float32}
@@ -1283,6 +1657,7 @@ end
 WorkingMemoryWriteForwardScratch() = WorkingMemoryWriteForwardScratch(
     Matrix{Float32}(undef, MODEL_DIM, REGISTER_COUNT),
     Matrix{Float32}(undef, ATTENTION_DIM, REGISTER_COUNT),
+    Array{Float32}(undef, MODEL_DIM, ATTENTION_HEADS, REGISTER_COUNT),
     Matrix{Int16}(undef, EPISODIC_SUPPORT, REGISTER_COUNT),
     Array{Float32}(undef, EPISODIC_SUPPORT, REGISTER_COUNT, ATTENTION_HEADS),
     Matrix{Float32}(undef, TOKEN_COUNT, ATTENTION_HEADS),
@@ -1634,25 +2009,54 @@ function _cross_attention_forward!(
         scratch.register_route,
     )
 
-    mul!(scratch.query, model.cross_q, scratch.normalized)
+    # Project the register support union once.  The same token may be selected
+    # by several registers; repeating its dense K/V projection changes no
+    # semantics and only burns memory bandwidth and MACs.
+    fill!(scratch.union_seen, false)
+    union_count = 0
     @inbounds for register in 1:REGISTER_COUNT
         for support_index in 1:EPISODIC_SUPPORT
             token = Int(scratch.selected_ids[support_index, register])
-            @simd for coordinate in 1:MODEL_DIM
-                scratch.selected_memory[coordinate, support_index, register] =
-                    memory_normalized[coordinate, token]
+            if !scratch.union_seen[token]
+                scratch.union_seen[token] = true
+                union_count += 1
+                scratch.union_ids[union_count] = Int16(token)
+                scratch.token_slots[token] = Int16(union_count)
+                @simd for coordinate in 1:MODEL_DIM
+                    scratch.union_memory[coordinate, union_count] =
+                        memory_normalized[coordinate, token]
+                end
+            end
+            scratch.support_slots[support_index, register] =
+                scratch.token_slots[token]
+        end
+    end
+    union_count <= MAX_EPISODIC_UNION || error(
+        "episodic support union exceeded its fixed scratch",
+    )
+    _register_attention_forward!(
+        scratch.query, model.cross_q, scratch.normalized,
+    )
+    _register_attention_forward!(
+        @view(scratch.union_key[:, 1:union_count]),
+        model.cross_k,
+        @view(scratch.union_memory[:, 1:union_count]),
+    )
+    _register_attention_forward!(
+        @view(scratch.union_value[:, 1:union_count]),
+        model.cross_v,
+        @view(scratch.union_memory[:, 1:union_count]),
+    )
+    @inbounds for register in 1:REGISTER_COUNT
+        for support_index in 1:EPISODIC_SUPPORT
+            slot = Int(scratch.support_slots[support_index, register])
+            @simd for coordinate in 1:ATTENTION_DIM
+                scratch.key[coordinate, support_index, register] =
+                    scratch.union_key[coordinate, slot]
+                scratch.value[coordinate, support_index, register] =
+                    scratch.union_value[coordinate, slot]
             end
         end
-        mul!(
-            @view(scratch.key[:, :, register]),
-            model.cross_k,
-            @view(scratch.selected_memory[:, :, register]),
-        )
-        mul!(
-            @view(scratch.value[:, :, register]),
-            model.cross_v,
-            @view(scratch.selected_memory[:, :, register]),
-        )
     end
     fill!(scratch.attention_context, 0.0f0)
     head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
@@ -1714,7 +2118,9 @@ function _cross_attention_forward!(
             )
         end
     end
-    mul!(scratch.output, model.cross_o, scratch.attention_context)
+    _register_attention_expand!(
+        scratch.output, model.cross_o, scratch.attention_context,
+    )
     alpha = _residual_scale(model.cross_scale_logit[1])
     summary_alpha = _residual_scale(model.relation_scale_logit[1])
     @inbounds for register in 1:REGISTER_COUNT
@@ -1732,6 +2138,9 @@ function _cross_attention_forward!(
         scratch.register_route,
         scratch.token_route,
         scratch.selected_ids,
+        scratch.support_slots,
+        scratch.union_ids,
+        Int16(union_count),
         scratch.query,
         scratch.key,
         scratch.value,
@@ -1751,21 +2160,40 @@ function _working_memory_write_forward!(
     registers,
     read_weights,
     selected_ids,
+    support_slots,
+    union_ids,
+    union_count::Int,
 )
     copyto!(scratch.registers, registers)
     copyto!(scratch.selected_ids, selected_ids)
     mul!(scratch.value, model.memory_write_v, registers)
-    fill!(scratch.seen, false)
-    write_count = 0
+    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
     @inbounds for register in 1:REGISTER_COUNT
-        for support_index in 1:EPISODIC_SUPPORT
-            token = Int(selected_ids[support_index, register])
-            scratch.seen[token] && continue
-            scratch.seen[token] = true
-            write_count += 1
-            scratch.write_ids[write_count] = Int16(token)
-            scratch.token_slots[token] = Int16(write_count)
+        for head in 1:ATTENTION_HEADS
+            first_coordinate = (head - 1) * head_dim + 1
+            last_coordinate = head * head_dim
+            for coordinate in 1:MODEL_DIM
+                value = 0.0f0
+                @simd for attention_coordinate in
+                        first_coordinate:last_coordinate
+                    value = muladd(
+                        model.memory_write_o[
+                            coordinate, attention_coordinate,
+                        ],
+                        scratch.value[attention_coordinate, register],
+                        value,
+                    )
+                end
+                scratch.basis[coordinate, head, register] = value
+            end
         end
+    end
+    write_count = union_count
+    @inbounds for write_index in 1:write_count
+        token16 = union_ids[write_index]
+        token = Int(token16)
+        scratch.write_ids[write_index] = token16
+        scratch.token_slots[token] = Int16(write_index)
     end
     @inbounds for write_index in 1:write_count
         token = Int(scratch.write_ids[write_index])
@@ -1774,6 +2202,9 @@ function _working_memory_write_forward!(
         end
         @simd for coordinate in 1:ATTENTION_DIM
             scratch.context[coordinate, write_index] = 0.0f0
+        end
+        @simd for coordinate in 1:MODEL_DIM
+            scratch.projected[coordinate, write_index] = 0.0f0
         end
     end
     @inbounds for register in 1:REGISTER_COUNT
@@ -1792,11 +2223,10 @@ function _working_memory_write_forward!(
                 inv(scratch.inverse_weight_sums[token, head])
         end
     end
-    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
     @inbounds for register in 1:REGISTER_COUNT
         for support_index in 1:EPISODIC_SUPPORT
             token = Int(selected_ids[support_index, register])
-            write_index = Int(scratch.token_slots[token])
+            write_index = Int(support_slots[support_index, register])
             for head in 1:ATTENTION_HEADS
                 first_coordinate = (head - 1) * head_dim + 1
                 last_coordinate = head * head_dim
@@ -1809,14 +2239,16 @@ function _working_memory_write_forward!(
                         scratch.context[coordinate, write_index],
                     )
                 end
+                @simd for coordinate in 1:MODEL_DIM
+                    scratch.projected[coordinate, write_index] = muladd(
+                        weight,
+                        scratch.basis[coordinate, head, register],
+                        scratch.projected[coordinate, write_index],
+                    )
+                end
             end
         end
     end
-    mul!(
-        @view(scratch.projected[:, 1:write_count]),
-        model.memory_write_o,
-        @view(scratch.context[:, 1:write_count]),
-    )
     alpha = _residual_scale(model.memory_write_scale_logit[1])
     copyto!(scratch.output, memory)
     @inbounds for write_index in 1:write_count
@@ -1832,6 +2264,7 @@ function _working_memory_write_forward!(
     return scratch.output, WorkingMemoryWriteTape(
         scratch.registers,
         scratch.value,
+        scratch.basis,
         scratch.selected_ids,
         scratch.weights,
         scratch.inverse_weight_sums,
@@ -1847,10 +2280,11 @@ end
 
 function _working_memory_write_forward(
     model, memory, registers, read_weights, selected_ids,
+    support_slots, union_ids, union_count,
 )
     return _working_memory_write_forward!(
         WorkingMemoryWriteForwardScratch(), model, memory, registers,
-        read_weights, selected_ids,
+        read_weights, selected_ids, support_slots, union_ids, union_count,
     )
 end
 
@@ -2358,15 +2792,17 @@ function advance_trajectory!(
     state.stopped && error("cannot advance a stopped trajectory")
     step_index = length(state.steps) + 1
     step_index <= MAX_RECURRENT_STEPS || error("trajectory exceeded recurrent bound")
-    memory, spatial = if state.arena === nothing
-        _spatial_attention_forward(model, state.memory)
-    else
-        spatial_scratch = state.arena.spatial_scratch[step_index]
-        if spatial_scratch === nothing
-            spatial_scratch = SpatialAttentionForwardScratch()
-            state.arena.spatial_scratch[step_index] = spatial_scratch
+    memory, spatial = @subphase 1 begin
+        if state.arena === nothing
+            _spatial_attention_forward(model, state.memory)
+        else
+            spatial_scratch = state.arena.spatial_scratch[step_index]
+            if spatial_scratch === nothing
+                spatial_scratch = SpatialAttentionForwardScratch()
+                state.arena.spatial_scratch[step_index] = spatial_scratch
+            end
+            _spatial_attention_forward!(spatial_scratch, model, state.memory)
         end
-        _spatial_attention_forward!(spatial_scratch, model, state.memory)
     end
     cross_scratch = if state.arena === nothing
         nothing
@@ -2378,38 +2814,40 @@ function advance_trajectory!(
         end
         value
     end
-    registers, cross = if state.arena === nothing
-        _cross_attention_forward(
-            model,
-            state.registers,
-            spatial.output_normalized,
-        )
-    else
-        _cross_attention_forward!(
-            cross_scratch,
-            model,
-            state.registers,
-            spatial.output_normalized,
-            state.arena.buckets,
-        )
+    registers, cross = @subphase 2 begin
+        if state.arena === nothing
+            _cross_attention_forward(
+                model,
+                state.registers,
+                spatial.output_normalized,
+            )
+        else
+            _cross_attention_forward!(
+                cross_scratch,
+                model,
+                state.registers,
+                spatial.output_normalized,
+                state.arena.buckets,
+            )
+        end
     end
     if state.arena === nothing
-        registers, self = _self_attention_forward(model, registers)
-        registers, swiglu = _swiglu_forward(model, registers)
-        registers, lookup = _lookup_carrier_forward(
+        registers, self = @subphase 3 _self_attention_forward(model, registers)
+        registers, swiglu = @subphase 4 _swiglu_forward(model, registers)
+        registers, lookup = @subphase 5 _lookup_carrier_forward(
             model, registers, state.temperature, materialize,
         )
         pooled = _pool_registers(registers)
         final_registers = copy(registers)
     else
-        registers, self = _self_attention_forward!(
+        registers, self = @subphase 3 _self_attention_forward!(
             state.arena.self_scratch[step_index], model, registers,
         )
-        registers, swiglu = _swiglu_forward!(
+        registers, swiglu = @subphase 4 _swiglu_forward!(
             state.arena.swiglu_scratch[step_index], model, registers,
         )
         carrier_scratch = state.arena.carrier_scratch[step_index]
-        registers, lookup = _lookup_carrier_forward!(
+        registers, lookup = @subphase 5 _lookup_carrier_forward!(
             carrier_scratch,
             model,
             registers,
@@ -2421,17 +2859,21 @@ function advance_trajectory!(
         pooled = _pool_registers!(carrier_scratch.pooled, registers)
         final_registers = registers
     end
-    memory, memory_write = if state.arena === nothing
-        _working_memory_write_forward(
-            model, memory, registers, cross.attention_weights,
-            cross.selected_ids,
-        )
-    else
-        _working_memory_write_forward!(
-            state.arena.memory_write_scratch[step_index],
-            model, memory, registers, cross.attention_weights,
-            cross.selected_ids,
-        )
+    memory, memory_write = @subphase 6 begin
+        if state.arena === nothing
+            _working_memory_write_forward(
+                model, memory, registers, cross.attention_weights,
+                cross.selected_ids, cross.support_slots, cross.union_ids,
+                Int(cross.union_count),
+            )
+        else
+            _working_memory_write_forward!(
+                state.arena.memory_write_scratch[step_index],
+                model, memory, registers, cross.attention_weights,
+                cross.selected_ids, cross.support_slots, cross.union_ids,
+                Int(cross.union_count),
+            )
+        end
     end
     # A fixed monotone hazard prior prevents tiny global bias changes around
     # logit zero from flipping the entire panel between the minimum and maximum
@@ -2610,11 +3052,16 @@ mutable struct BackwardScratch
     attention_dquery::Matrix{Float32}
     attention_dkey::Matrix{Float32}
     attention_dvalue::Matrix{Float32}
+    cross_dkey_union::Matrix{Float32}
+    cross_dvalue_union::Matrix{Float32}
+    cross_union_memory::Matrix{Float32}
+    cross_union_gradient::Matrix{Float32}
     attention_dscore::Matrix{Float32}
     attention_dweights::Matrix{Float32}
     attention_external_dweights::Array{Float32,3}
     memory_write_dcontext::Matrix{Float32}
     memory_write_dvalue::Matrix{Float32}
+    memory_write_dbasis::Array{Float32,3}
     memory_write_dregisters::Matrix{Float32}
     dnormalized::Matrix{Float32}
     dregister_route::Matrix{Float32}
@@ -2665,11 +3112,16 @@ function BackwardScratch()
         zeros(Float32, ATTENTION_DIM, REGISTER_COUNT),
         zeros(Float32, ATTENTION_DIM, TOKEN_COUNT),
         zeros(Float32, ATTENTION_DIM, TOKEN_COUNT),
+        zeros(Float32, ATTENTION_DIM, MAX_EPISODIC_UNION),
+        zeros(Float32, ATTENTION_DIM, MAX_EPISODIC_UNION),
+        zeros(Float32, MODEL_DIM, MAX_EPISODIC_UNION),
+        zeros(Float32, MODEL_DIM, MAX_EPISODIC_UNION),
         zeros(Float32, TOKEN_COUNT, REGISTER_COUNT),
         zeros(Float32, TOKEN_COUNT, REGISTER_COUNT),
         zeros(Float32, TOKEN_COUNT, REGISTER_COUNT, ATTENTION_HEADS),
         zeros(Float32, ATTENTION_DIM, TOKEN_COUNT),
         zeros(Float32, ATTENTION_DIM, REGISTER_COUNT),
+        zeros(Float32, MODEL_DIM, ATTENTION_HEADS, REGISTER_COUNT),
         zeros(Float32, MODEL_DIM, REGISTER_COUNT),
         zeros(Float32, MODEL_DIM, REGISTER_COUNT),
         zeros(Float32, EPISODIC_ROUTER_DIM, REGISTER_COUNT),
@@ -2914,110 +3366,113 @@ function _spatial_attention_vjp!(
     output_cotangent, dinput, scratch::BackwardScratch,
 )
     copyto!(dinput, output_cotangent)
-    scale_gradient = dot(
-        @view(output_cotangent[:, 1:CELL_COUNT]), tape.projected,
-    ) * _residual_scale_derivative(model.spatial_scale_logit[1])
-    _dgv(accumulator, :spatial_scale_logit)[1] += scale_gradient
-
-    dprojected = scratch.spatial_dprojected
-    @inbounds for token in 1:CELL_COUNT
-        @simd for coordinate in 1:MODEL_DIM
-            dprojected[coordinate, token] =
-                tape.alpha * output_cotangent[coordinate, token]
-        end
-    end
-    dcontext = scratch.spatial_dcontext
-    _structured_attention_expand_vjp!(
-        _dgm(accumulator, :spatial_o),
-        dcontext,
-        model.spatial_o,
-        tape.context,
-        dprojected,
-    )
-    dquery = scratch.spatial_dquery
-    dkey = scratch.spatial_dkey
-    dvalue = scratch.spatial_dvalue
-    fill!(dquery, 0.0f0)
-    fill!(dkey, 0.0f0)
-    fill!(dvalue, 0.0f0)
-    relative_gradient = accumulator.dense[:spatial_relative_bias]::Array{Float32,3}
-    head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
-    score_scale = inv(sqrt(Float32(head_dim)))
-    dweights = scratch.dweights
-    @inbounds for token in 1:CELL_COUNT
-        row, column = _cell_row_column(token)
-        count = Int(tape.neighbor_counts[token])
-        for head in 1:ATTENTION_HEADS
-            first_coordinate = (head - 1) * head_dim + 1
-            last_coordinate = head * head_dim
-            projection = 0.0f0
-            for edge in 1:count
-                neighbor = Int(tape.neighbor_ids[edge, token])
-                value_gradient = 0.0f0
-                @simd for coordinate in first_coordinate:last_coordinate
-                    value_gradient = muladd(
-                        tape.value[coordinate, neighbor],
-                        dcontext[coordinate, token], value_gradient,
-                    )
-                end
-                dweights[edge] = value_gradient
-                projection = muladd(
-                    tape.weights[edge, token, head], value_gradient, projection,
-                )
-            end
-            for edge in 1:count
-                neighbor = Int(tape.neighbor_ids[edge, token])
-                neighbor_row, neighbor_column = _cell_row_column(neighbor)
-                probability = tape.weights[edge, token, head]
-                dscore = probability * (dweights[edge] - projection)
-                relative_gradient[
-                    neighbor_row - row + 2,
-                    neighbor_column - column + 2,
-                    head,
-                ] += dscore
-                @simd for coordinate in first_coordinate:last_coordinate
-                    dquery[coordinate, token] = muladd(
-                        dscore * score_scale, tape.key[coordinate, neighbor],
-                        dquery[coordinate, token],
-                    )
-                    dkey[coordinate, neighbor] = muladd(
-                        dscore * score_scale, tape.query[coordinate, token],
-                        dkey[coordinate, neighbor],
-                    )
-                    dvalue[coordinate, neighbor] = muladd(
-                        probability, dcontext[coordinate, token],
-                        dvalue[coordinate, neighbor],
-                    )
-                end
-            end
-        end
-    end
-    cell_normalized = @view tape.normalized[:, 1:CELL_COUNT]
     dnormalized = scratch.spatial_dnormalized
     projection_input_gradient = scratch.spatial_projection_input
-    _structured_attention_vjp!(
-        _dgm(accumulator, :spatial_q),
-        dnormalized,
-        model.spatial_q,
-        cell_normalized,
-        dquery,
-    )
-    _structured_attention_vjp!(
-        _dgm(accumulator, :spatial_k),
-        projection_input_gradient,
-        model.spatial_k,
-        cell_normalized,
-        dkey,
-    )
-    dnormalized .+= projection_input_gradient
-    _structured_attention_vjp!(
-        _dgm(accumulator, :spatial_v),
-        projection_input_gradient,
-        model.spatial_v,
-        cell_normalized,
-        dvalue,
-    )
-    dnormalized .+= projection_input_gradient
+    cell_normalized = @view tape.normalized[:, 1:CELL_COUNT]
+    fill!(dnormalized, 0.0f0)
+    if SPATIAL_RELATION_MODE === :attention_depthwise
+        scale_gradient = dot(
+            @view(output_cotangent[:, 1:CELL_COUNT]), tape.projected,
+        ) * _residual_scale_derivative(model.spatial_scale_logit[1])
+        _dgv(accumulator, :spatial_scale_logit)[1] += scale_gradient
+
+        dprojected = scratch.spatial_dprojected
+        @inbounds for token in 1:CELL_COUNT
+            @simd for coordinate in 1:MODEL_DIM
+                dprojected[coordinate, token] =
+                    tape.alpha * output_cotangent[coordinate, token]
+            end
+        end
+        dcontext = scratch.spatial_dcontext
+        _structured_attention_expand_vjp!(
+            _dgm(accumulator, :spatial_o),
+            dcontext,
+            model.spatial_o,
+            tape.context,
+            dprojected,
+        )
+        dquery = scratch.spatial_dquery
+        dkey = scratch.spatial_dkey
+        dvalue = scratch.spatial_dvalue
+        fill!(dquery, 0.0f0)
+        fill!(dkey, 0.0f0)
+        fill!(dvalue, 0.0f0)
+        relative_gradient =
+            accumulator.dense[:spatial_relative_bias]::Array{Float32,3}
+        head_dim = ATTENTION_DIM ÷ ATTENTION_HEADS
+        score_scale = inv(sqrt(Float32(head_dim)))
+        dweights = scratch.dweights
+        @inbounds for token in 1:CELL_COUNT
+            row, column = _cell_row_column(token)
+            count = Int(tape.neighbor_counts[token])
+            for head in 1:ATTENTION_HEADS
+                first_coordinate = (head - 1) * head_dim + 1
+                last_coordinate = head * head_dim
+                projection = 0.0f0
+                for edge in 1:count
+                    neighbor = Int(tape.neighbor_ids[edge, token])
+                    value_gradient = 0.0f0
+                    @simd for coordinate in
+                            first_coordinate:last_coordinate
+                        value_gradient = muladd(
+                            tape.value[coordinate, neighbor],
+                            dcontext[coordinate, token],
+                            value_gradient,
+                        )
+                    end
+                    dweights[edge] = value_gradient
+                    projection = muladd(
+                        tape.weights[edge, token, head],
+                        value_gradient,
+                        projection,
+                    )
+                end
+                for edge in 1:count
+                    neighbor = Int(tape.neighbor_ids[edge, token])
+                    neighbor_row, neighbor_column =
+                        _cell_row_column(neighbor)
+                    probability = tape.weights[edge, token, head]
+                    dscore = probability * (dweights[edge] - projection)
+                    relative_gradient[
+                        neighbor_row - row + 2,
+                        neighbor_column - column + 2,
+                        head,
+                    ] += dscore
+                    @simd for coordinate in
+                            first_coordinate:last_coordinate
+                        dquery[coordinate, token] = muladd(
+                            dscore * score_scale,
+                            tape.key[coordinate, neighbor],
+                            dquery[coordinate, token],
+                        )
+                        dkey[coordinate, neighbor] = muladd(
+                            dscore * score_scale,
+                            tape.query[coordinate, token],
+                            dkey[coordinate, neighbor],
+                        )
+                        dvalue[coordinate, neighbor] = muladd(
+                            probability,
+                            dcontext[coordinate, token],
+                            dvalue[coordinate, neighbor],
+                        )
+                    end
+                end
+            end
+        end
+        _structured_attention_qkv_vjp!(
+            _dgm(accumulator, :spatial_q),
+            _dgm(accumulator, :spatial_k),
+            _dgm(accumulator, :spatial_v),
+            dnormalized,
+            model.spatial_q,
+            model.spatial_k,
+            model.spatial_v,
+            cell_normalized,
+            dquery,
+            dkey,
+            dvalue,
+        )
+    end
 
     # The recurrent depthwise path is a parallel residual on the same
     # RMS-normalized cell memory.  Its VJP remains local to physical 3x3
@@ -3200,25 +3655,35 @@ function _cross_attention_vjp!(
         output_cotangent[index] = tape.alpha * state_cotangent[index]
     end
     cross_o_gradient = _dgm(accumulator, :cross_o)
-    @inbounds for attention_coordinate in 1:ATTENTION_DIM
-        for coordinate in 1:MODEL_DIM
-            gradient = 0.0f0
-            @simd for register in 1:REGISTER_COUNT
-                gradient = muladd(
-                    output_cotangent[coordinate, register],
-                    tape.attention_context[attention_coordinate, register],
-                    gradient,
-                )
-            end
-            cross_o_gradient[coordinate, attention_coordinate] += gradient
-        end
-    end
     attention_context_cotangent = scratch.attention_dcontext
-    mul!(
-        attention_context_cotangent,
-        transpose(model.cross_o),
-        output_cotangent,
-    )
+    if REGISTER_ATTENTION_PROJECTION === :dense
+        @inbounds for attention_coordinate in 1:ATTENTION_DIM
+            for coordinate in 1:MODEL_DIM
+                gradient = 0.0f0
+                @simd for register in 1:REGISTER_COUNT
+                    gradient = muladd(
+                        output_cotangent[coordinate, register],
+                        tape.attention_context[attention_coordinate, register],
+                        gradient,
+                    )
+                end
+                cross_o_gradient[coordinate, attention_coordinate] += gradient
+            end
+        end
+        mul!(
+            attention_context_cotangent,
+            transpose(model.cross_o),
+            output_cotangent,
+        )
+    else
+        _register_attention_expand_vjp!(
+            cross_o_gradient,
+            attention_context_cotangent,
+            model.cross_o,
+            tape.attention_context,
+            output_cotangent,
+        )
+    end
     dnormalized = scratch.dnormalized
     dregister_route = scratch.dregister_route
     fill!(dnormalized, 0.0f0)
@@ -3232,6 +3697,11 @@ function _cross_attention_vjp!(
     dweight_storage = scratch.attention_dweights
     cross_k_gradient = _dgm(accumulator, :cross_k)
     cross_v_gradient = _dgm(accumulator, :cross_v)
+    union_count = Int(tape.union_count)
+    dkey_union = @view scratch.cross_dkey_union[:, 1:union_count]
+    dvalue_union = @view scratch.cross_dvalue_union[:, 1:union_count]
+    fill!(dkey_union, 0.0f0)
+    fill!(dvalue_union, 0.0f0)
     router_scale = ROUTER_STE_SCALE / sqrt(Float32(EPISODIC_ROUTER_DIM))
     @inbounds for register in 1:REGISTER_COUNT
         query = @view tape.query[:, register:register]
@@ -3253,36 +3723,17 @@ function _cross_attention_vjp!(
             dquery, dkey, dvalue, dscore_total, dweights,
             query, key, value, weights, context_gradient, external,
         )
-        selected_memory =
-            @view scratch.spatial_projection_input[:, 1:EPISODIC_SUPPORT]
         for support_index in 1:EPISODIC_SUPPORT
-            token = Int(tape.selected_ids[support_index, register])
-            @simd for coordinate in 1:MODEL_DIM
-                selected_memory[coordinate, support_index] =
-                    memory_normalized[coordinate, token]
+            slot = Int(tape.support_slots[support_index, register])
+            @simd for coordinate in 1:ATTENTION_DIM
+                dkey_union[coordinate, slot] +=
+                    dkey[coordinate, support_index]
+                dvalue_union[coordinate, slot] +=
+                    dvalue[coordinate, support_index]
             end
         end
-        mul!(
-            cross_k_gradient, dkey, transpose(selected_memory),
-            1.0f0, 1.0f0,
-        )
-        mul!(
-            cross_v_gradient, dvalue, transpose(selected_memory),
-            1.0f0, 1.0f0,
-        )
-        selected_gradient =
-            @view scratch.spatial_dprojected[:, 1:EPISODIC_SUPPORT]
-        mul!(selected_gradient, transpose(model.cross_k), dkey)
-        mul!(
-            selected_gradient, transpose(model.cross_v), dvalue,
-            1.0f0, 1.0f0,
-        )
         for support_index in 1:EPISODIC_SUPPORT
             token = Int(tape.selected_ids[support_index, register])
-            @simd for coordinate in 1:MODEL_DIM
-                dmemory_normalized[coordinate, token] +=
-                    selected_gradient[coordinate, support_index]
-            end
             coefficient = dscore_total[support_index, 1] * router_scale
             _touch_route_gradient!(scratch, token)
             for route in 1:EPISODIC_ROUTER_DIM
@@ -3297,14 +3748,44 @@ function _cross_attention_vjp!(
             end
         end
     end
-    mul!(
-        _dgm(accumulator, :cross_q),
-        dquery_total,
-        transpose(tape.normalized),
-        1.0f0,
-        1.0f0,
+    union_memory = @view scratch.cross_union_memory[:, 1:union_count]
+    @inbounds for union_index in 1:union_count
+        token = Int(tape.union_ids[union_index])
+        @simd for coordinate in 1:MODEL_DIM
+            union_memory[coordinate, union_index] =
+                memory_normalized[coordinate, token]
+        end
+    end
+    union_gradient = @view scratch.cross_union_gradient[:, 1:union_count]
+    _register_attention_vjp!(
+        cross_k_gradient,
+        union_gradient,
+        model.cross_k,
+        union_memory,
+        dkey_union,
     )
-    mul!(dnormalized, transpose(model.cross_q), dquery_total)
+    _register_attention_vjp!(
+        cross_v_gradient,
+        union_gradient,
+        model.cross_v,
+        union_memory,
+        dvalue_union;
+        accumulate_input=true,
+    )
+    @inbounds for union_index in 1:union_count
+        token = Int(tape.union_ids[union_index])
+        @simd for coordinate in 1:MODEL_DIM
+            dmemory_normalized[coordinate, token] +=
+                union_gradient[coordinate, union_index]
+        end
+    end
+    _register_attention_vjp!(
+        _dgm(accumulator, :cross_q),
+        dnormalized,
+        model.cross_q,
+        tape.normalized,
+        dquery_total,
+    )
     @inbounds for register in 1:REGISTER_COUNT
         fill!(scratch.register_input_gradient, 0.0f0)
         _structured_router_selected_vjp!(
@@ -3390,21 +3871,10 @@ function _working_memory_write_vjp!(
                 tape.alpha * memory_cotangent[coordinate, token]
         end
     end
-    mul!(
-        _dgm(accumulator, :memory_write_o),
-        @view(dprojected[:, 1:write_count]),
-        transpose(@view(tape.context[:, 1:write_count])),
-        1.0f0,
-        1.0f0,
-    )
-    dcontext = scratch.memory_write_dcontext
-    mul!(
-        @view(dcontext[:, 1:write_count]),
-        transpose(model.memory_write_o),
-        @view(dprojected[:, 1:write_count]),
-    )
     dvalue = scratch.memory_write_dvalue
     fill!(dvalue, 0.0f0)
+    dbasis = scratch.memory_write_dbasis
+    fill!(dbasis, 0.0f0)
     external = scratch.attention_external_dweights
     fill!(@view(external[1:EPISODIC_SUPPORT, :, :]), 0.0f0)
     token_projection = scratch.attention_dscore
@@ -3420,19 +3890,18 @@ function _working_memory_write_vjp!(
             token = Int(tape.selected_ids[support_index, register])
             write_index = Int(tape.token_slots[token])
             for head in 1:ATTENTION_HEADS
-                first_coordinate = (head - 1) * head_dim + 1
-                last_coordinate = head * head_dim
                 dweight = 0.0f0
-                @simd for coordinate in first_coordinate:last_coordinate
+                weight = tape.weights[support_index, register, head]
+                @simd for coordinate in 1:MODEL_DIM
                     dweight = muladd(
-                        dcontext[coordinate, write_index],
-                        tape.value[coordinate, register],
+                        dprojected[coordinate, write_index],
+                        tape.basis[coordinate, head, register],
                         dweight,
                     )
-                    dvalue[coordinate, register] = muladd(
-                        tape.weights[support_index, register, head],
-                        dcontext[coordinate, write_index],
-                        dvalue[coordinate, register],
+                    dbasis[coordinate, head, register] = muladd(
+                        weight,
+                        dprojected[coordinate, write_index],
+                        dbasis[coordinate, head, register],
                     )
                 end
                 external[support_index, register, head] = dweight
@@ -3453,6 +3922,41 @@ function _working_memory_write_vjp!(
                     external[support_index, register, head] -
                     token_projection[token, head]
                 )
+            end
+        end
+    end
+    memory_write_o_gradient = _dgm(accumulator, :memory_write_o)
+    @inbounds for register in 1:REGISTER_COUNT
+        for head in 1:ATTENTION_HEADS
+            first_coordinate = (head - 1) * head_dim + 1
+            last_coordinate = head * head_dim
+            for coordinate in 1:MODEL_DIM
+                basis_gradient = dbasis[coordinate, head, register]
+                @simd for attention_coordinate in
+                        first_coordinate:last_coordinate
+                    memory_write_o_gradient[
+                        coordinate, attention_coordinate,
+                    ] = muladd(
+                        basis_gradient,
+                        tape.value[attention_coordinate, register],
+                        memory_write_o_gradient[
+                            coordinate, attention_coordinate,
+                        ],
+                    )
+                end
+            end
+            for attention_coordinate in first_coordinate:last_coordinate
+                value_gradient = 0.0f0
+                @simd for coordinate in 1:MODEL_DIM
+                    value_gradient = muladd(
+                        model.memory_write_o[
+                            coordinate, attention_coordinate,
+                        ],
+                        dbasis[coordinate, head, register],
+                        value_gradient,
+                    )
+                end
+                dvalue[attention_coordinate, register] += value_gradient
             end
         end
     end
@@ -3786,6 +4290,8 @@ function _visual_stem_vjp!(
     input,
     token_cotangents,
     scratch::BackwardScratch,
+    visual_scale_contributions=nothing,
+    visual_scale_contribution_index::Int=0,
 )
     features = _visual_stack_forward_features!(
         scratch.visual_features, model, input,
@@ -3801,6 +4307,7 @@ function _visual_stem_vjp!(
     output_scale_derivative = _residual_scale_derivative(
         model.visual_scale_logit[1],
     )
+    visual_scale_contribution = 0.0f0
     @inbounds for token in 1:CELL_COUNT
         visual_1 = features[1, token, final_stage]
         visual_2 = features[2, token, final_stage]
@@ -3810,9 +4317,17 @@ function _visual_stem_vjp!(
             visual_output = model.visual_pointwise[coordinate, 1] * visual_1 +
                 model.visual_pointwise[coordinate, 2] * visual_2 +
                 model.visual_pointwise[coordinate, 3] * visual_3
-            dscale[1] = muladd(
-                gradient, visual_output * output_scale_derivative, dscale[1],
-            )
+            if visual_scale_contributions === nothing
+                dscale[1] = muladd(
+                    gradient, visual_output * output_scale_derivative, dscale[1],
+                )
+            else
+                visual_scale_contribution = muladd(
+                    gradient,
+                    visual_output * output_scale_derivative,
+                    visual_scale_contribution,
+                )
+            end
             scaled_gradient = output_alpha * gradient
             dpointwise[coordinate, 1] = muladd(
                 scaled_gradient, visual_1, dpointwise[coordinate, 1],
@@ -3836,6 +4351,13 @@ function _visual_stem_vjp!(
                 feature_cotangents[3, token, final_stage],
             )
         end
+    end
+    if visual_scale_contributions !== nothing
+        visual_scale_contribution_index >= 1 || throw(ArgumentError(
+            "visual scale contribution index must be positive",
+        ))
+        @inbounds visual_scale_contributions[visual_scale_contribution_index] =
+            visual_scale_contribution
     end
     @inbounds for stage in VISUAL_STAGES:-1:1
         dilation = VISUAL_DILATIONS[stage]
@@ -4043,6 +4565,8 @@ marked active only when its accumulated cotangent is actually non-zero.
 """
 function _tokenize_vjp_dense!(
     accumulator, model, input, token_cotangents, scratch::BackwardScratch,
+    visual_scale_contributions=nothing,
+    visual_scale_contribution_index::Int=0,
 )
     size(token_cotangents) == (MODEL_DIM, TOKEN_COUNT) ||
         throw(DimensionMismatch("recurrent memory cotangent shape changed"))
@@ -4094,6 +4618,7 @@ function _tokenize_vjp_dense!(
     end
     _visual_stem_vjp!(
         accumulator, model, input, token_cotangents, scratch,
+        visual_scale_contributions, visual_scale_contribution_index,
     )
     return nothing
 end
@@ -4115,6 +4640,8 @@ function backward_trajectory!(
     unprobed_policy_scale=0.10f0,
     temperature=0.50f0,
     ffn_scale_contributions=nothing,
+    visual_scale_contributions=nothing,
+    visual_scale_contribution_index::Int=0,
     lookup_balance_stats=nothing,
     lookup_balance_weight=0.0f0,
 )
@@ -4230,7 +4757,7 @@ function backward_trajectory!(
     fill!(scratch.memory_gradient, 0.0f0)
     for step_index in depth:-1:1
         step = tape.steps[step_index]
-        external_cross_dweights = _working_memory_write_vjp!(
+        external_cross_dweights = @subphase 7 _working_memory_write_vjp!(
             accumulator,
             model,
             step.memory_write,
@@ -4262,26 +4789,26 @@ function backward_trajectory!(
         end
         next_cotangent = state_cotangent === scratch.state_a ?
             scratch.state_b : scratch.state_a
-        state_cotangent = _lookup_carrier_vjp!(
+        state_cotangent = @subphase 8 _lookup_carrier_vjp!(
             accumulator, model, step.lookup, state_cotangent,
             Float32(temperature), scratch, next_cotangent,
             lookup_balance_stats, Float32(lookup_balance_weight),
         )
         next_cotangent = state_cotangent === scratch.state_a ?
             scratch.state_b : scratch.state_a
-        state_cotangent = _swiglu_vjp!(
+        state_cotangent = @subphase 9 _swiglu_vjp!(
             accumulator, model, step.swiglu, state_cotangent,
             scratch, next_cotangent, ffn_scale_contributions, step_index,
         )
         next_cotangent = state_cotangent === scratch.state_a ?
             scratch.state_b : scratch.state_a
-        state_cotangent = _self_attention_vjp!(
+        state_cotangent = @subphase 10 _self_attention_vjp!(
             accumulator, model, step.self, state_cotangent,
             scratch, next_cotangent,
         )
         next_cotangent = state_cotangent === scratch.state_a ?
             scratch.state_b : scratch.state_a
-        state_cotangent = _cross_attention_vjp!(
+        state_cotangent = @subphase 11 _cross_attention_vjp!(
             accumulator, model, step.cross, step.spatial.output_normalized,
             state_cotangent, scratch, next_cotangent,
             scratch.memory_postnorm,
@@ -4291,16 +4818,18 @@ function backward_trajectory!(
         # Cross reads the RMS-normalized post-spatial memory.  Convert that
         # gradient back to the raw post-spatial state before joining the BPTT
         # edge from the following recurrent step.
-        _rmsnorm_columns_vjp!(
-            scratch.memory_previous,
-            step.spatial.output_normalized,
-            step.spatial.output_inverse_rms,
-            scratch.memory_postnorm,
-        )
-        @inbounds @simd for index in eachindex(scratch.memory_previous)
-            scratch.memory_previous[index] += scratch.memory_gradient[index]
+        @subphase 12 begin
+            _rmsnorm_columns_vjp!(
+                scratch.memory_previous,
+                step.spatial.output_normalized,
+                step.spatial.output_inverse_rms,
+                scratch.memory_postnorm,
+            )
+            @inbounds @simd for index in eachindex(scratch.memory_previous)
+                scratch.memory_previous[index] += scratch.memory_gradient[index]
+            end
         end
-        _spatial_attention_vjp!(
+        @subphase 13 _spatial_attention_vjp!(
             accumulator,
             model,
             step.spatial,
@@ -4313,8 +4842,9 @@ function backward_trajectory!(
     @inbounds @simd for index in eachindex(register_seed_gradient)
         register_seed_gradient[index] += state_cotangent[index]
     end
-    _tokenize_vjp_dense!(
+    @subphase 14 _tokenize_vjp_dense!(
         accumulator, model, tape.input, scratch.memory_gradient, scratch,
+        visual_scale_contributions, visual_scale_contribution_index,
     )
     return nothing
 end

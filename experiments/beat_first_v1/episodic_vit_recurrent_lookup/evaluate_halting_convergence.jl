@@ -7,6 +7,9 @@ This program never constructs validation rows and never uses a sealed seed.
 Pass semicolon-separated absolute checkpoint paths through
 `EVRL_HALTING_EVAL_CHECKPOINTS`.  The JSON result is written to
 `EVRL_HALTING_EVAL_OUTPUT` when that variable is nonempty and is always printed.
+`EVRL_HALTING_EVAL_FORCE_DEPTH` may be set to a recurrent depth for an
+evaluation-only ablation.  Checkpoint restoration always uses the inherited
+training hyperparameters; the override is applied only to prediction.
 """
 
 for (name, value) in (
@@ -45,6 +48,13 @@ const PANEL_STATES = parse(
     Int, strip(get(ENV, "EVRL_HALTING_EVAL_STATES", "128")),
 )
 PANEL_STATES > 0 || error("EVRL_HALTING_EVAL_STATES must be positive")
+const FORCE_DEPTH = parse(
+    Int, strip(get(ENV, "EVRL_HALTING_EVAL_FORCE_DEPTH", "0")),
+)
+FORCE_DEPTH == 0 ||
+    Training.Model.MIN_RECURRENT_STEPS <= FORCE_DEPTH <=
+        Training.Model.MAX_RECURRENT_STEPS ||
+    error("EVRL_HALTING_EVAL_FORCE_DEPTH must be zero or inside recurrent bounds")
 
 function _required_paths()
     raw = strip(get(ENV, "EVRL_HALTING_EVAL_CHECKPOINTS", ""))
@@ -79,6 +89,17 @@ function _evaluate_checkpoint(
         manifest_sha256,
         hyperparameters,
     )
+    evaluation_hyperparameters = if iszero(FORCE_DEPTH)
+        hyperparameters
+    else
+        merge(
+            hyperparameters,
+            (; halting=merge(
+                hyperparameters.halting,
+                (; fixed_depth=FORCE_DEPTH),
+            )),
+        )
+    end
     depth_counts = zeros(Int, Training.Model.MAX_RECURRENT_STEPS)
     metrics = TrainingCore.evaluation_metrics(
         dataset,
@@ -90,7 +111,7 @@ function _evaluate_checkpoint(
                 batch;
                 training=false,
                 expected_update=trainer.update,
-                hyperparameters,
+                hyperparameters=evaluation_hyperparameters,
                 record_tapes=false,
             )
             @inbounds for candidate in 1:count
@@ -123,6 +144,7 @@ function _evaluate_checkpoint(
         mean_depth=Float64(mean_depth),
         minimum_depth=minimum(active_depths),
         maximum_depth=maximum(active_depths),
+        forced_depth=FORCE_DEPTH,
         depth_counts,
         halt_weight_norm=Float64(norm(trainer.model.lookup.halt_weight)),
         halt_bias=Float64(trainer.model.lookup.halt_bias[1]),
@@ -188,6 +210,7 @@ function main()
         dataset_manifest_sha256=manifest_sha256,
         training_rows=length(rows),
         training_rows_sha256=rows_sha256,
+        forced_depth=FORCE_DEPTH,
         validation_rows_touched=false,
         sealed_seed_touched=false,
         checkpoints=results,

@@ -47,6 +47,16 @@ loss`2.858829`、top-1`0.453125`、NDCG`0.974179`、pairwise`0.834829`、
 [`FIXED_K_SUPPORT_TUNING_2026-07-24.md`](FIXED_K_SUPPORT_TUNING_2026-07-24.md)
 を参照。
 
+K幅変更後の根本速度改善では、Lookup bank容量を維持したままregister workspaceと
+projection、SwiGLU幅、backward tailを見直した。速度合格候補は6,897,248 parameter、
+2 register、attention 16、1 head、FFN 32である。固定深度2のproduction相当計測は
+`41.545 updates/s`、sampled hard haltingを有効化した実測は平均深度`2.979`で
+`27.614 updates/s`となり、目標40と動的段階の下限20をそれぞれ満たした。
+serial/barrierless smokeと551件の回帰テストも合格している。品質はまだ未確定なので、
+この構成を直ちに最終性能checkpointとは扱わない。全試行と評価境界は
+[`ROOT_SPEED_TUNING_2026-07-24.md`](ROOT_SPEED_TUNING_2026-07-24.md)
+を参照。
+
 ## アーキテクチャ
 
 各候補は、PreActベースラインと同じ入力フィールド、すなわち盤面、候補、差分、NEXT/HOLD、`aux37`から独立に評価される。teacher Q値と順位は教師信号としてのみ用いる。
@@ -97,6 +107,32 @@ working-memory write、各VJPは選択された64 token接続に限定する。L
 - `SINGLE_LOOKUP_BOTTLENECK_PROFILE_2026-07-23.md`：単一Lookup化後のphase別速度、演算内訳、残存ボトルネック
 - `FIXED_K64_EPISODIC_ROUTING_2026-07-24.md`：固定K64の疎いepisodic read/write、数値一致、速度、学習率比較
 - `FIXED_K_SUPPORT_TUNING_2026-07-24.md`：固定K=64/80/88/96/128の同一条件比較と採否
+- `ROOT_SPEED_TUNING_2026-07-24.md`：K幅変更後の根本速度改善、40 updates/s候補、動的halting速度、数値一致
+
+## 速度合格候補
+
+次のgeometryは速度と数値一致に合格したが、長期品質は未確定である。
+
+```text
+carrier/model dim          128
+Lookup tables per block     13
+WTA choices                 16
+rows selected per table      3
+Lookup blocks per step        1
+attention dim               16
+attention heads              1
+registers                    2
+episodic cross support       64 / register
+register projection  structured
+spatial recurrent path depthwise_only
+SwiGLU FFN dim               32
+forward queue chunk           8
+backward queue chunk          1
+recurrent depth            2--12
+```
+
+固定深度2はscratch学習初期のwarmup専用である。その後はsampled hard haltingと
+候補固有1-step probeを用い、速度のために平均深度を固定しない。
 
 ## 検証済みproduction geometry
 

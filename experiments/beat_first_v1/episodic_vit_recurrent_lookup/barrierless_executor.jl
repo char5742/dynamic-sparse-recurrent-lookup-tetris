@@ -442,12 +442,14 @@ mutable struct BarrierlessExecutor
     active_workers::Int
     julia_workers::Int
     fixed_chunk_size::Int
+    backward_chunk_size::Int
     adaptive_tail::Bool
     candidates::Vector{BarrierlessCandidateRuntime}
     states::Vector{BarrierlessStateRuntime}
     workers::Vector{BarrierlessWorkerRuntime}
     worker_accumulators::Vector{Model.GradientAccumulator}
     ffn_scale_contributions::Matrix{Float32}
+    visual_scale_contributions::Vector{Float32}
     initial_jobs::Vector{BarrierlessJob}
     state_results::Vector{Any}
     epoch_context::Base.RefValue{Any}
@@ -472,6 +474,7 @@ function BarrierlessExecutor(
     worker_accumulators::Vector{Model.GradientAccumulator};
     active_workers::Int=length(worker_accumulators),
     fixed_chunk_size::Int=8,
+    backward_chunk_size::Int=2,
     adaptive_tail::Bool=false,
     queue_capacity::Int=1024,
 )
@@ -481,6 +484,9 @@ function BarrierlessExecutor(
     ))
     fixed_chunk_size in (8, 16, 32) || throw(ArgumentError(
         "fixed chunk size must be 8, 16, or 32",
+    ))
+    backward_chunk_size in (1, 2, 4, 8) || throw(ArgumentError(
+        "backward chunk size must be 1, 2, 4, or 8",
     ))
     ispow2(queue_capacity) || throw(ArgumentError("queue capacity must be a power of two"))
     queue_capacity >= 2 * MAX_FLAT_CANDIDATES || throw(ArgumentError(
@@ -498,12 +504,14 @@ function BarrierlessExecutor(
         active_workers,
         julia_workers,
         fixed_chunk_size,
+        backward_chunk_size,
         adaptive_tail,
         [BarrierlessCandidateRuntime() for _ in 1:MAX_FLAT_CANDIDATES],
         [BarrierlessStateRuntime() for _ in 1:TRAINING_STATE_BATCH],
         [BarrierlessWorkerRuntime(maximum_chunk) for _ in 1:active_workers],
         worker_accumulators,
         zeros(Float32, Model.MAX_RECURRENT_STEPS, MAX_FLAT_CANDIDATES),
+        zeros(Float32, MAX_FLAT_CANDIDATES),
         fill(zero(BarrierlessJob), MAX_FLAT_CANDIDATES),
         Any[nothing for _ in 1:TRAINING_STATE_BATCH],
         Ref{Any}(nothing),
@@ -1077,6 +1085,8 @@ function _barrierless_backward!(
         lookup_balance_weight=context.hyperparameters.routing.balance_weight,
         temperature=context.temperature,
         ffn_scale_contributions,
+        visual_scale_contributions=executor.visual_scale_contributions,
+        visual_scale_contribution_index=flat_job,
     )
     # `cell_bias` receives one Float32 addition per active cell token.  Keep
     # those exact per-token summands in candidate-owned storage so the update
@@ -1135,6 +1145,27 @@ function _barrierless_finalize_ordered_ffn_scale!(executor, context)
             for step_index in length(tape.steps):-1:1
                 target[1] += executor.ffn_scale_contributions[step_index, flat_job]
             end
+        end
+    end
+    return nothing
+end
+
+"""Restore the serial state/candidate sum for the visual residual scale.
+
+The visual stem produces one scalar contribution per candidate. Candidate VJPs
+retain that contribution in executor-owned storage, and this update-boundary
+replay removes worker completion order from the shared Float32 reduction.
+"""
+function _barrierless_finalize_ordered_visual_scale!(executor, context)
+    for accumulator in executor.worker_accumulators
+        accumulator.dense[:visual_scale_logit][1] = 0.0f0
+    end
+    target = executor.worker_accumulators[1].dense[:visual_scale_logit]
+    @inbounds for state_slot in 1:TRAINING_STATE_BATCH
+        state = executor.states[state_slot]
+        for candidate in 1:Int(state.candidate_count)
+            flat_job = Int(state.candidate_jobs[candidate])
+            target[1] += executor.visual_scale_contributions[flat_job]
         end
     end
     return nothing
@@ -1231,6 +1262,34 @@ function _barrierless_dispatch_job!(
     return continuation_count
 end
 
+"""Redistribute heavy backward jobs without changing the forward chunk.
+
+Backward cost scales with each candidate's realized recurrent depth.  If one
+worker retains the normal eight-job candidate chunk, the other workers become
+idle after the global queue drains.  Returning the unclaimed suffix to the
+same MPMC queue keeps forward at chunk eight while bounding each worker's
+private backward tail.
+"""
+@inline function _barrierless_limit_backward_claim!(
+    executor::BarrierlessExecutor,
+    worker::BarrierlessWorkerRuntime,
+    count::Int,
+)
+    limit = executor.backward_chunk_size
+    count <= limit && return count
+    first_job = @inbounds worker.dequeue_buffer[1]
+    first_job.kind == UInt8(BARRIERLESS_BACKWARD) || return count
+    spill = count - limit
+    @inbounds for index in 1:spill
+        worker.continuation_buffer[index] =
+            worker.dequeue_buffer[limit + index]
+    end
+    _barrierless_enqueue_batch!(
+        executor, worker.continuation_buffer, spill,
+    )
+    return limit
+end
+
 function _barrierless_take_batch!(
     executor::BarrierlessExecutor,
     worker::BarrierlessWorkerRuntime,
@@ -1257,13 +1316,17 @@ function _barrierless_take_batch!(
                 !barrierless_postphase_complete(executor) ? 1 :
                 _barrierless_chunk_size(executor)
         count = Queue.try_dequeue_batch!(queue, worker.dequeue_buffer, chunk)
-        count > 0 && return count
+        count > 0 && return _barrierless_limit_backward_claim!(
+            executor, worker, count,
+        )
 
         # Required double-check pattern: observe the notification epoch, retry
         # dequeue, re-check the external predicate, then park in WaitOnAddress.
         expected = Queue.item_epoch(queue)
         count = Queue.try_dequeue_batch!(queue, worker.dequeue_buffer, chunk)
-        count > 0 && return count
+        count > 0 && return _barrierless_limit_backward_claim!(
+            executor, worker, count,
+        )
         stop_at_gradient_boundary &&
             executor.gradient_ready_states[] == TRAINING_STATE_BATCH &&
             executor.active_dispatches[] == 0 &&
@@ -1633,6 +1696,7 @@ function wait_barrierless_gradients!(executor::BarrierlessExecutor)
     )
     state_results = _barrierless_drain_update!(executor, 1)
     _barrierless_finalize_ordered_ffn_scale!(executor, context)
+    _barrierless_finalize_ordered_visual_scale!(executor, context)
     _barrierless_finalize_ordered_cell_bias!(executor, context)
     _barrierless_finish_executor_measurement!(executor)
     return state_results
