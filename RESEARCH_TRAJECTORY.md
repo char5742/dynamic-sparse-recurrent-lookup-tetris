@@ -899,3 +899,38 @@ candidates/sは1.413倍、recurrent steps/sは1.475倍だった。stepあたりf
 詳細は
 [`SINGLE_LOOKUP_BOTTLENECK_PROFILE_2026-07-23.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/SINGLE_LOOKUP_BOTTLENECK_PROFILE_2026-07-23.md)
 へ記録した。
+
+## 32. 2026-07-25 — 高速executor上で表現力を段階復元
+
+速度優先100k構成で低下した順位品質を回復するため、executor、入力、teacher、loss、
+LookupFFN、hard halting、optimizerを固定し、learned spatial attention、register数、
+attention幅／head数、SwiGLU幅を順に戻した。
+
+dynamic haltingの短時間実測では、4 registerはattention 16／1 head、SwiGLU 32でも
+`19.630 updates/s`、attention 32／4 headsでは`16.943 updates/s`となり、速度下限20を
+割った。2 registerでもattention 32／4 headsはSwiGLU 64で`19.326 updates/s`だった。
+一方、3 register、attention 16／1 headはSwiGLU 64で`22.202 updates/s`を得たため、
+learned spatial attention＋3 register＋SwiGLU 64を長期候補に選んだ。
+
+10,000更新checkpointのserial／barrierless smokeは出力、loss、raw VJPが完全一致し、
+parameter gradient相対L2`7.27e-6`、optimizer後parameter state相対L2`1.56e-8`で
+合格した。総parameter数は`6,909,665`である。
+
+100,000更新まで400,000 teacher stateを学習した。10kから100kの区間は4,522.717秒、
+`19.900 updates/s`、100k checkpointのsteady 100更新は`20.301 updates/s`だった。
+steady allocationは`12.849 MB/update`、GC占有率`1.178%`である。
+
+同じtraining-only固定128状態の100kはloss`2.686149`、top-1`0.578125`、
+NDCG`0.984347`、pairwise`0.874771`、margin`0.097056`、平均深度`3.023`、
+深度範囲3～6だった。速度優先100kよりtop-1は`-0.007813`だが、loss`-0.048686`、
+NDCG`+0.004060`、pairwise`+0.010962`、margin`+0.017248`を得た。90kは
+NDCG`0.985523`、pairwise`0.875144`で最良だった。
+
+従って速度下限を守った部分的な表現力回復は確認したが、縮小前4-register構成やPreActの
+到達品質までは戻っていない。4 registerとattention 32／4 headsを戻すには、モデルを
+再び削るのではなく、register read/writeとspatial-attention VJPのexecutorに速度余裕を
+作る必要がある。validationとsealed seedは使用していない。
+
+詳細は
+[`EXPRESSION_RESTORATION_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/EXPRESSION_RESTORATION_2026-07-25.md)
+へ記録した。

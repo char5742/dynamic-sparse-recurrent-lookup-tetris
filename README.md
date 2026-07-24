@@ -24,25 +24,29 @@ failed overfit tests, is preserved in
 
 ## Latest verified milestone
 
-On 2026-07-24 the current one-Lookup-block model completed 100,000 optimizer
-updates with fixed-K=64, register-specific episodic routing.  A cheap all-token
-mean path prevents hard-routing input disconnection, while exact multi-head
-cross-attention and working-memory writes execute only on selected support.
+On 2026-07-25 the fast one-Lookup-block executor was used to restore model
+capacity in measured stages.  The largest configuration that retained the
+20-updates/s steady-state floor uses learned local spatial attention, three
+registers, 16-dimensional one-head register attention, and a width-64 SwiGLU.
 
-- parameters: 6,954,877;
-- fixed-K structural tests: 25/25 pass;
+- parameters: 6,909,665;
 - strict serial/barrierless correctness smoke: pass;
-- production segment, updates 10,000 to 100,000: 12.31 updates/s;
-- steady allocation: 9.067 MB/update; measured GC share: 0.83%;
-- fixed training-only panel at update 100,000: loss 2.602389, top-1 0.617188,
-  NDCG 0.989165, pairwise 0.903184, mean depth 3.026;
+- production segment, updates 10,000 to 100,000: 19.90 updates/s;
+- 100k checkpoint steady measurement: 20.30 updates/s;
+- steady allocation: 12.849 MB/update; measured GC share: 1.18%;
+- fixed training-only panel at update 100,000: loss 2.686149, top-1 0.578125,
+  NDCG 0.984347, pairwise 0.874771, margin 0.097056, mean depth 3.023;
+- relative to the preceding speed-first 100k model, loss, NDCG, pairwise, and
+  margin improved while top-1 decreased by one of 128 panel states;
 - game-validation and sealed-seed panels were not opened;
 - final checkpoint SHA-256:
-  `094b0767f91d3d488532570b8363c573b2a76716b21db0a7372d5abbeeefa0e9`.
+  `324492322bf441c9c3b69767e8d997545d0a4b5383e50b0fd431ae12ad9b456f`.
 
-The complete architecture, tuning, 10k checkpoint trajectory, PreAct boundary,
-and limitations are recorded in
-[`FIXED_K64_EPISODIC_ROUTING_2026-07-24.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/FIXED_K64_EPISODIC_ROUTING_2026-07-24.md).
+Four registers and 32-dimensional four-head attention were also measured, but
+fell below 20 updates/s under dynamic halting and were not adopted.  The full
+staged results, 10k checkpoint trajectory, PreAct boundary, and limitations
+are recorded in
+[`EXPRESSION_RESTORATION_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/EXPRESSION_RESTORATION_2026-07-25.md).
 
 ## Repository policy
 

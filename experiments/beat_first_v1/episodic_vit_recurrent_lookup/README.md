@@ -4,6 +4,20 @@
 
 ## 最新の学習結果
 
+2026-07-25に、高速executor上で表現力を段階的に戻した。dynamic haltingで
+20 updates/s以上という条件を満たした最大構成は、learned local spatial attention、
+3 register、attention 16／1 head、SwiGLU 64である。4 registerとattention
+32／4 headsは実装済みだが、実測で20を割ったため採用しなかった。
+
+採用構成は総parameter数`6,909,665`で、スクラッチから100,000更新まで学習した。
+10kから100kの長期区間は`19.900 updates/s`、100k checkpointのsteady測定は
+`20.301 updates/s`だった。training-only固定128状態ではloss`2.686149`、
+top-1`0.578125`、NDCG`0.984347`、pairwise`0.874771`、margin`0.097056`、
+平均深度`3.023`を得た。速度優先100kよりtop-1は1件分低いが、loss、NDCG、
+pairwise、marginは改善した。詳細は
+[`EXPRESSION_RESTORATION_2026-07-25.md`](EXPRESSION_RESTORATION_2026-07-25.md)
+を参照。
+
 2026-07-24の速度構成では、固定深度2を採用せず、haltingを候補状態とhalt weightの
 正規化類似度で決める方式へ修正した。residual scale 0.55のスクラッチ学習を100,000更新
 まで行い、training-only固定128状態でloss`2.734835`、top-1`0.585938`、
