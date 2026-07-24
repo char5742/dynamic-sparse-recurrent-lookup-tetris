@@ -92,7 +92,63 @@ GC時間比`4.756%`だった。
 再帰stepを実行した結果である。動的版も下限`20 updates/s`を満たす。
 
 速度のためにhalt確率を強制的に上げたり、平均深度を2へ固定したりはしない。固定深度2は
-scratch学習初期のwarmupに限定し、その後はtask lossと1-step probeから深度を学習させる。
+再帰stepあたりの速度上限を測る比較専用とし、本学習では最初の更新からtask lossと
+1-step probeによって深度を学習させる。
+
+この後、学習開始方法も実teacherで比較した。深度2～6のrandom-depth warmupを
+1,000更新行った試行は平均深度約4.0、`17.368 updates/s`となり、下限20を割ったため
+不採用とした。保存されたcheckpointから本学習を継続していない。
+
+代わりに、warmupを置かず最初の更新からsampled hard haltingとstateあたり4候補の
+1-step probeを有効化した。5,000更新pilotは次の結果となった。
+
+| 指標 | 結果 |
+|---|---:|
+| 更新数 | 5,000 |
+| 処理state数 | 20,000 |
+| updates/s | **25.866** |
+| states/s | 103.464 |
+| recurrent steps/s | 14,161.317 |
+| 平均CPU使用率 | 52.396% |
+| candidate中CPU使用率 | 54.778% |
+| update 5,000の平均深度 | 2.975 |
+| update 5,000の深度範囲 | 2～8 |
+| 最初10観測点の平均loss | 4.0176 |
+| 最後10観測点の平均loss | 3.2603 |
+| loss低下率 | 18.85% |
+
+100更新ごとの観測値はteacher batchが異なるため単調ではないが、前後平均には明確な
+学習信号がある。固定training panel 128状態の5,000更新評価は次だった。
+
+| 指標 | 結果 |
+|---|---:|
+| composite loss | 3.023583 |
+| top-1 | 0.4765625 |
+| NDCG | 0.968138 |
+| pairwise | 0.808480 |
+| margin | 0.050655 |
+| 平均深度 | 3.01195 |
+| 深度範囲 | 3～6 |
+
+5,000更新checkpointを使い、動的haltingと4-probeを有効にしたまま追加100更新を
+allocation/GC計測した。定常`28.551 updates/s`、計測込み`27.451 updates/s`、
+allocation`11.516 MiB/update`、GC時間比`1.656%`だった。全体CPU使用率は
+`53.015%`、candidate executorは`58.901%`である。probeの追加計算を含めても下限20を
+十分に上回った。
+
+pilot checkpoint：
+
+```text
+D:\tetris-paper-plus\runs\beat_first_v1\episodic_vit_recurrent_lookup\
+evrl_root_dynamic_from_scratch_pilot_u000000_u005000_20260724\
+checkpoints\checkpoint_000005000.jls
+```
+
+SHA-256：
+
+```text
+86aa6b71e951a6df8498b33eec1ad6aca09e1fb599afb861f87b20aa432153f9
+```
 
 ## 数値一致
 
@@ -133,6 +189,7 @@ Kをさらに狭めるのではなく、register workspaceとprojection、FFN幅
 修正することで、bank容量を維持したまま定常`41.545 updates/s`へ到達した。
 sampled hard haltingを有効にした場合も`27.614 updates/s`で下限を満たす。
 
-この段階で速度探索は終了する。ただし、縮小したworkspaceの最終品質は未確定である。
-本学習前にfixed-batch overfitと短い実teacher学習で学習信号を確認し、品質が維持される
-場合だけ100k学習へ進む。
+この段階で速度探索は終了する。縮小したworkspaceの最終品質は未確定だが、
+dynamic-from-scratch 5,000更新でloss、top-1、NDCG、marginとhalting挙動を確認し、
+短期学習ゲートは通過した。本学習はpilot checkpointからの継続ではなく、
+同じdynamic-from-scratch条件を維持して100kまで継続できる。
