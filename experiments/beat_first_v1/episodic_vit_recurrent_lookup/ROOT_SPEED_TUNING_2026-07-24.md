@@ -189,6 +189,14 @@ Kをさらに狭めるのではなく、register workspaceとprojection、FFN幅
 修正することで、bank容量を維持したまま定常`41.545 updates/s`へ到達した。
 sampled hard haltingを有効にした場合も`27.614 updates/s`で下限を満たす。
 
+ただし固定深度2は実装上限の比較専用であり、採用モデルではない。その後の100,000更新
+評価で旧haltingがdeterministic深度3へcollapseしたため、候補状態とhalt weightの
+正規化類似度へ変更し、residual scaleを0.55へ調整した。新条件は20,000更新時点で
+深度3、5、6、平均3.409へ分布し、`27.243 updates/s`を維持した。採用対象はこの
+`fixed_depth=0`の動的版だけである。詳細は
+[`DYNAMIC_HALTING_NORMALIZATION_2026-07-24.md`](DYNAMIC_HALTING_NORMALIZATION_2026-07-24.md)
+に記録した。
+
 この段階で速度探索は終了する。縮小したworkspaceの最終品質は未確定だが、
 dynamic-from-scratch 5,000更新でloss、top-1、NDCG、marginとhalting挙動を確認し、
 短期学習ゲートは通過した。本学習はpilot checkpointからの継続ではなく、

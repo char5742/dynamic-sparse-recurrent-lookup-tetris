@@ -59,7 +59,11 @@ const DEFAULT_CHECKPOINT_SHA256 =
 
 const OUTPUT_ATOL = 1.0e-6
 const OUTPUT_RTOL = 1.0e-6
-const GRADIENT_ATOL = 5.0e-5
+# Dynamic trajectories can accumulate substantially larger visual-stem
+# gradients than the former fixed-depth smoke.  Keep a strict relative-L2
+# guard and use an absolute floor appropriate for Float32 reductions over all
+# active cell tokens; optimizer/parameter state is checked again below.
+const GRADIENT_ATOL = 2.0e-4
 const GRADIENT_RELATIVE_L2 = 1.0e-5
 const FORBIDDEN_TEACHER_SEEDS = Set{Int}(vcat(
     collect(8001:8008),

@@ -101,6 +101,10 @@ function _evaluate_checkpoint(
         )
     end
     depth_counts = zeros(Int, Training.Model.MAX_RECURRENT_STEPS)
+    halt_evidence_counts = zeros(Int, Training.Model.MAX_RECURRENT_STEPS)
+    halt_evidence_sums = zeros(Float64, Training.Model.MAX_RECURRENT_STEPS)
+    halt_evidence_minima = fill(Inf, Training.Model.MAX_RECURRENT_STEPS)
+    halt_evidence_maxima = fill(-Inf, Training.Model.MAX_RECURRENT_STEPS)
     metrics = TrainingCore.evaluation_metrics(
         dataset,
         rows,
@@ -112,10 +116,37 @@ function _evaluate_checkpoint(
                 training=false,
                 expected_update=trainer.update,
                 hyperparameters=evaluation_hyperparameters,
-                record_tapes=false,
+                record_tapes=true,
             )
             @inbounds for candidate in 1:count
                 depth_counts[trainer.workspace.depths[candidate]] += 1
+                tape = trainer.workspace.tapes[candidate]
+                tape === nothing && error("halting telemetry lost its tape")
+                for (step_index, step) in enumerate(tape.steps)
+                    probability = clamp(
+                        Float64(step.halt_probability),
+                        1.0e-7,
+                        1.0 - 1.0e-7,
+                    )
+                    halt_logit = log(probability / (1.0 - probability))
+                    prior = Float64(Training.Model.HALT_DEPTH_PRIOR_SLOPE) *
+                        (
+                            step_index -
+                            Float64(Training.Model.HALT_DEPTH_PRIOR_CENTER)
+                        )
+                    evidence = (halt_logit - prior) /
+                        Float64(Training.Model.HALT_RESIDUAL_LOGIT_SCALE)
+                    halt_evidence_counts[step_index] += 1
+                    halt_evidence_sums[step_index] += evidence
+                    halt_evidence_minima[step_index] = min(
+                        halt_evidence_minima[step_index],
+                        evidence,
+                    )
+                    halt_evidence_maxima[step_index] = max(
+                        halt_evidence_maxima[step_index],
+                        evidence,
+                    )
+                end
             end
             Training.raw_output(raw)
         end;
@@ -132,6 +163,17 @@ function _evaluate_checkpoint(
         for depth in eachindex(depth_counts)
     ) / total_candidates
     active_depths = findall(!iszero, depth_counts)
+    halt_evidence_by_step = [
+        (;
+            step,
+            count=halt_evidence_counts[step],
+            mean=halt_evidence_sums[step] / halt_evidence_counts[step],
+            minimum=halt_evidence_minima[step],
+            maximum=halt_evidence_maxima[step],
+        )
+        for step in eachindex(halt_evidence_counts)
+        if !iszero(halt_evidence_counts[step])
+    ]
     result = (;
         update=Int(payload.update),
         consumed_states=Int(payload.consumed_states),
@@ -146,6 +188,7 @@ function _evaluate_checkpoint(
         maximum_depth=maximum(active_depths),
         forced_depth=FORCE_DEPTH,
         depth_counts,
+        halt_evidence_by_step,
         halt_weight_norm=Float64(norm(trainer.model.lookup.halt_weight)),
         halt_bias=Float64(trainer.model.lookup.halt_bias[1]),
     )

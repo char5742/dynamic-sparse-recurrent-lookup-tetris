@@ -238,7 +238,7 @@ const HALT_DEPTH_PRIOR_CENTER = let raw = strip(get(
     value
 end
 const HALT_RESIDUAL_LOGIT_SCALE = let raw = strip(get(
-    ENV, "EVRL_HALT_RESIDUAL_LOGIT_SCALE", "0.75",
+    ENV, "EVRL_HALT_RESIDUAL_LOGIT_SCALE", "0.55",
 ))
     value = parse(Float32, raw)
     isfinite(value) && value >= 0.0f0 || throw(ArgumentError(
@@ -246,6 +246,62 @@ const HALT_RESIDUAL_LOGIT_SCALE = let raw = strip(get(
     ))
     value
 end
+
+# A shared additive halt bias can move an entire batch across the deterministic
+# threshold and collapse every candidate to one common depth.  Raw projections
+# can also saturate a bounded nonlinearity with the same result.  Use cosine
+# evidence instead: its sign and magnitude are candidate-specific and its
+# bounded scale is independent of halt-weight or register-state norms.
+#
+# The retained scalar parameter is a positive gain in [0.5, 1.5], not a shared
+# stopping threshold.  This preserves checkpoint/optimizer structure without
+# allowing one scalar to choose the depth of every candidate.
+@inline function _normalized_halt_evidence(
+    bias::Float32,
+    candidate_projection::Float32,
+    halt_weight_squared_norm::Float32,
+    pooled_squared_norm::Float32,
+)
+    denominator = sqrt(max(
+        halt_weight_squared_norm * pooled_squared_norm,
+        eps(Float32),
+    ))
+    cosine = candidate_projection / denominator
+    probability = _sigmoid(bias)
+    gain = 0.5f0 + probability
+    return gain * cosine
+end
+
+@inline function _normalized_halt_evidence_vjp(
+    bias::Float32,
+    candidate_projection::Float32,
+    halt_weight_squared_norm::Float32,
+    pooled_squared_norm::Float32,
+    upstream::Float32,
+)
+    denominator = sqrt(max(
+        halt_weight_squared_norm * pooled_squared_norm,
+        eps(Float32),
+    ))
+    cosine = candidate_projection / denominator
+    probability = _sigmoid(bias)
+    gain = 0.5f0 + probability
+    bias_gradient =
+        upstream * cosine * probability * (1.0f0 - probability)
+    cosine_gradient = upstream * gain
+    projection_gradient = cosine_gradient / denominator
+    weight_norm_gradient = -0.5f0 * cosine_gradient * cosine /
+        max(halt_weight_squared_norm, eps(Float32))
+    pooled_norm_gradient = -0.5f0 * cosine_gradient * cosine /
+        max(pooled_squared_norm, eps(Float32))
+    return (
+        bias_gradient,
+        projection_gradient,
+        weight_norm_gradient,
+        pooled_norm_gradient,
+    )
+end
+
 const BLOCKS = SparseLookup.BLOCKS
 const LOCAL_SPATIAL_NEIGHBORS = 8
 const VISUAL_CHANNELS = 3
@@ -2877,14 +2933,26 @@ function advance_trajectory!(
     end
     # A fixed monotone hazard prior prevents tiny global bias changes around
     # logit zero from flipping the entire panel between the minimum and maximum
-    # depth.  The learned head remains candidate-specific and learns only the
-    # residual evidence for stopping earlier or later than the prior centre.
-    learned_halt_logit = model.lookup.halt_bias[1] +
-        dot(model.lookup.halt_weight, pooled)
+    # depth.  The normalized cosine head remains candidate-specific and learns
+    # only the residual evidence for stopping earlier or later than the prior
+    # centre; its scalar parameter controls gain rather than a shared threshold.
+    halt_bias = model.lookup.halt_bias[1]
+    candidate_halt_projection = dot(model.lookup.halt_weight, pooled)
+    halt_weight_squared_norm = dot(
+        model.lookup.halt_weight,
+        model.lookup.halt_weight,
+    )
+    pooled_squared_norm = dot(pooled, pooled)
+    candidate_halt_evidence = _normalized_halt_evidence(
+        halt_bias,
+        candidate_halt_projection,
+        halt_weight_squared_norm,
+        pooled_squared_norm,
+    )
     halt_logit =
         HALT_DEPTH_PRIOR_SLOPE *
             (Float32(step_index) - HALT_DEPTH_PRIOR_CENTER) +
-        HALT_RESIDUAL_LOGIT_SCALE * tanh(learned_halt_logit)
+        HALT_RESIDUAL_LOGIT_SCALE * candidate_halt_evidence
     halt_probability = _sigmoid(halt_logit)
     forced_depth = iszero(state.forced_depth) ? nothing : Int(state.forced_depth)
     forced_stop = step_index == MAX_RECURRENT_STEPS ||
@@ -4642,6 +4710,8 @@ function backward_trajectory!(
     ffn_scale_contributions=nothing,
     visual_scale_contributions=nothing,
     visual_scale_contribution_index::Int=0,
+    halt_weight_contributions=nothing,
+    halt_bias_contributions=nothing,
     lookup_balance_stats=nothing,
     lookup_balance_weight=0.0f0,
 )
@@ -4679,6 +4749,21 @@ function backward_trajectory!(
             "FFN scale contribution scratch is shorter than trajectory depth",
         ))
         fill!(ffn_scale_contributions, 0.0f0)
+    end
+    if halt_weight_contributions !== nothing
+        size(halt_weight_contributions, 1) == MODEL_DIM ||
+            throw(DimensionMismatch("halt-weight contribution width changed"))
+        size(halt_weight_contributions, 2) >= depth ||
+            throw(DimensionMismatch(
+                "halt-weight contribution scratch is shorter than trajectory depth",
+            ))
+        fill!(halt_weight_contributions, 0.0f0)
+    end
+    if halt_bias_contributions !== nothing
+        length(halt_bias_contributions) >= depth || throw(DimensionMismatch(
+            "halt-bias contribution scratch is shorter than trajectory depth",
+        ))
+        fill!(halt_bias_contributions, 0.0f0)
     end
     depth <= length(scratch.halt_gradients) || throw(DimensionMismatch(
         "episodic recurrent depth exceeded backward scratch",
@@ -4768,20 +4853,51 @@ function backward_trajectory!(
         halt_gradient = halt_logit_gradients[step_index]
         if !iszero(halt_gradient)
             step_pooled = _pool_registers!(scratch.pooled, step.final_registers)
-            learned_halt_logit = model.lookup.halt_bias[1] +
+            halt_bias = model.lookup.halt_bias[1]
+            candidate_halt_projection =
                 dot(model.lookup.halt_weight, step_pooled)
-            learned_tanh = tanh(learned_halt_logit)
-            learned_halt_gradient = halt_gradient *
-                HALT_RESIDUAL_LOGIT_SCALE *
-                (1.0f0 - learned_tanh * learned_tanh)
-            accumulator.lookup.dhalt_bias[1] += learned_halt_gradient
-            @inbounds @simd for coordinate in 1:MODEL_DIM
-                accumulator.lookup.dhalt_weight[coordinate] = muladd(
-                    learned_halt_gradient, step_pooled[coordinate],
-                    accumulator.lookup.dhalt_weight[coordinate],
+            halt_weight_squared_norm = dot(
+                model.lookup.halt_weight,
+                model.lookup.halt_weight,
+            )
+            pooled_squared_norm = dot(step_pooled, step_pooled)
+            halt_evidence_gradient =
+                halt_gradient * HALT_RESIDUAL_LOGIT_SCALE
+            halt_bias_gradient,
+            halt_projection_gradient,
+            halt_weight_norm_gradient,
+            pooled_norm_gradient = _normalized_halt_evidence_vjp(
+                    halt_bias,
+                    candidate_halt_projection,
+                    halt_weight_squared_norm,
+                    pooled_squared_norm,
+                    halt_evidence_gradient,
                 )
-                gradient = model.lookup.halt_weight[coordinate] *
-                    learned_halt_gradient / Float32(REGISTER_COUNT)
+            if halt_bias_contributions === nothing
+                accumulator.lookup.dhalt_bias[1] += halt_bias_gradient
+            else
+                @inbounds halt_bias_contributions[step_index] =
+                    halt_bias_gradient
+            end
+            @inbounds @simd for coordinate in 1:MODEL_DIM
+                halt_weight = model.lookup.halt_weight[coordinate]
+                pooled_value = step_pooled[coordinate]
+                weight_gradient = muladd(
+                    halt_projection_gradient,
+                    pooled_value,
+                    halt_weight_norm_gradient * 2.0f0 * halt_weight,
+                )
+                if halt_weight_contributions === nothing
+                    accumulator.lookup.dhalt_weight[coordinate] +=
+                        weight_gradient
+                else
+                    halt_weight_contributions[coordinate, step_index] =
+                        weight_gradient
+                end
+                gradient = (
+                    halt_weight * halt_projection_gradient +
+                    2.0f0 * pooled_value * pooled_norm_gradient
+                ) / Float32(REGISTER_COUNT)
                 for register in 1:REGISTER_COUNT
                     state_cotangent[coordinate, register] += gradient
                 end

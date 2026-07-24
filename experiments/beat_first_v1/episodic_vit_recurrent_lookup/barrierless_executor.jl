@@ -450,6 +450,8 @@ mutable struct BarrierlessExecutor
     worker_accumulators::Vector{Model.GradientAccumulator}
     ffn_scale_contributions::Matrix{Float32}
     visual_scale_contributions::Vector{Float32}
+    halt_weight_contributions::Array{Float32,3}
+    halt_bias_contributions::Matrix{Float32}
     initial_jobs::Vector{BarrierlessJob}
     state_results::Vector{Any}
     epoch_context::Base.RefValue{Any}
@@ -512,6 +514,13 @@ function BarrierlessExecutor(
         worker_accumulators,
         zeros(Float32, Model.MAX_RECURRENT_STEPS, MAX_FLAT_CANDIDATES),
         zeros(Float32, MAX_FLAT_CANDIDATES),
+        zeros(
+            Float32,
+            Model.MODEL_DIM,
+            Model.MAX_RECURRENT_STEPS,
+            MAX_FLAT_CANDIDATES,
+        ),
+        zeros(Float32, Model.MAX_RECURRENT_STEPS, MAX_FLAT_CANDIDATES),
         fill(zero(BarrierlessJob), MAX_FLAT_CANDIDATES),
         Any[nothing for _ in 1:TRAINING_STATE_BATCH],
         Ref{Any}(nothing),
@@ -1063,6 +1072,10 @@ function _barrierless_backward!(
     tape === nothing && error("candidate $flat_job lost its training tape")
     accumulator = @inbounds executor.worker_accumulators[worker_slot]
     ffn_scale_contributions = @view executor.ffn_scale_contributions[:, flat_job]
+    halt_weight_contributions =
+        @view executor.halt_weight_contributions[:, :, flat_job]
+    halt_bias_contributions =
+        @view executor.halt_bias_contributions[:, flat_job]
     Model.backward_trajectory!(
         accumulator,
         trainer.model,
@@ -1087,6 +1100,8 @@ function _barrierless_backward!(
         ffn_scale_contributions,
         visual_scale_contributions=executor.visual_scale_contributions,
         visual_scale_contribution_index=flat_job,
+        halt_weight_contributions,
+        halt_bias_contributions,
     )
     # `cell_bias` receives one Float32 addition per active cell token.  Keep
     # those exact per-token summands in candidate-owned storage so the update
@@ -1166,6 +1181,45 @@ function _barrierless_finalize_ordered_visual_scale!(executor, context)
         for candidate in 1:Int(state.candidate_count)
             flat_job = Int(state.candidate_jobs[candidate])
             target[1] += executor.visual_scale_contributions[flat_job]
+        end
+    end
+    return nothing
+end
+
+"""Restore serial state/candidate/reverse-step order for the halt head.
+
+Normalized halting uses reductions over the candidate state, so individual
+components can be much larger than their final norm.  Retain the inexpensive
+per-step vector/scalar summands and replay them at the update boundary instead
+of allowing worker completion order to perturb the halt optimizer state.
+"""
+function _barrierless_finalize_ordered_halt_head!(executor, context)
+    for accumulator in executor.worker_accumulators
+        fill!(accumulator.lookup.dhalt_weight, 0.0f0)
+        fill!(accumulator.lookup.dhalt_bias, 0.0f0)
+    end
+    target_weight = executor.worker_accumulators[1].lookup.dhalt_weight
+    target_bias = executor.worker_accumulators[1].lookup.dhalt_bias
+    scheduler = context.trainer.scheduler
+    @inbounds for state_slot in 1:TRAINING_STATE_BATCH
+        state = executor.states[state_slot]
+        workspace = scheduler.state_workspaces[state_slot]
+        for candidate in 1:Int(state.candidate_count)
+            flat_job = Int(state.candidate_jobs[candidate])
+            tape = workspace.tapes[candidate]
+            tape === nothing && error(
+                "candidate $flat_job lost its ordered halt tape",
+            )
+            for step_index in length(tape.steps):-1:1
+                target_bias[1] +=
+                    executor.halt_bias_contributions[step_index, flat_job]
+                @simd for coordinate in 1:Model.MODEL_DIM
+                    target_weight[coordinate] +=
+                        executor.halt_weight_contributions[
+                            coordinate, step_index, flat_job,
+                        ]
+                end
+            end
         end
     end
     return nothing
@@ -1697,6 +1751,7 @@ function wait_barrierless_gradients!(executor::BarrierlessExecutor)
     state_results = _barrierless_drain_update!(executor, 1)
     _barrierless_finalize_ordered_ffn_scale!(executor, context)
     _barrierless_finalize_ordered_visual_scale!(executor, context)
+    _barrierless_finalize_ordered_halt_head!(executor, context)
     _barrierless_finalize_ordered_cell_bias!(executor, context)
     _barrierless_finish_executor_measurement!(executor)
     return state_results

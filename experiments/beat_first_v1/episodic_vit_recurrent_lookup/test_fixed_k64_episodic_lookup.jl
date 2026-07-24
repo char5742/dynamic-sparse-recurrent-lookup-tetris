@@ -28,6 +28,85 @@ BLAS.set_num_threads(1)
 @testset "fixed K=$(Model.EPISODIC_SUPPORT) episodic lookup" begin
     rng = Xoshiro(0x4b3634455049534f)
     model = Model.initialize_model(rng)
+
+    # The halt scalar controls only gain, while normalized candidate evidence
+    # controls stopping depth.  Verify the scalar helper and its VJP against
+    # finite differences; vector-norm paths are checked separately below.
+    for bias in Float32[-1.25, 0.0, 1.4],
+            projection in Float32[-0.8, -0.1, 0.0, 0.25, 0.9]
+        weight_squared_norm = 1.7f0
+        pooled_squared_norm = 2.3f0
+        evidence = Model._normalized_halt_evidence(
+            bias,
+            projection,
+            weight_squared_norm,
+            pooled_squared_norm,
+        )
+        projection == 0.0f0 && @test evidence == 0.0f0
+        upstream = 0.73f0
+        dbias, dprojection, dweight_norm, dpooled_norm =
+            Model._normalized_halt_evidence_vjp(
+                bias,
+                projection,
+                weight_squared_norm,
+                pooled_squared_norm,
+                upstream,
+            )
+        epsilon = 1.0f-3
+        objective(b, p, wn, pn) = upstream *
+            Model._normalized_halt_evidence(b, p, wn, pn)
+        finite_dbias = (
+            objective(
+                bias + epsilon, projection,
+                weight_squared_norm, pooled_squared_norm,
+            ) -
+            objective(
+                bias - epsilon, projection,
+                weight_squared_norm, pooled_squared_norm,
+            )
+        ) / (2.0f0 * epsilon)
+        finite_dprojection = (
+            objective(
+                bias, projection + epsilon,
+                weight_squared_norm, pooled_squared_norm,
+            ) -
+            objective(
+                bias, projection - epsilon,
+                weight_squared_norm, pooled_squared_norm,
+            )
+        ) / (2.0f0 * epsilon)
+        finite_dweight_norm = (
+            objective(
+                bias, projection,
+                weight_squared_norm + epsilon, pooled_squared_norm,
+            ) -
+            objective(
+                bias, projection,
+                weight_squared_norm - epsilon, pooled_squared_norm,
+            )
+        ) / (2.0f0 * epsilon)
+        finite_dpooled_norm = (
+            objective(
+                bias, projection,
+                weight_squared_norm, pooled_squared_norm + epsilon,
+            ) -
+            objective(
+                bias, projection,
+                weight_squared_norm, pooled_squared_norm - epsilon,
+            )
+        ) / (2.0f0 * epsilon)
+        @test isapprox(dbias, finite_dbias; rtol=2.0f-3, atol=3.0f-5)
+        @test isapprox(
+            dprojection, finite_dprojection; rtol=2.0f-3, atol=3.0f-5,
+        )
+        @test isapprox(
+            dweight_norm, finite_dweight_norm; rtol=3.0f-3, atol=3.0f-5,
+        )
+        @test isapprox(
+            dpooled_norm, finite_dpooled_norm; rtol=3.0f-3, atol=3.0f-5,
+        )
+    end
+
     input = Model.EpisodicCandidateInput(
         randn(rng, Float32, Model.BOARD_HEIGHT, Model.BOARD_WIDTH),
         randn(rng, Float32, Model.BOARD_HEIGHT, Model.BOARD_WIDTH),

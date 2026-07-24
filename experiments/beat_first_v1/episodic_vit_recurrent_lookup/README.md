@@ -4,6 +4,15 @@
 
 ## 最新の学習結果
 
+2026-07-24の速度構成では、固定深度2を採用せず、haltingを候補状態とhalt weightの
+正規化類似度で決める方式へ修正した。residual scale 0.55のスクラッチ学習を20,000更新
+まで行い、training-only固定128状態でloss`2.903470`、top-1`0.500000`、
+NDCG`0.976220`、pairwise`0.831282`、margin`0.062859`を得た。deterministic深度は
+3、5、6へ分かれ、平均`3.409`である。追加15,000更新は`27.243 updates/s`で、
+動的実行の最低20 updates/sを維持した。詳細は
+[`DYNAMIC_HALTING_NORMALIZATION_2026-07-24.md`](DYNAMIC_HALTING_NORMALIZATION_2026-07-24.md)
+を参照。
+
 候補固有の各step 1-step信用割当と有界halting式を含む現行モデルを、親checkpointなしで
 100,000更新した。400,000 teacher stateを処理し、`10.651 updates/s`、GC比率
 `0.665%`で完走した。
@@ -50,8 +59,9 @@ loss`2.858829`、top-1`0.453125`、NDCG`0.974179`、pairwise`0.834829`、
 K幅変更後の根本速度改善では、Lookup bank容量を維持したままregister workspaceと
 projection、SwiGLU幅、backward tailを見直した。速度合格候補は6,897,248 parameter、
 2 register、attention 16、1 head、FFN 32である。固定深度2のproduction相当計測は
-`41.545 updates/s`、sampled hard haltingを有効化した実測は平均深度`2.979`で
-`27.614 updates/s`となり、目標40と動的段階の下限20をそれぞれ満たした。
+`41.545 updates/s`だったが、これは1 step単価の比較上限であり採用モデルではない。
+sampled hard haltingを有効化した実測は平均深度`2.979`で`27.614 updates/s`となり、
+動的段階の下限20を満たした。
 serial/barrierless smokeと551件の回帰テストも合格している。品質はまだ未確定なので、
 この構成を直ちに最終性能checkpointとは扱わない。全試行と評価境界は
 [`ROOT_SPEED_TUNING_2026-07-24.md`](ROOT_SPEED_TUNING_2026-07-24.md)
