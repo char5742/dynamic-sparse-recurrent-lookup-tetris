@@ -5,6 +5,7 @@ using Random
 using Test
 
 for (name, value) in (
+    "DSRL_BLOCKS" => "1",
     "DSRL_CARRIER_DIM" => "128",
     "DSRL_TABLES_PER_BLOCK" => "13",
     "DSRL_WTA_CHOICES" => "16",

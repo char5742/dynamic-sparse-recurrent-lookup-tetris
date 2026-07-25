@@ -934,3 +934,34 @@ NDCG`0.985523`、pairwise`0.875144`で最良だった。
 詳細は
 [`EXPRESSION_RESTORATION_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/EXPRESSION_RESTORATION_2026-07-25.md)
 へ記録した。
+
+## 33. 2026-07-25 — 現行高速構成で3段Lookupを再検証
+
+現行のlearned spatial attention、3 registers、attention 16／1 head、SwiGLU64、
+固定K64 episodic read/write、dynamic hard haltingを保ち、再帰step内のLookup block数
+だけを1から3へ戻した。総parameter数は`6,909,665 -> 20,542,179`、registerを含む
+Lookup micro-callはstepあたり`3 -> 9`となった。
+
+3段forward/backward回帰11/11、既存1段回帰8/8、fixed-K64回帰614/614が合格した。
+10k checkpointのserial／barrierless smokeも、output、loss、raw VJP完全一致、
+parameter gradient相対L2`9.93e-6`、optimizer後state相対L2`1.23e-8`で合格した。
+
+3段を初期値から100,000更新した。10k→100kは6,676.473秒、長期平均
+`13.480 updates/s`、CPU平均`47.773%`、candidate中`55.058%`だった。100kからの
+checkpoint非保存steady測定では`22.341 updates/s`、allocation`8.815 MB/update`、
+GC比率`0.804%`を得たが、短いbatch依存値なので長期平均の代わりには用いない。
+
+同じtraining-only固定128状態の100kはloss`2.665670`、top-1`0.609375`、
+NDCG`0.986058`、pairwise`0.880499`、margin`0.079165`だった。現行1段100k比で
+loss`-0.020479`、top-1`+0.031250`、NDCG`+0.001711`、pairwise`+0.005728`を得た一方、
+marginは`-0.017891`、長期速度は`-6.420 updates/s`だった。deterministic評価深度は
+10kから100kまで全candidateで3に集中した。
+
+従って追加Lookupには部分的な表現力回復効果があるが、過去の固定深度・WD`3e-4`
+Trial 3のtop-1`0.804688`との差の約13.8%しか埋めない。過去性能との差には
+register、attention、SwiGLU、episodic support、haltingの縮小も含まれる。
+validationとsealed seedは使用していない。
+
+詳細は
+[`THREE_LOOKUP_RESTORATION_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/THREE_LOOKUP_RESTORATION_2026-07-25.md)
+へ記録した。

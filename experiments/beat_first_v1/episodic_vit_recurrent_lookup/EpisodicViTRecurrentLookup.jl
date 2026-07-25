@@ -4,10 +4,6 @@ using LinearAlgebra
 using Random
 
 if !isdefined(Main, :DynamicSparseRecurrentLookup)
-    # EVRL is one recurrent block.  Repetition belongs to the outer adaptive
-    # recurrence, so one macro step must not contain another three-deep Lookup
-    # stack.
-    ENV["DSRL_BLOCKS"] = "1"
     Base.include(
         Main,
         joinpath(
@@ -18,9 +14,6 @@ if !isdefined(Main, :DynamicSparseRecurrentLookup)
 end
 const SparseLookup = Main.DynamicSparseRecurrentLookup
 const SparseEngine = Main.ResidualLookupSlide
-SparseLookup.BLOCKS == 1 || error(
-    "EVRL requires DSRL_BLOCKS=1; start it in a fresh Julia process",
-)
 
 # This module deliberately defines its input boundary independently of the
 # historical sparse-feature adapters.  These are exactly the five tensors read
@@ -646,7 +639,7 @@ function topology(model::EpisodicViTLookupModel)
         register_attention_projection=String(REGISTER_ATTENTION_PROJECTION),
         spatial_relation_mode=String(SPATIAL_RELATION_MODE),
         ffn_dim=FFN_DIM,
-        recurrent_block="shared-cell-depthwise-spatial-attention-fixed-k$(EPISODIC_SUPPORT)-wta-cross-register-self-swiglu-single-register-local-active-lookup-same-support-working-memory-write",
+        recurrent_block="shared-cell-depthwise-spatial-attention-fixed-k$(EPISODIC_SUPPORT)-wta-cross-register-self-swiglu-$(SparseLookup.BLOCKS)-block-register-local-active-lookup-same-support-working-memory-write",
         episodic_router="learned-block-wta-fixed-k$(EPISODIC_SUPPORT)-register-specific",
         episodic_attention="global-mean-safety-path-plus-exact-softmax-on-wta-selected-$(EPISODIC_SUPPORT)-token-support",
         episodic_projected_token_occurrences_per_step=

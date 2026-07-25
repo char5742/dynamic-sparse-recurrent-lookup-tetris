@@ -4,6 +4,20 @@
 
 ## 最新の学習結果
 
+2026-07-25に、現行の3-register、attention 16／1 head、SwiGLU64、固定K64構成を
+維持したまま、再帰step内のLookupFFNだけを1段から3段へ戻した。3段版は
+20,542,179 parameterで、スクラッチから100,000更新した。training-only固定128状態では
+loss`2.665670`、top-1`0.609375`、NDCG`0.986058`、pairwise`0.880499`、
+margin`0.079165`を得た。
+
+1段Lookup 100k比でloss`-0.020479`、top-1`+0.031250`、NDCG`+0.001711`、
+pairwise`+0.005728`を回復したが、marginは`-0.017891`だった。10kから100kの
+長期平均は`13.480 updates/s`で、1段の`19.900`より遅い。3段化だけで過去の
+top-1`0.804688`との差の約13.8%を埋めたに留まり、残りはregister、attention、
+SwiGLU、episodic support、haltingの差である。詳細は
+[`THREE_LOOKUP_RESTORATION_2026-07-25.md`](THREE_LOOKUP_RESTORATION_2026-07-25.md)
+を参照。
+
 2026-07-25に、高速executor上で表現力を段階的に戻した。dynamic haltingで
 20 updates/s以上という条件を満たした最大構成は、learned local spatial attention、
 3 register、attention 16／1 head、SwiGLU 64である。4 registerとattention
@@ -49,12 +63,14 @@ validationとsealed seedは使用していない。全推移と評価境界は
 [`HALTING_FULLSCRATCH_100K_2026-07-23.md`](HALTING_FULLSCRATCH_100K_2026-07-23.md)
 を参照。
 
-上記100,000更新は3段Lookup版の最終学習結果であり、現在のsource geometryとは異なる。
-2026-07-23に、再帰step内のLookupを3段から1段へ縮約し、24x10セルworking memoryへ
+上記2026-07-23の100,000更新は旧3段・4-register geometryの結果であり、現在の
+3段・3-register・固定K64 geometryとは異なる。2026-07-23に、再帰step内のLookupを
+3段から1段へ縮約し、24x10セルworking memoryへ
 共有3x3 depthwise convolutionを追加した。さらに2026-07-24に、registerから入力memory
 への読出しを固定K=64のlearned WTA/hash routingへ変更した。選択64 token内だけで正確な
 attentionを行い、全283 tokenの平均を常設の安全経路として残す。旧checkpointは研究履歴
-として保持し、新しい1段Lookup＋固定K64 geometryへ暗黙変換しない。移行の詳細は
+として保持し、異なるgeometryへ暗黙変換しない。2026-07-25にはこの新しい固定K64
+geometry上でLookupだけを3段へ戻して再学習した。移行の詳細は
 [`SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md`](SINGLE_LOOKUP_RECURRENT_DWCONV_2026-07-23.md)
 および
 [`FIXED_K64_EPISODIC_ROUTING_2026-07-24.md`](FIXED_K64_EPISODIC_ROUTING_2026-07-24.md)
@@ -103,7 +119,8 @@ GC時間比`1.656%`を確認した。深度2～6のrandom-depth warmupは
 4. 複数の再帰register
 5. 各registerがlearned WTA/hashで283 tokenから固定64 tokenを取得し、そのsupport内だけで行うexact cross-attention。全token平均の常設残差経路により入力切断を防ぐ
 6. learned register self-attentionとSwiGLU変換
-7. 各registerが単一の共有bankから独立にroutingするactive-only LookupFFN長期記憶。再帰step内でLookupを重ねず、必要な追加深度は外側の再帰が担う
+7. 各registerが共有bankから独立にroutingするactive-only LookupFFN長期記憶。
+   `DSRL_BLOCKS=1:3`でstep内のLookup深度を選択でき、現行の品質復元構成は3段を使う
 8. 更新後registerから読出しと同じ選択supportへだけ書き戻す、入力固有の物理的に疎なread/write working memory
 9. 残差再帰更新とhard halting interface
 
@@ -126,6 +143,7 @@ working-memory write、各VJPは選択された64 token接続に限定する。L
 - `barrierless_postphase.jl`：決定論的reduceとoptimizer phase
 - `barrierless_correctness_smoke.jl`：single-thread oracleとの比較
 - `test_single_lookup_recurrent_depthwise.jl`：単一Lookup契約とrecurrent DWConv VJPの有限差分検証
+- `test_three_lookup_blocks.jl`：3段Lookupのforward、backward、全bank sparse gradient検証
 - `test_fixed_k64_episodic_lookup.jl`：固定64 support、同一support書込み、全token平均経路、router勾配の検証
 - `evaluate_halting_convergence.jl`：validationを構築しない固定training panelのcheckpoint深度評価
 - `bounded_mpmc_queue.jl`：Windows向けbounded allocation-free MPMC queue
@@ -142,6 +160,7 @@ working-memory write、各VJPは選択された64 token接続に限定する。L
 - `FIXED_K64_EPISODIC_ROUTING_2026-07-24.md`：固定K64の疎いepisodic read/write、数値一致、速度、学習率比較
 - `FIXED_K_SUPPORT_TUNING_2026-07-24.md`：固定K=64/80/88/96/128の同一条件比較と採否
 - `ROOT_SPEED_TUNING_2026-07-24.md`：K幅変更後の根本速度改善、40 updates/s候補、動的halting速度、数値一致
+- `THREE_LOOKUP_RESTORATION_2026-07-25.md`：現行構成のLookupだけを1段から3段へ戻した100k精度・速度アブレーション
 
 ## 速度合格候補
 
