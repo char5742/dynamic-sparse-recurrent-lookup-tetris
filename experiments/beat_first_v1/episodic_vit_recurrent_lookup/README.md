@@ -4,6 +4,20 @@
 
 ## 最新の学習結果
 
+2026-07-25に、Lookupを1段へ戻し、4 registers、attention 32／4 heads、
+SwiGLU128、固定K128、model dim 256へ拡幅した13,909,501 parameterの上限構成を
+100,000更新した。最良composite lossは70kの`2.697863`で、top-1`0.562500`、
+NDCG`0.983626`、pairwise`0.868009`、margin`0.078324`、平均深度`3.426`だった。
+top-1最高は60kの`0.625000`である。
+
+10kから100kは`8.204 updates/s`で、最良70kのsteady測定も`8.319 updates/s`だった。
+allocationは`17.797 MB/update`、GC比率は`0.481%`であり、速度低下はGCではなく
+4-register K128 read/writeとbackwardの実計算量である。70k以降は反落し、100kは
+loss`2.817819`、top-1`0.492188`となった。既存1段K64と3段K64の総合品質を超えず、
+速度下限10も満たさないためproduction主採用にはしない。詳細は
+[`WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md`](WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md)
+を参照。
+
 2026-07-25に、現行の3-register、attention 16／1 head、SwiGLU64、固定K64構成を
 維持したまま、再帰step内のLookupFFNだけを1段から3段へ戻した。3段版は
 20,542,179 parameterで、スクラッチから100,000更新した。training-only固定128状態では

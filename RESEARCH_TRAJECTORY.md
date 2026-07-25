@@ -965,3 +965,32 @@ validationとsealed seedは使用していない。
 詳細は
 [`THREE_LOOKUP_RESTORATION_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/THREE_LOOKUP_RESTORATION_2026-07-25.md)
 へ記録した。
+
+## 34. 2026-07-25 — 単一Lookup上で4-register・K128へ拡幅
+
+再帰step内のLookupFFNを1段へ戻し、4 registers、attention 32／4 heads、
+SwiGLU128、固定K128 episodic read/writeへ拡幅した。runではsource既定の
+`model_dim=256`も使用したため、旧高速K64の`model_dim=128`からcarrier幅も増えている。
+総parameter数は13,909,501である。この試行をK128単独ablationとは扱わない。
+
+fixed-K128回帰1,126/1,126、single-Lookup＋DWConv回帰8/8が合格した。10k
+checkpointのserial／barrierless smokeもoutput、loss、raw VJP完全一致、
+parameter gradient相対L2`4.53e-6`、optimizer後state相対L2`9.61e-9`で合格した。
+
+スクラッチから100,000更新した。10k→100kの長期平均は`8.204 updates/s`、CPU平均
+`66.664%`、candidate中`69.012%`だった。最良70kからのsteady測定は
+`8.319 updates/s`、allocation`17.797 MB/update`、GC比率`0.481%`である。GCではなく、
+4-register K128 read/writeとそのbackwardの実計算が速度を支配している。
+
+同じtraining-only固定128状態では、70kがloss`2.697863`、NDCG`0.983626`、
+pairwise`0.868009`で最良、60kがtop-1`0.625000`で最高だった。70k以降は反落し、
+100kはloss`2.817819`、top-1`0.492188`となった。最良70kも既存1段K64 100kと
+3段K64 100kの総合順位品質を超えず、速度下限10も満たさなかった。
+
+従って、単一Lookupの計算をworkspace容量へ振り替える方向自体は実装できたが、
+今回の一括拡幅は安定収束やPreAct超えへ結び付かなかった。top-1の局所的改善だけを
+production採用根拠にはしない。validationとsealed seedは使用していない。
+
+詳細は
+[`WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md)
+へ記録した。

@@ -24,28 +24,26 @@ failed overfit tests, is preserved in
 
 ## 最新の検証結果
 
-2026-07-25に、learned local spatial attention、3 registers、attention
-16／1 head、SwiGLU64、固定K64 episodic read/writeを保ち、再帰step内の
-LookupFFNだけを1段から3段へ戻した。
+2026-07-25に、再帰step内のLookupFFNを1段へ戻し、4 registers、attention
+32／4 heads、SwiGLU128、固定K128 episodic read/write、model dim 256へ拡幅した。
 
-- parameter数：20,542,179
+- parameter数：13,909,501
 - serial／barrierless correctness smoke：合格
-- 10,000→100,000更新の長期平均：13.480 updates/s
-- 100k checkpointの短期steady測定：22.341 updates/s
-- steady allocation：8.815 MB/update、GC比率0.804%
-- 固定training-only 128状態の100k：loss 2.665670、top-1 0.609375、
-  NDCG 0.986058、pairwise 0.880499、margin 0.079165、評価深度3
-- 1段Lookup 100k比：loss -0.020479、top-1 +0.031250、
-  NDCG +0.001711、pairwise +0.005728、margin -0.017891
+- 10,000→100,000更新の長期平均：8.204 updates/s
+- 70k checkpointの短期steady測定：8.319 updates/s
+- steady allocation：17.797 MB/update、GC比率0.481%
+- 固定training-only 128状態の最良70k：loss 2.697863、top-1 0.562500、
+  NDCG 0.983626、pairwise 0.868009、margin 0.078324、平均深度3.426
+- top-1最高60k：0.625000
 - game validationとsealed seed：未使用
-- 最終checkpoint SHA-256：
-  `fc8f7e7e389d721dc02821fef45733394d6fe96bcfff8d14e98570e37222fa48`
+- 主比較70k SHA-256：
+  `1df101be811a7c1338bbd0456c41fefcc3a5244890aaf3ac9bda8dad71093287`
 
-3段化は順位品質を部分的に戻したが、過去の固定深度tuning winner
-top-1 0.804688との差の約13.8%を埋めたに留まる。marginと長期速度は悪化したため、
-Lookup段数だけが過去からの性能低下原因ではない。全10k checkpoint推移、旧DSRLN、
-PreAct、速度、GC、数値一致の境界は
-[`THREE_LOOKUP_RESTORATION_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/THREE_LOOKUP_RESTORATION_2026-07-25.md)
+70k以降はlossと連続順位品質が反落し、100kはloss 2.817819、top-1 0.492188まで
+悪化した。最良70kも既存1段K64 100kと3段K64 100kの総合品質を超えず、速度下限10も
+満たさなかった。これはK128だけでなくmodel dim 128から256への復元も含む拡幅上限
+試験であり、K単独効果とは解釈しない。全推移、旧構成、PreAct、速度、GC、数値一致は
+[`WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md)
 に記録した。
 
 ## Repository policy
