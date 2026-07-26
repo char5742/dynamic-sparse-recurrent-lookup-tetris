@@ -123,12 +123,21 @@ BLAS.set_num_threads(1)
     @test length(tape.steps) == 2
 
     for step in tape.steps
+        candidates = step.cross.candidate_ids
+        @test size(candidates) ==
+            (Model.EPISODIC_CANDIDATE_CAP, Model.REGISTER_COUNT)
         selected = step.cross.selected_ids
         @test size(selected) ==
             (Model.EPISODIC_SUPPORT, Model.REGISTER_COUNT)
         for register in 1:Model.REGISTER_COUNT
+            @test length(unique(@view candidates[:, register])) ==
+                Model.EPISODIC_CANDIDATE_CAP
             @test length(unique(@view selected[:, register])) ==
                 Model.EPISODIC_SUPPORT
+            @test all(
+                token -> token in @view(candidates[:, register]),
+                @view(selected[:, register]),
+            )
         end
         union_ids = unique(vec(selected))
         union_count = Int(step.cross.union_count)
@@ -285,4 +294,6 @@ BLAS.set_num_threads(1)
     @test any(!iszero, accumulator.dense[:register_router])
     @test any(!iszero, accumulator.dense[:relation_scale_logit])
     @test all(accumulator.active_tokens)
+    @test accumulator.backward_scratch.route_count >
+        Model.EPISODIC_SUPPORT
 end

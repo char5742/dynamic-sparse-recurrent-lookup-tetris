@@ -4,6 +4,21 @@
 
 ## 最新の学習結果
 
+2026-07-26に、全trajectory有限差分監査によってinput-token routerの信用割当を再確認
+した。主要な連続VJPは正しかったが、hard-routing代理勾配がtoken表現とregister状態へ
+逆流し、本来のtask gradientを汚していた。代理勾配をrouter parameterだけへ限定し、
+learned hashの128候補を8次元routerで再順位付けして物理K64だけを読む方式へ修正した。
+学習時は8個のsparse probeと候補内attention distillationを使い、未選択候補にも
+router固有の信用を返す。
+
+修正後は全trajectory監査、633件のK64回帰、serial／barrierless optimizer一致に合格
+した。real-teacher同一4状態100更新では、固定3-stepでloss`35.26%`低下、hard halting
+有効時で`52.75%`低下し、旧破綻試験の`4.04%`を明確に上回った。production条件の
+100更新は`14.953 updates/s`、allocation`12.390 MB/update`、GC比率`0.681%`だった。
+詳細は
+[`ROUTER_CREDIT_REPAIR_2026-07-26.md`](ROUTER_CREDIT_REPAIR_2026-07-26.md)
+を参照。
+
 2026-07-25に、Lookupを1段へ戻し、4 registers、attention 32／4 heads、
 SwiGLU128、固定K128、model dim 256へ拡幅した13,909,501 parameterの上限構成を
 100,000更新した。最良composite lossは70kの`2.697863`で、top-1`0.562500`、
@@ -159,6 +174,8 @@ working-memory write、各VJPは選択された64 token接続に限定する。L
 - `test_single_lookup_recurrent_depthwise.jl`：単一Lookup契約とrecurrent DWConv VJPの有限差分検証
 - `test_three_lookup_blocks.jl`：3段Lookupのforward、backward、全bank sparse gradient検証
 - `test_fixed_k64_episodic_lookup.jl`：固定64 support、同一support書込み、全token平均経路、router勾配の検証
+- `test_full_trajectory_vjp.jl`：離散trajectoryを固定したモデル全体の手書きVJP有限差分監査
+- `test_fixed_batch_learning.jl`：validationを使わないreal-teacher同一4状態の短期記憶診断
 - `evaluate_halting_convergence.jl`：validationを構築しない固定training panelのcheckpoint深度評価
 - `bounded_mpmc_queue.jl`：Windows向けbounded allocation-free MPMC queue
 - `windows_cpu_sets.jl`：実行時P/Eコア検出と、任意のCPU Sets割り当て
@@ -175,6 +192,7 @@ working-memory write、各VJPは選択された64 token接続に限定する。L
 - `FIXED_K_SUPPORT_TUNING_2026-07-24.md`：固定K=64/80/88/96/128の同一条件比較と採否
 - `ROOT_SPEED_TUNING_2026-07-24.md`：K幅変更後の根本速度改善、40 updates/s候補、動的halting速度、数値一致
 - `THREE_LOOKUP_RESTORATION_2026-07-25.md`：現行構成のLookupだけを1段から3段へ戻した100k精度・速度アブレーション
+- `ROUTER_CREDIT_REPAIR_2026-07-26.md`：router代理勾配の本体汚染修正、候補内対照信用、全trajectory監査
 
 ## 速度合格候補
 

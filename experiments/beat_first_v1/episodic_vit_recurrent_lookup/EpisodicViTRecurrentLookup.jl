@@ -143,9 +143,9 @@ const EPISODIC_BUCKET_CAP = let raw = strip(get(ENV, "EVRL_ROUTER_BUCKET_CAP", "
     value
 end
 # Episodic read support is fixed for the lifetime of one model/run.  The
-# environment variable exists only for controlled architecture tuning; there
-# is no within-run shortlist, curriculum, annealing, or inference-time change
-# of K.
+# learned hash first retrieves a bounded wider candidate pool, then an exact
+# tiny-router score chooses the physical K/V support.  Expensive attention is
+# still evaluated only on EPISODIC_SUPPORT tokens.
 const EPISODIC_SUPPORT = let raw = strip(get(
     ENV, "EVRL_EPISODIC_SUPPORT", "64",
 ))
@@ -156,7 +156,27 @@ const EPISODIC_SUPPORT = let raw = strip(get(
     value
 end
 const EPISODIC_SHORTLIST = EPISODIC_SUPPORT
-const EPISODIC_CANDIDATE_CAP = EPISODIC_SUPPORT
+const EPISODIC_CANDIDATE_CAP = let raw = strip(get(
+    ENV, "EVRL_EPISODIC_CANDIDATE_CAP",
+    string(min(TOKEN_COUNT, 2 * EPISODIC_SUPPORT)),
+))
+    value = parse(Int, raw)
+    EPISODIC_SUPPORT <= value <= TOKEN_COUNT || throw(ArgumentError(
+        "EVRL_EPISODIC_CANDIDATE_CAP must be in " *
+        "EVRL_EPISODIC_SUPPORT:TOKEN_COUNT",
+    ))
+    value
+end
+const EPISODIC_EXPLORATION_SLOTS = let raw = strip(get(
+    ENV, "EVRL_EPISODIC_EXPLORATION_SLOTS", "8",
+))
+    value = parse(Int, raw)
+    0 <= value < EPISODIC_SUPPORT || throw(ArgumentError(
+        "EVRL_EPISODIC_EXPLORATION_SLOTS must be in " *
+        "0:(EVRL_EPISODIC_SUPPORT-1)",
+    ))
+    value
+end
 const MAX_EPISODIC_UNION = min(
     TOKEN_COUNT, EPISODIC_SUPPORT * REGISTER_COUNT,
 )
@@ -187,6 +207,15 @@ const SPATIAL_CANDIDATE_CAP = let raw = strip(get(
 end
 const EPISODIC_ROOT_CAP = min(TOKEN_COUNT, max(64, EPISODIC_CANDIDATE_CAP))
 const ROUTER_STE_SCALE = 0.25f0
+const ROUTER_DISTILL_WEIGHT = let raw = strip(get(
+    ENV, "EVRL_ROUTER_DISTILL_WEIGHT", "0.10",
+))
+    value = parse(Float32, raw)
+    isfinite(value) && value >= 0.0f0 || throw(ArgumentError(
+        "EVRL_ROUTER_DISTILL_WEIGHT must be finite and nonnegative",
+    ))
+    value
+end
 const FFN_MULTIPLIER = let raw = strip(get(ENV, "EVRL_FFN_MULTIPLIER", "2"))
     value = parse(Int, raw)
     1 <= value <= 4 || throw(ArgumentError("EVRL_FFN_MULTIPLIER must be in 1:4"))
@@ -639,13 +668,19 @@ function topology(model::EpisodicViTLookupModel)
         register_attention_projection=String(REGISTER_ATTENTION_PROJECTION),
         spatial_relation_mode=String(SPATIAL_RELATION_MODE),
         ffn_dim=FFN_DIM,
-        recurrent_block="shared-cell-depthwise-spatial-attention-fixed-k$(EPISODIC_SUPPORT)-wta-cross-register-self-swiglu-$(SparseLookup.BLOCKS)-block-register-local-active-lookup-same-support-working-memory-write",
-        episodic_router="learned-block-wta-fixed-k$(EPISODIC_SUPPORT)-register-specific",
-        episodic_attention="global-mean-safety-path-plus-exact-softmax-on-wta-selected-$(EPISODIC_SUPPORT)-token-support",
+        recurrent_block="shared-cell-depthwise-spatial-attention-hash-candidate-exact-k$(EPISODIC_SUPPORT)-cross-register-self-swiglu-$(SparseLookup.BLOCKS)-block-register-local-active-lookup-same-support-working-memory-write",
+        episodic_router="learned-block-wta-candidate-$(EPISODIC_CANDIDATE_CAP)-exact-router-rerank-fixed-k$(EPISODIC_SUPPORT)-register-specific",
+        episodic_router_training_exploration_slots=EPISODIC_EXPLORATION_SLOTS,
+        episodic_router_distill_weight=ROUTER_DISTILL_WEIGHT,
+        episodic_attention="global-mean-safety-path-plus-exact-softmax-on-reranked-$(EPISODIC_SUPPORT)-token-support",
         episodic_projected_token_occurrences_per_step=
             REGISTER_COUNT * EPISODIC_SUPPORT,
         episodic_qk_pairs_per_step=REGISTER_COUNT * EPISODIC_SUPPORT,
-        episodic_exact_rerank_pairs_per_step=0,
+        episodic_exact_rerank_pairs_per_step=
+            REGISTER_COUNT * EPISODIC_CANDIDATE_CAP,
+        episodic_exact_rerank_scalar_macs_per_step=
+            REGISTER_COUNT * EPISODIC_CANDIDATE_CAP *
+            EPISODIC_ROUTER_DIM,
         episodic_gather_rows_per_step=REGISTER_COUNT * EPISODIC_SUPPORT,
         episodic_exact_dot_scalar_macs_per_step=
             REGISTER_COUNT * EPISODIC_SUPPORT * ATTENTION_DIM,
@@ -671,7 +706,7 @@ function topology(model::EpisodicViTLookupModel)
             length(model.recurrent_depthwise_scale_logit),
         recurrent_depthwise_scalar_macs_per_step=
             CELL_COUNT * MODEL_DIM * 9,
-        candidate_support_cap=EPISODIC_SUPPORT,
+        candidate_support_cap=EPISODIC_CANDIDATE_CAP,
         spatial_dense_all_token_scores=0,
         long_memory_carriers_per_step=REGISTER_COUNT,
         long_memory_micro_calls_per_step=BLOCKS * REGISTER_COUNT,
@@ -973,6 +1008,33 @@ function _structured_router_selected_vjp!(
             input_gradient[coordinate] = muladd(
                 weights[local_coordinate, route], gradient,
                 input_gradient[coordinate],
+            )
+        end
+    end
+    return nothing
+end
+
+"""Update only router parameters for a hard-routing surrogate objective.
+
+The support-selection STE and candidate distillation are not derivatives of
+the model's continuous task objective.  Propagating them into token/register
+representations corrupts the exact task VJP and lets the representation absorb
+an arbitrary routing surrogate.  The router therefore observes stop-gradient
+features and owns the surrogate credit exclusively.
+"""
+function _structured_router_selected_weight_vjp!(
+    weight_gradient, input, column, route_gradient,
+)
+    @inbounds for route in 1:EPISODIC_ROUTER_DIM
+        first_coordinate = (route - 1) * EPISODIC_ROUTER_BLOCK_WIDTH + 1
+        last_coordinate = min(route * EPISODIC_ROUTER_BLOCK_WIDTH, MODEL_DIM)
+        gradient = route_gradient[route]
+        @simd for coordinate in first_coordinate:last_coordinate
+            local_coordinate = coordinate - first_coordinate + 1
+            weight_gradient[local_coordinate, route] = muladd(
+                gradient,
+                input[coordinate, column],
+                weight_gradient[local_coordinate, route],
             )
         end
     end
@@ -1605,6 +1667,7 @@ struct CrossAttentionTape
     inverse_rms::Vector{Float32}
     register_route::Matrix{Float32}
     token_route::Matrix{Float32}
+    candidate_ids::Matrix{Int16}
     selected_ids::Matrix{Int16}
     support_slots::Matrix{Int16}
     union_ids::Vector{Int16}
@@ -1627,6 +1690,8 @@ struct CrossAttentionForwardScratch
     inverse_rms::Vector{Float32}
     register_route::Matrix{Float32}
     token_route::Matrix{Float32}
+    candidate_ids::Matrix{Int16}
+    candidate_scores::Matrix{Float32}
     selected_ids::Matrix{Int16}
     candidate_seen::Matrix{Bool}
     union_seen::Vector{Bool}
@@ -1653,6 +1718,8 @@ CrossAttentionForwardScratch() = CrossAttentionForwardScratch(
     Vector{Float32}(undef, REGISTER_COUNT),
     Matrix{Float32}(undef, EPISODIC_ROUTER_DIM, REGISTER_COUNT),
     Matrix{Float32}(undef, EPISODIC_ROUTER_DIM, TOKEN_COUNT),
+    Matrix{Int16}(undef, EPISODIC_CANDIDATE_CAP, REGISTER_COUNT),
+    Matrix{Float32}(undef, EPISODIC_CANDIDATE_CAP, REGISTER_COUNT),
     Matrix{Int16}(undef, EPISODIC_SUPPORT, REGISTER_COUNT),
     Matrix{Bool}(undef, TOKEN_COUNT, REGISTER_COUNT),
     falses(TOKEN_COUNT),
@@ -1853,6 +1920,96 @@ function _retrieve_candidates(buckets::EpisodicBuckets, register_route)
     return _retrieve_candidates!(selected, seen, buckets, register_route)
 end
 
+"""Choose the exact K/V support from the bounded learned-hash candidate pool.
+
+The score is deliberately computed in the tiny router space, not in the
+ATTENTION_DIM Q/K space.  During training a few support slots are reserved for
+deterministic candidates outside the current top set.  Those sparse probes
+receive exact attention/task credit and can subsequently be promoted by the
+router; inference uses the full top-K support.
+"""
+function _rerank_candidates!(
+    selected,
+    candidate_scores,
+    seen_matrix,
+    candidate_ids,
+    token_route,
+    register_route,
+    training::Bool,
+)
+    size(selected) == (EPISODIC_SUPPORT, REGISTER_COUNT) ||
+        throw(DimensionMismatch("episodic selected scratch shape changed"))
+    size(candidate_ids) == (EPISODIC_CANDIDATE_CAP, REGISTER_COUNT) ||
+        throw(DimensionMismatch("episodic candidate scratch shape changed"))
+    size(candidate_scores) == size(candidate_ids) ||
+        throw(DimensionMismatch("episodic score scratch shape changed"))
+    inverse_scale = inv(sqrt(Float32(EPISODIC_ROUTER_DIM)))
+    exploit_count = training ?
+        EPISODIC_SUPPORT - EPISODIC_EXPLORATION_SLOTS :
+        EPISODIC_SUPPORT
+    @inbounds for register in 1:REGISTER_COUNT
+        seen = @view seen_matrix[:, register]
+        fill!(seen, false)
+        for candidate_index in 1:EPISODIC_CANDIDATE_CAP
+            token = Int(candidate_ids[candidate_index, register])
+            score = 0.0f0
+            @simd for route in 1:EPISODIC_ROUTER_DIM
+                score = muladd(
+                    register_route[route, register],
+                    token_route[route, token],
+                    score,
+                )
+            end
+            candidate_scores[candidate_index, register] =
+                score * inverse_scale
+        end
+        for support_index in 1:exploit_count
+            best_index = 0
+            best_score = -Inf32
+            best_token = typemax(Int16)
+            for candidate_index in 1:EPISODIC_CANDIDATE_CAP
+                token16 = candidate_ids[candidate_index, register]
+                token = Int(token16)
+                seen[token] && continue
+                score = candidate_scores[candidate_index, register]
+                if score > best_score ||
+                        (score == best_score && token16 < best_token)
+                    best_index = candidate_index
+                    best_score = score
+                    best_token = token16
+                end
+            end
+            best_index != 0 || error("episodic rerank failed to fill top support")
+            selected[support_index, register] = best_token
+            seen[Int(best_token)] = true
+        end
+        if exploit_count < EPISODIC_SUPPORT
+            probe_hash = 0
+            for table in 1:EPISODIC_ROUTER_TABLES
+                probe_hash = probe_hash * EPISODIC_BUCKETS +
+                    _route_code(register_route, table, register) - 1
+            end
+            start = mod(probe_hash, EPISODIC_CANDIDATE_CAP)
+            support_index = exploit_count
+            for offset in 0:(EPISODIC_CANDIDATE_CAP - 1)
+                candidate_index =
+                    mod(start + offset, EPISODIC_CANDIDATE_CAP) + 1
+                token16 = candidate_ids[candidate_index, register]
+                token = Int(token16)
+                seen[token] && continue
+                support_index += 1
+                selected[support_index, register] = token16
+                seen[token] = true
+                support_index == EPISODIC_SUPPORT && break
+            end
+            support_index == EPISODIC_SUPPORT || error(
+                "episodic exploration failed to fill support",
+            )
+        end
+    end
+    return selected
+end
+
 function _anchor_relation_forward(
     anchor::Int,
     routed_ids,
@@ -2024,10 +2181,13 @@ function _attention_context!(weights, context, query, key, value)
     return context
 end
 
-function _cross_attention_forward(model, registers, memory_normalized)
+function _cross_attention_forward(
+    model, registers, memory_normalized, training::Bool=false,
+)
     scratch = CrossAttentionForwardScratch()
     return _cross_attention_forward!(
         scratch, model, registers, memory_normalized, EpisodicBuckets(),
+        training,
     )
 end
 
@@ -2038,6 +2198,7 @@ function _cross_attention_forward!(
     registers,
     memory_normalized,
     buckets::EpisodicBuckets,
+    training::Bool=false,
 )
     copyto!(scratch.input, registers)
     copyto!(scratch.normalized, registers)
@@ -2054,8 +2215,17 @@ function _cross_attention_forward!(
     )
     _build_token_buckets!(buckets, scratch.token_route)
     _retrieve_candidates!(
-        scratch.selected_ids, scratch.candidate_seen, buckets,
+        scratch.candidate_ids, scratch.candidate_seen, buckets,
         scratch.register_route,
+    )
+    _rerank_candidates!(
+        scratch.selected_ids,
+        scratch.candidate_scores,
+        scratch.candidate_seen,
+        scratch.candidate_ids,
+        scratch.token_route,
+        scratch.register_route,
+        training,
     )
 
     # Project the register support union once.  The same token may be selected
@@ -2186,6 +2356,7 @@ function _cross_attention_forward!(
         scratch.inverse_rms,
         scratch.register_route,
         scratch.token_route,
+        scratch.candidate_ids,
         scratch.selected_ids,
         scratch.support_slots,
         scratch.union_ids,
@@ -2869,6 +3040,7 @@ function advance_trajectory!(
                 model,
                 state.registers,
                 spatial.output_normalized,
+                state.training,
             )
         else
             _cross_attention_forward!(
@@ -2877,6 +3049,7 @@ function advance_trajectory!(
                 state.registers,
                 spatial.output_normalized,
                 state.arena.buckets,
+                state.training,
             )
         end
     end
@@ -3191,6 +3364,7 @@ function BackwardScratch()
         # episodic/register shortlists; undersizing this vector silently wrote
         # past the Julia array under @inbounds and eventually corrupted GC.
         zeros(Float32, max(
+            EPISODIC_CANDIDATE_CAP,
             EPISODIC_SHORTLIST,
             REGISTER_COUNT,
             SPATIAL_SHORTLIST,
@@ -3808,6 +3982,71 @@ function _cross_attention_vjp!(
                 )
             end
         end
+        # The hard hash/top-K boundary has no true derivative.  The former STE
+        # only updated already-selected tokens, so an early routing miss could
+        # never be repaired.  Distil the exact selected-support attention mass
+        # into a soft distribution over the bounded hash candidate pool.  This
+        # gives every retrieved candidate a contrastive signal while K/V,
+        # exact QK attention, memory write and their VJPs remain physically K.
+        if ROUTER_DISTILL_WEIGHT > 0.0f0
+            probabilities = scratch.dweights
+            maximum_score = -Inf32
+            for candidate_index in 1:EPISODIC_CANDIDATE_CAP
+                token = Int(tape.candidate_ids[candidate_index, register])
+                score = 0.0f0
+                @simd for route in 1:EPISODIC_ROUTER_DIM
+                    score = muladd(
+                        tape.register_route[route, register],
+                        tape.token_route[route, token],
+                        score,
+                    )
+                end
+                score /= sqrt(Float32(EPISODIC_ROUTER_DIM))
+                probabilities[candidate_index] = score
+                maximum_score = max(maximum_score, score)
+            end
+            denominator = 0.0f0
+            for candidate_index in 1:EPISODIC_CANDIDATE_CAP
+                probability =
+                    exp(probabilities[candidate_index] - maximum_score)
+                probabilities[candidate_index] = probability
+                denominator += probability
+            end
+            inverse_denominator = inv(denominator)
+            inverse_heads = inv(Float32(ATTENTION_HEADS))
+            inverse_router_scale =
+                inv(sqrt(Float32(EPISODIC_ROUTER_DIM)))
+            for candidate_index in 1:EPISODIC_CANDIDATE_CAP
+                token = Int(tape.candidate_ids[candidate_index, register])
+                target = 0.0f0
+                for support_index in 1:EPISODIC_SUPPORT
+                    Int(tape.selected_ids[support_index, register]) == token ||
+                        continue
+                    for head in 1:ATTENTION_HEADS
+                        target += tape.attention_weights[
+                            support_index, register, head,
+                        ] * inverse_heads
+                    end
+                    break
+                end
+                coefficient = ROUTER_DISTILL_WEIGHT *
+                    (probabilities[candidate_index] * inverse_denominator -
+                     target) * inverse_router_scale
+                _touch_route_gradient!(scratch, token)
+                @simd for route in 1:EPISODIC_ROUTER_DIM
+                    dregister_route[route, register] = muladd(
+                        coefficient,
+                        tape.token_route[route, token],
+                        dregister_route[route, register],
+                    )
+                    scratch.route_gradient[route, token] = muladd(
+                        coefficient,
+                        tape.register_route[route, register],
+                        scratch.route_gradient[route, token],
+                    )
+                end
+            end
+        end
     end
     union_memory = @view scratch.cross_union_memory[:, 1:union_count]
     @inbounds for union_index in 1:union_count
@@ -3848,35 +4087,21 @@ function _cross_attention_vjp!(
         dquery_total,
     )
     @inbounds for register in 1:REGISTER_COUNT
-        fill!(scratch.register_input_gradient, 0.0f0)
-        _structured_router_selected_vjp!(
+        _structured_router_selected_weight_vjp!(
             _dgm(accumulator, :register_router),
-            scratch.register_input_gradient,
-            model.register_router,
             tape.normalized,
             register,
             @view(dregister_route[:, register]),
         )
-        @simd for coordinate in 1:MODEL_DIM
-            dnormalized[coordinate, register] +=
-                scratch.register_input_gradient[coordinate]
-        end
     end
     @inbounds for route_index in 1:scratch.route_count
         token = Int(scratch.route_ids[route_index])
-        fill!(scratch.token_input_gradient, 0.0f0)
-        _structured_router_selected_vjp!(
+        _structured_router_selected_weight_vjp!(
             _dgm(accumulator, :token_router),
-            scratch.token_input_gradient,
-            model.token_router,
             memory_normalized,
             token,
             @view(scratch.route_gradient[:, token]),
         )
-        @simd for coordinate in 1:MODEL_DIM
-            dmemory_normalized[coordinate, token] +=
-                scratch.token_input_gradient[coordinate]
-        end
     end
 
     # Dense only in the cheap mean path: every token receives the same

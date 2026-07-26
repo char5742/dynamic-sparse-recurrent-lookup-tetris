@@ -4,6 +4,27 @@ This ledger records both successful and failed runs. Teacher-held rows are not
 game-validation seeds; game validation `8001:8008` and sealed seeds
 `91001:91032` remain unopened.
 
+## 2026-07-26 — エピソード記憶routerの信用割当修正
+
+- 仮説：1段Lookupの性能低下には、Lookup段数以外にhard token routerの代理勾配が
+  本体task gradientを汚す問題が含まれる。
+- 監査：固定trajectoryの全体VJPを40 parameter familyで有限差分比較した。router
+  surrogateをtoken/register表現へ流す旧方式では不一致が出たが、router parameterだけへ
+  限定すると全項目が合格した。
+- 修正：learned hashの128候補を小型routerで再順位付けし、K64だけへ正確な
+  cross-attentionとworking-memory writeを実行する。学習時は8 sparse probeと候補内
+  attention distillationを用いる。
+- 学習可能性：real-teacher同一4状態100更新で、固定3-stepのlossが35.26%、hard
+  halting有効時が52.75%低下した。後者はtop-1 `0→1.0`、評価深度4～5を得た。
+- 正当性：K64回帰633件、1段／3段Lookup回帰、全trajectory VJP、serial／barrierless
+  optimizer一致がすべて合格した。optimizer後parameter/state相対L2は`1.259e-9`。
+- 速度：100更新のproduction測定は`14.953 updates/s`、allocation
+  `12.390 MB/update`、GC比率`0.681%`。許容下限10は満たすが、旧20目標には届かない。
+- 境界：training rowだけを使用し、validation rowとsealed game seedには触れていない。
+  同一4状態の結果は汎化性能を意味しない。
+- 詳細：
+  `episodic_vit_recurrent_lookup/ROUTER_CREDIT_REPAIR_2026-07-26.md`。
+
 ## 2026-07-20 — spatial episodic recurrent LookupFFN, 20,000 updates
 
 - Repair: added recurrent physical local-8 cell attention, shared learned
