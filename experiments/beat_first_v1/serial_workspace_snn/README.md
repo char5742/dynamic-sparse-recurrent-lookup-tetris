@@ -50,9 +50,18 @@ PreAct超えを事前に主張するものではない。評価はreal-teacher�
 
 - `SerialWorkspaceSNN.jl`：モデル、0/1 encoder、逐次／学習用走査、構造固定化、思考trace
 - `train_teacher.jl`：teacher_v3読込、共通損失、AdamW、training-only評価、checkpoint
+- `ArenaWorkspaceTraining.jl`：固定candidate arena、解析VJP、worker-local勾配、
+  isbits MPMC queue、parallel in-place AdamW、Windows CPU Set固定
+- `train_arena_100k.jl`：GC-free hot loop、10k刻みcheckpoint、SHA検証付きresume、
+  100,000更新production driver
+- `benchmark_arena.jl` / `profile_arena_allocations.jl`：CPU・phase・allocation・GC実測
+- `test_arena_training.jl` / `test_arena_real_batch.jl`：Zygote参照との
+  loss・raw VJP・全parameter勾配・AdamW更新一致
 - `evaluate_training_panel.jl`：既存2モデルと同じ固定128状態panelの再評価
 - `runtests.jl`：入出力契約、8機構の因果性、勾配、逐次一致
 - `RESULTS_2026-07-27.md`：scaled初回300更新の条件、数値、比較境界
+- `BARRIERLESS_ARENA_PERFORMANCE_2026-07-27.md`：GC排除、CPU tuning、
+  1,000更新soak、100k実行条件
 - `trained/<run-id>/results.json`：前後評価、連続／構造学習witness、速度、artifact hash
 - `trained/<run-id>/checkpoint_final.jld2`：parameter、optimizer、sampler、設定
 
@@ -78,6 +87,23 @@ $env:SWSNN_RUN_DIR = "experiments/beat_first_v1/serial_workspace_snn/trained/sca
 julia --project=. experiments/beat_first_v1/serial_workspace_snn/evaluate_training_panel.jl
 ```
 
+GC-free barrierless arenaで100,000更新する場合：
+
+```powershell
+$env:SWSNN_MAX_UPDATES = "100000"
+$env:SWSNN_STATE_BATCH = "8"
+$env:SWSNN_ACTIVE_WORKERS = "20"
+$env:SWSNN_CPUSET_MODE = "all"
+$env:SWSNN_CHECKPOINT_INTERVAL = "10000"
+$env:SWSNN_RUN_ID = "arena_scaled_u100000"
+julia --threads=20,0 --project=. experiments/beat_first_v1/serial_workspace_snn/train_arena_100k.jl
+```
+
+`SWSNN_RESUME_CHECKPOINT`と`SWSNN_RESUME_SHA256`を同時に指定すると、
+parameter、AdamW moment/clock、sampler permutation/RNG、構造学習状態、累積性能計数を
+検証して再開する。`SWSNN_MAX_HOT_ALLOCATION_BYTES=0`では、1更新でもhot loopに
+allocationが戻れば学習を停止する。
+
 `SWSNN_PRESET`は`tiny`、`small`、`scaled`、`large`を受け付ける。`large`は
 8,192 node、262,144候補シナプスであり、まず`scaled`の収束とCPU効率を確認してから
 長時間学習へ進むための構成である。
@@ -94,6 +120,9 @@ julia --project=. experiments/beat_first_v1/serial_workspace_snn/evaluate_traini
 - 1周と4周で出力が変化
 - 逐次edge scanとベクトル化edge scanの一致
 - 実teacherの読込、更新、評価、checkpoint再現情報の保存
+- real-teacher scaledでarenaとZygoteの全parameter勾配差 `1.049042e-5`以下
+- 100% allocation samplingでhot update `0 allocation / 0 byte`
+- 1,000更新soakでhot allocation `0 byte`、hot GC `0.0秒`
 
 結果の解釈では、training-only固定panelの改善を未見データ汎化と呼ばない。また、
 parameter数だけでPreActやDSRLNと同等とはみなさず、teacher state予算とpanelを揃えた

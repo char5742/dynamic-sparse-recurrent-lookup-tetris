@@ -17,6 +17,9 @@ The central implementation is
 An independent third-model line, which scales the serial synaptic-printer
 concept into a supervised Tetris graph SNN with a hard global workspace, is in
 [`experiments/beat_first_v1/serial_workspace_snn`](experiments/beat_first_v1/serial_workspace_snn/README.md).
+Its production trainer uses fixed candidate arenas, analytic VJPs, an isbits
+MPMC scheduler, and parallel in-place AdamW; a 1,000-update soak measured zero
+hot-loop allocation/GC and 85.74% utilization across all 20 physical cores.
 Earlier sparse models, routing experiments, CPU scheduler work, comparison
 harnesses, and failed experiments are retained under
 [`experiments/beat_first_v1`](experiments/beat_first_v1).
