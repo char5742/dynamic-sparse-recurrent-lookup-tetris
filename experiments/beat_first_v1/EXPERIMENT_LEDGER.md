@@ -717,3 +717,27 @@ game-validation seeds; game validation `8001:8008` and sealed seeds
   validation row、game validation、sealed seedは使用していない。
 - 詳細：
   `episodic_vit_recurrent_lookup/BP_REPAIR_SPEED25_100K_2026-07-27.md`
+
+## 2026-07-27 — EVRLの幅・深さバランス調整
+
+- 速度下限を`15 updates/s`へ緩和し、register数3／4、attention
+  24／3・32／4・48／6、SwiGLU 64／96／128、Lookup 1／2段を同じ
+  real-teacher条件で比較した。
+- 3R・24/3・F64・L1は短期`21.077 updates/s`、長期累積
+  `19.932 updates/s`で数値一致にも合格した。3R・32/4・F96・L1は30k品質で
+  上回ったが、serial／barrierless gradient一致が既存閾値を超えたため不採用とした。
+- 2段Lookupは13,736,244 parameter、`16.466 updates/s`で、同幅1段に対して
+  10k lossを改善せず、top-1も`0.492188 -> 0.445312`へ低下した。
+- 採用拡幅候補をスクラッチから100kまで学習した。固定training-only 128状態で
+  loss`2.679211`、top-1`0.578125`、NDCG`0.983389`、
+  pairwise`0.872891`、margin`0.085935`を得た。
+- 従来2R・16/1・F32・L1 100k比ではpairwise`+0.001632`、margin`+0.000124`
+  だけが改善し、loss`+0.010151`、top-1`-0.015625`、速度約`-20%`だった。
+  従って現行Pareto最適は従来の細い1段構成と確定した。
+- 100k smokeはoutput、loss、raw VJP完全一致、全離散support・RNG・optimizer
+  clock一致、全tolerance violation 0で合格した。GC比率は`0.633%`である。
+- checkpoint SHA-256：
+  `38efe79fb7a5b843fe1044342637ace7d64095463f08f9e4a6814304cef80035`
+- validation、game validation、sealed seedは使用していない。
+- 詳細：
+  `episodic_vit_recurrent_lookup/WIDTH_DEPTH_BALANCE_TUNING_100K_2026-07-27.md`

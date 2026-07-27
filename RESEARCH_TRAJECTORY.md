@@ -994,3 +994,34 @@ production採用根拠にはしない。validationとsealed seedは使用して�
 詳細は
 [`WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md)
 へ記録した。
+
+## 35. 2026-07-27 — 速度下限15で幅と深さのPareto点を再探索
+
+STE／本体勾配分離修正後の同一モデルについて、速度下限を`15 updates/s`まで緩和し、
+register数、attention幅・head数、SwiGLU幅、Lookup段数を比較した。入力、teacher、
+loss、hard halting、K64 active-only read/write、sparse optimizerは変更していない。
+
+数値一致を満たす拡幅上限は3 registers、attention 24／3 heads、SwiGLU64、
+1段Lookupとなった。6,919,987 parameterでスクラッチから100,000更新、
+400,000 teacher stateを学習し、累積`19.932 updates/s`を得た。100kは
+loss`2.679211`、top-1`0.578125`、NDCG`0.983389`、
+pairwise`0.872891`、margin`0.085935`だった。steady allocationは
+`9.820 MB/update`、GC比率は`0.633%`で、GCはボトルネックではなかった。
+
+より広い3R・32/4・F96は30kでloss`2.816099`、top-1`0.507812`となり、
+24幅を上回ったが、serial／barrierless gradient一致が既存閾値を超えたため、
+品質値だけを理由に採用しなかった。2段Lookupはparameter数をほぼ倍増させ、
+`16.466 updates/s`へ低下した一方、同幅1段の10k品質を改善しなかった。
+
+100kの拡幅候補は、既存2R・16/1・F32・L1に対してpairwiseとmarginを僅かに
+改善しただけで、loss、top-1、NDCG、速度は悪化した。従って「安定して使える拡幅上限」
+は3R・24/3・F64だが、「総合的な幅・深さPareto最適」は従来の
+2R・16/1・F32・1段Lookupである。
+
+100k checkpointのserial／barrierless smokeは、出力、loss、raw VJP完全一致、
+全routing ID、hard halting、probe、RNG、optimizer clock一致、全tolerance
+violation 0で合格した。validationとsealed seedは使用していない。
+
+詳細は
+[`WIDTH_DEPTH_BALANCE_TUNING_100K_2026-07-27.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/WIDTH_DEPTH_BALANCE_TUNING_100K_2026-07-27.md)
+へ記録した。

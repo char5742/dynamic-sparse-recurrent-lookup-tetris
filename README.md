@@ -24,26 +24,28 @@ failed overfit tests, is preserved in
 
 ## 最新の検証結果
 
-2026-07-25に、再帰step内のLookupFFNを1段へ戻し、4 registers、attention
-32／4 heads、SwiGLU128、固定K128 episodic read/write、model dim 256へ拡幅した。
+2026-07-27に速度下限を`15 updates/s`へ緩和し、register数、attention幅・head数、
+SwiGLU幅、Lookup段数を比較した。数値一致と安定性を満たした拡幅上限は
+3 registers、attention 24／3 heads、SwiGLU64、1段Lookupである。
 
-- parameter数：13,909,501
-- serial／barrierless correctness smoke：合格
-- 10,000→100,000更新の長期平均：8.204 updates/s
-- 70k checkpointの短期steady測定：8.319 updates/s
-- steady allocation：17.797 MB/update、GC比率0.481%
-- 固定training-only 128状態の最良70k：loss 2.697863、top-1 0.562500、
-  NDCG 0.983626、pairwise 0.868009、margin 0.078324、平均深度3.426
-- top-1最高60k：0.625000
-- game validationとsealed seed：未使用
-- 主比較70k SHA-256：
-  `1df101be811a7c1338bbd0456c41fefcc3a5244890aaf3ac9bda8dad71093287`
+- parameter数：6,919,987
+- スクラッチ100,000更新：400,000 teacher state
+- 累積学習時間：5,017.156秒、19.932 updates/s
+- steady：20.924 updates/s
+- allocation：9.820 MB/update、GC比率0.633%
+- 固定training-only 128状態の100k：loss 2.679211、top-1 0.578125、
+  NDCG 0.983389、pairwise 0.872891、margin 0.085935
+- serial／barrierless最終smoke：合格
+- validation、game validation、sealed seed：未使用
+- 100k SHA-256：
+  `38efe79fb7a5b843fe1044342637ace7d64095463f08f9e4a6814304cef80035`
 
-70k以降はlossと連続順位品質が反落し、100kはloss 2.817819、top-1 0.492188まで
-悪化した。最良70kも既存1段K64 100kと3段K64 100kの総合品質を超えず、速度下限10も
-満たさなかった。これはK128だけでなくmodel dim 128から256への復元も含む拡幅上限
-試験であり、K単独効果とは解釈しない。全推移、旧構成、PreAct、速度、GC、数値一致は
-[`WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/WIDENED_SINGLE_LOOKUP_K128_2026-07-25.md)
+この拡幅候補はpairwiseとmarginを僅かに改善したが、従来の2-register、
+attention 16／1 head、SwiGLU32構成よりlossとtop-1が悪く、約20%遅かった。
+2段Lookupもparameter数をほぼ倍増させながら10k品質を改善しなかった。したがって、
+拡幅可能な上限は確認したものの、現時点の幅・深さPareto最適は従来の細い1段構成である。
+全候補、30k選別、100k推移、PreAct差、GC、数値一致は
+[`WIDTH_DEPTH_BALANCE_TUNING_100K_2026-07-27.md`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/WIDTH_DEPTH_BALANCE_TUNING_100K_2026-07-27.md)
 に記録した。
 
 ## Repository policy

@@ -4,6 +4,24 @@
 
 ## 最新の学習結果
 
+2026-07-27に速度下限を`15 updates/s`へ緩和し、STE分離修正版の幅と深さを
+系統的に比較した。3 registers、attention 24／3 heads、SwiGLU64、1段Lookupが、
+数値一致を満たす拡幅候補の最良となった。6,919,987 parameterをスクラッチから
+100,000更新し、400,000 teacher stateを累積`19.932 updates/s`で処理した。
+
+training-only固定128状態の100kはloss`2.679211`、top-1`0.578125`、
+NDCG`0.983389`、pairwise`0.872891`、margin`0.085935`だった。steady速度は
+`20.924 updates/s`、allocation`9.820 MB/update`、GC比率`0.633%`である。
+100k最終checkpointもserial／barrierless smokeに合格した。
+
+ただし従来の2-register、attention 16／1 head、SwiGLU32、1段Lookup 100kと比べると、
+pairwise`+0.001632`、margin`+0.000124`に対し、loss`+0.010151`、
+top-1`-0.015625`、NDCG`-0.001616`、速度約`-20%`だった。2段Lookupも10k品質を
+改善しなかったため、現時点の幅・深さPareto最適は従来の細い1段構成と確定した。
+詳細は
+[`WIDTH_DEPTH_BALANCE_TUNING_100K_2026-07-27.md`](WIDTH_DEPTH_BALANCE_TUNING_100K_2026-07-27.md)
+を参照。
+
 2026-07-27に、STE／本体勾配分離の回帰検査を追加した。task-onlyのhard support固定
 有限差分、RMSNorm有限差分、router-only隔離、勾配加法性、旧漏洩箇所3点、
 router-only optimizer更新後のdistillation loss低下を合計902件検査し、全件合格した。
