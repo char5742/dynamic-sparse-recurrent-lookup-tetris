@@ -1,0 +1,65 @@
+serial-synaptic-printer-poc-v1
+input_zero	1,3,5
+input_one	2,4,6
+output_zero	7,9
+output_one	8,10
+nodes	18
+node	1	1	1	input[1]=0
+node	2	1	1	input[1]=1
+node	3	1	1	input[2]=0
+node	4	1	1	input[2]=1
+node	5	1	1	input[3]=0
+node	6	1	1	input[3]=1
+node	7	3	1	output[1]=0
+node	8	3	1	output[1]=1
+node	9	3	1	output[2]=0
+node	10	3	1	output[2]=1
+node	11	2	3	prototype[000]
+node	12	2	3	prototype[001]
+node	13	2	3	prototype[010]
+node	14	2	3	prototype[011]
+node	15	2	3	prototype[100]
+node	16	2	3	prototype[101]
+node	17	2	3	prototype[110]
+node	18	2	3	prototype[111]
+synapses	40
+synapse	1	1	11	1	1
+synapse	2	3	11	1	1
+synapse	3	5	11	1	1
+synapse	4	11	7	1	2
+synapse	5	11	9	1	2
+synapse	6	1	12	1	1
+synapse	7	3	12	1	1
+synapse	8	6	12	1	1
+synapse	9	12	8	1	2
+synapse	10	12	9	1	2
+synapse	11	1	13	1	1
+synapse	12	4	13	1	1
+synapse	13	5	13	1	1
+synapse	14	13	8	1	2
+synapse	15	13	9	1	2
+synapse	16	1	14	1	1
+synapse	17	4	14	1	1
+synapse	18	6	14	1	1
+synapse	19	14	7	1	2
+synapse	20	14	10	1	2
+synapse	21	2	15	1	1
+synapse	22	3	15	1	1
+synapse	23	5	15	1	1
+synapse	24	15	8	1	2
+synapse	25	15	9	1	2
+synapse	26	2	16	1	1
+synapse	27	3	16	1	1
+synapse	28	6	16	1	1
+synapse	29	16	7	1	2
+synapse	30	16	10	1	2
+synapse	31	2	17	1	1
+synapse	32	4	17	1	1
+synapse	33	5	17	1	1
+synapse	34	17	7	1	2
+synapse	35	17	10	1	2
+synapse	36	2	18	1	1
+synapse	37	4	18	1	1
+synapse	38	6	18	1	1
+synapse	39	18	8	1	2
+synapse	40	18	10	1	2
