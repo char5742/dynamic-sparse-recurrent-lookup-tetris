@@ -54,6 +54,8 @@ PreAct超えを事前に主張するものではない。評価はreal-teacher�
   isbits MPMC queue、parallel in-place AdamW、Windows CPU Set固定
 - `train_arena_100k.jl`：GC-free hot loop、10k刻みcheckpoint、SHA検証付きresume、
   100,000更新production driver
+- `evaluate_arena_checkpoint.jl`：arena checkpoint、training split、固定panelの
+  SHAを照合し、別processで最終評価と`results.json`を生成
 - `benchmark_arena.jl` / `profile_arena_allocations.jl`：CPU・phase・allocation・GC実測
 - `test_arena_training.jl` / `test_arena_real_batch.jl`：Zygote参照との
   loss・raw VJP・全parameter勾配・AdamW更新一致
@@ -63,7 +65,8 @@ PreAct超えを事前に主張するものではない。評価はreal-teacher�
 - `BARRIERLESS_ARENA_PERFORMANCE_2026-07-27.md`：GC排除、CPU tuning、
   1,000更新soak、100k実行条件
 - `trained/<run-id>/results.json`：前後評価、連続／構造学習witness、速度、artifact hash
-- `trained/<run-id>/checkpoint_final.jld2`：parameter、optimizer、sampler、設定
+- `trained/<run-id>/checkpoints/checkpoint_<update>.jld2`：
+  parameter、optimizer、sampler、構造状態、設定
 
 ## 実行
 
@@ -99,6 +102,14 @@ $env:SWSNN_RUN_ID = "arena_scaled_u100000"
 julia --threads=20,0 --project=. experiments/beat_first_v1/serial_workspace_snn/train_arena_100k.jl
 ```
 
+100k checkpointを学習processと分離して評価する場合：
+
+```powershell
+$env:SWSNN_CHECKPOINT = "experiments/beat_first_v1/serial_workspace_snn/trained/arena_scaled_u100000/checkpoints/checkpoint_000100000.jld2"
+$env:SWSNN_CHECKPOINT_SHA256 = "<checkpoint SHA-256>"
+julia --threads=1,0 --project=. experiments/beat_first_v1/serial_workspace_snn/evaluate_arena_checkpoint.jl
+```
+
 `SWSNN_RESUME_CHECKPOINT`と`SWSNN_RESUME_SHA256`を同時に指定すると、
 parameter、AdamW moment/clock、sampler permutation/RNG、構造学習状態、累積性能計数を
 検証して再開する。`SWSNN_MAX_HOT_ALLOCATION_BYTES=0`では、1更新でもhot loopに
@@ -123,6 +134,10 @@ allocationが戻れば学習を停止する。
 - real-teacher scaledでarenaとZygoteの全parameter勾配差 `1.049042e-5`以下
 - 100% allocation samplingでhot update `0 allocation / 0 byte`
 - 1,000更新soakでhot allocation `0 byte`、hot GC `0.0秒`
+- 100,000更新／800,000状態で`77.812378 states/s`、全20 core平均
+  CPU`87.618880%`、hot allocation `0 byte`、hot GC `0.0秒`
+- 固定128状態でloss `5.258287 → 2.720394`、top-1
+  `0.023438 → 0.523438`、NDCG `0.825348 → 0.978654`
 
 結果の解釈では、training-only固定panelの改善を未見データ汎化と呼ばない。また、
 parameter数だけでPreActやDSRLNと同等とはみなさず、teacher state予算とpanelを揃えた
