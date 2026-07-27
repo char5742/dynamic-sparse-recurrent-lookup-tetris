@@ -4,6 +4,22 @@
 
 ## 最新の学習結果
 
+2026-07-27に、STE／本体勾配分離の回帰検査を追加した。task-onlyのhard support固定
+有限差分、RMSNorm有限差分、router-only隔離、勾配加法性、旧漏洩箇所3点、
+router-only optimizer更新後のdistillation loss低下を合計902件検査し、全件合格した。
+production既定値のserial／barrierless smokeも再合格している。
+
+同修正版を、2 registers、attention 16／1 head、SwiGLU32、1段Lookup、
+learned 8近傍spatial attentionを持つ6,897,248 parameter構成で、スクラッチから
+100,000更新した。400,000 teacher stateを`25.230 updates/s`で処理した。
+training-only固定128状態では、10kから100kでloss`2.933468 -> 2.669060`、
+top-1`0.476562 -> 0.593750`、NDCG`0.976198 -> 0.985005`、
+pairwise`0.829715 -> 0.871259`へ改善した。100kはlossとtop-1、90kはNDCGと
+pairwiseが最良である。一方、決定論的推論深度は全checkpoint・全候補で3に集中し、
+既存PreAct基準にも未到達だった。詳細は
+[`BP_REPAIR_SPEED25_100K_2026-07-27.md`](BP_REPAIR_SPEED25_100K_2026-07-27.md)
+を参照。
+
 2026-07-26に、全trajectory有限差分監査によってinput-token routerの信用割当を再確認
 した。主要な連続VJPは正しかったが、hard-routing代理勾配がtoken表現とregister状態へ
 逆流し、本来のtask gradientを汚していた。代理勾配をrouter parameterだけへ限定し、
@@ -193,6 +209,7 @@ working-memory write、各VJPは選択された64 token接続に限定する。L
 - `ROOT_SPEED_TUNING_2026-07-24.md`：K幅変更後の根本速度改善、40 updates/s候補、動的halting速度、数値一致
 - `THREE_LOOKUP_RESTORATION_2026-07-25.md`：現行構成のLookupだけを1段から3段へ戻した100k精度・速度アブレーション
 - `ROUTER_CREDIT_REPAIR_2026-07-26.md`：router代理勾配の本体汚染修正、候補内対照信用、全trajectory監査
+- `BP_REPAIR_SPEED25_100K_2026-07-27.md`：STE分離回帰、速度25構成の100k学習、10k刻み推移、PreAct差
 
 ## 速度合格候補
 

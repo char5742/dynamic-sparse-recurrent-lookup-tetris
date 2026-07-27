@@ -18,6 +18,7 @@ for (name, value) in (
     "EVRL_ROUTER_BUCKET_CAP" => "64",
     "EVRL_EPISODIC_SUPPORT" => "64",
     "EVRL_FFN_DIM" => "128",
+    "EVRL_ROUTER_DISTILL_WEIGHT" => "0.10",
 )
     ENV[name] = get(ENV, name, value)
 end
@@ -164,11 +165,179 @@ function _audit_parameter!(
         relative_error,
         index=string(CartesianIndices(parameter)[index]),
         epsilon=used_epsilon,
+        support_stable=true,
     ))
     return nothing
 end
 
-@testset "full fixed-trajectory VJP directional audit" begin
+const _ROUTER_PARAMETER_NAMES = (:token_router, :register_router)
+
+_maximum_abs(array) = isempty(array) ? 0.0f0 : maximum(abs, array)
+
+function _backward_with_router_scale(
+    model, tape, output_cotangent, router_surrogate_scale,
+)
+    accumulator = Model.GradientAccumulator(model)
+    Model.backward_trajectory!(
+        accumulator,
+        model,
+        tape,
+        output_cotangent;
+        realized_loss=1.0f0,
+        baseline=1.0f0,
+        compute_price=0.0f0,
+        policy_weight=0.0f0,
+        entropy_weight=0.0f0,
+        temperature=0.50f0,
+        lookup_balance_weight=0.0f0,
+        router_surrogate_scale,
+    )
+    return accumulator
+end
+
+function _lookup_gradient_maximum(accumulator)
+    lookup = accumulator.lookup
+    result = maximum((
+        _maximum_abs(lookup.dalpha_logits),
+        _maximum_abs(lookup.dhead),
+        _maximum_abs(lookup.dbias),
+        _maximum_abs(lookup.dhalt_weight),
+        _maximum_abs(lookup.dhalt_bias),
+        _maximum_abs(lookup.dreinject_logit),
+    ))
+    for block in 1:Model.BLOCKS
+        result = max(result, _maximum_abs(lookup.dbh4[block]))
+        for gradient in values(lookup.bank_gradients[block])
+            result = max(result, _maximum_abs(gradient))
+        end
+    end
+    return result
+end
+
+function _cross_vjp_snapshot(model, step, state_cotangent, router_scale)
+    accumulator = Model.GradientAccumulator(model)
+    scratch = accumulator.backward_scratch
+    dinput = zeros(Float32, Model.MODEL_DIM, Model.REGISTER_COUNT)
+    dmemory = zeros(Float32, Model.MODEL_DIM, Model.TOKEN_COUNT)
+    Model._cross_attention_vjp!(
+        accumulator,
+        model,
+        step.cross,
+        step.spatial.output_normalized,
+        state_cotangent,
+        scratch,
+        dinput,
+        dmemory;
+        router_surrogate_scale=router_scale,
+    )
+    return (;
+        accumulator,
+        dinput=copy(dinput),
+        dmemory_normalized=copy(dmemory),
+        dnormalized=copy(scratch.dnormalized),
+        dregister_route=copy(scratch.dregister_route),
+    )
+end
+
+function _fixed_support_router_distillation_loss(model, tape)
+    inverse_root = inv(sqrt(Float64(Model.EPISODIC_ROUTER_DIM)))
+    inverse_heads = inv(Float64(Model.ATTENTION_HEADS))
+    logits = Vector{Float64}(undef, Model.EPISODIC_CANDIDATE_CAP)
+    loss = 0.0
+    for step in tape.steps
+        cross = step.cross
+        token_route = Model._structured_router_forward(
+            model.token_router, step.spatial.output_normalized,
+        )
+        register_route = Model._structured_router_forward(
+            model.register_router, cross.normalized,
+        )
+        for register in 1:Model.REGISTER_COUNT
+            maximum_logit = -Inf
+            for candidate_index in 1:Model.EPISODIC_CANDIDATE_CAP
+                token = Int(cross.candidate_ids[candidate_index, register])
+                logit = 0.0
+                for route in 1:Model.EPISODIC_ROUTER_DIM
+                    logit += Float64(register_route[route, register]) *
+                        Float64(token_route[route, token])
+                end
+                logit *= inverse_root
+                logits[candidate_index] = logit
+                maximum_logit = max(maximum_logit, logit)
+            end
+            log_normalizer = maximum_logit + log(sum(
+                exp(logits[index] - maximum_logit)
+                for index in eachindex(logits)
+            ))
+            for candidate_index in 1:Model.EPISODIC_CANDIDATE_CAP
+                token = Int(cross.candidate_ids[candidate_index, register])
+                target = 0.0
+                for support_index in 1:Model.EPISODIC_SUPPORT
+                    Int(cross.selected_ids[support_index, register]) == token ||
+                        continue
+                    for head in 1:Model.ATTENTION_HEADS
+                        target += Float64(cross.attention_weights[
+                            support_index, register, head,
+                        ]) * inverse_heads
+                    end
+                    break
+                end
+                loss -= Float64(Model.ROUTER_DISTILL_WEIGHT) * target *
+                    (logits[candidate_index] - log_normalizer)
+            end
+        end
+    end
+    return loss
+end
+
+function _router_only_adam_step!(
+    model, optimizer, accumulator; learning_rate=1.0f-4,
+)
+    # This is deliberately test-local: it exercises the same canonical Adam
+    # primitive used by optimizer_step!, but dispatches only the router group.
+    # Body parameters, body moments, lookup clocks, and sparse row state are
+    # therefore outside the update transaction by construction.
+    next_step = optimizer.dense_step + UInt64(1)
+    parameters = Model._dense_parameters(model)
+    for name in _ROUTER_PARAMETER_NAMES
+        parameter = getproperty(parameters, name)
+        m, v = optimizer.dense_states[name]
+        Model.SparseLookup._adam_update!(
+            parameter,
+            m,
+            v,
+            accumulator.dense[name],
+            next_step,
+            learning_rate;
+            beta1=0.9f0,
+            beta2=0.999f0,
+            epsilon=1.0f-8,
+            weight_decay=0.0f0,
+        )
+    end
+    return nothing
+end
+
+function _tree_equal(left, right)
+    typeof(left) === typeof(right) || return false
+    if left isa AbstractArray
+        return size(left) == size(right) && all(isequal.(left, right))
+    elseif left isa Tuple
+        return length(left) == length(right) &&
+            all(_tree_equal(left[index], right[index]) for index in eachindex(left))
+    elseif left isa AbstractDict
+        keys(left) == keys(right) || return false
+        return all(_tree_equal(left[key], right[key]) for key in keys(left))
+    elseif isstructtype(typeof(left)) && fieldcount(typeof(left)) > 0
+        return all(
+            _tree_equal(getfield(left, index), getfield(right, index))
+            for index in 1:fieldcount(typeof(left))
+        )
+    end
+    return isequal(left, right)
+end
+
+@testset "task loss only: fixed-support continuous VJP" begin
     rng = Xoshiro(0x46554c4c564a5031)
     model = Model.initialize_model(rng)
     input = _input(rng)
@@ -189,6 +358,7 @@ end
         entropy_weight=0.0f0,
         temperature=0.50f0,
         lookup_balance_weight=0.0f0,
+        router_surrogate_scale=0.0f0,
     )
 
     # token_router and register_router intentionally use a hard-support STE.
@@ -330,5 +500,200 @@ end
         row.absolute_error > 2.0e-3 &&
             row.relative_error > 7.5e-2
     end
+    @test all(row.support_stable for row in rows)
     @test isempty(failures)
+end
+
+@testset "RMSNorm continuous VJP" begin
+    rng = Xoshiro(0x524d534e4f524d31)
+    input = randn(rng, Float32, Model.MODEL_DIM, Model.REGISTER_COUNT)
+    cotangent = randn(rng, Float32, size(input))
+    normalized = copy(input)
+    inverse_rms = zeros(Float32, Model.REGISTER_COUNT)
+    Model._rmsnorm_columns!(normalized, inverse_rms)
+    analytic = zeros(Float32, size(input))
+    Model._rmsnorm_columns_vjp!(
+        analytic, normalized, inverse_rms, cotangent,
+    )
+    function objective(candidate)
+        value = copy(candidate)
+        inverse = zeros(Float32, Model.REGISTER_COUNT)
+        Model._rmsnorm_columns!(value, inverse)
+        return dot(Float64.(value), Float64.(cotangent))
+    end
+    for index in _strongest_indices(analytic; limit=8)
+        original = input[index]
+        epsilon = 1.0f-3
+        input[index] = original + epsilon
+        positive = objective(input)
+        input[index] = original - epsilon
+        negative = objective(input)
+        input[index] = original
+        numeric = (positive - negative) / (2.0 * Float64(epsilon))
+        @test isapprox(
+            Float64(analytic[index]), numeric; atol=3.0e-4, rtol=3.0e-3,
+        )
+    end
+end
+
+@testset "STE and continuous-gradient separation" begin
+    rng = Xoshiro(0x5354455345504152)
+    model = Model.initialize_model(rng)
+    input = _input(rng)
+    output_cotangent = randn(rng, Float32, Model.OUTPUT_DIM)
+    _, tape = _objective(model, input, output_cotangent)
+    reference_signature = _discrete_signature(tape)
+
+    task = _backward_with_router_scale(
+        model, tape, output_cotangent, 0.0f0,
+    )
+    total = _backward_with_router_scale(
+        model, tape, output_cotangent, 1.0f0,
+    )
+    lambda = 0.37f0
+    combined = _backward_with_router_scale(
+        model, tape, output_cotangent, lambda,
+    )
+
+    # The same fixed trajectory is used for all three losses.  No forward is
+    # repeated here, so both episodic token IDs and Lookup row IDs are
+    # definitionally identical to the asserted finite-difference support.
+    @test _same_signature(reference_signature, _discrete_signature(tape))
+
+    dense_parameters = Model._dense_parameters(model)
+    for name in propertynames(dense_parameters)
+        task_gradient = task.dense[name]
+        total_gradient = total.dense[name]
+        combined_gradient = combined.dense[name]
+        expected = task_gradient .+
+            lambda .* (total_gradient .- task_gradient)
+        @test isapprox(
+            combined_gradient, expected; atol=2.0f-6, rtol=2.0f-5,
+        )
+        if !(name in _ROUTER_PARAMETER_NAMES)
+            # Enabling router credit must not change any continuous task VJP.
+            @test total_gradient == task_gradient
+            @test combined_gradient == task_gradient
+        end
+    end
+    @test maximum(
+        _maximum_abs(total.dense[name] .- task.dense[name])
+        for name in _ROUTER_PARAMETER_NAMES
+    ) > 1.0f-7
+
+    for field in (
+        :dalpha_logits, :dhead, :dbias, :dhalt_weight, :dhalt_bias,
+        :dreinject_logit,
+    )
+        @test getproperty(task.lookup, field) ==
+            getproperty(total.lookup, field)
+        @test getproperty(task.lookup, field) ==
+            getproperty(combined.lookup, field)
+    end
+    for block in 1:Model.BLOCKS
+        @test task.lookup.dbh4[block] == total.lookup.dbh4[block]
+        @test task.lookup.dbh4[block] == combined.lookup.dbh4[block]
+        @test keys(task.lookup.bank_gradients[block]) ==
+            keys(total.lookup.bank_gradients[block])
+        @test keys(task.lookup.bank_gradients[block]) ==
+            keys(combined.lookup.bank_gradients[block])
+        for column in keys(task.lookup.bank_gradients[block])
+            @test task.lookup.bank_gradients[block][column] ==
+                total.lookup.bank_gradients[block][column]
+            @test task.lookup.bank_gradients[block][column] ==
+                combined.lookup.bank_gradients[block][column]
+        end
+    end
+
+    # An explicit router auxiliary loss (distillation with zero task
+    # cotangent) may update only the two router parameter matrices.
+    router_only = _backward_with_router_scale(
+        model, tape, zeros(Float32, Model.OUTPUT_DIM), 1.0f0,
+    )
+    @test _maximum_abs(router_only.dense[:token_router]) > 1.0f-7
+    @test _maximum_abs(router_only.dense[:register_router]) > 1.0f-7
+    for name in propertynames(dense_parameters)
+        name in _ROUTER_PARAMETER_NAMES && continue
+        @test _maximum_abs(router_only.dense[name]) == 0.0f0
+    end
+    @test _lookup_gradient_maximum(router_only) == 0.0f0
+
+    # Inspect the three historical leakage locations directly.  dregister_route
+    # is allowed to contain the STE/distillation surrogate; dnormalized and
+    # dmemory_normalized must remain the exact task cotangents.
+    state_cotangent = randn(
+        rng, Float32, Model.MODEL_DIM, Model.REGISTER_COUNT,
+    )
+    first_step = first(tape.steps)
+    router_disabled = _cross_vjp_snapshot(
+        model, first_step, state_cotangent, 0.0f0,
+    )
+    router_enabled = _cross_vjp_snapshot(
+        model, first_step, state_cotangent, 1.0f0,
+    )
+    @test router_enabled.dnormalized == router_disabled.dnormalized
+    @test router_enabled.dmemory_normalized ==
+        router_disabled.dmemory_normalized
+    @test router_enabled.dinput == router_disabled.dinput
+    @test _maximum_abs(router_disabled.dregister_route) == 0.0f0
+    @test _maximum_abs(router_enabled.dregister_route) > 1.0f-7
+
+    isolated_router = _cross_vjp_snapshot(
+        model,
+        first_step,
+        zeros(Float32, Model.MODEL_DIM, Model.REGISTER_COUNT),
+        1.0f0,
+    )
+    @test _maximum_abs(isolated_router.dnormalized) == 0.0f0
+    @test _maximum_abs(isolated_router.dmemory_normalized) == 0.0f0
+    @test _maximum_abs(isolated_router.dinput) == 0.0f0
+    @test _maximum_abs(isolated_router.dregister_route) > 1.0f-7
+
+    # A true router-only optimizer transaction must leave both body parameters
+    # and body moment state untouched.  STE is intentionally not compared with
+    # finite differences; instead its auxiliary objective must improve.
+    optimizer = Model.initialize_optimizer(model)
+    lookup_before = deepcopy(model.lookup)
+    lookup_optimizer_before = deepcopy(optimizer.lookup)
+    token_event_count_before = copy(optimizer.token_event_count)
+    dense_step_before = optimizer.dense_step
+    body_parameters_before = Dict(
+        name => copy(getproperty(dense_parameters, name))
+        for name in propertynames(dense_parameters)
+        if !(name in _ROUTER_PARAMETER_NAMES)
+    )
+    body_states_before = Dict(
+        name => (copy(optimizer.dense_states[name][1]),
+                 copy(optimizer.dense_states[name][2]))
+        for name in propertynames(dense_parameters)
+        if !(name in _ROUTER_PARAMETER_NAMES)
+    )
+    token_router_before = copy(model.token_router)
+    register_router_before = copy(model.register_router)
+    router_loss_before = _fixed_support_router_distillation_loss(model, tape)
+    _router_only_adam_step!(
+        model, optimizer, router_only; learning_rate=1.0f-4,
+    )
+    router_loss_after = _fixed_support_router_distillation_loss(model, tape)
+    @test router_loss_after < router_loss_before
+    @test model.token_router != token_router_before
+    @test model.register_router != register_router_before
+    for (name, parameter_before) in body_parameters_before
+        @test getproperty(Model._dense_parameters(model), name) ==
+            parameter_before
+        m_before, v_before = body_states_before[name]
+        m_after, v_after = optimizer.dense_states[name]
+        @test m_after == m_before
+        @test v_after == v_before
+    end
+    @test _tree_equal(model.lookup, lookup_before)
+    @test _tree_equal(optimizer.lookup, lookup_optimizer_before)
+    @test optimizer.token_event_count == token_event_count_before
+    @test optimizer.dense_step == dense_step_before
+    println(
+        "router_distillation_loss\t",
+        router_loss_before,
+        '\t',
+        router_loss_after,
+    )
 end

@@ -690,3 +690,30 @@ game-validation seeds; game validation `8001:8008` and sealed seeds
   `80cc8264a03facf5ff4d0c13cde205b0763012281254362b2f15521c262a4f1c`.
 - Detailed record:
   `episodic_vit_recurrent_lookup/TOKEN_ROUTING_ABLATION_2026-07-21.md`.
+
+## 2026-07-27 — STE分離回帰とBP修復後100,000更新
+
+- hard-routingの代理勾配を本体の連続VJPから分離した状態を固定するため、
+  task-only有限差分、router-only隔離、勾配加法性、旧漏洩箇所、
+  router-only optimizer更新を検査する回帰テストを追加した。
+- task-only固定support有限差分は3/3、RMSNorm有限差分は8/8、
+  STE分離・加法性・optimizer隔離は891/891合格した。router-only更新で
+  distillation lossは`3.689158 -> 3.688441`へ低下した。
+- production既定値のserial／barrierless smokeも再合格した。出力、loss、
+  raw VJPは完全一致し、parameter勾配の最大絶対差は`2.9430e-7`だった。
+- BP修復後の速度構成は6,897,248 parameter、2 registers、attention 16／1 head、
+  SwiGLU32、1段Lookup、K64 episodic read/write、learned 8近傍spatial attentionである。
+- スクラッチから100,000更新、400,000 teacher stateを学習し、学習区間は
+  `3,962.715秒`、`25.230 updates/s`だった。
+- 同一training-only固定128状態では、10kから100kでloss
+  `2.933468 -> 2.669060`、top-1`0.476562 -> 0.593750`、NDCG
+  `0.976198 -> 0.985005`、pairwise`0.829715 -> 0.871259`へ改善した。
+- 100kはlossとtop-1、90kはNDCGとpairwiseが最良だった。一方、決定論的深度は
+  全checkpoint・全5,357候補で3に集中し、入力依存haltingの獲得は未達である。
+- 同一パネルのPreAct 12.75kに対し、100k EVRLはloss`+0.118155`、
+  top-1`-0.195312`、NDCG`-0.009463`、pairwise`-0.058944`で未到達だった。
+- 100k checkpoint SHA-256は
+  `0a3e20c3f575a2b56edef68c40f92d6db067d0dc1e2dd50c2cc8ed0a39093d59`。
+  validation row、game validation、sealed seedは使用していない。
+- 詳細：
+  `episodic_vit_recurrent_lookup/BP_REPAIR_SPEED25_100K_2026-07-27.md`

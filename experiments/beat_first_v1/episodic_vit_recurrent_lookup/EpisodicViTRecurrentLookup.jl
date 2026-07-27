@@ -3867,6 +3867,8 @@ function _cross_attention_vjp!(
     accumulator, model, tape, memory_normalized, state_cotangent,
     scratch::BackwardScratch, dinput, dmemory_normalized,
     external_dweights=nothing,
+    ;
+    router_surrogate_scale::Real=1.0f0,
 )
     fill!(dmemory_normalized, 0.0f0)
     _dgv(accumulator, :cross_scale_logit)[1] +=
@@ -3937,7 +3939,13 @@ function _cross_attention_vjp!(
     dvalue_union = @view scratch.cross_dvalue_union[:, 1:union_count]
     fill!(dkey_union, 0.0f0)
     fill!(dvalue_union, 0.0f0)
-    router_scale = ROUTER_STE_SCALE / sqrt(Float32(EPISODIC_ROUTER_DIM))
+    # Test-only separation control.  Production callers retain the exact
+    # historical value 1.0.  Setting this to zero removes both hard-support
+    # STE and routing distillation credit while leaving the continuous task
+    # VJP untouched, so the two gradient families can be audited separately.
+    surrogate_scale = Float32(router_surrogate_scale)
+    router_scale = surrogate_scale * ROUTER_STE_SCALE /
+        sqrt(Float32(EPISODIC_ROUTER_DIM))
     @inbounds for register in 1:REGISTER_COUNT
         query = @view tape.query[:, register:register]
         key = @view tape.key[:, :, register]
@@ -4029,7 +4037,7 @@ function _cross_attention_vjp!(
                     end
                     break
                 end
-                coefficient = ROUTER_DISTILL_WEIGHT *
+                coefficient = surrogate_scale * ROUTER_DISTILL_WEIGHT *
                     (probabilities[candidate_index] * inverse_denominator -
                      target) * inverse_router_scale
                 _touch_route_gradient!(scratch, token)
@@ -4932,6 +4940,7 @@ function backward_trajectory!(
     halt_bias_contributions=nothing,
     lookup_balance_stats=nothing,
     lookup_balance_weight=0.0f0,
+    router_surrogate_scale::Real=1.0f0,
 )
     scratch = accumulator.backward_scratch
     length(output_cotangent) == OUTPUT_DIM || throw(DimensionMismatch(
@@ -5146,7 +5155,8 @@ function backward_trajectory!(
             accumulator, model, step.cross, step.spatial.output_normalized,
             state_cotangent, scratch, next_cotangent,
             scratch.memory_postnorm,
-            external_cross_dweights,
+            external_cross_dweights;
+            router_surrogate_scale,
         )
 
         # Cross reads the RMS-normalized post-spatial memory.  Convert that
