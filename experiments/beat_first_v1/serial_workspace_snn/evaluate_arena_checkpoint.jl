@@ -49,6 +49,13 @@ function last_trace_record(path)
 end
 
 function evaluate_checkpoint_main()
+    error(
+        "evaluate_arena_checkpoint.jl is a legacy v1/v2 recovery tool and " *
+        "is disabled because it can overwrite a v3 run's results.json. " *
+        "Use run_arena_100k_controller.ps1 -StartMode finalize-only for " *
+        "recovery, then analyze_arena_checkpoint.jl --run-dir for analysis.",
+    )
+
     checkpoint_path = abspath(get(ENV, "SWSNN_CHECKPOINT", ""))
     isempty(strip(checkpoint_path)) && error("set SWSNN_CHECKPOINT")
     expected_sha256 =

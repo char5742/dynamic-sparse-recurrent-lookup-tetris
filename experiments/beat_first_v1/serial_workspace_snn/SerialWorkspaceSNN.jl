@@ -6,15 +6,30 @@ using Statistics
 using Zygote
 
 export AUX_LEVELS,
+    HIDDEN_RMS_SCALE,
+    HIDDEN_NORM_SCALE,
     INPUT_RAILS,
+    QUERY_NORM_SCALE,
+    QUERY_RMS_SCALE,
+    RMS_EPS,
+    RMS_NORM_EPS,
     SerialWorkspaceModel,
+    WORKSPACE_DECAY_MAX,
+    WORKSPACE_DECAY_MIN,
+    WORKSPACE_DECAY_SPAN,
     binary_rails,
+    bounded_workspace_decay,
+    bounded_workspace_decay_derivative,
     build_model,
     consolidate_structure,
     enabled_synapse_count,
     graph_topology,
+    head_features,
     parameter_count,
+    rms_inverse,
+    rms_normalize,
     serial_synapse_scan,
+    standardized_route_probabilities,
     structural_mask,
     trace_candidate,
     vectorized_synapse_scan
@@ -27,6 +42,19 @@ const INPUT_RAILS =
     2 * BOARD_CELLS + 2 * BOARD_CELLS + QUEUE_BITS + AUX_FEATURES * AUX_LEVELS
 const OUTPUT_DIM = 22
 const QUANTILES = 16
+const RMS_NORM_EPS = 1.0f-4
+const QUERY_NORM_SCALE = 0.50f0
+const HIDDEN_NORM_SCALE = 0.75f0
+const WORKSPACE_DECAY_MIN = 0.60f0
+const WORKSPACE_DECAY_MAX = 0.95f0
+const WORKSPACE_DECAY_SPAN =
+    WORKSPACE_DECAY_MAX - WORKSPACE_DECAY_MIN
+# Backward-compatible descriptive aliases for diagnostics written against the
+# first normalized-readout prototype.
+const RMS_EPS = RMS_NORM_EPS
+const QUERY_RMS_SCALE = QUERY_NORM_SCALE
+const HIDDEN_RMS_SCALE = HIDDEN_NORM_SCALE
+const WORKSPACE_DECAY_RANGE = WORKSPACE_DECAY_SPAN
 
 """
 Third beat-first model: a recurrent graph of continuous LIF-like nodes.
@@ -117,20 +145,94 @@ function build_model(preset::Symbol=:scaled)
         blocks=32, node_dim=24, fanout=12, cycles=4, workspace_k=4, hidden=96,
     )
     preset === :scaled && return SerialWorkspaceModel()
+    preset === :scaled_v2 && return SerialWorkspaceModel()
     preset === :large && return SerialWorkspaceModel(
         blocks=128, node_dim=64, fanout=32, cycles=4, workspace_k=8, hidden=256,
     )
-    throw(ArgumentError("unknown preset $preset; use :tiny, :small, :scaled, or :large"))
+    throw(ArgumentError(
+        "unknown preset $preset; use :tiny, :small, :scaled, :scaled_v2, or :large",
+    ))
 end
 
 @inline _logit(probability::Float32) = log(probability / (1.0f0 - probability))
+
+"""
+Candidate-local inverse RMS shared by the differentiable reference and the
+allocation-free arena implementation.
+"""
+@inline function rms_inverse(
+    sum_squares::T,
+    count::Integer,
+) where {T<:AbstractFloat}
+    count >= 1 || throw(ArgumentError("RMS count must be positive"))
+    return inv(sqrt(sum_squares / T(count) + T(RMS_EPS)))
+end
+
+"""
+Normalize every candidate column independently.  Unlike batch normalization,
+this operation has no cross-candidate state and remains deterministic for
+single-candidate Loihi-style inference.
+"""
+function rms_normalize(
+    values::AbstractMatrix,
+    scale::Real=1.0f0,
+)
+    inverse_rms = inv.(sqrt.(
+        sum(abs2, values; dims=1) ./ Float32(size(values, 1)) .+
+        RMS_EPS,
+    ))
+    return Float32(scale) .* values .* inverse_rms
+end
+
+@inline function bounded_workspace_decay(logit::Real)
+    return WORKSPACE_DECAY_MIN +
+        WORKSPACE_DECAY_RANGE * sigmoid(logit)
+end
+
+@inline function bounded_workspace_decay_derivative(logit::Real)
+    probability = sigmoid(logit)
+    return WORKSPACE_DECAY_RANGE *
+        probability *
+        (1.0f0 - probability)
+end
+
+"""
+Project the random gate prior onto an exact per-node hard fanout budget.
+
+Only the signs are chosen by the budget: every logit's sampled magnitude is
+retained (up to `margin`).  Stable sorting makes exact ties prefer the lower
+relation index.  This is an initialization invariant only; subsequent gradient
+and utility-based structural learning remain free to change every gate.
+"""
+function _normalize_initial_gate_logits!(
+    logits::AbstractMatrix{Float32};
+    margin::Float32=0.01f0,
+)
+    margin > 0.0f0 || throw(ArgumentError("gate margin must be positive"))
+    nodes, fanout = size(logits)
+    keep = round(Int, fanout / 2)
+    1 <= keep <= fanout || error("invalid initial gate budget")
+    @inbounds for node in 1:nodes
+        order = sortperm(
+            @view(logits[node, :]);
+            rev=true,
+            alg=Base.Sort.MergeSort,
+        )
+        for rank in 1:fanout
+            relation = order[rank]
+            magnitude = max(abs(logits[node, relation]), margin)
+            logits[node, relation] =
+                rank <= keep ? magnitude : -magnitude
+        end
+    end
+    return logits
+end
 
 function Lux.initialparameters(rng::AbstractRNG, model::SerialWorkspaceModel)
     nodes = model.blocks * model.node_dim
     edge_scale = 0.65f0 / sqrt(Float32(model.fanout))
     gate_logits = 0.08f0 .* randn(rng, Float32, nodes, model.fanout)
-    # Keep an exact mixed structural prior: neither all-on nor all-off.
-    gate_logits[iszero.(gate_logits)] .= 0.01f0
+    _normalize_initial_gate_logits!(gate_logits)
     return (;
         input_gain=1.0f0 .+ 0.10f0 .* randn(rng, Float32, nodes),
         input_bias=-0.15f0 .+ 0.05f0 .* randn(rng, Float32, nodes),
@@ -146,10 +248,13 @@ function Lux.initialparameters(rng::AbstractRNG, model::SerialWorkspaceModel)
         gate_logits,
         delay_logits=fill(_logit(0.20f0), nodes, model.fanout) .+
             0.10f0 .* randn(rng, Float32, nodes, model.fanout),
-        workspace_decay_logit=Float32[_logit(0.55f0)],
+        workspace_decay_logit=Float32[_logit(
+            (0.75f0 - WORKSPACE_DECAY_MIN) /
+            WORKSPACE_DECAY_RANGE,
+        )],
         head_weight=0.12f0 .* randn(
-            rng, Float32, model.hidden, 3 * model.node_dim,
-        ) ./ sqrt(Float32(3 * model.node_dim)),
+            rng, Float32, model.hidden, 2 * model.node_dim,
+        ) ./ sqrt(Float32(2 * model.node_dim)),
         head_bias=zeros(Float32, model.hidden),
         output_weight=0.08f0 .* randn(rng, Float32, OUTPUT_DIM, model.hidden) ./
             sqrt(Float32(model.hidden)),
@@ -275,11 +380,36 @@ end
     return hard .+ soft .- Zygote.dropgrad(soft)
 end
 
-function _workspace_mask(scores, model::SerialWorkspaceModel)
-    soft = sigmoid.(scores ./ model.route_temperature)
-    soft = Float32(model.workspace_k) .* soft ./ max.(
-        sum(soft; dims=1), eps(Float32),
+"""
+Stable, candidate-local soft routing surrogate.
+
+Scores are standardized by a positive candidate-specific scale before the
+softmax, so this transformation cannot change the hard top-k ordering.
+Returned columns sum to `workspace_k`, matching the mass of the hard mask.
+"""
+function standardized_route_probabilities(
+    scores::AbstractMatrix,
+    model::SerialWorkspaceModel,
+)
+    block_count = Float32(size(scores, 1))
+    score_mean = sum(scores; dims=1) ./ block_count
+    centered = scores .- score_mean
+    inverse_std = inv.(sqrt.(
+        sum(abs2, centered; dims=1) ./ block_count .+
+        RMS_NORM_EPS,
+    ))
+    logits =
+        centered .* inverse_std ./ model.route_temperature
+    shifted = logits .- maximum(logits; dims=1)
+    weights = exp.(shifted)
+    return Float32(model.workspace_k) .* weights ./ max.(
+        sum(weights; dims=1),
+        eps(Float32),
     )
+end
+
+function _workspace_mask(scores, model::SerialWorkspaceModel)
+    soft = standardized_route_probabilities(scores, model)
     hard = _hard_topk_mask(scores, model.workspace_k)
     return hard .+ soft .- Zygote.dropgrad(soft)
 end
@@ -360,10 +490,12 @@ function _dynamics(
     nodes = model.blocks * model.node_dim
     candidates = size(rails, 2)
     seed = ps.input_gain .* rails[model.feature_for_node, :] .+ ps.input_bias
-    query = tanh.(ps.query_weight * rails)
+    query_pre = ps.query_weight * rails
+    query = tanh.(rms_normalize(query_pre, QUERY_NORM_SCALE))
     membrane = seed
     previous_active_spikes = zeros(Float32, nodes, candidates)
     workspace = zeros(Float32, model.node_dim, candidates)
+    final_block_mask = zeros(Float32, model.blocks, candidates)
     cycle_trace = Any[]
     threshold = 0.25f0 .+ 0.75f0 .* sigmoid.(ps.threshold_logits)
     leak = 0.45f0 .+ 0.50f0 .* sigmoid.(ps.leak_logits)
@@ -405,10 +537,11 @@ function _dynamics(
         else
             vectorized_synapse_scan(model, active_spikes, previous_active_spikes, ps)
         end
+        final_block_mask = block_mask
         selected = reshape(block_mask, 1, model.blocks, candidates)
         write = dropdims(sum(block_state .* selected; dims=2); dims=2) ./
             Float32(model.workspace_k)
-        decay = sigmoid(ps.workspace_decay_logit[1])
+        decay = bounded_workspace_decay(ps.workspace_decay_logit[1])
         workspace = tanh.(decay .* workspace .+ write)
         feedback = reshape(
             feedback_gain .* reshape(workspace, model.node_dim, 1, candidates),
@@ -445,15 +578,32 @@ function _dynamics(
     end
 
     final_blocks = reshape(membrane, model.node_dim, model.blocks, candidates)
-    pooled = dropdims(mean(final_blocks; dims=2); dims=2)
+    # The output may only observe the graph states selected by the last hard
+    # workspace route.  Routing receives its own local three-factor credit, so
+    # the readout does not inject a second soft-attention shortcut.
+    final_hard_mask = Zygote.dropgrad(final_block_mask)
+    pooled = dropdims(sum(
+        final_blocks .*
+        reshape(final_hard_mask, 1, model.blocks, candidates);
+        dims=2,
+    ); dims=2) ./ Float32(model.workspace_k)
     return (; workspace, query, pooled, membrane, cycle_trace)
+end
+
+"""Normalized workspace/selected-pool readout; the routing query is never exposed."""
+function head_features(dynamics)
+    return vcat(
+        rms_normalize(dynamics.workspace),
+        rms_normalize(dynamics.pooled),
+    )
 end
 
 function (model::SerialWorkspaceModel)(input, ps, st)
     rails = binary_rails(input)
     dynamics = _dynamics(model, rails, ps)
-    features = vcat(dynamics.workspace, dynamics.query, dynamics.pooled)
-    hidden = tanh.(ps.head_weight * features .+ ps.head_bias)
+    features = head_features(dynamics)
+    hidden_pre = ps.head_weight * features .+ ps.head_bias
+    hidden = tanh.(rms_normalize(hidden_pre, HIDDEN_NORM_SCALE))
     raw = ps.output_weight * hidden .+ ps.output_bias
     output = (;
         q=vec(raw[1:1, :]),
@@ -478,8 +628,9 @@ function trace_candidate(model::SerialWorkspaceModel, input, ps; candidate::Int=
     )
     rails = binary_rails(sliced)
     dynamics = _dynamics(model, rails, ps; record_trace=true, serial=true)
-    features = vcat(dynamics.workspace, dynamics.query, dynamics.pooled)
-    hidden = tanh.(ps.head_weight * features .+ ps.head_bias)
+    features = head_features(dynamics)
+    hidden_pre = ps.head_weight * features .+ ps.head_bias
+    hidden = tanh.(rms_normalize(hidden_pre, HIDDEN_NORM_SCALE))
     raw = ps.output_weight * hidden .+ ps.output_bias
     return (;
         raw=vec(raw),

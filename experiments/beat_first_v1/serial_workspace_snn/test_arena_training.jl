@@ -135,7 +135,8 @@ end
         )
     end
 
-    serial_raw = raw_matrix(first(model(batch.inputs, parameters, states)))
+    serial_output = first(model(batch.inputs, parameters, states))
+    serial_raw = raw_matrix(serial_output)
     valid = Int.(arena.valid_flats[1:arena.valid_count])
     @test arena.raw[:, valid] ≈ serial_raw[:, valid] atol=3.0f-5 rtol=3.0f-5
     @test all(iszero, arena.raw[:, setdiff(1:arena.capacity, valid)])
@@ -155,6 +156,60 @@ end
         trainer.structure_weight,
     )
     @test manual_loss.composite_loss ≈ serial_loss atol=6.0f-5 rtol=3.0f-5
+    serial_components = supervised_components(serial_output, batch)
+    @test fieldnames(typeof(manual_loss)) == (
+        :composite_loss,
+        :listnet_loss,
+        :teacher_entropy,
+        :listnet_kl,
+        :old_q_loss,
+        :q_huber_loss,
+        :margin_loss,
+        :raw_top_gap_loss,
+        :death_loss,
+        :quantile_teacher_loss,
+        :geometry_loss,
+        :line_clear_loss,
+        :max_height_loss,
+        :holes_loss,
+        :cavities_loss,
+        :structure_loss,
+        :gate_density,
+        :valid_candidates,
+    )
+    @test manual_loss.old_q_loss ≈
+        serial_components.old_q_loss atol=2.0f-6 rtol=2.0f-6
+    @test manual_loss.q_huber_loss ≈
+        serial_components.q_huber_loss atol=2.0f-6 rtol=2.0f-6
+    @test manual_loss.margin_loss ≈
+        serial_components.margin_loss atol=2.0f-6 rtol=2.0f-6
+    @test manual_loss.raw_top_gap_loss ≈
+        serial_components.raw_top_gap_loss atol=2.0f-6 rtol=2.0f-6
+    @test reinterpret(UInt32, manual_loss.q_huber_loss) ==
+        reinterpret(UInt32, manual_loss.old_q_loss)
+    @test reinterpret(UInt32, manual_loss.raw_top_gap_loss) ==
+        reinterpret(UInt32, manual_loss.margin_loss)
+    @test manual_loss.line_clear_loss ≈
+        serial_components.line_clear_loss atol=2.0f-6 rtol=2.0f-6
+    @test manual_loss.max_height_loss ≈
+        serial_components.max_height_loss atol=2.0f-6 rtol=2.0f-6
+    @test manual_loss.holes_loss ≈
+        serial_components.holes_loss atol=2.0f-6 rtol=2.0f-6
+    @test manual_loss.cavities_loss ≈
+        serial_components.cavities_loss atol=2.0f-6 rtol=2.0f-6
+    @test all(
+        value -> isfinite(value) && value >= 0.0f0,
+        (
+            manual_loss.old_q_loss,
+            manual_loss.q_huber_loss,
+            manual_loss.margin_loss,
+            manual_loss.raw_top_gap_loss,
+            manual_loss.line_clear_loss,
+            manual_loss.max_height_loss,
+            manual_loss.holes_loss,
+            manual_loss.cavities_loss,
+        ),
+    )
 
     task_raw_loss, task_raw_pullback = Zygote.pullback(serial_raw) do raw
         output = (;

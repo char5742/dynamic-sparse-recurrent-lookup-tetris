@@ -36,10 +36,10 @@ PreAct超えを事前に主張するものではない。評価はreal-teacher�
 | グラフ構造＝意味・知識 | 固定edge identityと、学習される各edgeのON/OFF・重み・遅延 |
 | 現在の発火経路＝思考 | 各cycleの`(source, destination, relation)`列をtraceへ保存 |
 | ノード内部状態＝連続的な概念状態 | 各LIF-like nodeの`Float32` membrane |
-| active block＝global workspace | content WTAで96 blockから毎cycle 8 blockを選択 |
-| 発火先の選択＝attentionの代替 | token間softmax attentionを使わず、query・membrane・keyによるhard top-k routing |
-| シナプスON/OFF変更＝構造的学習 | gateのSTE学習と、重み×gate evidenceによる周期的な離散consolidation |
-| 重み・遅延変更＝連続的学習 | 各edgeのweightと0～1 cycleの連続delayをAdamWで更新 |
+| active block＝global workspace | 96 blockから毎cycle 8 blockを選択。局所学習時だけ確率的top-k、推論時は決定論的hard top-k |
+| 発火先の選択＝attentionの代替 | token間softmax attentionを使わず、query・membrane・keyによるtop-k routingを三因子学習 |
+| シナプスON/OFF変更＝構造的学習 | `abs(third factor × eligibility)`のEMA utilityから、巡回・低turnoverでgateを離散consolidation |
+| 重み・遅延変更＝連続的学習 | weight、gate、delay、leak、threshold、feedback、sensory gain/bias、workspace decayを局所traceで更新 |
 | 周回走査＝時間発展 | edge tape全体を4周し、leak・spike・reset・遅延配送・workspace feedbackを更新 |
 
 通常学習は、inboxへ加算してからnodeを更新するという同じ意味を保ったままedgeを
@@ -50,8 +50,13 @@ PreAct超えを事前に主張するものではない。評価はreal-teacher�
 
 - `SerialWorkspaceSNN.jl`：モデル、0/1 encoder、逐次／学習用走査、構造固定化、思考trace
 - `train_teacher.jl`：teacher_v3読込、共通損失、AdamW、training-only評価、checkpoint
-- `ArenaWorkspaceTraining.jl`：固定candidate arena、解析VJP、worker-local勾配、
-  isbits MPMC queue、parallel in-place AdamW、Windows CPU Set固定
+- `ArenaWorkspaceTraining.jl`：固定candidate arena、解析VJP、および
+  e-prop eligibility + block-local error + routing三因子学習、isbits MPMC queue、
+  reducer-local勾配、parallel in-place AdamW、Windows CPU Set固定
+- `benchmark_eprop_shadow.jl` / `benchmark_hybrid_learning.jl`：局所勾配と
+  解析VJPの方向比較、shuffle/zero falsification、固定panel学習・速度・メモリ比較
+- `test_eprop_shadow.jl`：全recurrent parameterの局所更新、確率的routing、
+  utility構造統合、VJP shadow controls
 - `train_arena_100k.jl`：GC-free hot loop、10k刻みcheckpoint、SHA検証付きresume、
   100,000更新production driver
 - `evaluate_arena_checkpoint.jl`：arena checkpoint、training split、固定panelの
@@ -66,7 +71,7 @@ PreAct超えを事前に主張するものではない。評価はreal-teacher�
   1,000更新soak、100k実行条件
 - `trained/<run-id>/results.json`：前後評価、連続／構造学習witness、速度、artifact hash
 - `trained/<run-id>/checkpoints/checkpoint_<update>.jld2`：
-  parameter、optimizer、sampler、構造状態、設定
+  parameter、optimizer、sampler、utility構造状態、設定
 
 ## 実行
 
@@ -102,6 +107,20 @@ $env:SWSNN_RUN_ID = "arena_scaled_u100000"
 julia --threads=20,0 --project=. experiments/beat_first_v1/serial_workspace_snn/train_arena_100k.jl
 ```
 
+全recurrent graphを局所学習へ切り替える場合：
+
+```powershell
+$env:SWSNN_LEARNING_MODE = "local_hybrid"
+$env:SWSNN_EPROP_REDUCERS = "12"
+$env:SWSNN_STRUCTURAL_INTERVAL = "25"
+julia --threads=20,0 --project=. experiments/beat_first_v1/serial_workspace_snn/train_arena_100k.jl
+```
+
+このモードではheadの教師ありVJPだけを残し、recurrent側の全parameterは
+e-prop/DECOLLE型の局所信号で更新する。学習時routingはcounter-based Gumbel
+top-k、評価・推論は従来の決定論的hard top-kである。12 reducerは20 workerの
+forward/head並列性を保ちつつ、巨大なedge勾配bufferの複製を減らす。
+
 100k checkpointを学習processと分離して評価する場合：
 
 ```powershell
@@ -127,6 +146,15 @@ allocationが戻れば学習を停止する。
 - 非二値の連続membrane
 - gate全OFF ablationで出力が変化
 - weight、delay、gateの非ゼロend-to-end gradient
+- 全11 recurrent parameter群の非ゼロlocal update。最終`local_hybrid`では
+  recurrent parameterの凍結なし
+- 第三因子zeroで全局所勾配が0、候補shuffleでVJP方向一致が低下
+- 128状態のaligned local/VJP cosineはweight `0.375`、input gain `0.701`、
+  input bias `0.608`、gate `0.278`、delay `0.164`、routing key `0.608`、
+  routing query `0.778`（全群正）
+- 100k checkpointコピーの64更新で固定panel loss `2.720101 → 2.663746`、
+  `6.905 updates/s`（同時測定VJP `6.128`）、12 reducerのworker学習メモリ
+  `28.06 MB`、hot allocation `0 byte`、GC `0.0秒`
 - ONとOFFを同時に変更する構造consolidation
 - 1周と4周で出力が変化
 - 逐次edge scanとベクトル化edge scanの一致
