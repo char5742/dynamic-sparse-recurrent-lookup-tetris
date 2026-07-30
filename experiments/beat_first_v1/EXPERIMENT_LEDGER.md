@@ -21,12 +21,24 @@ game-validation seeds; game validation `8001:8008` and sealed seeds
   SoA cell stepのwarm allocation `0 byte`と発火source限定event配送を実装した。
   次の本線はanalytic VJPと既存barrierless executorの統合である。
 - 比較：Point-SNN、frozen 11-state、direct Reduced Hay、state-matched diagonal
-  GRUの4 armを定義した。state静的比`1.038889`、演算見積比`1.304348`。
+  GRUの4 armを定義した。Pointの公共interfaceもReducedと同じ12次元へ揃えた。
+  state静的比`1.038889`、演算見積比`1.290323`。
   最終判定は同一wall-clock/fixed panelの実測だけで行う。
 - 注意：固定panelではgraph gradientが0だったため、このrunはevent graphの
   有効性を示さない。TwinProp再現、Hay同等性、他modelへの優位も主張しない。
+- held検証：1k scratch x 3 seed、各64 teacher-validation rowで比較した。
+  Reduced Hay / Point / GRUの平均composite lossは
+  `4.684535 / 4.770735 / 4.540472`、NDCGは
+  `0.869148 / 0.857926 / 0.882222`、pairwiseは
+  `0.508210 / 0.403064 / 0.617944`。ReducedはPointよりloss/NDCG/pairwiseが
+  良いがtop-1は低く、GRUが品質・速度とも最良だった。
+- 機構ablation：厳密な状態ゼロ化で`ablated-full` lossはplateau
+  `-0.004517`、apical `+0.003041`、recurrent `-0.000118`。
+  plateauはほぼ非活動かつ有効でなく、apical寄与は小さく、recurrent graphは
+  未利用。完全なHay由来機構の効果は未達と判定した。
 - 詳細：`reduced_hay_direct_tetris/README.md`および
-  `reduced_hay_direct_tetris/SMOKE_2026-07-30.md`。
+  `reduced_hay_direct_tetris/SMOKE_2026-07-30.md`、
+  `reduced_hay_direct_tetris/VALIDATION_2026-07-30.md`。
 
 ## 2026-07-26 — エピソード記憶routerの信用割当修正
 

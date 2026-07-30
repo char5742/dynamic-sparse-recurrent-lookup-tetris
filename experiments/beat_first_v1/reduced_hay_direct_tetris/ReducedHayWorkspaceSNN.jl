@@ -228,6 +228,10 @@ function reduced_hay_dynamics(
     model::ReducedHayWorkspaceModel,
     rails::AbstractMatrix,
     ps,
+    ;
+    plateau_scale::Real=1.0f0,
+    apical_scale::Real=1.0f0,
+    recurrent_scale::Real=1.0f0,
 )
     base = model.base
     cells = base.blocks * base.cells_per_block
@@ -264,6 +268,8 @@ function reduced_hay_dynamics(
     adaptation = zeros(Float32, cells, candidates)
     active_spikes = zeros(Float32, cells, candidates)
     previous_active_spikes = zeros(Float32, cells, candidates)
+    active_spike_sum = 0.0f0
+    soma_spike_sum = 0.0f0
     workspace = zeros(Float32, base.node_dim, candidates)
     final_block_mask = zeros(Float32, base.blocks, candidates)
 
@@ -382,12 +388,14 @@ function reduced_hay_dynamics(
             candidates,
         )
 
-        recurrent_inbox = Dendritic.vectorized_dendritic_synapse_scan(
-            base,
-            active_spikes,
-            previous_active_spikes,
-            ps,
-        )
+        recurrent_inbox =
+            Float32(recurrent_scale) .*
+            Dendritic.vectorized_dendritic_synapse_scan(
+                base,
+                active_spikes,
+                previous_active_spikes,
+                ps,
+            )
         recurrent_exc = max.(recurrent_inbox, 0.0f0)
         recurrent_inh = max.(-recurrent_inbox, 0.0f0)
         exc_drive = recurrent_exc .+ 0.18f0 .* sensory_exc
@@ -423,12 +431,14 @@ function reduced_hay_dynamics(
             plateau_slope .*
             (next_branch_voltage .- plateau_threshold),
         )
-        next_plateau = clamp.(
-            plateau_decay .* plateau .+
-            plateau_gain .* next_nmda .* coincidence,
-            0.0f0,
-            4.0f0,
-        )
+        next_plateau =
+            Float32(plateau_scale) .*
+            clamp.(
+                plateau_decay .* plateau .+
+                plateau_gain .* next_nmda .* coincidence,
+                0.0f0,
+                4.0f0,
+            )
 
         selected = reshape(block_mask, 1, base.blocks, candidates)
         write = dropdims(
@@ -454,7 +464,9 @@ function reduced_hay_dynamics(
             cells,
             candidates,
         ) ./ Float32(base.readout_per_cell)
-        next_apical = apical_leak .* apical .+ apical_drive
+        next_apical =
+            Float32(apical_scale) .*
+            (apical_leak .* apical .+ apical_drive)
         basal = dropdims(
             sum(
                 soma_coupling .*
@@ -480,6 +492,8 @@ function reduced_hay_dynamics(
         next_adaptation =
             adaptation_decay .* adaptation .+
             adaptation_gain .* spikes
+        active_spike_sum += sum(next_active_spikes)
+        soma_spike_sum += sum(spikes)
 
         previous_active_spikes = active_spikes
         active_spikes = next_active_spikes
@@ -527,6 +541,12 @@ function reduced_hay_dynamics(
         soma,
         adaptation,
         active_spikes,
+        active_spike_rate=
+            active_spike_sum /
+            Float32(cells * candidates * base.cycles),
+        soma_spike_rate=
+            soma_spike_sum /
+            Float32(cells * candidates * base.cycles),
         final_block_mask,
     )
 end
@@ -535,8 +555,19 @@ function reduced_hay_raw(
     model::ReducedHayWorkspaceModel,
     rails::AbstractMatrix,
     ps,
+    ;
+    plateau_scale::Real=1.0f0,
+    apical_scale::Real=1.0f0,
+    recurrent_scale::Real=1.0f0,
 )
-    dynamics = reduced_hay_dynamics(model, rails, ps)
+    dynamics = reduced_hay_dynamics(
+        model,
+        rails,
+        ps;
+        plateau_scale,
+        apical_scale,
+        recurrent_scale,
+    )
     features = vcat(
         Dendritic.rms_normalize(dynamics.workspace),
         Dendritic.rms_normalize(dynamics.pooled),

@@ -106,6 +106,8 @@ candidate executor.
 | focused unit/finite-difference checks | `runtests.jl` |
 | four-arm CPU budget contract | `compare_cpu_budget.jl` |
 | shared Point/Reduced/GRU preflight | `train_budget_arm.jl` |
+| held-teacher budget validation | `validate_budget_arms.jl` |
+| exact checkpoint ablation replay | `reevaluate_budget_ablations.jl` |
 | TwinProp/paper reproduction history | `../paper_multicompartment_snn/` |
 
 Example:
@@ -120,7 +122,7 @@ julia --project=. --threads=1 `
 
 The first equal-budget screen has four arms:
 
-1. Point-SNN;
+1. Point-SNN (31 blocks x 12 public dimensions, 372 states);
 2. Digital-Twin-derived frozen 11-state cell;
 3. direct-Tetris Reduced Hay cell;
 4. state-matched diagonal GRU.
@@ -152,6 +154,24 @@ Required measured outputs are loss components, top-1/NDCG/pairwise, updates/s,
 states/s, CPU seconds, allocation/update, GC seconds, peak resident memory,
 event rate, delivered edges and effective active cells.
 
+## Current validation status
+
+The 1,000-update, three-seed held-teacher comparison is recorded in
+`VALIDATION_2026-07-30.md`.
+
+- Reduced Hay beat Point-SNN on mean composite loss, NDCG and pairwise, but
+  not top-1.
+- diagonal GRU beat Reduced Hay on aggregate quality, throughput and
+  allocation.
+- exact-zero ablation found a small favorable apical contribution, no
+  recurrent contribution, and a plateau path that was almost inactive and
+  slightly harmful.
+- the frozen 11-state control remains unavailable because no qualified
+  artifact exists.
+
+This is an equal-update reference-BPTT result on teacher-validation rows, not
+the final equal-wall-clock production or gameplay evaluation.
+
 ## Claim boundary
 
 Paper reproduction and CPU-model claims are separate.
@@ -163,15 +183,17 @@ dynamics. It must not claim:
 - reproduction of TwinProp XOR/parity results;
 - equivalence to the full Hay cell;
 - a speed advantage from the current Zygote reference;
-- superiority over Point-SNN, frozen 11-state, GRU, DSRLN or PreAct before a
+- complete Hay-mechanism efficacy from nonzero internal activity;
+- superiority over the frozen 11-state, GRU, DSRLN or PreAct controls before a
   fixed-panel equal-wall-clock comparison.
 
 ## Next critical path
 
-1. close an analytic one-cycle VJP against the functional reference;
-2. reverse the fixed trajectory without a global graph backward scan;
-3. add a `BPTT` job phase to the existing barrierless executor;
-4. verify serial/barrierless parameter equivalence and hot allocation;
-5. run 64-update and 1k scratch gates;
-6. execute the four-arm fixed-panel equal-wall-clock comparison;
+1. make the plateau path materially active without destabilizing the soma;
+2. make recurrent event delivery measurably affect held loss;
+3. repeat the same three-seed 1k gate;
+4. only after an architecture win, close the analytic reverse-time VJP and
+   integrate it into the barrierless executor;
+5. add the frozen 11-state arm when a qualified artifact exists;
+6. execute the final fixed-panel equal-wall-clock comparison;
 7. scale only if Reduced Hay improves Tetris quality per CPU time.

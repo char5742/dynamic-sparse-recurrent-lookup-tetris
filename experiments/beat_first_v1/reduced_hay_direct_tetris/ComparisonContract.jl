@@ -21,8 +21,8 @@ function comparison_arms()
         ComparisonArm(
             :point_snn,
             "Point-LIF SWSNN control",
-            368,
-            3_312,
+            372,
+            3_348,
             :analytic_vjp,
             true,
             joinpath(@__DIR__, "BudgetMatchedPointSNN.jl"),

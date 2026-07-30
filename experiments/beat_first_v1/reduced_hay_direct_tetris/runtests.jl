@@ -69,6 +69,20 @@ end
         @test size(dynamics.gaba) == size(dynamics.branch_voltage)
         @test maximum(dynamics.nmda) > 0.0f0
         @test maximum(dynamics.plateau) > 0.0f0
+        plateau_off = reduced_hay_dynamics(
+            model,
+            rails,
+            parameters;
+            plateau_scale=0.0f0,
+        )
+        apical_off = reduced_hay_dynamics(
+            model,
+            rails,
+            parameters;
+            apical_scale=0.0f0,
+        )
+        @test all(iszero, plateau_off.plateau)
+        @test all(iszero, apical_off.apical)
 
         objective(ps) = sum(abs2, reduced_hay_raw(model, rails, ps))
         gradient = only(Zygote.gradient(objective, parameters))
@@ -163,7 +177,7 @@ end
         point_raw = budget_point_raw(point, rails, point_parameters)
         @test size(point_raw) == (22, 3)
         point_topology = budget_point_topology(point)
-        @test point_topology.persistent_state_scalars == 368
+        @test point_topology.persistent_state_scalars == 372
 
         frozen = build_budget_frozen_model()
         frozen_topology = budget_frozen_topology(frozen)
