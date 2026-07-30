@@ -34,8 +34,8 @@ The older Point-SNN, detailed Hay oracle, Digital Twin and frozen distilled
 | `loss_and_raw_gradient!` | reuse unchanged | exact shared 22-output ListNet/Q/death/quantile/geometry cotangent |
 | Point-SNN source-major graph and fixed gates | reuse design/data layout | appropriate for sparse event delivery and utility consolidation |
 | `DendriticCellArena` / SoA layout | reuse design | branch-major fixed storage and allocation-free scalar kernel |
-| MPMC barrierless phases and worker-local gradients | reuse after VJP closure | candidate jobs, deterministic reduction and sharded AdamW remain valid |
-| Dendritic `local_hybrid` replay | adapt as CPU production candidate | DECOLLE/e-prop fits sparse event execution, but its traces must be rederived for the causal Reduced Hay v2 equations |
+| MPMC barrierless phases and worker-local gradients | reused | candidate jobs, deterministic parallel reduction and sharded AdamW now drive the v2 production trainer |
+| Dendritic `local_hybrid` replay | adapted for v2 | the old three-state trace was replaced by a seven-component AMPA/NMDA/GABA/branch/plateau/soma/adaptation trace |
 | Dense Digital Twin training | control only | useful paper/oracle experiment, unnecessary dependency for Tetris optimization |
 | 11-state distillation/freeze | control only | the final Tetris cell must not freeze internal dynamics because of lineage |
 | full Hay cell | oracle only | too expensive for mass placement; useful for mechanism ablation |
@@ -50,12 +50,11 @@ CPU production candidate:
 PACK -> FORWARD -> BLOCK SIGNAL -> LOCAL REPLAY -> AdamW
 ```
 
-The direct path is retained as the teacher and quality ceiling. It is not a
-decision to discard DECOLLE/e-prop. The existing local learner cannot be
-called unchanged because it encodes the old dendritic transition, routing
-order and eligibility recurrence. The causal v2 local path must reproduce the
-new AMPA/NMDA/GABA, plateau, apical, adaptation and delayed recurrent
-equations, then be compared with the direct gradient in shadow mode.
+The direct path is retained as the teacher and quality ceiling. The production
+v2 trainer now implements the corresponding local path in
+`ReducedHayV2ArenaTraining.jl`. It uses the causal state-update-before-route
+order, located one-pulse sensory contacts, fixed-fanout recurrent structure,
+block-fixed DECOLLE projections and forward Reduced-Hay eligibility traces.
 
 Only hard spike, hard workspace routing, gate state and future compartment
 placement are discrete in the reference path. Continuous state and parameters
@@ -104,15 +103,66 @@ The present reference uses Zygote to establish the BPTT contract. It is
 correctness code and a teacher/control, not the only final learning rule.
 `ReducedHayCellKernel.jl` already supplies allocation-free SoA state
 transition and fired-source-only event delivery. Production experiments must
-compare an analytic reverse-time VJP and a v2-specific DECOLLE/e-prop replay
-at equal CPU wall-clock; neither is promoted on implementation preference
-alone.
+still compare the direct reference and the v2-specific DECOLLE/e-prop replay
+at equal CPU wall-clock. The local backend is now executable at full width;
+this does not by itself establish a quality win.
+
+## CPU production credit path
+
+The production update is:
+
+```text
+fixed width-80 candidate pack
+  -> causal Reduced Hay forward for every candidate
+  -> ListNet and 22-output raw cotangent
+  -> forward trajectory replay
+  -> block-local DECOLLE signal
+  -> seven-component e-prop edge eligibility
+  -> supervised-reward-surrogate routing update
+  -> utility structure consolidation
+  -> deterministic parallel reduction
+  -> sharded AdamW
+```
+
+For every block and cycle:
+
+```text
+M_block =
+    B_block * delta_raw
+  + B_block * local_predictor_error
+```
+
+`B_block` is seed-fixed, block-specific and not trainable. The local predictor
+uses only that block's exported soma, apical and branch states plus its spike
+events. Recurrent third-factor construction does not read `head_weight` or
+`output_weight`; exact analytic VJP remains only for `head_weight`,
+`head_bias`, `output_weight` and `output_bias`.
+
+Each weight, gate and delay trace follows the local causal path through:
+
+```text
+AMPA -> NMDA -> GABA -> branch voltage
+     -> plateau -> soma -> adaptation
+```
+
+Routing retains stochastic Plackett-Luce top-k during training and hard top-k
+during evaluation. Its reward is explicitly a candidate-centered supervised
+ListNet/local-loss surrogate, not an environment return. Structure keeps an
+exact fixed fanout, mask-aware execution, one source swap per consolidation,
+connection cost, branch utility relocation and optimizer-moment reset.
+
+Setting the recurrent third-factor scale to zero freezes all 30 cell/graph/
+routing parameter groups including weight decay and structure changes, while
+the four supervised head groups continue learning.
 
 ## Canonical entrypoints
 
 | Purpose | Entrypoint |
 |---|---|
 | direct-Tetris Reduced Hay reference | `train_reduced_hay_direct.jl` |
+| width-80 barrierless DECOLLE/e-prop training | `train_reduced_hay_v2_arena.jl` |
+| held-teacher checkpoint evaluation | `evaluate_reduced_hay_v2_arena.jl` |
+| v2 arena integration/equivalence checks | `test_reduced_hay_v2_arena_training.jl` |
 | focused unit/finite-difference checks | `runtests.jl` |
 | paired parent/current v2 CPU benchmark | `benchmark_v2_reference.jl` |
 | four-arm CPU budget contract | `compare_cpu_budget.jl` |
@@ -132,6 +182,24 @@ julia --project=. --threads=1 `
 
 The canonical builder default is `:reduced_hay_scaled_v2`.  The retained
 `:tiny` and `:reduced_hay_scaled_v1` presets are legacy controls.
+
+Production scratch training:
+
+```powershell
+julia --project=. --threads=20,0 `
+  experiments/beat_first_v1/reduced_hay_direct_tetris/train_reduced_hay_v2_arena.jl `
+  --preset reduced_hay_scaled_v2 --updates 100000 `
+  --state-batch 8 --width 80 --workers 20
+```
+
+Held validation-panel evaluation:
+
+```powershell
+julia --project=. --threads=20,0 `
+  experiments/beat_first_v1/reduced_hay_direct_tetris/evaluate_reduced_hay_v2_arena.jl `
+  --checkpoint D:\path\to\checkpoint.jld2 `
+  --split validation --states 128 --workers 20
+```
 
 ## Comparison contract
 
@@ -221,6 +289,27 @@ causal repair arm are recorded in `RECURRENT_REPAIR_2026-07-30.md`.
 - the frozen 11-state control remains unavailable because no qualified
   artifact exists.
 
+The first full-width local-backend scratch preflight completed on 2026-07-30:
+
+- preset `reduced_hay_scaled_v2`, width 80, state batch 8, 20 workers;
+- 1,000 updates / 8,000 teacher states from scratch;
+- composite loss `6.053182 -> 3.776091`;
+- all 34 parameter groups changed, including all 30 cell/graph/routing groups;
+- local Q loss `5.453151 -> 3.434759`, death
+  `0.693703 -> 0.547826`, quantile `2.725258 -> 2.575974`, and geometry
+  `0.065771 -> 0.061002`;
+- final firing rate `0.040790`, plateau mean `0.130119`, routing entropy
+  `0.811297`;
+- hot allocation `0` bytes and GC `0` seconds for all measured updates;
+- checkpoint SHA-256
+  `0c5151d2679ddc3c9247d6e4bd40a83cb1cf8923786ccc4b047ac776d531f83b`.
+
+The deterministic 128-state validation panel at update 1,000 measured
+top-1 `0.078125`, NDCG `0.824687` and pairwise `0.508192` at
+`241.997 states/s`. This is an early learnability/evaluator check, not a
+competitive quality result; comparison with Point-SNN, DSRLN, PreAct and GRU
+requires matched 10k/100k or equal-wall-clock runs on the identical panel.
+
 Run a retained exact continuation with:
 
 ```powershell
@@ -256,14 +345,13 @@ dynamics. It must not claim:
 
 ## Next critical path
 
-1. port the causal v2 compartment equations and fixed-fanout graph into the
-   existing fixed SoA tape;
-2. rederive the DECOLLE block-local signals and e-prop eligibility traces for
-   that exact v2 tape, while retaining direct BPTT as shadow teacher/control;
-3. reproduce the v2 separation on the two retained independent seeds;
-4. expose the full width-80 teacher corpus under the same Point/Reduced-v2
-   comparison contract;
-5. report direct-VJP and DECOLLE/e-prop equal-update and equal-wall-clock
+1. run the same validation-panel evaluator for Point-SNN and GRU under a
+   matched width-80/equal-wall-clock schedule;
+2. extend the retained scratch run to 10k, inspect the fixed-panel curve, then
+   proceed to 100k only if it continues improving;
+3. report direct-BPTT and DECOLLE/e-prop equal-update and equal-wall-clock
    curves separately;
-6. integrate the winning credit path into the barrierless executor;
-7. add the frozen 11-state arm when a qualified artifact exists.
+4. tune candidate/local replay load balance if it improves states/s without
+   changing serial-equivalence or zero-allocation behavior;
+5. reproduce the result on a second model/sampler/routing seed;
+6. add the frozen 11-state arm when a qualified artifact exists.

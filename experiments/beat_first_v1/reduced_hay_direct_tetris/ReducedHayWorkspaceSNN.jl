@@ -410,7 +410,19 @@ function reduced_hay_topology(
         continuous_credit=:direct_bptt,
         reference_continuous_credit=:direct_bptt,
         cpu_credit_candidate=:decolle_eprop,
-        cpu_credit_status=:requires_causal_v2_rederivation,
+        cpu_credit_status=model.variant === :causal_recurrent_v2 ?
+            :implemented_fixed_arena_barrierless :
+            :requires_causal_v2_rederivation,
+        cpu_credit_trace=model.variant === :causal_recurrent_v2 ?
+            (
+                :ampa,
+                :nmda,
+                :gaba,
+                :branch_voltage,
+                :plateau,
+                :soma,
+                :adaptation,
+            ) : (),
         discrete_credit=(:spike_surrogate, :route_ste, :gate_ste),
     )
 end
