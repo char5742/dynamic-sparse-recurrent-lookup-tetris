@@ -24,7 +24,11 @@ function _options(arguments)
     end
     return (;
         dataset=abspath(get(values, "dataset", DEFAULT_DATASET)),
-        preset=Symbol(get(values, "preset", "tiny")),
+        preset=Symbol(get(
+            values,
+            "preset",
+            "tiny_recurrent_v2",
+        )),
         updates=parse(Int, get(values, "updates", "16")),
         state_batch=parse(Int, get(values, "state-batch", "1")),
         width=parse(Int, get(values, "width", "40")),

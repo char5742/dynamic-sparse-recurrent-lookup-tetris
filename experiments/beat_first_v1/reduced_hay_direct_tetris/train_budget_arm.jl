@@ -48,6 +48,10 @@ function _arm(name::Symbol)
         build_reduced_hay_model(:tiny),
         reduced_hay_raw,
     )
+    name === :reduced_v2 && return (
+        build_reduced_hay_model(:tiny_recurrent_v2),
+        reduced_hay_raw,
+    )
     name === :gru && return (
         DiagonalGRUBaseline(),
         budget_gru_raw,
@@ -56,7 +60,9 @@ function _arm(name::Symbol)
         "the frozen arm is fail-closed and artifact-backed; construct it " *
         "with BudgetMatchedFrozenElevenState.build_budget_frozen_trainer",
     )
-    error("unknown arm $name; use point, reduced, gru, or frozen")
+    error(
+        "unknown arm $name; use point, reduced, reduced_v2, gru, or frozen",
+    )
 end
 
 function main(arguments=ARGS)

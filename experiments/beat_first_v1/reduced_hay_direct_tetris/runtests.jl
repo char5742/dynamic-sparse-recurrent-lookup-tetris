@@ -171,6 +171,73 @@ end
         )) > 0.0f0
     end
 
+    @testset "causal recurrent v2 closes legacy shortcuts" begin
+        canonical_model = build_reduced_hay_model()
+        canonical_topology = reduced_hay_topology(canonical_model)
+        @test canonical_topology.variant === :causal_recurrent_v2
+        @test canonical_topology.sensory_protocol === :initial_pulse
+        @test canonical_topology.fixed_recurrent_fanout == 24
+
+        recurrent_model =
+            build_reduced_hay_model(:tiny_recurrent_v2)
+        recurrent_parameters, _ =
+            Lux.setup(MersenneTwister(41), recurrent_model)
+        topology = reduced_hay_topology(
+            recurrent_model,
+            recurrent_parameters,
+        )
+        @test topology.variant === :causal_recurrent_v2
+        @test topology.sensory_fanin == 120
+        @test topology.sensory_protocol === :initial_pulse
+        @test topology.route_query === :cell_state_summary
+        @test topology.enabled_synapses == 64
+        @test !hasproperty(recurrent_parameters, :query_weight)
+        @test hasproperty(recurrent_parameters, :state_query_weight)
+        @test length(unique(vcat(
+            vec(recurrent_model.excitatory_feature),
+            vec(recurrent_model.inhibitory_feature),
+        ))) == 1298
+
+        gate = reduced_hay_recurrent_gate(
+            recurrent_model,
+            recurrent_parameters.gate_logits,
+        )
+        @test all(vec(sum(gate .> 0.5f0; dims=2)) .== 4)
+        dynamics = reduced_hay_dynamics(
+            recurrent_model,
+            rails,
+            recurrent_parameters,
+        )
+        @test dynamics.recurrent_abs_mean > 0.0f0
+        @test dynamics.recurrent_nonzero_fraction > 0.0f0
+        @test dynamics.recurrent_gate_density ≈ 0.5f0
+        recurrent_off = reduced_hay_raw(
+            recurrent_model,
+            rails,
+            recurrent_parameters;
+            recurrent_scale=0.0f0,
+        )
+        recurrent_on = reduced_hay_raw(
+            recurrent_model,
+            rails,
+            recurrent_parameters,
+        )
+        @test maximum(abs.(recurrent_on .- recurrent_off)) >
+            1.0f-5
+
+        objective_v2(ps) =
+            sum(abs2, reduced_hay_raw(recurrent_model, rails, ps))
+        gradient_v2 = only(Zygote.gradient(
+            objective_v2,
+            recurrent_parameters,
+        ))
+        @test tree_norm(gradient_v2.input_exc_logits) > 0.0
+        @test tree_norm(gradient_v2.state_query_weight) > 0.0
+        @test tree_norm(gradient_v2.synapse_weight) > 0.0
+        @test tree_norm(gradient_v2.gate_logits) > 0.0
+        @test tree_norm(gradient_v2.delay_logits) > 0.0
+    end
+
     @testset "state-matched recurrent control and budget contract" begin
         point = build_budget_point_snn()
         point_parameters, _ = Lux.setup(MersenneTwister(29), point)

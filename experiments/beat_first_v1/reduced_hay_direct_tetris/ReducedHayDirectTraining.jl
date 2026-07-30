@@ -227,6 +227,8 @@ function gradient_group_norms(gradient)
     compartment_names = (
         :input_exc_gain,
         :input_inh_gain,
+        :input_exc_logits,
+        :input_inh_logits,
         :branch_bias,
         :branch_leak_logits,
         :ampa_decay_logits,
@@ -256,6 +258,7 @@ function gradient_group_norms(gradient)
     )
     routing_names = (
         :query_weight,
+        :state_query_weight,
         :workspace_key,
         :feedback_gain,
         :workspace_decay_logit,
@@ -269,6 +272,7 @@ function gradient_group_norms(gradient)
     group(names) = sqrt(sum(
         tree_norm(getproperty(gradient, name))^2
         for name in names
+        if hasproperty(gradient, name)
     ))
     return (;
         compartment=group(compartment_names),

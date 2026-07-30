@@ -126,8 +126,10 @@ function _validate(options)
     options.weight_decay >= 0.0f0 ||
         error("weight decay must be nonnegative")
     isempty(options.arms) && error("at least one arm is required")
-    all(arm in (:point, :reduced, :gru) for arm in options.arms) ||
-        error("reference runner supports point,reduced,gru")
+    all(
+        arm in (:point, :reduced, :reduced_v2, :gru)
+        for arm in options.arms
+    ) || error("reference runner supports point,reduced,reduced_v2,gru")
     length(unique(options.arms)) == length(options.arms) ||
         error("arm names must be unique")
     Threads.nthreads(:default) == 1 ||
@@ -204,6 +206,11 @@ function _arm(name::Symbol)
     )
     name === :reduced && return (
         model=build_reduced_hay_model(:tiny),
+        raw_function=reduced_hay_raw,
+        activity=true,
+    )
+    name === :reduced_v2 && return (
+        model=build_reduced_hay_model(:tiny_recurrent_v2),
         raw_function=reduced_hay_raw,
         activity=true,
     )
@@ -301,6 +308,24 @@ function _reduced_activity(
         )),
         nmda_mean=Float64(mean(dynamics.nmda)),
         branch_effective_rank=_effective_rank(branch),
+        recurrent_abs_mean=Float64(
+            hasproperty(dynamics, :recurrent_abs_mean) ?
+                dynamics.recurrent_abs_mean : 0.0f0,
+        ),
+        recurrent_nonzero_fraction=Float64(
+            hasproperty(dynamics, :recurrent_nonzero_fraction) ?
+                dynamics.recurrent_nonzero_fraction : 0.0f0,
+        ),
+        recurrent_to_sensory_ratio=Float64(
+            hasproperty(dynamics, :recurrent_to_sensory_ratio) ?
+                dynamics.recurrent_to_sensory_ratio : 0.0f0,
+        ),
+        recurrent_gate_density=Float64(
+            hasproperty(dynamics, :recurrent_gate_density) ?
+                dynamics.recurrent_gate_density : mean(
+                    parameters.gate_logits .>= 0.0f0,
+                ),
+        ),
     )
 end
 
@@ -325,6 +350,10 @@ function _evaluate!(
         :plateau_active_fraction => 0.0,
         :nmda_mean => 0.0,
         :branch_effective_rank => 0.0,
+        :recurrent_abs_mean => 0.0,
+        :recurrent_nonzero_fraction => 0.0,
+        :recurrent_to_sensory_ratio => 0.0,
+        :recurrent_gate_density => 0.0,
     )
     for row in rows
         pack_rows!(trainer, dataset, [row])
@@ -606,7 +635,7 @@ function _train_arm!(
     maximum_rss_after = Sys.maxrss()
     after = learning_curve[string(length(train_schedule))]
     ablations = nothing
-    if name === :reduced
+    if name in (:reduced, :reduced_v2)
         ablations = Dict{String,Any}()
         for mode in (:plateau_off, :apical_off, :recurrent_off)
             result = _evaluate!(

@@ -115,8 +115,12 @@ Example:
 ```powershell
 julia --project=. --threads=1 `
   experiments/beat_first_v1/reduced_hay_direct_tetris/train_reduced_hay_direct.jl `
-  --preset tiny --updates 16 --state-batch 1 --width 40 --fixed-panel true
+  --preset tiny_recurrent_v2 --updates 16 --state-batch 1 --width 40 `
+  --fixed-panel true
 ```
+
+The canonical builder default is `:reduced_hay_scaled_v2`.  The retained
+`:tiny` and `:reduced_hay_scaled_v1` presets are legacy controls.
 
 ## Comparison contract
 
@@ -160,6 +164,8 @@ The 1,000-update comparison is recorded in `VALIDATION_2026-07-30.md`.
 The 10,000-update learning curve is in
 `VALIDATION_10K_2026-07-30.md`; the current result is the exact-checkpoint
 continuation to 100,000 updates in `VALIDATION_100K_2026-07-30.md`.
+The recurrent-path failure exposed by that comparison and the separate
+causal repair arm are recorded in `RECURRENT_REPAIR_2026-07-30.md`.
 
 - All three 10k checkpoints were resumed with exact parameters, AdamW state,
   training-order prefix and fixed panel, then completed to 100k for three
@@ -171,6 +177,26 @@ continuation to 100,000 updates in `VALIDATION_100K_2026-07-30.md`.
 - Reduced Hay apical ablation costs `+0.135536` loss. Plateau costs only
   `+0.020348` with seed-variable sign, and recurrent-input ablation is
   effectively neutral at `+0.001859`.
+- The legacy trajectory had a dense 15,576-parameter direct-input routing
+  shortcut, repeated sensory injection, an input-independent first route,
+  only three cycles, and collapsing independent recurrent gates.
+- `:tiny_recurrent_v2` removes the dense input query, places 15,360 learned
+  E/I sensory contacts across four branches, pulses sensory conductance only
+  at cycle 1, routes after the compartment update, uses six causal cycles,
+  and preserves exactly four learned recurrent contacts per source.
+- At 10k, v2 recurrent-off costs `+0.011584` composite loss and reduces NDCG
+  by `0.011866` and pairwise by `0.010937`. Plateau-off costs `+0.098793`
+  loss.
+- The exact v2 continuation reached 100k at loss `3.016713`, top-1
+  `0.359375`, NDCG `0.948239`, and pairwise `0.766848`. Against the retained
+  same-seed Point checkpoint, the differences are respectively `-0.047389`,
+  `+0.109375`, `+0.009201`, and `+0.089252`.
+- At 100k, v2 recurrent-off costs `+0.041193` loss and reduces top-1, NDCG,
+  and pairwise. Plateau-off costs `+0.307227`; apical-off costs `+0.036818`.
+  The repaired mechanisms remain causally useful rather than saturating away.
+- This is one-seed equal-update evidence. V2 reference throughput is only
+  `67.399 updates/s`, about `2.21x` slower than the retained legacy seed-1
+  continuation, so it is not yet an equal-wall-clock CPU victory.
 - Reference GRU training remains about `1.77x` faster in the dedicated
   benchmark (`2.09x` in the concurrent continuation), so Reduced Hay has not
   won the equal-wall-clock CPU objective.
@@ -214,12 +240,12 @@ dynamics. It must not claim:
 
 ## Next critical path
 
-1. do not extend the same width-40 configuration solely for more updates;
-2. expose the full width-80 teacher corpus under the same Point/Reduced
+1. reproduce the v2 separation on the two retained independent seeds;
+2. move the causal order and fixed-fanout graph into the existing SoA event
+   kernel, eliminating the current six-cycle Zygote reference overhead;
+3. expose the full width-80 teacher corpus under the same Point/Reduced-v2
    comparison contract;
-3. report equal-update and equal-wall-clock curves separately;
-4. determine why recurrent input is causally neutral and whether rising soma
-   event rate erodes the intended sparse-CPU advantage;
+4. report equal-update and equal-wall-clock curves separately;
 5. only after a quality-per-CPU advantage, close the analytic reverse-time VJP
    and integrate it into the barrierless executor;
 6. add the frozen 11-state arm when a qualified artifact exists.
