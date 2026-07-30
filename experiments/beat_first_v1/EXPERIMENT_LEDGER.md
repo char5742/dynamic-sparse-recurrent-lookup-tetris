@@ -46,10 +46,26 @@ game-validation seeds; game validation `8001:8008` and sealed seeds
   exact ablationの`ablated-full` lossはplateau `+0.009515`、apical
   `+0.017961`、recurrent `+0.016232`へ変化し、長期学習で機構が利用された。
   GRUは依然`1.77x` updates/sのため、equal-wall-clock勝利は未達。
+- 100k継続：10kのparameter/AdamW stateと同一schedule/panelを厳密復元し、
+  3 seed x 3 armを100kまで完了した。再開equivalenceはloss、gradient trace、
+  全parameterがexactで最大差`0.0`。100k平均lossはPoint `3.067797`、
+  Reduced `3.064013`、GRU `3.174158`、NDCGは`0.949494 / 0.948069 /
+  0.928019`、pairwiseは`0.734008 / 0.730139 / 0.700770`。PointとReducedは
+  実質同率、GRUはequal-updateで劣後した。
+- 50k→100k held loss改善はPoint `0.029996`、Reduced `0.020375`、GRU
+  `0.020293`だけで、全armが飽和域に入った。Reducedの100k exact ablationは
+  plateau `+0.020348 +/- 0.029474`、apical `+0.135536 +/- 0.040475`、
+  recurrent `+0.001859 +/- 0.005203`。高次元状態は活動しているが、強い因果寄与は
+  apicalに偏り、Point優位は示せない。
+- 100kはwidth 40適格row 40,630件を約2.46周した。全100,243 train rowを使う
+  にはwidth 80が必要。同一width 40の追加updateより、full-width dataと
+  equal-wall-clock比較を次gateとする。詳細：
+  `reduced_hay_direct_tetris/VALIDATION_100K_2026-07-30.md`。
 - 詳細：`reduced_hay_direct_tetris/README.md`および
   `reduced_hay_direct_tetris/SMOKE_2026-07-30.md`、
   `reduced_hay_direct_tetris/VALIDATION_2026-07-30.md`、
-  `reduced_hay_direct_tetris/VALIDATION_10K_2026-07-30.md`。
+  `reduced_hay_direct_tetris/VALIDATION_10K_2026-07-30.md`、
+  `reduced_hay_direct_tetris/VALIDATION_100K_2026-07-30.md`。
 
 ## 2026-07-26 — エピソード記憶routerの信用割当修正
 

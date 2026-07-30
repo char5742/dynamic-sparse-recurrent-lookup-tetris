@@ -157,35 +157,45 @@ event rate, delivered edges and effective active cells.
 ## Current validation status
 
 The 1,000-update comparison is recorded in `VALIDATION_2026-07-30.md`.
-The current result is the 10,000-update learning curve in
-`VALIDATION_10K_2026-07-30.md`.
+The 10,000-update learning curve is in
+`VALIDATION_10K_2026-07-30.md`; the current result is the exact-checkpoint
+continuation to 100,000 updates in `VALIDATION_100K_2026-07-30.md`.
 
-- GRU led composite loss through 5k, but Reduced Hay improved `2.13x` as much
-  from 5k to 10k and narrowly crossed the 10k mean loss.
-- Point, Reduced Hay and GRU respectively lead NDCG, composite loss and
-  top-1/pairwise; there is no uniform quality winner.
-- plateau activity rose about `102x` from 1k to 10k. Exact-zero ablation now
-  finds favorable plateau, apical and recurrent contributions, although
-  plateau/recurrent effects remain seed-variable.
-- GRU remains `1.77x` faster per reference training update, so Reduced Hay has
-  not won the equal-wall-clock CPU objective.
+- All three 10k checkpoints were resumed with exact parameters, AdamW state,
+  training-order prefix and fixed panel, then completed to 100k for three
+  independent seeds.
+- Point and Reduced Hay are tied at 100k: mean composite loss is respectively
+  `3.067797` and `3.064013`, while NDCG is `0.949494` and `0.948069`.
+- The smaller diagonal GRU saturates at loss `3.174158`, NDCG `0.928019` and
+  pairwise `0.700770`, but retains a small top-1 lead.
+- Reduced Hay apical ablation costs `+0.135536` loss. Plateau costs only
+  `+0.020348` with seed-variable sign, and recurrent-input ablation is
+  effectively neutral at `+0.001859`.
+- Reference GRU training remains about `1.77x` faster in the dedicated
+  benchmark (`2.09x` in the concurrent continuation), so Reduced Hay has not
+  won the equal-wall-clock CPU objective.
+- Width 40 exposes 40,630 eligible rows; 100k is about 2.46 passes. The full
+  100,243-row corpus requires width 80.
 - the frozen 11-state control remains unavailable because no qualified
   artifact exists.
 
-Run a retained learning curve with:
+Run a retained exact continuation with:
 
 ```powershell
 julia --project=. --threads=1 `
   experiments/beat_first_v1/reduced_hay_direct_tetris/validate_budget_arms.jl `
-  --updates 10000 `
-  --evaluation-milestones 1000,2000,5000,10000 `
+  --updates 100000 `
+  --resume-dir D:\path\to\10k\artifact `
+  --resume-update 10000 `
+  --evaluation-milestones 20000,50000,100000 `
   --validation-states 64 --width 40 --arms point,reduced,gru
 ```
 
-The runner writes parameter and optimizer state checkpoints at every
-milestone. This is still an equal-update reference-BPTT result on
-teacher-validation rows, not the final equal-wall-clock production or
-gameplay evaluation.
+Resume fails closed unless arm, update, seeds, exact schedule prefix and held
+panel match. The runner writes parameter and optimizer state checkpoints at
+every milestone. This is still an equal-update reference-BPTT result on
+teacher-validation rows, not the final equal-wall-clock production or gameplay
+evaluation.
 
 ## Claim boundary
 
@@ -204,12 +214,12 @@ dynamics. It must not claim:
 
 ## Next critical path
 
-1. resume the preserved 10k optimizer checkpoints to at least 20k;
-2. report equal-update and equal-wall-clock curves separately;
-3. select checkpoints by ranking metrics as well as composite loss;
-4. verify whether plateau and recurrent contributions persist across the
-   longer horizon;
-5. only after a quality-per-CPU advantage, close the analytic reverse-time
-   VJP and integrate it into the barrierless executor;
-6. add the frozen 11-state arm when a qualified artifact exists;
-7. scale only if Reduced Hay improves Tetris quality per CPU time.
+1. do not extend the same width-40 configuration solely for more updates;
+2. expose the full width-80 teacher corpus under the same Point/Reduced
+   comparison contract;
+3. report equal-update and equal-wall-clock curves separately;
+4. determine why recurrent input is causally neutral and whether rising soma
+   event rate erodes the intended sparse-CPU advantage;
+5. only after a quality-per-CPU advantage, close the analytic reverse-time VJP
+   and integrate it into the barrierless executor;
+6. add the frozen 11-state arm when a qualified artifact exists.

@@ -23,7 +23,7 @@ const DEFAULT_DATASET =
 const DEFAULT_OUTPUT_ROOT =
     raw"D:\tetris-paper-plus\runs\reduced_hay_direct_validation"
 const VALIDATION_SCHEMA =
-    "reduced-hay-budget-validation-v3"
+    "reduced-hay-budget-validation-v4"
 
 function _parse(arguments)
     values = Dict{String,String}()
@@ -40,6 +40,8 @@ function _parse(arguments)
         index += 2
     end
     output_dir = get(values, "output-dir", "")
+    resume_dir = strip(get(values, "resume-dir", ""))
+    resume_update = parse(Int, get(values, "resume-update", "0"))
     arms = Symbol.(
         split(get(values, "arms", "point,reduced,gru"), ','),
     )
@@ -66,6 +68,9 @@ function _parse(arguments)
         )),
         output_dir=isempty(output_dir) ?
             nothing : abspath(output_dir),
+        resume_dir=isempty(resume_dir) ?
+            nothing : abspath(resume_dir),
+        resume_update,
         arms,
         updates,
         evaluation_milestones,
@@ -95,10 +100,22 @@ function _validate(options)
     isdir(options.dataset) ||
         error("teacher dataset is absent: $(options.dataset)")
     options.updates > 0 || error("updates must be positive")
+    if options.resume_dir === nothing
+        options.resume_update == 0 ||
+            error("resume-update requires resume-dir")
+    else
+        isdir(options.resume_dir) ||
+            error("resume directory is absent: $(options.resume_dir)")
+        0 < options.resume_update < options.updates ||
+            error("resume-update must lie within 1:(updates-1)")
+    end
     all(
-        milestone -> 1 <= milestone <= options.updates,
+        milestone ->
+            options.resume_update < milestone <= options.updates,
         options.evaluation_milestones,
-    ) || error("evaluation milestones must lie within 1:updates")
+    ) || error(
+        "evaluation milestones must follow resume-update and not exceed updates",
+    )
     last(options.evaluation_milestones) == options.updates ||
         error("final update must be an evaluation milestone")
     options.width > 0 || error("width must be positive")
@@ -418,6 +435,56 @@ function _warmup!(
     return nothing
 end
 
+function _restore_checkpoint!(
+    trainer,
+    name::Symbol,
+    train_schedule::Vector{Int},
+    validation_rows::Vector{Int},
+    options,
+)
+    options.resume_dir === nothing && return nothing
+    checkpoint_path = joinpath(
+        options.resume_dir,
+        "checkpoint_$(String(name))_u$(options.resume_update).jld2",
+    )
+    isfile(checkpoint_path) ||
+        error("resume checkpoint is absent: $checkpoint_path")
+    checkpoint = JLD2.load(checkpoint_path)
+    for field in (
+        "parameters",
+        "optimizer_state",
+        "update",
+        "model_seed",
+        "schedule_seed",
+        "train_schedule",
+        "validation_rows",
+        "arm",
+    )
+        haskey(checkpoint, field) ||
+            error("resume checkpoint lacks $field: $checkpoint_path")
+    end
+    Int(checkpoint["update"]) == options.resume_update ||
+        error("resume update mismatch: $checkpoint_path")
+    Int(checkpoint["model_seed"]) == options.model_seed ||
+        error("resume model seed mismatch: $checkpoint_path")
+    Int(checkpoint["schedule_seed"]) == options.schedule_seed ||
+        error("resume schedule seed mismatch: $checkpoint_path")
+    String(checkpoint["arm"]) == String(name) ||
+        error("resume arm mismatch: $checkpoint_path")
+    saved_schedule = Int.(checkpoint["train_schedule"])
+    length(saved_schedule) >= options.resume_update ||
+        error("resume schedule is too short: $checkpoint_path")
+    saved_schedule[1:options.resume_update] ==
+        train_schedule[1:options.resume_update] ||
+        error("resume training schedule prefix mismatch: $checkpoint_path")
+    Int.(checkpoint["validation_rows"]) == validation_rows ||
+        error("resume validation panel mismatch: $checkpoint_path")
+    trainer.parameters = checkpoint["parameters"]
+    trainer.optimizer_state = checkpoint["optimizer_state"]
+    trainer.updates = options.resume_update
+    return checkpoint_path
+end
+
 function _train_arm!(
     name::Symbol,
     dataset,
@@ -437,6 +504,13 @@ function _train_arm!(
         learning_rate=options.learning_rate,
         weight_decay=options.weight_decay,
     )
+    resume_checkpoint = _restore_checkpoint!(
+        trainer,
+        name,
+        train_schedule,
+        validation_rows,
+        options,
+    )
     before_timed = @timed _evaluate!(
         trainer,
         dataset,
@@ -444,28 +518,35 @@ function _train_arm!(
         collect_activity=arm.activity,
     )
     before = before_timed.value
-    learning_curve = Dict{String,Any}("0" => before)
+    start_update = options.resume_update
+    learning_curve = Dict{String,Any}(
+        string(start_update) => before,
+    )
     evaluation_wall_seconds = Dict{String,Float64}(
-        "0" => before_timed.time,
+        string(start_update) => before_timed.time,
     )
     milestone_checkpoints = Dict{String,String}()
-    loss_trace = Vector{Float64}(undef, length(train_schedule))
+    continuation_updates = length(train_schedule) - start_update
+    loss_trace = Vector{Float64}(undef, continuation_updates)
     gradient_trace = similar(loss_trace)
     GC.gc()
     maximum_rss_before = Sys.maxrss()
     training_wall_seconds = 0.0
     training_allocation_bytes = 0
     training_gc_seconds = 0.0
-    segment_start = 1
+    segment_start = start_update + 1
     for milestone in options.evaluation_milestones
         timed = @timed begin
             for update in segment_start:milestone
                 row = train_schedule[update]
                 pack_rows!(trainer, dataset, [row])
                 loss = direct_update!(trainer)
-                loss_trace[update] = Float64(loss.composite_loss)
-                gradient_trace[update] = trainer.last_gradient_norm
-                if update == 1 ||
+                trace_index = update - start_update
+                loss_trace[trace_index] =
+                    Float64(loss.composite_loss)
+                gradient_trace[trace_index] =
+                    trainer.last_gradient_norm
+                if update == start_update + 1 ||
                    update == length(train_schedule) ||
                    update % max(div(length(train_schedule), 4), 1) == 0
                     @printf(
@@ -542,6 +623,7 @@ function _train_arm!(
         "status" => "complete",
         "parameter_count" =>
             _parameter_count(trainer.parameters),
+        "resumed_from" => resume_checkpoint,
         "before" => before,
         "after" => after,
         "learning_curve" => learning_curve,
@@ -549,7 +631,9 @@ function _train_arm!(
         "milestone_checkpoints" => milestone_checkpoints,
         "ablations" => ablations,
         "training" => Dict(
-            "updates" => length(train_schedule),
+            "updates" => continuation_updates,
+            "update_start" => start_update + 1,
+            "update_end" => length(train_schedule),
             "loss_first" => first(loss_trace),
             "loss_last" => last(loss_trace),
             "loss_mean" => mean(loss_trace),
@@ -557,10 +641,10 @@ function _train_arm!(
             "gradient_last" => last(gradient_trace),
             "wall_seconds" => training_wall_seconds,
             "updates_per_second" =>
-                length(train_schedule) / training_wall_seconds,
+                continuation_updates / training_wall_seconds,
             "allocation_bytes" => training_allocation_bytes,
             "allocation_bytes_per_update" =>
-                training_allocation_bytes / length(train_schedule),
+                training_allocation_bytes / continuation_updates,
             "gc_seconds" => training_gc_seconds,
             "maxrss_before" => maximum_rss_before,
             "maxrss_after" => maximum_rss_after,
@@ -607,6 +691,8 @@ function main(arguments=ARGS)
         "options" => Dict(
             "arms" => String.(options.arms),
             "updates" => options.updates,
+            "resume_dir" => options.resume_dir,
+            "resume_update" => options.resume_update,
             "evaluation_milestones" =>
                 options.evaluation_milestones,
             "width" => options.width,
@@ -646,7 +732,10 @@ function main(arguments=ARGS)
         JLD2.jldsave(
             checkpoint_path;
             parameters=run.trainer.parameters,
+            optimizer_state=run.trainer.optimizer_state,
+            update=options.updates,
             model_seed=options.model_seed,
+            schedule_seed=options.schedule_seed,
             train_schedule,
             validation_rows,
             arm=String(name),
