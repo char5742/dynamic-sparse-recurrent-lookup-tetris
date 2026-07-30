@@ -163,6 +163,52 @@ Before v2 can replace the production arm, the same causal order must be moved
 into the existing SoA event kernel and barrierless executor, and compared at
 equal wall-clock.
 
+## First CPU pass
+
+The first optimization pass leaves the direct-BPTT learning contract intact
+and changes only two allocation-heavy primitives:
+
+1. delayed recurrent delivery now scans source-major fixed-fanout contacts
+   directly instead of materializing `mixed`, `payload`, destination gather
+   and per-branch concatenation arrays;
+2. sensory injection now scans the fixed feature contacts directly instead of
+   constructing two `fanin * branch * cell * candidate` rail tensors.
+
+Both primitives have explicit exact pullbacks. Gate and delay transforms are
+materialized once per trajectory rather than once per cycle. The fixed tests
+compare their forward values and materialized weight/gate/delay and E/I/bias
+gradients with the retained dense formulas.
+
+The reproducible paired benchmark is:
+
+```powershell
+julia --project=. --threads=1 `
+  experiments/beat_first_v1/reduced_hay_direct_tetris/benchmark_v2_reference.jl `
+  --repetitions 100 --warmup 5 --width 40 --seed 20260730 `
+  --baseline-revision 5c0af8f019d3405b003f509f59934c3b7f3d67b6
+```
+
+It loads the parent implementation and the working implementation in the same
+Julia process, uses the same fixed teacher row and initialization, and removes
+the warmup samples. The measured full-update result was:
+
+| Version | Updates/s | Allocation/update |
+|---|---:|---:|
+| parent dense gather | 55.625 | 30.453 MB |
+| sparse/contact kernel | **79.310** | **15.134 MB** |
+
+This is a `1.426x` throughput improvement and a `50.3%` allocation reduction.
+The paired equivalence check found zero initial-parameter difference, raw
+maximum absolute difference `1.49e-8`, and full gradient-tree maximum absolute
+difference `9.54e-6`.
+
+This is still reference-BPTT, not the final CPU learner. DECOLLE/e-prop was
+not deleted: it remains in the Serial/Dendritic SNN trainer. It was not called
+from this Reduced Hay path because its eligibility recurrence implements the
+old cell equations. The next CPU comparison must retain direct BPTT as the
+teacher/control while adding a v2-specific DECOLLE block signal and e-prop
+trace over the same causal tape.
+
 ## 100k exact continuation
 
 The v2 10k checkpoint was continued exactly to 100k with parameter and AdamW

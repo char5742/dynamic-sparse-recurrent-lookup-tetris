@@ -60,6 +60,10 @@ end
         topology = reduced_hay_topology(model, parameters)
         @test topology.persistent_states_per_cell == 23
         @test topology.continuous_credit === :direct_bptt
+        @test topology.reference_continuous_credit === :direct_bptt
+        @test topology.cpu_credit_candidate === :decolle_eprop
+        @test topology.cpu_credit_status ===
+            :requires_causal_v2_rederivation
         raw = reduced_hay_raw(model, rails, parameters)
         @test size(raw) == (22, 3)
         @test all(isfinite, raw)
@@ -236,6 +240,304 @@ end
         @test tree_norm(gradient_v2.synapse_weight) > 0.0
         @test tree_norm(gradient_v2.gate_logits) > 0.0
         @test tree_norm(gradient_v2.delay_logits) > 0.0
+    end
+
+    @testset "causal v2 sparse kernels preserve reference BPTT" begin
+        recurrent_model =
+            build_reduced_hay_model(:tiny_recurrent_v2)
+        recurrent_parameters, _ =
+            Lux.setup(MersenneTwister(43), recurrent_model)
+        base = recurrent_model.base
+        cells = base.blocks * base.cells_per_block
+        candidates = 3
+        kernel_rng = MersenneTwister(47)
+        current = rand(
+            kernel_rng,
+            Float32,
+            cells,
+            candidates,
+        )
+        previous = rand(
+            kernel_rng,
+            Float32,
+            cells,
+            candidates,
+        )
+        gate = reduced_hay_recurrent_gate(
+            recurrent_model,
+            recurrent_parameters.gate_logits,
+        )
+        delay = sigmoid.(recurrent_parameters.delay_logits)
+
+        function dense_recurrent_reference(
+            weight,
+            materialized_gate,
+            materialized_delay,
+        )
+            mixed =
+                reshape(current, cells, 1, candidates) .*
+                reshape(
+                    1.0f0 .- materialized_delay,
+                    cells,
+                    base.fanout,
+                    1,
+                ) .+
+                reshape(previous, cells, 1, candidates) .*
+                reshape(
+                    materialized_delay,
+                    cells,
+                    base.fanout,
+                    1,
+                )
+            payload = mixed .* reshape(
+                weight .* materialized_gate,
+                cells,
+                base.fanout,
+                1,
+            )
+            linear_source = vec(
+                base.source_for_destination .+
+                reshape(
+                    (0:(base.fanout - 1)) .* cells,
+                    1,
+                    base.fanout,
+                ),
+            )
+            gathered = reshape(
+                reshape(
+                    payload,
+                    cells * base.fanout,
+                    candidates,
+                )[linear_source, :],
+                cells,
+                base.fanout,
+                candidates,
+            )
+            per_branch = map(1:base.branches) do branch
+                relations = base.relations_for_branch[branch]
+                dropdims(
+                    sum(
+                        @view(gathered[:, relations, :]);
+                        dims=2,
+                    );
+                    dims=2,
+                )
+            end
+            return cat(
+                map(
+                    values -> reshape(
+                        values,
+                        1,
+                        cells,
+                        candidates,
+                    ),
+                    per_branch,
+                )...;
+                dims=1,
+            )
+        end
+
+        sparse_recurrent =
+            ReducedHayWorkspaceSNN._causal_recurrent_scan_kernel(
+                recurrent_model,
+                current,
+                previous,
+                recurrent_parameters.synapse_weight,
+                gate,
+                delay,
+            )
+        dense_recurrent = dense_recurrent_reference(
+            recurrent_parameters.synapse_weight,
+            gate,
+            delay,
+        )
+        @test sparse_recurrent ≈ dense_recurrent atol=2.0f-7 rtol=2.0f-6
+
+        recurrent_cotangent = randn(
+            kernel_rng,
+            Float32,
+            size(sparse_recurrent),
+        )
+        sparse_recurrent_objective(weight, materialized_gate, materialized_delay) =
+            sum(
+                recurrent_cotangent .*
+                ReducedHayWorkspaceSNN._causal_recurrent_scan_kernel(
+                    recurrent_model,
+                    current,
+                    previous,
+                    weight,
+                    materialized_gate,
+                    materialized_delay,
+                ),
+            )
+        dense_recurrent_objective(weight, materialized_gate, materialized_delay) =
+            sum(
+                recurrent_cotangent .*
+                dense_recurrent_reference(
+                    weight,
+                    materialized_gate,
+                    materialized_delay,
+                ),
+            )
+        sparse_recurrent_gradient = Zygote.gradient(
+            sparse_recurrent_objective,
+            recurrent_parameters.synapse_weight,
+            gate,
+            delay,
+        )
+        dense_recurrent_gradient = Zygote.gradient(
+            dense_recurrent_objective,
+            recurrent_parameters.synapse_weight,
+            gate,
+            delay,
+        )
+        for parameter_index in 1:3
+            @test sparse_recurrent_gradient[parameter_index] ≈
+                dense_recurrent_gradient[parameter_index] atol=2.0f-6 rtol=2.0f-5
+        end
+
+        sensory_rails = Float32.(
+            rand(kernel_rng, Bool, 1298, candidates),
+        )
+        excitatory_gain = ReducedHayWorkspaceSNN._sensory_gain(
+            recurrent_parameters.input_exc_logits,
+        )
+        inhibitory_gain = ReducedHayWorkspaceSNN._sensory_gain(
+            recurrent_parameters.input_inh_logits,
+        )
+        function dense_sensory_reference(
+            exc_gain,
+            inh_gain,
+            branch_bias,
+        )
+            shape = (
+                recurrent_model.sensory_fanin,
+                base.branches,
+                cells,
+                candidates,
+            )
+            excitatory_rails = reshape(
+                sensory_rails[
+                    vec(recurrent_model.excitatory_feature),
+                    :,
+                ],
+                shape,
+            )
+            inhibitory_rails = reshape(
+                sensory_rails[
+                    vec(recurrent_model.inhibitory_feature),
+                    :,
+                ],
+                shape,
+            )
+            normalization =
+                inv(sqrt(Float32(recurrent_model.sensory_fanin)))
+            excitatory = dropdims(
+                sum(
+                    reshape(
+                        exc_gain,
+                        recurrent_model.sensory_fanin,
+                        base.branches,
+                        cells,
+                        1,
+                    ) .* excitatory_rails;
+                    dims=1,
+                );
+                dims=1,
+            ) .* normalization
+            inhibitory = dropdims(
+                sum(
+                    reshape(
+                        inh_gain,
+                        recurrent_model.sensory_fanin,
+                        base.branches,
+                        cells,
+                        1,
+                    ) .* inhibitory_rails;
+                    dims=1,
+                );
+                dims=1,
+            ) .* normalization
+            return (
+                excitatory .+
+                    reshape(branch_bias, base.branches, cells, 1),
+                inhibitory,
+            )
+        end
+        sparse_sensory =
+            ReducedHayWorkspaceSNN._causal_sensory_drive_kernel(
+                recurrent_model,
+                sensory_rails,
+                excitatory_gain,
+                inhibitory_gain,
+                recurrent_parameters.branch_bias,
+            )
+        dense_sensory = dense_sensory_reference(
+            excitatory_gain,
+            inhibitory_gain,
+            recurrent_parameters.branch_bias,
+        )
+        @test sparse_sensory[1] ≈ dense_sensory[1] atol=2.0f-7 rtol=2.0f-6
+        @test sparse_sensory[2] ≈ dense_sensory[2] atol=2.0f-7 rtol=2.0f-6
+
+        sensory_cotangent = (
+            randn(kernel_rng, Float32, size(sparse_sensory[1])),
+            randn(kernel_rng, Float32, size(sparse_sensory[2])),
+        )
+        sparse_sensory_objective(exc_gain, inh_gain, branch_bias) =
+            sum(
+                sensory_cotangent[1] .*
+                ReducedHayWorkspaceSNN._causal_sensory_drive_kernel(
+                    recurrent_model,
+                    sensory_rails,
+                    exc_gain,
+                    inh_gain,
+                    branch_bias,
+                )[1],
+            ) +
+            sum(
+                sensory_cotangent[2] .*
+                ReducedHayWorkspaceSNN._causal_sensory_drive_kernel(
+                    recurrent_model,
+                    sensory_rails,
+                    exc_gain,
+                    inh_gain,
+                    branch_bias,
+                )[2],
+            )
+        dense_sensory_objective(exc_gain, inh_gain, branch_bias) =
+            sum(
+                sensory_cotangent[1] .*
+                dense_sensory_reference(
+                    exc_gain,
+                    inh_gain,
+                    branch_bias,
+                )[1],
+            ) +
+            sum(
+                sensory_cotangent[2] .*
+                dense_sensory_reference(
+                    exc_gain,
+                    inh_gain,
+                    branch_bias,
+                )[2],
+            )
+        sparse_sensory_gradient = Zygote.gradient(
+            sparse_sensory_objective,
+            excitatory_gain,
+            inhibitory_gain,
+            recurrent_parameters.branch_bias,
+        )
+        dense_sensory_gradient = Zygote.gradient(
+            dense_sensory_objective,
+            excitatory_gain,
+            inhibitory_gain,
+            recurrent_parameters.branch_bias,
+        )
+        for parameter_index in 1:3
+            @test sparse_sensory_gradient[parameter_index] ≈
+                dense_sensory_gradient[parameter_index] atol=3.0f-6 rtol=3.0f-5
+        end
     end
 
     @testset "state-matched recurrent control and budget contract" begin

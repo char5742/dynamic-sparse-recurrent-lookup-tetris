@@ -408,6 +408,9 @@ function reduced_hay_topology(
         workspace_capacity=base.workspace_k,
         input_rails=Dendritic.INPUT_RAILS,
         continuous_credit=:direct_bptt,
+        reference_continuous_credit=:direct_bptt,
+        cpu_credit_candidate=:decolle_eprop,
+        cpu_credit_status=:requires_causal_v2_rederivation,
         discrete_credit=(:spike_surrogate, :route_ste, :gate_ste),
     )
 end
@@ -455,108 +458,358 @@ function reduced_hay_recurrent_gate(
     return permutedims(hard .+ soft .- Zygote.dropgrad(soft))
 end
 
+function _causal_recurrent_scan_kernel(
+    model::ReducedHayWorkspaceModel,
+    current_spikes::AbstractMatrix,
+    previous_spikes::AbstractMatrix,
+    synapse_weight::AbstractMatrix,
+    recurrent_gate::AbstractMatrix,
+    delay::AbstractMatrix,
+)
+    base = model.base
+    cells, candidates = size(current_spikes)
+    size(previous_spikes) == size(current_spikes) ||
+        throw(DimensionMismatch("previous recurrent spikes"))
+    edge_shape = (cells, base.fanout)
+    size(synapse_weight) == edge_shape ||
+        throw(DimensionMismatch("recurrent weight"))
+    size(recurrent_gate) == edge_shape ||
+        throw(DimensionMismatch("recurrent gate"))
+    size(delay) == edge_shape ||
+        throw(DimensionMismatch("recurrent delay"))
+    inbox = zeros(
+        Float32,
+        base.branches,
+        cells,
+        candidates,
+    )
+    @inbounds for candidate in 1:candidates
+        for source in 1:cells
+            current = current_spikes[source, candidate]
+            previous = previous_spikes[source, candidate]
+            for relation in 1:base.fanout
+                gate = recurrent_gate[source, relation]
+                signal = muladd(
+                    1.0f0 - delay[source, relation],
+                    current,
+                    delay[source, relation] * previous,
+                )
+                payload =
+                    synapse_weight[source, relation] *
+                    gate *
+                    signal
+                destination =
+                    base.destination_for_source[source, relation]
+                branch = Int(base.branch_for_relation[relation])
+                inbox[branch, destination, candidate] += payload
+            end
+        end
+    end
+    return inbox
+end
+
+Zygote.@adjoint function _causal_recurrent_scan_kernel(
+    model::ReducedHayWorkspaceModel,
+    current_spikes::AbstractMatrix,
+    previous_spikes::AbstractMatrix,
+    synapse_weight::AbstractMatrix,
+    recurrent_gate::AbstractMatrix,
+    delay::AbstractMatrix,
+)
+    inbox = _causal_recurrent_scan_kernel(
+        model,
+        current_spikes,
+        previous_spikes,
+        synapse_weight,
+        recurrent_gate,
+        delay,
+    )
+    function recurrent_pullback(inbox_cotangent)
+        base = model.base
+        cells, candidates = size(current_spikes)
+        current_cotangent = zeros(Float32, size(current_spikes))
+        previous_cotangent = zeros(Float32, size(previous_spikes))
+        weight_cotangent = zeros(Float32, size(synapse_weight))
+        gate_cotangent = zeros(Float32, size(recurrent_gate))
+        delay_cotangent = zeros(Float32, size(delay))
+        inbox_cotangent === nothing &&
+            return (
+                nothing,
+                current_cotangent,
+                previous_cotangent,
+                weight_cotangent,
+                gate_cotangent,
+                delay_cotangent,
+            )
+        @inbounds for candidate in 1:candidates
+            for source in 1:cells
+                current = current_spikes[source, candidate]
+                previous = previous_spikes[source, candidate]
+                for relation in 1:base.fanout
+                    destination =
+                        base.destination_for_source[source, relation]
+                    branch = Int(base.branch_for_relation[relation])
+                    output_cotangent =
+                        inbox_cotangent[
+                            branch,
+                            destination,
+                            candidate,
+                        ]
+                    edge_delay = delay[source, relation]
+                    signal = muladd(
+                        1.0f0 - edge_delay,
+                        current,
+                        edge_delay * previous,
+                    )
+                    weight = synapse_weight[source, relation]
+                    gate = recurrent_gate[source, relation]
+                    weighted = output_cotangent * weight * gate
+                    current_cotangent[source, candidate] = muladd(
+                        weighted,
+                        1.0f0 - edge_delay,
+                        current_cotangent[source, candidate],
+                    )
+                    previous_cotangent[source, candidate] = muladd(
+                        weighted,
+                        edge_delay,
+                        previous_cotangent[source, candidate],
+                    )
+                    weight_cotangent[source, relation] = muladd(
+                        output_cotangent,
+                        gate * signal,
+                        weight_cotangent[source, relation],
+                    )
+                    gate_cotangent[source, relation] = muladd(
+                        output_cotangent,
+                        weight * signal,
+                        gate_cotangent[source, relation],
+                    )
+                    delay_cotangent[source, relation] = muladd(
+                        output_cotangent,
+                        weight * gate * (previous - current),
+                        delay_cotangent[source, relation],
+                    )
+                end
+            end
+        end
+        return (
+            nothing,
+            current_cotangent,
+            previous_cotangent,
+            weight_cotangent,
+            gate_cotangent,
+            delay_cotangent,
+        )
+    end
+    return inbox, recurrent_pullback
+end
+
 function _causal_recurrent_scan(
     model::ReducedHayWorkspaceModel,
     current_spikes::AbstractMatrix,
     previous_spikes::AbstractMatrix,
     ps,
 )
-    base = model.base
-    cells, candidates = size(current_spikes)
-    gate = reduced_hay_recurrent_gate(model, ps.gate_logits)
-    delay = sigmoid.(ps.delay_logits)
-    mixed =
-        reshape(current_spikes, cells, 1, candidates) .*
-        reshape(1.0f0 .- delay, cells, base.fanout, 1) .+
-        reshape(previous_spikes, cells, 1, candidates) .*
-        reshape(delay, cells, base.fanout, 1)
-    payload = mixed .* reshape(
-        ps.synapse_weight .* gate,
-        cells,
-        base.fanout,
-        1,
-    )
-    linear_source = vec(
-        base.source_for_destination .+
-        reshape((0:(base.fanout - 1)) .* cells, 1, base.fanout),
-    )
-    gathered = reshape(
-        reshape(payload, cells * base.fanout, candidates)[linear_source, :],
-        cells,
-        base.fanout,
-        candidates,
-    )
-    per_branch = map(1:base.branches) do branch
-        relations = base.relations_for_branch[branch]
-        dropdims(
-            sum(@view(gathered[:, relations, :]); dims=2);
-            dims=2,
-        )
-    end
-    return cat(
-        map(
-            values -> reshape(values, 1, cells, candidates),
-            per_branch,
-        )...;
-        dims=1,
+    return _causal_recurrent_scan_kernel(
+        model,
+        current_spikes,
+        previous_spikes,
+        ps.synapse_weight,
+        reduced_hay_recurrent_gate(model, ps.gate_logits),
+        sigmoid.(ps.delay_logits),
     )
 end
 
 @inline _sensory_gain(logits) =
     0.002f0 .+ 0.198f0 .* sigmoid.(logits)
 
+function _causal_sensory_drive_kernel(
+    model::ReducedHayWorkspaceModel,
+    rails::AbstractMatrix,
+    excitatory_gain::AbstractArray{Float32,3},
+    inhibitory_gain::AbstractArray{Float32,3},
+    branch_bias::AbstractMatrix{Float32},
+)
+    base = model.base
+    cells = base.blocks * base.cells_per_block
+    candidates = size(rails, 2)
+    gain_shape = (
+        model.sensory_fanin,
+        base.branches,
+        cells,
+    )
+    size(excitatory_gain) == gain_shape ||
+        throw(DimensionMismatch("excitatory sensory gain"))
+    size(inhibitory_gain) == gain_shape ||
+        throw(DimensionMismatch("inhibitory sensory gain"))
+    size(branch_bias) == (base.branches, cells) ||
+        throw(DimensionMismatch("sensory branch bias"))
+    normalization = inv(sqrt(Float32(model.sensory_fanin)))
+    excitatory = zeros(
+        Float32,
+        base.branches,
+        cells,
+        candidates,
+    )
+    inhibitory = similar(excitatory)
+    @inbounds for candidate in 1:candidates
+        for cell in 1:cells
+            for branch in 1:base.branches
+                exc = 0.0f0
+                inh = 0.0f0
+                for contact in 1:model.sensory_fanin
+                    exc = muladd(
+                        excitatory_gain[contact, branch, cell],
+                        rails[
+                            model.excitatory_feature[
+                                contact,
+                                branch,
+                                cell,
+                            ],
+                            candidate,
+                        ],
+                        exc,
+                    )
+                    inh = muladd(
+                        inhibitory_gain[contact, branch, cell],
+                        rails[
+                            model.inhibitory_feature[
+                                contact,
+                                branch,
+                                cell,
+                            ],
+                            candidate,
+                        ],
+                        inh,
+                    )
+                end
+                excitatory[branch, cell, candidate] =
+                    exc * normalization +
+                    branch_bias[branch, cell]
+                inhibitory[branch, cell, candidate] =
+                    inh * normalization
+            end
+        end
+    end
+    return excitatory, inhibitory
+end
+
+Zygote.@adjoint function _causal_sensory_drive_kernel(
+    model::ReducedHayWorkspaceModel,
+    rails::AbstractMatrix,
+    excitatory_gain::AbstractArray{Float32,3},
+    inhibitory_gain::AbstractArray{Float32,3},
+    branch_bias::AbstractMatrix{Float32},
+)
+    drives = _causal_sensory_drive_kernel(
+        model,
+        rails,
+        excitatory_gain,
+        inhibitory_gain,
+        branch_bias,
+    )
+    function sensory_pullback(drive_cotangents)
+        base = model.base
+        cells = base.blocks * base.cells_per_block
+        candidates = size(rails, 2)
+        excitatory_output_cotangent =
+            drive_cotangents[1]
+        inhibitory_output_cotangent =
+            drive_cotangents[2]
+        normalization = inv(sqrt(Float32(model.sensory_fanin)))
+        excitatory_gain_cotangent =
+            zeros(Float32, size(excitatory_gain))
+        inhibitory_gain_cotangent =
+            zeros(Float32, size(inhibitory_gain))
+        bias_cotangent = zeros(Float32, size(branch_bias))
+        @inbounds for candidate in 1:candidates
+            for cell in 1:cells
+                for branch in 1:base.branches
+                    exc_signal =
+                        excitatory_output_cotangent === nothing ?
+                        0.0f0 :
+                        excitatory_output_cotangent[
+                            branch,
+                            cell,
+                            candidate,
+                        ]
+                    inh_signal =
+                        inhibitory_output_cotangent === nothing ?
+                        0.0f0 :
+                        inhibitory_output_cotangent[
+                            branch,
+                            cell,
+                            candidate,
+                        ]
+                    bias_cotangent[branch, cell] += exc_signal
+                    for contact in 1:model.sensory_fanin
+                        excitatory_gain_cotangent[
+                            contact,
+                            branch,
+                            cell,
+                        ] = muladd(
+                            exc_signal * normalization,
+                            rails[
+                                model.excitatory_feature[
+                                    contact,
+                                    branch,
+                                    cell,
+                                ],
+                                candidate,
+                            ],
+                            excitatory_gain_cotangent[
+                                contact,
+                                branch,
+                                cell,
+                            ],
+                        )
+                        inhibitory_gain_cotangent[
+                            contact,
+                            branch,
+                            cell,
+                        ] = muladd(
+                            inh_signal * normalization,
+                            rails[
+                                model.inhibitory_feature[
+                                    contact,
+                                    branch,
+                                    cell,
+                                ],
+                                candidate,
+                            ],
+                            inhibitory_gain_cotangent[
+                                contact,
+                                branch,
+                                cell,
+                            ],
+                        )
+                    end
+                end
+            end
+        end
+        return (
+            nothing,
+            nothing,
+            excitatory_gain_cotangent,
+            inhibitory_gain_cotangent,
+            bias_cotangent,
+        )
+    end
+    return drives, sensory_pullback
+end
+
 function _causal_sensory_drive(
     model::ReducedHayWorkspaceModel,
     rails::AbstractMatrix,
     ps,
 )
-    base = model.base
-    cells = base.blocks * base.cells_per_block
-    candidates = size(rails, 2)
-    shape = (
-        model.sensory_fanin,
-        base.branches,
-        cells,
-        candidates,
+    return _causal_sensory_drive_kernel(
+        model,
+        rails,
+        _sensory_gain(ps.input_exc_logits),
+        _sensory_gain(ps.input_inh_logits),
+        ps.branch_bias,
     )
-    excitatory_rails = reshape(
-        rails[vec(model.excitatory_feature), :],
-        shape,
-    )
-    inhibitory_rails = reshape(
-        rails[vec(model.inhibitory_feature), :],
-        shape,
-    )
-    normalization = inv(sqrt(Float32(model.sensory_fanin)))
-    excitatory = dropdims(
-        sum(
-            reshape(
-                _sensory_gain(ps.input_exc_logits),
-                model.sensory_fanin,
-                base.branches,
-                cells,
-                1,
-            ) .* excitatory_rails;
-            dims=1,
-        );
-        dims=1,
-    ) .* normalization
-    inhibitory = dropdims(
-        sum(
-            reshape(
-                _sensory_gain(ps.input_inh_logits),
-                model.sensory_fanin,
-                base.branches,
-                cells,
-                1,
-            ) .* inhibitory_rails;
-            dims=1,
-        );
-        dims=1,
-    ) .* normalization
-    excitatory = excitatory .+
-        reshape(ps.branch_bias, base.branches, cells, 1)
-    return excitatory, inhibitory
 end
 
 function _legacy_reduced_hay_dynamics(
@@ -1032,15 +1285,18 @@ function _causal_reduced_hay_dynamics(
     nmda_half = reshape(ps.nmda_half_logits, branch_shape)
     recurrent_gate =
         reduced_hay_recurrent_gate(model, ps.gate_logits)
+    recurrent_delay = sigmoid.(ps.delay_logits)
 
     for cycle in 1:base.cycles
         recurrent_inbox =
             Float32(recurrent_scale) .*
-            _causal_recurrent_scan(
+            _causal_recurrent_scan_kernel(
                 model,
                 active_spikes,
                 previous_active_spikes,
-                ps,
+                ps.synapse_weight,
+                recurrent_gate,
+                recurrent_delay,
             )
         pulse = cycle <= model.sensory_cycles ? 1.0f0 : 0.0f0
         recurrent_exc = max.(recurrent_inbox, 0.0f0)

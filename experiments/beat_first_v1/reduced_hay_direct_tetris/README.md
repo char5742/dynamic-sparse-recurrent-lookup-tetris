@@ -35,24 +35,33 @@ The older Point-SNN, detailed Hay oracle, Digital Twin and frozen distilled
 | Point-SNN source-major graph and fixed gates | reuse design/data layout | appropriate for sparse event delivery and utility consolidation |
 | `DendriticCellArena` / SoA layout | reuse design | branch-major fixed storage and allocation-free scalar kernel |
 | MPMC barrierless phases and worker-local gradients | reuse after VJP closure | candidate jobs, deterministic reduction and sharded AdamW remain valid |
-| Dendritic `local_hybrid` replay | not mainline credit | recurrent dynamics receive DECOLLE/e-prop, not the global teacher VJP |
+| Dendritic `local_hybrid` replay | adapt as CPU production candidate | DECOLLE/e-prop fits sparse event execution, but its traces must be rederived for the causal Reduced Hay v2 equations |
 | Dense Digital Twin training | control only | useful paper/oracle experiment, unnecessary dependency for Tetris optimization |
 | 11-state distillation/freeze | control only | the final Tetris cell must not freeze internal dynamics because of lineage |
 | full Hay cell | oracle only | too expensive for mass placement; useful for mechanism ablation |
 
-The executor phase change required for production is:
+There are two deliberately separate credit-assignment tracks:
 
 ```text
-old dendritic path:
-PACK -> FORWARD -> BLOCK SIGNAL -> LOCAL REPLAY -> AdamW
-
-new direct path:
+quality/reference control:
 PACK -> FORWARD -> REVERSE-TIME VJP -> AdamW
+
+CPU production candidate:
+PACK -> FORWARD -> BLOCK SIGNAL -> LOCAL REPLAY -> AdamW
 ```
 
+The direct path is retained as the teacher and quality ceiling. It is not a
+decision to discard DECOLLE/e-prop. The existing local learner cannot be
+called unchanged because it encodes the old dendritic transition, routing
+order and eligibility recurrence. The causal v2 local path must reproduce the
+new AMPA/NMDA/GABA, plateau, apical, adaptation and delayed recurrent
+equations, then be compared with the direct gradient in shadow mode.
+
 Only hard spike, hard workspace routing, gate state and future compartment
-placement are discrete. Continuous state and parameters are differentiated
-through the complete Tetris trajectory.
+placement are discrete in the reference path. Continuous state and parameters
+are differentiated through the complete Tetris trajectory there; the CPU
+candidate approximates the same credit with block-local third factors and
+forward eligibility traces.
 
 ## Minimal Reduced Hay cell
 
@@ -81,7 +90,7 @@ adaptation.
 Normalized voltage/time units are used intentionally. This is a Hay-derived
 CPU model, not a claim that one Tetris cycle equals a biological millisecond.
 
-## Direct credit assignment
+## Reference direct credit assignment
 
 `ReducedHayDirectTraining.jl` does the following:
 
@@ -92,11 +101,12 @@ CPU model, not a claim that one Tetris cycle equals a biological millisecond.
 5. update compartment, graph, routing and head parameters with AdamW.
 
 The present reference uses Zygote to establish the BPTT contract. It is
-correctness code, not the final throughput result. `ReducedHayCellKernel.jl`
-already supplies allocation-free SoA state transition and fired-source-only
-event delivery. The remaining CPU critical path is an analytic reverse-time
-VJP over the fixed tape, followed by integration into the existing MPMC
-candidate executor.
+correctness code and a teacher/control, not the only final learning rule.
+`ReducedHayCellKernel.jl` already supplies allocation-free SoA state
+transition and fired-source-only event delivery. Production experiments must
+compare an analytic reverse-time VJP and a v2-specific DECOLLE/e-prop replay
+at equal CPU wall-clock; neither is promoted on implementation preference
+alone.
 
 ## Canonical entrypoints
 
@@ -104,6 +114,7 @@ candidate executor.
 |---|---|
 | direct-Tetris Reduced Hay reference | `train_reduced_hay_direct.jl` |
 | focused unit/finite-difference checks | `runtests.jl` |
+| paired parent/current v2 CPU benchmark | `benchmark_v2_reference.jl` |
 | four-arm CPU budget contract | `compare_cpu_budget.jl` |
 | shared Point/Reduced/GRU preflight | `train_budget_arm.jl` |
 | held-teacher budget validation | `validate_budget_arms.jl` |
@@ -194,9 +205,14 @@ causal repair arm are recorded in `RECURRENT_REPAIR_2026-07-30.md`.
 - At 100k, v2 recurrent-off costs `+0.041193` loss and reduces top-1, NDCG,
   and pairwise. Plateau-off costs `+0.307227`; apical-off costs `+0.036818`.
   The repaired mechanisms remain causally useful rather than saturating away.
-- This is one-seed equal-update evidence. V2 reference throughput is only
-  `67.399 updates/s`, about `2.21x` slower than the retained legacy seed-1
-  continuation, so it is not yet an equal-wall-clock CPU victory.
+- This is one-seed equal-update evidence. The retained 100k run used the
+  original dense-gather v2 reference at `67.399 updates/s`. The first CPU
+  pass now replaces the recurrent and sensory gathers with direct
+  source/contact-major kernels and exact custom pullbacks. A warmed paired
+  100-update benchmark against parent `5c0af8f` measured `79.310` versus
+  `55.625 updates/s` (`1.426x`) and cut allocation from `30.453` to
+  `15.134 MB/update` (`50.3%`). This is still not an allocation-free,
+  barrierless or equal-wall-clock gameplay victory.
 - Reference GRU training remains about `1.77x` faster in the dedicated
   benchmark (`2.09x` in the concurrent continuation), so Reduced Hay has not
   won the equal-wall-clock CPU objective.
@@ -240,12 +256,14 @@ dynamics. It must not claim:
 
 ## Next critical path
 
-1. reproduce the v2 separation on the two retained independent seeds;
-2. move the causal order and fixed-fanout graph into the existing SoA event
-   kernel, eliminating the current six-cycle Zygote reference overhead;
-3. expose the full width-80 teacher corpus under the same Point/Reduced-v2
+1. port the causal v2 compartment equations and fixed-fanout graph into the
+   existing fixed SoA tape;
+2. rederive the DECOLLE block-local signals and e-prop eligibility traces for
+   that exact v2 tape, while retaining direct BPTT as shadow teacher/control;
+3. reproduce the v2 separation on the two retained independent seeds;
+4. expose the full width-80 teacher corpus under the same Point/Reduced-v2
    comparison contract;
-4. report equal-update and equal-wall-clock curves separately;
-5. only after a quality-per-CPU advantage, close the analytic reverse-time VJP
-   and integrate it into the barrierless executor;
-6. add the frozen 11-state arm when a qualified artifact exists.
+5. report direct-VJP and DECOLLE/e-prop equal-update and equal-wall-clock
+   curves separately;
+6. integrate the winning credit path into the barrierless executor;
+7. add the frozen 11-state arm when a qualified artifact exists.
