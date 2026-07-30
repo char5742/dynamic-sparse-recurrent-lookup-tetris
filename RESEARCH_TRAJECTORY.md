@@ -6,6 +6,15 @@
 研究について、着想、設計判断、失敗、修正、検証結果を時系列で保存する。
 成功結果だけでなく、棄却した方式と未解決事項も記録する。
 
+## 現在のSNN研究線
+
+2026-07-30時点では、点LIFによるSerial Workspace SNNを対照モデルとして残し、
+多区画の連続電位状態とspike eventを分離した高次元ニューロンへ研究対象を
+拡張している。現在の到達点、実測値、論文再現の境界、正本entrypoint、
+進行中の50,000 + 2,000試行Hay/NEURON教師生成は、次のsnapshotを正本とする。
+
+[`experiments/beat_first_v1/paper_multicompartment_snn/RESEARCH_STATUS_2026-07-30.md`](experiments/beat_first_v1/paper_multicompartment_snn/RESEARCH_STATUS_2026-07-30.md)
+
 ## 1. 研究の出発点
 
 着想は、脳の計算原理に見られる次の性質をニューラルネットワークへ

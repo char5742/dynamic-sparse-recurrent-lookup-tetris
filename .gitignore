@@ -11,3 +11,13 @@ __pycache__/
 *.pyc
 node_modules/
 .DS_Store
+
+# Local edit probes retained during the HD-SWSNN-TwinProp investigation.
+experiments/beat_first_v1/paper_multicompartment_snn/.patch_probe
+experiments/beat_first_v1/paper_multicompartment_snn/_apply_patch_probe_final.tmp
+experiments/beat_first_v1/paper_multicompartment_snn/_apply_patch_probe_official.tmp
+experiments/beat_first_v1/paper_multicompartment_snn/_fix_sealed_parse.patch
+experiments/beat_first_v1/paper_multicompartment_snn/_fix_sealed_parse_v2.patch
+experiments/beat_first_v1/paper_multicompartment_snn/_patch_probe.tmp
+experiments/beat_first_v1/paper_multicompartment_snn/_trainer_patch_probe.tmp
+experiments/beat_first_v1/dendritic_workspace_snn/audit_checkpoint_representation_tmp.jl
