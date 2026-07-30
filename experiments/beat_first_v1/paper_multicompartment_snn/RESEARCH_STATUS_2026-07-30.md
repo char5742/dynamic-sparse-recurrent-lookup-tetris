@@ -1,6 +1,12 @@
 # HD-SWSNN-TwinProp 研究状況
 
-最終更新: 2026-07-30 11:34 JST
+> **2026-07-30 本線変更:** この文書は今後TwinProp/Digital Twin研究branchの
+> 履歴を記録し、Tetrisモデル開発の正本ではない。CPU知能の本線は
+> `../reduced_hay_direct_tetris/README.md`、すなわちTetris教師損失から
+> 直接最適化するReduced Hay cellである。詳細Hay、Digital Twin、frozen
+> 11-state cellは削除せず、oracle/controlとして維持する。
+
+最終更新: 2026-07-30 16:40 JST
 整理時の基準revision: `797ac31ccf5b5d5d4f9b10a447ec7fbc568582ac`
 
 ## 結論
@@ -200,13 +206,17 @@ hot allocation `1,952 byte`、hot GC `0秒`を確認した。これらは実装�
 `runs/`, datasets、NEURON shards、PyTorch/JLD2 checkpointはGit対象外である。
 manifest、hash、checkpoint lineageによって外部artifactを結び付ける。
 
-## 5. 進行中のproduction教師生成
+## 5. 停止したproduction教師生成
+
+本線変更後の指示により、2026-07-30 16:40 JSTまでにproduction generator、
+monitor、watchdogを停止した。生成済みshardとlogは保持している。以下は履歴
+snapshotであり、現在実行中という意味ではない。
 
 2026-07-30 11:34:09 JSTのsnapshot:
 
 | 項目 | 値 |
 |---|---:|
-| status | running |
+| status | stopped; historical snapshot |
 | watchdog attempt | 1 |
 | completed | 1,018 / 52,000 trials |
 | progress | 1.957692% |
@@ -230,12 +240,13 @@ runs/paper_elm_official_fit50k/
   teacher_production_generation_20260730T0854JST/
 ```
 
-このsnapshotは進行中の観測値であり、完了実績ではない。watchdogはverified
-`.done.json` shardから再開する。
+このsnapshotは当時進行中だった観測値であり、完了実績ではない。再開を明示
+された場合はverified `.done.json` shardから再開できる。
 
-## 6. 次のcritical path
+## 6. TwinProp研究branchを再開する場合の旧critical path
 
-新しい監査項目は増やさず、次の直線だけを進める。
+以下は停止中であり、Reduced Hay direct-Tetris本線の依存関係ではない。
+論文再現branchの再開を明示された場合にだけ実行する。
 
 1. 52,000試行のproduction teacherを完了し、manifest/shard hashを確定する。
 2. M1000 digital twinをproduction train splitでscratch学習する。

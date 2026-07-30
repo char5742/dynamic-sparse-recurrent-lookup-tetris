@@ -4,6 +4,30 @@ This ledger records both successful and failed runs. Teacher-held rows are not
 game-validation seeds; game validation `8001:8008` and sealed seeds
 `91001:91032` remain unopened.
 
+## 2026-07-30 — Reduced Hay direct-Tetris mainline
+
+- 方針変更：Hay教師→Dense Digital Twin→11状態蒸留・凍結をTetris本線の
+  必須経路から外した。詳細Hay、Digital Twin、frozen 11-stateは削除せず
+  oracle/controlとして残す。
+- 新cell：4 basal branchそれぞれにvoltage、AMPA、NMDA、GABA、plateauを持ち、
+  apical、soma、adaptationを加えた23連続状態/cell。
+- 信用割当：既存の1,298 binary railと22出力ListNet/Q/death/quantile/geometry
+  cotangentを再利用し、全cycleをreverse-modeで直接BPTTした。hard spike、
+  workspace route、gateだけがsurrogate/STEである。
+- 実Tetris固定panel：train row 1、34候補、tiny 16-cell、6更新でcomposite loss
+  `7.854910→5.480639`。compartment gradientは非ゼロで内部parameterも変化した。
+- CPU境界：初回pullback compile込みのZygote referenceは
+  `0.174899 updates/s`で、速度結果ではない。別途
+  SoA cell stepのwarm allocation `0 byte`と発火source限定event配送を実装した。
+  次の本線はanalytic VJPと既存barrierless executorの統合である。
+- 比較：Point-SNN、frozen 11-state、direct Reduced Hay、state-matched diagonal
+  GRUの4 armを定義した。state静的比`1.038889`、演算見積比`1.304348`。
+  最終判定は同一wall-clock/fixed panelの実測だけで行う。
+- 注意：固定panelではgraph gradientが0だったため、このrunはevent graphの
+  有効性を示さない。TwinProp再現、Hay同等性、他modelへの優位も主張しない。
+- 詳細：`reduced_hay_direct_tetris/README.md`および
+  `reduced_hay_direct_tetris/SMOKE_2026-07-30.md`。
+
 ## 2026-07-26 — エピソード記憶routerの信用割当修正
 
 - 仮説：1段Lookupの性能低下には、Lookup段数以外にhard token routerの代理勾配が
