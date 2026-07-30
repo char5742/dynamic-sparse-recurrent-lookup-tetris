@@ -27,6 +27,13 @@ const NEXT_HOLD_TOKENS = 6
 const AUX_FEATURES = 37
 const TOKEN_COUNT = CELL_COUNT + NEXT_HOLD_TOKENS + AUX_FEATURES
 const OUTPUT_DIM = 22
+# The historical per-sample balance auxiliary has an absorbing optimum at a
+# uniform hard router: it supplies dense credit to every WTA logit while the
+# task loss can only credit already-selected rows.  Keep collecting routing
+# statistics for diagnostics, but never inject that auxiliary into EVRL's
+# body VJP.  New runs also persist a zero balance weight; this guard makes old
+# checkpoints carrying the former 0.05 value safe to resume.
+const LOOKUP_BALANCE_AUXILIARY_ENABLED = false
 const SUBPHASE_PROFILE_ENABLED =
     strip(get(ENV, "EVRL_SUBPHASE_PROFILE", "0")) == "1"
 const SUBPHASE_LABELS = (
@@ -712,7 +719,7 @@ function topology(model::EpisodicViTLookupModel)
         long_memory_micro_calls_per_step=BLOCKS * REGISTER_COUNT,
         long_memory_register_injection="register-local-sigmoid-gated-residual",
         long_memory_compute_reduction_vs_per_register=1,
-        long_memory_balance="state-local-hard-frequency-times-soft-probability-auxiliary-credit",
+        long_memory_balance="diagnostic-only-no-auxiliary-gradient",
         register_relation="fixed-k$(EPISODIC_SUPPORT)-wta-support-exact-multihead-cross-attention",
         initial_halt_probability=INITIAL_HALT_PROBABILITY,
         recurrent_steps=(MIN_RECURRENT_STEPS, MAX_RECURRENT_STEPS),
@@ -4436,6 +4443,10 @@ function _lookup_carrier_vjp!(
     # Parameters are shared, so gradients accumulate into the same sparse bank
     # rows without pooling the credit signal between registers.
     copyto!(dinput, state_cotangent)
+    effective_balance_stats =
+        LOOKUP_BALANCE_AUXILIARY_ENABLED ? balance_stats : nothing
+    effective_balance_weight =
+        LOOKUP_BALANCE_AUXILIARY_ENABLED ? balance_weight : 0.0f0
     gate_gradient = _dgv(accumulator, :lookup_register_gate)
     @inbounds for register in 1:REGISTER_COUNT
         gate = tape.gates[register]
@@ -4453,11 +4464,11 @@ function _lookup_carrier_vjp!(
             lookup_input_cotangent = SparseLookup._lookup_micro_vjp!(
                 accumulator.lookup, model.lookup, tape.blocks[block, register],
                 block, lookup_input_cotangent, Float32(temperature),
-                balance_stats === nothing ? nothing :
-                    balance_stats.hard_frequencies,
-                balance_stats === nothing ? 0 :
-                    Int(balance_stats.observations[block]),
-                balance_weight,
+                effective_balance_stats === nothing ? nothing :
+                    effective_balance_stats.hard_frequencies,
+                effective_balance_stats === nothing ? 0 :
+                    Int(effective_balance_stats.observations[block]),
+                effective_balance_weight,
             )
         end
         @simd for coordinate in 1:MODEL_DIM

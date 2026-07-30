@@ -28,7 +28,7 @@ for (name, value) in (
     # This diagnostic isolates recurrent body credit assignment.  Production
     # hard halting remains unchanged and is checked by the correctness smoke.
     "EVRL_FIXED_DEPTH" => "3",
-    "EVRL_ROUTE_BALANCE_WEIGHT" => "0.05",
+    "EVRL_ROUTE_BALANCE_WEIGHT" => "0.0",
     "EVRL_WD_DENSE" => "0.0003",
 )
     ENV[name] = get(ENV, name, value)
@@ -37,12 +37,32 @@ end
 include(joinpath(@__DIR__, "teacher_training.jl"))
 const Training = Main.EpisodicViTRecurrentLookupTeacherTraining
 const TrainingCore = Training.TrainingCore
+const Model = Training.Model
 
 BLAS.set_num_threads(1)
 Base.Threads.nthreads(:interactive) == 0 ||
     error("use JULIA_NUM_THREADS=<workers>,0")
 
-const UPDATES = parse(Int, get(ENV, "EVRL_FIXED_BATCH_UPDATES", "100"))
+const UPDATES = parse(Int, get(ENV, "EVRL_FIXED_BATCH_UPDATES", "500"))
+
+function _lookup_health(model)
+    return (;
+        bh4_stage_rms=[
+            [
+                sqrt(sum(abs2, @view(diagonals[:, stage])) /
+                     size(diagonals, 1))
+                for stage in axes(diagonals, 2)
+            ]
+            for diagonals in model.lookup.bh4_diagonals
+        ],
+        lookup_alpha=Float64.(Model.SparseLookup.residual_alpha.(
+            model.lookup.alpha_logits,
+        )),
+        register_gates=Float64.(Model._sigmoid.(
+            model.lookup_register_gate,
+        )),
+    )
+end
 
 function main()
     hyperparameters = Training.runtime_hyperparameters(UPDATES)
@@ -70,6 +90,7 @@ function main()
         1; max_candidates=Training.LEARNER_WIDTH,
     )
     trainer = Training.initialize_trainer(hyperparameters)
+    lookup_health_before = _lookup_health(trainer.model)
     before = Training.held_evaluation(
         trainer, dataset, rows, evaluation_batch; hyperparameters,
     )
@@ -93,23 +114,51 @@ function main()
         trainer, dataset, rows, evaluation_batch; hyperparameters,
     )
     window = min(10, UPDATES)
+    first_window_loss = sum(@view(losses[1:window])) / window
+    last_window_loss =
+        sum(@view(losses[(end - window + 1):end])) / window
+    loss_reduction_fraction =
+        1.0 - last_window_loss / first_window_loss
+    lookup_health_after = _lookup_health(trainer.model)
+    bh4_maximum_rms_error = maximum(
+        abs(Float64(rms) - 1.0)
+        for block in lookup_health_after.bh4_stage_rms
+        for rms in block
+    )
+    criteria = (;
+        all_teacher_top1=after.metrics.top1_agreement == 1.0,
+        ndcg=after.metrics.ndcg >= 0.99,
+        pairwise=after.metrics.pairwise_accuracy >= 0.85,
+        old_q_reduction=after.metrics.old_q_loss <=
+            0.10 * before.metrics.old_q_loss,
+        loss_reduction=loss_reduction_fraction >= 0.20,
+        bh4_conditioned=bh4_maximum_rms_error <= 1.0e-3,
+        lookup_path_active=
+            minimum(lookup_health_after.lookup_alpha) >= 0.10 &&
+            minimum(lookup_health_after.register_gates) >= 0.10,
+    )
+    passed = all(values(criteria))
     record = (;
-        status="pass",
+        status=passed ? "pass" : "fail",
+        criteria,
         rows,
         updates=UPDATES,
         elapsed_seconds=elapsed,
         updates_per_second=UPDATES / elapsed,
-        first_window_loss=sum(@view(losses[1:window])) / window,
-        last_window_loss=sum(@view(losses[(end - window + 1):end])) / window,
-        loss_reduction_fraction=1.0 -
-            (sum(@view(losses[(end - window + 1):end])) /
-             sum(@view(losses[1:window]))),
+        first_window_loss,
+        last_window_loss,
+        loss_reduction_fraction,
         mean_depth=sum(depths) / length(depths),
         before,
         after,
+        lookup_health_before,
+        lookup_health_after,
     )
     JSON3.pretty(stdout, record)
     write(stdout, '\n')
+    passed || error(
+        "fixed-batch memorization criteria failed: $(criteria)",
+    )
     return record
 end
 
