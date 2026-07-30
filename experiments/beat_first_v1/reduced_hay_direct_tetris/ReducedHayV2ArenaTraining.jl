@@ -1413,35 +1413,6 @@ end
     return nothing
 end
 
-@inline function _signal_coordinate!(
-    scratch::DendriticWorkerScratch,
-    tape::DendriticTape,
-    projection::Array{Float32,3},
-    model,
-    block::Int,
-    cycle::Int,
-    flat::Int,
-    global_signal_scale::Float32,
-    local_signal_scale::Float32,
-)
-    @inbounds for coordinate in 1:model.node_dim
-        signal = 0.0f0
-        for output in 1:OUTPUT_DIM
-            signal = muladd(
-                projection[coordinate, output, block],
-                global_signal_scale *
-                tape.base.raw_gradient[output, flat] +
-                local_signal_scale *
-                scratch.local_error[output],
-                signal,
-            )
-        end
-        signal /= Float32(model.cycles)
-        scratch.block_signal[coordinate] = signal
-    end
-    return nothing
-end
-
 function _prepare_block_signals!(
     scratch::DendriticWorkerScratch,
     tape::DendriticTape,
@@ -1457,32 +1428,33 @@ function _prepare_block_signals!(
     fill!(scratch.apical_signal, 0.0f0)
     fill!(scratch.branch_signal, 0.0f0)
     inverse_node_dim = inv(Float32(model.node_dim))
+    inverse_cycles = inv(Float32(model.cycles))
 
     @inbounds for cycle in 1:model.cycles
         for block in 1:model.blocks
-            fill!(scratch.local_prediction, 0.0f0)
             offset = (block - 1) * model.node_dim
+            for coordinate in 1:model.node_dim
+                state = base.membrane[
+                    offset + coordinate,
+                    cycle + 1,
+                    flat,
+                ]
+                cell = _cell_for_coordinate(
+                    model,
+                    coordinate,
+                    block,
+                )
+                spike = tape.cell_spikes[cell, cycle, flat]
+                scratch.block_signal[coordinate] =
+                    state +
+                    LOCAL_PREDICTOR_SPIKE_SCALE * spike
+            end
             for output in 1:OUTPUT_DIM
                 prediction = 0.0f0
                 for coordinate in 1:model.node_dim
-                    state = base.membrane[
-                        offset + coordinate,
-                        cycle + 1,
-                        flat,
-                    ]
-                    cell = _cell_for_coordinate(
-                        model,
-                        coordinate,
-                        block,
-                    )
-                    spike =
-                        tape.cell_spikes[cell, cycle, flat]
-                    predictor_state =
-                        state +
-                        LOCAL_PREDICTOR_SPIKE_SCALE * spike
                     prediction = muladd(
                         projection[coordinate, output, block],
-                        predictor_state,
+                        scratch.block_signal[coordinate],
                         prediction,
                     )
                 end
@@ -1494,17 +1466,21 @@ function _prepare_block_signals!(
                 flat,
                 record_metrics,
             )
-            _signal_coordinate!(
-                scratch,
-                tape,
-                projection,
-                model,
-                block,
-                cycle,
-                flat,
-                global_signal_scale,
-                local_signal_scale,
-            )
+            fill!(scratch.block_signal, 0.0f0)
+            for output in 1:OUTPUT_DIM
+                combined_error =
+                    global_signal_scale *
+                    base.raw_gradient[output, flat] +
+                    local_signal_scale *
+                    scratch.local_error[output]
+                for coordinate in 1:model.node_dim
+                    scratch.block_signal[coordinate] = muladd(
+                        projection[coordinate, output, block],
+                        combined_error,
+                        scratch.block_signal[coordinate],
+                    )
+                end
+            end
 
             advantage = 0.0f0
             for coordinate in 1:model.node_dim
@@ -1513,7 +1489,9 @@ function _prepare_block_signals!(
                     cycle + 1,
                     flat,
                 ]
-                signal = scratch.block_signal[coordinate]
+                signal =
+                    scratch.block_signal[coordinate] *
+                    inverse_cycles
                 advantage = muladd(
                     signal,
                     state,
@@ -2278,32 +2256,31 @@ function _accumulate_edge_eligibility!(
     flat::Int,
 )
     @inbounds for active_index in 1:scratch.active_edge_count
-        scratch.active_edge_mask[
-            scratch.active_edges[active_index]
-        ] = false
+        edge = Int(scratch.active_edges[active_index])
+        scratch.active_edge_mask[edge] = false
+        scratch.eligibility_weight_a[edge] = 0.0f0
+        scratch.eligibility_weight_n[edge] = 0.0f0
+        scratch.eligibility_weight_g[edge] = 0.0f0
+        scratch.eligibility_weight_u[edge] = 0.0f0
+        scratch.eligibility_weight_p[edge] = 0.0f0
+        scratch.eligibility_weight_s[edge] = 0.0f0
+        scratch.eligibility_weight_q[edge] = 0.0f0
+        scratch.eligibility_gate_a[edge] = 0.0f0
+        scratch.eligibility_gate_n[edge] = 0.0f0
+        scratch.eligibility_gate_g[edge] = 0.0f0
+        scratch.eligibility_gate_u[edge] = 0.0f0
+        scratch.eligibility_gate_p[edge] = 0.0f0
+        scratch.eligibility_gate_s[edge] = 0.0f0
+        scratch.eligibility_gate_q[edge] = 0.0f0
+        scratch.eligibility_delay_a[edge] = 0.0f0
+        scratch.eligibility_delay_n[edge] = 0.0f0
+        scratch.eligibility_delay_g[edge] = 0.0f0
+        scratch.eligibility_delay_u[edge] = 0.0f0
+        scratch.eligibility_delay_p[edge] = 0.0f0
+        scratch.eligibility_delay_s[edge] = 0.0f0
+        scratch.eligibility_delay_q[edge] = 0.0f0
     end
     scratch.active_edge_count = 0
-    fill!(scratch.eligibility_weight_a, 0.0f0)
-    fill!(scratch.eligibility_weight_n, 0.0f0)
-    fill!(scratch.eligibility_weight_g, 0.0f0)
-    fill!(scratch.eligibility_weight_u, 0.0f0)
-    fill!(scratch.eligibility_weight_p, 0.0f0)
-    fill!(scratch.eligibility_weight_s, 0.0f0)
-    fill!(scratch.eligibility_weight_q, 0.0f0)
-    fill!(scratch.eligibility_gate_a, 0.0f0)
-    fill!(scratch.eligibility_gate_n, 0.0f0)
-    fill!(scratch.eligibility_gate_g, 0.0f0)
-    fill!(scratch.eligibility_gate_u, 0.0f0)
-    fill!(scratch.eligibility_gate_p, 0.0f0)
-    fill!(scratch.eligibility_gate_s, 0.0f0)
-    fill!(scratch.eligibility_gate_q, 0.0f0)
-    fill!(scratch.eligibility_delay_a, 0.0f0)
-    fill!(scratch.eligibility_delay_n, 0.0f0)
-    fill!(scratch.eligibility_delay_g, 0.0f0)
-    fill!(scratch.eligibility_delay_u, 0.0f0)
-    fill!(scratch.eligibility_delay_p, 0.0f0)
-    fill!(scratch.eligibility_delay_s, 0.0f0)
-    fill!(scratch.eligibility_delay_q, 0.0f0)
     cells = model.blocks * model.cells_per_block
     @inbounds for cycle in 1:model.cycles
         fill!(scratch.branch_inbox, 0.0f0)
@@ -2702,28 +2679,6 @@ function dendritic_prepare_signal_candidate!(
     tape::DendriticTape,
     projection::Array{Float32,3},
     model,
-    flat::Int,
-    global_signal_scale::Float32,
-    local_signal_scale::Float32,
-)
-    _prepare_block_signals!(
-        scratch,
-        tape,
-        projection,
-        model,
-        flat,
-        true,
-        global_signal_scale,
-        local_signal_scale,
-    )
-    return nothing
-end
-
-function dendritic_local_candidate!(
-    scratch::DendriticWorkerScratch,
-    tape::DendriticTape,
-    projection::Array{Float32,3},
-    model,
     parameters,
     cache::DendriticParameterCache,
     branch_for_edge::Matrix{UInt8},
@@ -2737,16 +2692,9 @@ function dendritic_local_candidate!(
         projection,
         model,
         flat,
-        false,
+        true,
         global_signal_scale,
         local_signal_scale,
-    )
-    _accumulate_routing_gradients!(
-        scratch,
-        tape,
-        model,
-        parameters,
-        flat,
     )
     _accumulate_cell_parameter_gradients!(
         scratch,
@@ -2771,6 +2719,23 @@ function dendritic_local_candidate!(
         model,
         parameters,
         scratch.point_scratch,
+        flat,
+    )
+    return nothing
+end
+
+function dendritic_local_candidate!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+)
+    _accumulate_routing_gradients!(
+        scratch,
+        tape,
+        model,
+        parameters,
         flat,
     )
     return nothing
@@ -4225,6 +4190,9 @@ function _dispatch!(
             trainer.tape,
             trainer.projection,
             trainer.model,
+            trainer.parameters,
+            trainer.cache,
+            trainer.branch_for_edge,
             flat,
             trainer.global_signal_scale,
             trainer.local_signal_scale,
@@ -4234,14 +4202,9 @@ function _dispatch!(
         dendritic_local_candidate!(
             worker,
             trainer.tape,
-            trainer.projection,
             trainer.model,
             trainer.parameters,
-            trainer.cache,
-            trainer.branch_for_edge,
             flat,
-            trainer.global_signal_scale,
-            trainer.local_signal_scale,
         )
     elseif work.kind == UInt8(DENDRITIC_REDUCE)
         _reduce_shard!(executor, target)

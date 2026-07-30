@@ -304,6 +304,14 @@ The first full-width local-backend scratch preflight completed on 2026-07-30:
 - checkpoint SHA-256
   `0c5151d2679ddc3c9247d6e4bd40a83cb1cf8923786ccc4b047ac776d531f83b`.
 
+The 2026-07-31 local-replay optimization kept width 80, state batch 8,
+20 workers and all learning semantics fixed. On an identical 32-update
+scratch schedule it improved mean throughput from `50.092` to `89.969
+states/s` (`1.796x`); updates 9–32 averaged `93.295 states/s`. Hot allocation
+and GC remained zero, and the focused suite remained `27/27`. The retained
+benchmark entrypoint is `benchmark_reduced_hay_v2_arena.jl`; details and
+rejected variants are recorded in `V2_ARENA_INTEGRATION_2026-07-30.md`.
+
 The deterministic 128-state validation panel at update 1,000 measured
 top-1 `0.078125`, NDCG `0.824687` and pairwise `0.508192` at
 `241.997 states/s`. This is an early learnability/evaluator check, not a

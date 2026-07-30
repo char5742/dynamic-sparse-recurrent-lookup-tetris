@@ -136,6 +136,42 @@ checkpoint_000001000.jld2
 SHA-256 0c5151d2679ddc3c9247d6e4bd40a83cb1cf8923786ccc4b047ac776d531f83b
 ```
 
+## Local replay optimization — 2026-07-31
+
+The production dimensions remain fixed at width 80, state batch 8 and 20
+workers. The learning rule and all 34 trainable groups are unchanged. Four
+mechanical costs were removed:
+
+- block-local predictor state is formed once per coordinate instead of once
+  per output;
+- the fixed projection is traversed in contiguous output-major order;
+- cell, edge and supervised-head updates run during the first local-signal
+  phase, so the post-centering replay contains only routing;
+- only eligibility entries touched by the preceding candidate are cleared.
+
+On the identical 32-update scratch schedule, the original implementation and
+the optimized implementation measured:
+
+| Metric | Original | Optimized | Ratio |
+|---|---:|---:|---:|
+| mean states/s, all 32 updates | 50.092 | 89.969 | 1.796x |
+| mean states/s, updates 9–32 | 50.136 | 93.295 | 1.861x |
+| mean wall/update | 0.161734 s | 0.090287 s | 0.558x |
+| mean process CPU/update | 2.004 s | 1.197 s | 0.597x |
+| hot allocation / GC | 0 / 0 | 0 / 0 | unchanged |
+
+The optimized focused suite remains `27/27`. Two additional experiments,
+packed active-order trace storage and common-coefficient trace expansion, were
+rejected because each reduced measured throughput.
+
+Reproduce the phase benchmark without checkpoints using:
+
+```powershell
+julia --project=. --threads=20,0 `
+  experiments/beat_first_v1/reduced_hay_direct_tetris/benchmark_reduced_hay_v2_arena.jl `
+  --warmup 8 --repetitions 32 --state-batch 8 --width 80 --workers 20
+```
+
 ## Held-panel result and boundary
 
 `evaluate_reduced_hay_v2_arena.jl` evaluated the checkpoint on a deterministic
