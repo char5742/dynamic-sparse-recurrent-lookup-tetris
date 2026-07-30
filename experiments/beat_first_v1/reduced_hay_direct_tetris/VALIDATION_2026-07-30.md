@@ -1,5 +1,9 @@
 # Reduced Hay direct-Tetris validation — 2026-07-30
 
+> Follow-up: `VALIDATION_10K_2026-07-30.md` extends this experiment from 1k
+> to 10k. It supersedes the short-horizon interpretation that plateau and
+> recurrent mechanisms were unused; both become measurably active later.
+
 ## Scope
 
 This is the first held-teacher comparison of the direct-Tetris Reduced Hay

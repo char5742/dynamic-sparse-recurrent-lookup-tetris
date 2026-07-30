@@ -23,7 +23,7 @@ const DEFAULT_DATASET =
 const DEFAULT_OUTPUT_ROOT =
     raw"D:\tetris-paper-plus\runs\reduced_hay_direct_validation"
 const VALIDATION_SCHEMA =
-    "reduced-hay-budget-validation-v2"
+    "reduced-hay-budget-validation-v3"
 
 function _parse(arguments)
     values = Dict{String,String}()
@@ -43,6 +43,20 @@ function _parse(arguments)
     arms = Symbol.(
         split(get(values, "arms", "point,reduced,gru"), ','),
     )
+    updates = parse(Int, get(values, "updates", "64"))
+    milestone_text = strip(get(
+        values,
+        "evaluation-milestones",
+        "",
+    ))
+    evaluation_milestones = if isempty(milestone_text)
+        Int[updates]
+    else
+        sort!(unique!(parse.(Int, split(milestone_text, ','))))
+    end
+    updates in evaluation_milestones ||
+        push!(evaluation_milestones, updates)
+    sort!(evaluation_milestones)
     return (;
         dataset=abspath(get(values, "dataset", DEFAULT_DATASET)),
         output_root=abspath(get(
@@ -53,7 +67,8 @@ function _parse(arguments)
         output_dir=isempty(output_dir) ?
             nothing : abspath(output_dir),
         arms,
-        updates=parse(Int, get(values, "updates", "64")),
+        updates,
+        evaluation_milestones,
         width=parse(Int, get(values, "width", "40")),
         validation_states=parse(
             Int,
@@ -80,6 +95,12 @@ function _validate(options)
     isdir(options.dataset) ||
         error("teacher dataset is absent: $(options.dataset)")
     options.updates > 0 || error("updates must be positive")
+    all(
+        milestone -> 1 <= milestone <= options.updates,
+        options.evaluation_milestones,
+    ) || error("evaluation milestones must lie within 1:updates")
+    last(options.evaluation_milestones) == options.updates ||
+        error("final update must be an evaluation milestone")
     options.width > 0 || error("width must be positive")
     options.validation_states > 0 ||
         error("validation states must be positive")
@@ -403,6 +424,7 @@ function _train_arm!(
     train_schedule::Vector{Int},
     validation_rows::Vector{Int},
     options,
+    output_dir::AbstractString,
 )
     arm = _arm(name)
     _warmup!(arm, dataset, first(train_schedule), options)
@@ -415,44 +437,93 @@ function _train_arm!(
         learning_rate=options.learning_rate,
         weight_decay=options.weight_decay,
     )
-    before = _evaluate!(
+    before_timed = @timed _evaluate!(
         trainer,
         dataset,
         validation_rows;
         collect_activity=arm.activity,
     )
+    before = before_timed.value
+    learning_curve = Dict{String,Any}("0" => before)
+    evaluation_wall_seconds = Dict{String,Float64}(
+        "0" => before_timed.time,
+    )
+    milestone_checkpoints = Dict{String,String}()
     loss_trace = Vector{Float64}(undef, length(train_schedule))
     gradient_trace = similar(loss_trace)
     GC.gc()
     maximum_rss_before = Sys.maxrss()
-    timed = @timed begin
-        for (update, row) in enumerate(train_schedule)
-            pack_rows!(trainer, dataset, [row])
-            loss = direct_update!(trainer)
-            loss_trace[update] = Float64(loss.composite_loss)
-            gradient_trace[update] = trainer.last_gradient_norm
-            if update == 1 ||
-               update == length(train_schedule) ||
-               update % max(div(length(train_schedule), 4), 1) == 0
-                @printf(
-                    "arm=%s update=%d/%d loss=%.6f gradient=%.6f\n",
-                    String(name),
-                    update,
-                    length(train_schedule),
-                    loss.composite_loss,
-                    trainer.last_gradient_norm,
-                )
-                flush(stdout)
+    training_wall_seconds = 0.0
+    training_allocation_bytes = 0
+    training_gc_seconds = 0.0
+    segment_start = 1
+    for milestone in options.evaluation_milestones
+        timed = @timed begin
+            for update in segment_start:milestone
+                row = train_schedule[update]
+                pack_rows!(trainer, dataset, [row])
+                loss = direct_update!(trainer)
+                loss_trace[update] = Float64(loss.composite_loss)
+                gradient_trace[update] = trainer.last_gradient_norm
+                if update == 1 ||
+                   update == length(train_schedule) ||
+                   update % max(div(length(train_schedule), 4), 1) == 0
+                    @printf(
+                        "arm=%s update=%d/%d loss=%.6f gradient=%.6f\n",
+                        String(name),
+                        update,
+                        length(train_schedule),
+                        loss.composite_loss,
+                        trainer.last_gradient_norm,
+                    )
+                    flush(stdout)
+                end
             end
         end
+        training_wall_seconds += timed.time
+        training_allocation_bytes += timed.bytes
+        training_gc_seconds += timed.gctime
+        evaluation_timed = @timed _evaluate!(
+            trainer,
+            dataset,
+            validation_rows;
+            collect_activity=arm.activity,
+        )
+        evaluation = evaluation_timed.value
+        milestone_key = string(milestone)
+        learning_curve[milestone_key] = evaluation
+        evaluation_wall_seconds[milestone_key] =
+            evaluation_timed.time
+        checkpoint_path = joinpath(
+            output_dir,
+            "checkpoint_$(String(name))_u$(milestone).jld2",
+        )
+        JLD2.jldsave(
+            checkpoint_path;
+            parameters=trainer.parameters,
+            optimizer_state=trainer.optimizer_state,
+            update=milestone,
+            model_seed=options.model_seed,
+            schedule_seed=options.schedule_seed,
+            train_schedule,
+            validation_rows,
+            arm=String(name),
+        )
+        milestone_checkpoints[milestone_key] = checkpoint_path
+        @printf(
+            "held arm=%s update=%d loss=%.6f top1=%.6f ndcg=%.6f pairwise=%.6f\n",
+            String(name),
+            milestone,
+            evaluation.metrics.composite_loss,
+            evaluation.metrics.top1,
+            evaluation.metrics.ndcg,
+            evaluation.metrics.pairwise,
+        )
+        flush(stdout)
+        segment_start = milestone + 1
     end
     maximum_rss_after = Sys.maxrss()
-    after = _evaluate!(
-        trainer,
-        dataset,
-        validation_rows;
-        collect_activity=arm.activity,
-    )
+    after = learning_curve[string(length(train_schedule))]
     ablations = nothing
     if name === :reduced
         ablations = Dict{String,Any}()
@@ -473,6 +544,9 @@ function _train_arm!(
             _parameter_count(trainer.parameters),
         "before" => before,
         "after" => after,
+        "learning_curve" => learning_curve,
+        "evaluation_wall_seconds" => evaluation_wall_seconds,
+        "milestone_checkpoints" => milestone_checkpoints,
         "ablations" => ablations,
         "training" => Dict(
             "updates" => length(train_schedule),
@@ -481,13 +555,13 @@ function _train_arm!(
             "loss_mean" => mean(loss_trace),
             "gradient_first" => first(gradient_trace),
             "gradient_last" => last(gradient_trace),
-            "wall_seconds" => timed.time,
+            "wall_seconds" => training_wall_seconds,
             "updates_per_second" =>
-                length(train_schedule) / timed.time,
-            "allocation_bytes" => timed.bytes,
+                length(train_schedule) / training_wall_seconds,
+            "allocation_bytes" => training_allocation_bytes,
             "allocation_bytes_per_update" =>
-                timed.bytes / length(train_schedule),
-            "gc_seconds" => timed.gctime,
+                training_allocation_bytes / length(train_schedule),
+            "gc_seconds" => training_gc_seconds,
             "maxrss_before" => maximum_rss_before,
             "maxrss_after" => maximum_rss_after,
             "loss_trace" => loss_trace,
@@ -533,6 +607,8 @@ function main(arguments=ARGS)
         "options" => Dict(
             "arms" => String.(options.arms),
             "updates" => options.updates,
+            "evaluation_milestones" =>
+                options.evaluation_milestones,
             "width" => options.width,
             "validation_states" => options.validation_states,
             "learning_rate" => options.learning_rate,
@@ -562,6 +638,7 @@ function main(arguments=ARGS)
             train_schedule,
             validation_rows,
             options,
+            output_dir,
         )
         results["arms"][String(name)] = run.result
         checkpoint_path =

@@ -36,9 +36,20 @@ game-validation seeds; game validation `8001:8008` and sealed seeds
   `-0.004517`、apical `+0.003041`、recurrent `-0.000118`。
   plateauはほぼ非活動かつ有効でなく、apical寄与は小さく、recurrent graphは
   未利用。完全なHay由来機構の効果は未達と判定した。
+- 10k延長：同じ3 seedをscratch 10kへ延長し、1k/2k/5k/10kのheld曲線と
+  optimizer stateを保存した。5k→10kの平均loss改善はPoint `0.504689`、
+  Reduced `0.847511`、GRU `0.397154`。10k平均lossは
+  Point `3.794888`、Reduced `3.246140`、GRU `3.258115`となり、
+  ReducedがGRUを僅かに逆転した。ただしNDCGはPoint、top-1/pairwiseはGRUが
+  最良で、一様な品質優位ではない。
+- 10k機構利用：plateau活動率は1kの`0.000743`から`0.076048`へ増えた。
+  exact ablationの`ablated-full` lossはplateau `+0.009515`、apical
+  `+0.017961`、recurrent `+0.016232`へ変化し、長期学習で機構が利用された。
+  GRUは依然`1.77x` updates/sのため、equal-wall-clock勝利は未達。
 - 詳細：`reduced_hay_direct_tetris/README.md`および
   `reduced_hay_direct_tetris/SMOKE_2026-07-30.md`、
-  `reduced_hay_direct_tetris/VALIDATION_2026-07-30.md`。
+  `reduced_hay_direct_tetris/VALIDATION_2026-07-30.md`、
+  `reduced_hay_direct_tetris/VALIDATION_10K_2026-07-30.md`。
 
 ## 2026-07-26 — エピソード記憶routerの信用割当修正
 

@@ -156,21 +156,36 @@ event rate, delivered edges and effective active cells.
 
 ## Current validation status
 
-The 1,000-update, three-seed held-teacher comparison is recorded in
-`VALIDATION_2026-07-30.md`.
+The 1,000-update comparison is recorded in `VALIDATION_2026-07-30.md`.
+The current result is the 10,000-update learning curve in
+`VALIDATION_10K_2026-07-30.md`.
 
-- Reduced Hay beat Point-SNN on mean composite loss, NDCG and pairwise, but
-  not top-1.
-- diagonal GRU beat Reduced Hay on aggregate quality, throughput and
-  allocation.
-- exact-zero ablation found a small favorable apical contribution, no
-  recurrent contribution, and a plateau path that was almost inactive and
-  slightly harmful.
+- GRU led composite loss through 5k, but Reduced Hay improved `2.13x` as much
+  from 5k to 10k and narrowly crossed the 10k mean loss.
+- Point, Reduced Hay and GRU respectively lead NDCG, composite loss and
+  top-1/pairwise; there is no uniform quality winner.
+- plateau activity rose about `102x` from 1k to 10k. Exact-zero ablation now
+  finds favorable plateau, apical and recurrent contributions, although
+  plateau/recurrent effects remain seed-variable.
+- GRU remains `1.77x` faster per reference training update, so Reduced Hay has
+  not won the equal-wall-clock CPU objective.
 - the frozen 11-state control remains unavailable because no qualified
   artifact exists.
 
-This is an equal-update reference-BPTT result on teacher-validation rows, not
-the final equal-wall-clock production or gameplay evaluation.
+Run a retained learning curve with:
+
+```powershell
+julia --project=. --threads=1 `
+  experiments/beat_first_v1/reduced_hay_direct_tetris/validate_budget_arms.jl `
+  --updates 10000 `
+  --evaluation-milestones 1000,2000,5000,10000 `
+  --validation-states 64 --width 40 --arms point,reduced,gru
+```
+
+The runner writes parameter and optimizer state checkpoints at every
+milestone. This is still an equal-update reference-BPTT result on
+teacher-validation rows, not the final equal-wall-clock production or
+gameplay evaluation.
 
 ## Claim boundary
 
@@ -189,11 +204,12 @@ dynamics. It must not claim:
 
 ## Next critical path
 
-1. make the plateau path materially active without destabilizing the soma;
-2. make recurrent event delivery measurably affect held loss;
-3. repeat the same three-seed 1k gate;
-4. only after an architecture win, close the analytic reverse-time VJP and
-   integrate it into the barrierless executor;
-5. add the frozen 11-state arm when a qualified artifact exists;
-6. execute the final fixed-panel equal-wall-clock comparison;
+1. resume the preserved 10k optimizer checkpoints to at least 20k;
+2. report equal-update and equal-wall-clock curves separately;
+3. select checkpoints by ranking metrics as well as composite loss;
+4. verify whether plateau and recurrent contributions persist across the
+   longer horizon;
+5. only after a quality-per-CPU advantage, close the analytic reverse-time
+   VJP and integrate it into the barrierless executor;
+6. add the frozen 11-state arm when a qualified artifact exists;
 7. scale only if Reduced Hay improves Tetris quality per CPU time.
