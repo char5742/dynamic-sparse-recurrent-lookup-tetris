@@ -14,6 +14,13 @@ model combines:
 
 The central implementation is
 [`experiments/beat_first_v1/episodic_vit_recurrent_lookup`](experiments/beat_first_v1/episodic_vit_recurrent_lookup/README.md).
+An independent third-model line, which scales the serial synaptic-printer
+concept into a supervised Tetris graph SNN with a hard global workspace, is in
+[`experiments/beat_first_v1/serial_workspace_snn`](experiments/beat_first_v1/serial_workspace_snn/README.md).
+Its production trainer uses fixed candidate arenas, analytic VJPs, an isbits
+MPMC scheduler, and parallel in-place AdamW. Its 100,000-update run processed
+800,000 teacher states at 77.81 states/s and 87.62% utilization across all 20
+physical cores, with zero hot-loop allocation and zero GC time.
 Earlier sparse models, routing experiments, CPU scheduler work, comparison
 harnesses, and failed experiments are retained under
 [`experiments/beat_first_v1`](experiments/beat_first_v1).

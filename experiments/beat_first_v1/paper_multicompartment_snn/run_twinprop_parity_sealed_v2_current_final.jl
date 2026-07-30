@@ -1,0 +1,48 @@
+"""
+Production entry for full-cell d=2 XOR and d=4 parity on exact current V2.
+"""
+
+using SHA
+
+let
+    source_path = joinpath(
+        @__DIR__,
+        "run_twinprop_parity_sealed_final.jl",
+    )
+    expected_sha256 =
+        "2ce9cb907a9d72581a7b54da0122d9b499e50286ad4ba62b5d7e0e0bbd3cea4f"
+    bytes2hex(SHA.sha256(read(source_path))) == expected_sha256 ||
+        error("audited sealed parity runner source SHA-256 differs")
+    source = read(source_path, String)
+    old_include = "TwinPropParityOfficialSealedCanonical.jl"
+    current_include =
+        "LoadTwinPropParityOfficialSealedV2CanonicalCurrentFinal.jl"
+    length(findall(old_include, source)) == 1 ||
+        error("sealed parity runner canonical include differs")
+    source = replace(source, old_include => current_include; count=1)
+    length(findall("SealedELMRelease", source)) == 2 ||
+        error("sealed parity runner release references differ")
+    source = replace(
+        source,
+        "SealedELMRelease" => "SealedELMReleaseV2",
+    )
+    footer = "abspath(PROGRAM_FILE) == @__FILE__ && main()\n"
+    length(findall(footer, source)) == 1 ||
+        error("sealed parity runner footer differs")
+    source = replace(source, footer => ""; count=1)
+    any(
+        occursin(token, source)
+        for token in (":passive", ":no_nmda", ":soma_only")
+    ) && error("current sealed V2 runner contains an ablation path")
+    length(findall("variant=:full", source)) == 2 ||
+        error("current sealed V2 runner full-cell binding differs")
+    Base.include_string(
+        @__MODULE__,
+        source,
+        source_path * "#exact-current-v2-transform",
+    )
+end
+
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    main()
+end

@@ -62,6 +62,10 @@ const INITIAL_ALPHA_LOGIT = log(
      LOOKUP_RESIDUAL_SCALE_SPAN),
 )
 const INITIAL_REINJECT_LOGIT = log(0.10f0 / 0.90f0)
+const BH4_TARGET_STAGE_RMS = 1.0f0
+const BH4_SMALL_MAGNITUDE = 0.05f0
+const BH4_REPAIR_MAGNITUDE = 0.10f0
+const BH4_MAX_SMALL_FRACTION = 0.50f0
 
 @assert CARRIER_DIM == VALUE_DIM
 @assert CARRIER_DIM in (128, 256, 512)
@@ -376,6 +380,66 @@ function _bh4_forward(normalized, diagonals)
     inputs = ntuple(_ -> Vector{Float32}(undef, CARRIER_DIM), BH4_STAGES)
     current = Vector{Float32}(undef, CARRIER_DIM)
     return _bh4_forward!(current, inputs, normalized, diagonals)
+end
+
+"""Keep every multiplicative BH4 stage conditioned after an optimizer step.
+
+The overall scale of a BH4 stage is redundant with the routing temperature,
+but allowing Adam to learn that scale creates an absorbing zero-router state:
+once one stage approaches zero, both the route and the task gradient through
+the other stages disappear.  Unit-RMS projection removes that redundant
+degree of freedom.  A small magnitude floor is applied only when at least half
+of a stage has already become nearly singular.
+"""
+function condition_bh4!(diagonals::Matrix{Float32})
+    size(diagonals) == (CARRIER_DIM, BH4_STAGES) ||
+        throw(DimensionMismatch("BH4 diagonal shape differs"))
+    inverse_width = inv(Float32(CARRIER_DIM))
+    @inbounds for stage in 1:BH4_STAGES
+        squared = 0.0f0
+        for coordinate in 1:CARRIER_DIM
+            value = diagonals[coordinate, stage]
+            isfinite(value) || error("BH4 diagonal became non-finite")
+            squared = muladd(value, value, squared)
+        end
+        rms = sqrt(squared * inverse_width)
+        if rms <= eps(Float32)
+            fill!(@view(diagonals[:, stage]), BH4_TARGET_STAGE_RMS)
+            continue
+        end
+        scale = BH4_TARGET_STAGE_RMS / rms
+        small = 0
+        for coordinate in 1:CARRIER_DIM
+            value = diagonals[coordinate, stage] * scale
+            diagonals[coordinate, stage] = value
+            small += abs(value) < BH4_SMALL_MAGNITUDE
+        end
+        if Float32(small) * inverse_width >= BH4_MAX_SMALL_FRACTION
+            repaired_squared = 0.0f0
+            for coordinate in 1:CARRIER_DIM
+                value = diagonals[coordinate, stage]
+                if abs(value) < BH4_REPAIR_MAGNITUDE
+                    value = value == 0.0f0 ? BH4_REPAIR_MAGNITUDE :
+                        copysign(BH4_REPAIR_MAGNITUDE, value)
+                    diagonals[coordinate, stage] = value
+                end
+                repaired_squared = muladd(value, value, repaired_squared)
+            end
+            repaired_rms = sqrt(repaired_squared * inverse_width)
+            repaired_scale = BH4_TARGET_STAGE_RMS / repaired_rms
+            for coordinate in 1:CARRIER_DIM
+                diagonals[coordinate, stage] *= repaired_scale
+            end
+        end
+    end
+    return diagonals
+end
+
+function condition_bh4!(model::DynamicLookupModel)
+    @inbounds for block in 1:BLOCKS
+        condition_bh4!(model.bh4_diagonals[block])
+    end
+    return model
 end
 
 function _choice_probabilities!(probabilities, route, block, table, digit, temperature)
@@ -1393,6 +1457,7 @@ function optimizer_step!(
     for block in 1:BLOCKS
         _adam_update!(model.bh4_diagonals[block],dense.mbh4[block],dense.vbh4[block],accumulator.dbh4[block],next_step,bh4_learning_rate; adam_kwargs...)
     end
+    condition_bh4!(model)
     _adam_update!(model.alpha_logits,dense.malpha,dense.valpha,accumulator.dalpha_logits,next_step,alpha_learning_rate; adam_kwargs...)
     _adam_update!(model.head,dense.mhead,dense.vhead,accumulator.dhead,next_step,head_learning_rate; adam_kwargs...)
     _adam_update!(model.bias,dense.mbias,dense.vbias,accumulator.dbias,next_step,head_learning_rate; adam_kwargs...)

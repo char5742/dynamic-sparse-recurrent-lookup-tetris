@@ -120,7 +120,7 @@ function runtime_hyperparameters(maximum_updates::Int, payload=nothing)
         anneal_end_update=_int_env("EVRL_ROUTE_ANNEAL_END", _property_or(inherited_routing, :anneal_end_update, maximum_updates); minimum=1),
         balance_weight=_float32_env(
             "EVRL_ROUTE_BALANCE_WEIGHT",
-            _property_or(inherited_routing, :balance_weight, 0.05f0);
+            _property_or(inherited_routing, :balance_weight, 0.0f0);
             nonnegative=true,
         ),
     )

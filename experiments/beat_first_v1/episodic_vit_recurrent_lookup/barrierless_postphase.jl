@@ -494,6 +494,7 @@ function _barrierless_optimize_lookup_router!(runtime, trainer, opt)
             kwargs...,
         )
     end
+    Model.SparseLookup.condition_bh4!(model)
     Model.SparseLookup._adam_update!(
         model.alpha_logits, state.malpha, state.valpha, gradient.dalpha_logits,
         runtime.next_step, opt.lookup_alpha_learning_rate; kwargs...,

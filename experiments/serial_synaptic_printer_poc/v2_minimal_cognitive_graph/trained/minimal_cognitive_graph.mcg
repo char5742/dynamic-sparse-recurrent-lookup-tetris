@@ -1,0 +1,16 @@
+minimal-cognitive-graph-v2
+nodes	8
+blocks	5
+workspace_capacity	1
+structural_on_events	4
+structural_off_events	0
+continuous_updates	32
+synapses	8
+synapse	1	1	5	1	1	1	1	0	0	context0_to_workspace0
+synapse	2	2	6	1	1	1	1	0	0	context1_to_workspace1
+synapse	3	5	5	2	0.649999976	1	1	0	1	workspace0_recurrent
+synapse	4	6	6	2	0.649999976	1	1	0	1	workspace1_recurrent
+synapse	5	3	7	3	0.931851268	1.18173003	1	1	0	memory0_bit0_mapping
+synapse	6	4	8	3	0.931851268	1.18173003	1	1	0	memory0_bit1_mapping
+synapse	7	3	8	4	0.931851268	1.18173003	1	1	0	memory1_bit0_mapping
+synapse	8	4	7	4	0.931851268	1.18173003	1	1	0	memory1_bit1_mapping
