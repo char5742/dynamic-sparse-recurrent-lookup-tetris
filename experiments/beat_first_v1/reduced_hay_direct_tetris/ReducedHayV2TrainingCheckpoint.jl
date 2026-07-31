@@ -19,8 +19,10 @@ end
 
 const Core = Main.BeatFirstTrainingCore
 const Training = Main.ReducedHayV2ArenaTraining
-const CHECKPOINT_SCHEMA =
+const LEGACY_CHECKPOINT_SCHEMA =
     "reduced-hay-v2-decolle-eprop-arena-checkpoint-v1"
+const CHECKPOINT_SCHEMA =
+    "reduced-hay-v2-decolle-eprop-arena-checkpoint-v2"
 
 export CHECKPOINT_SCHEMA,
     load_reduced_hay_v2_checkpoint,
@@ -36,6 +38,22 @@ function _copy_tree!(destination, source, label::AbstractString)
     keys(destination) == keys(source) ||
         error("$label parameter registry differs")
     @inbounds for name in keys(destination)
+        target = getproperty(destination, name)
+        value = getproperty(source, name)
+        size(target) == size(value) ||
+            error("$label shape differs for $name")
+        copyto!(target, value)
+    end
+    return destination
+end
+
+function _copy_tree_compatible!(
+    destination,
+    source,
+    label::AbstractString,
+)
+    @inbounds for name in keys(destination)
+        hasproperty(source, name) || continue
         target = getproperty(destination, name)
         value = getproperty(source, name)
         size(target) == size(value) ||
@@ -114,6 +132,8 @@ function save_reduced_hay_v2_checkpoint(
             global_signal_scale=
                 trainer.global_signal_scale,
             local_signal_scale=trainer.local_signal_scale,
+            recurrent_learning_rate_multiplier=
+                trainer.recurrent_learning_rate_multiplier,
             routing_entropy_weight=
                 trainer.routing_entropy_weight,
             routing_entropy_floor=
@@ -147,7 +167,10 @@ function load_reduced_hay_v2_checkpoint(path::AbstractString)
         error("checkpoint has no payload")
     payload = data["payload"]
     hasproperty(payload, :checkpoint_schema) &&
-        payload.checkpoint_schema == CHECKPOINT_SCHEMA ||
+        payload.checkpoint_schema in (
+            CHECKPOINT_SCHEMA,
+            LEGACY_CHECKPOINT_SCHEMA,
+        ) ||
         error("unsupported Reduced Hay v2 checkpoint schema")
     return payload
 end
@@ -164,22 +187,27 @@ function restore_reduced_hay_v2_checkpoint!(
         width=trainer.tape.base.width,
     ) || error("checkpoint arena signature differs")
 
-    _copy_tree!(
+    legacy = payload.checkpoint_schema ==
+             LEGACY_CHECKPOINT_SCHEMA
+
+    copy_parameters! = legacy ?
+        _copy_tree_compatible! : _copy_tree!
+    copy_parameters!(
         trainer.parameters,
         payload.parameters,
         "parameters",
     )
-    _copy_tree!(
+    copy_parameters!(
         trainer.initial_parameters,
         payload.initial_parameters,
         "initial parameters",
     )
-    _copy_tree!(
+    copy_parameters!(
         trainer.optimizer.first_moment,
         payload.optimizer_first_moment,
         "first moment",
     )
-    _copy_tree!(
+    copy_parameters!(
         trainer.optimizer.second_moment,
         payload.optimizer_second_moment,
         "second moment",
@@ -209,10 +237,18 @@ function restore_reduced_hay_v2_checkpoint!(
         Int(trainer_state.structural_interval)
     trainer.branch_interval =
         Int(trainer_state.branch_interval)
-    trainer.global_signal_scale =
-        Float32(trainer_state.global_signal_scale)
-    trainer.local_signal_scale =
-        Float32(trainer_state.local_signal_scale)
+    trainer.global_signal_scale = legacy ?
+        1.0f0 : Float32(trainer_state.global_signal_scale)
+    trainer.local_signal_scale = legacy ?
+        1.0f0 : Float32(trainer_state.local_signal_scale)
+    if hasproperty(
+        trainer_state,
+        :recurrent_learning_rate_multiplier,
+    )
+        trainer.recurrent_learning_rate_multiplier = Float32(
+            trainer_state.recurrent_learning_rate_multiplier,
+        )
+    end
     trainer.routing_entropy_weight =
         Float32(trainer_state.routing_entropy_weight)
     trainer.routing_entropy_floor =
@@ -223,6 +259,28 @@ function restore_reduced_hay_v2_checkpoint!(
     size(trainer.projection) == size(payload.projection) ||
         error("checkpoint projection shape differs")
     copyto!(trainer.projection, payload.projection)
+    if legacy
+        copyto!(
+            trainer.parameters.local_readout,
+            trainer.projection,
+        )
+        copyto!(
+            trainer.initial_parameters.local_readout,
+            trainer.projection,
+        )
+        fill!(trainer.parameters.local_readout_bias, 0.0f0)
+        fill!(
+            trainer.initial_parameters.local_readout_bias,
+            0.0f0,
+        )
+        for moment in (
+            trainer.optimizer.first_moment,
+            trainer.optimizer.second_moment,
+        )
+            fill!(moment.local_readout, 0.0f0)
+            fill!(moment.local_readout_bias, 0.0f0)
+        end
+    end
     size(trainer.branch_for_edge) ==
         size(payload.branch_for_edge) ||
         error("checkpoint branch map shape differs")

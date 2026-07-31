@@ -56,7 +56,7 @@ export DendriticArenaExecutor,
     reduced_hay_v2_training_arena,
     run_with_dendritic_team!
 
-const DENDRITIC_PARAMETER_FIELDS = (
+const RECURRENT_PARAMETER_FIELDS = (
     :input_exc_logits,
     :input_inh_logits,
     :state_query_weight,
@@ -87,10 +87,11 @@ const DENDRITIC_PARAMETER_FIELDS = (
     :gate_logits,
     :delay_logits,
     :workspace_decay_logit,
-    :head_weight,
-    :head_bias,
-    :output_weight,
-    :output_bias,
+)
+
+const LOCAL_PREDICTOR_PARAMETER_FIELDS = (
+    :local_readout,
+    :local_readout_bias,
 )
 
 const HEAD_PARAMETER_FIELDS = (
@@ -98,6 +99,17 @@ const HEAD_PARAMETER_FIELDS = (
     :head_bias,
     :output_weight,
     :output_bias,
+)
+
+const MODEL_PARAMETER_FIELDS = (
+    RECURRENT_PARAMETER_FIELDS...,
+    HEAD_PARAMETER_FIELDS...,
+)
+
+const DENDRITIC_PARAMETER_FIELDS = (
+    RECURRENT_PARAMETER_FIELDS...,
+    LOCAL_PREDICTOR_PARAMETER_FIELDS...,
+    HEAD_PARAMETER_FIELDS...,
 )
 
 @inline _logistic_derivative(value::Float32) =
@@ -168,6 +180,26 @@ function _copy_parameters(parameters)
     return NamedTuple{keys(parameters)}(
         map(copy, values(parameters)),
     )
+end
+
+function _with_local_predictor(parameters, projection, model)
+    keys(parameters) == MODEL_PARAMETER_FIELDS || error(
+        "Reduced Hay v2 model parameter registry changed",
+    )
+    recurrent = map(
+        name -> getproperty(parameters, name),
+        RECURRENT_PARAMETER_FIELDS,
+    )
+    head = map(
+        name -> getproperty(parameters, name),
+        HEAD_PARAMETER_FIELDS,
+    )
+    return NamedTuple{DENDRITIC_PARAMETER_FIELDS}((
+        recurrent...,
+        copy(projection),
+        zeros(Float32, OUTPUT_DIM, model.blocks),
+        head...,
+    ))
 end
 
 mutable struct DendriticParameterCache
@@ -613,6 +645,8 @@ mutable struct DendriticWorkerScratch{G}
     local_prediction::Vector{Float32}
     local_error::Vector{Float32}
     block_signal::Vector{Float32}
+    global_block_signal::Vector{Float32}
+    local_block_signal::Vector{Float32}
     soma_signal::Matrix{Float32}
     apical_signal::Matrix{Float32}
     branch_signal::Array{Float32,3}
@@ -670,6 +704,8 @@ function DendriticWorkerScratch(model, parameters)
         zeros(Float32, cells, model.branches),
         zeros(Float32, OUTPUT_DIM),
         zeros(Float32, OUTPUT_DIM),
+        zeros(Float32, model.node_dim),
+        zeros(Float32, model.node_dim),
         zeros(Float32, model.node_dim),
         zeros(Float32, cells, model.cycles),
         zeros(Float32, cells, model.cycles),
@@ -1344,6 +1380,7 @@ end
     prediction = scratch.local_prediction
     error = scratch.local_error
     inverse_valid = inv(Float32(max(base.valid_count, 1)))
+    local_loss = 0.0f0
 
     q_residual =
         prediction[1] -
@@ -1352,6 +1389,8 @@ end
         0.25f0 *
         _huber_derivative(q_residual) *
         inverse_valid
+    local_loss +=
+        0.25f0 * _huber_loss(q_residual) * inverse_valid
     record_metrics &&
         (scratch.local_q_loss += _huber_loss(q_residual))
     if targets.death_mask[candidate, state_slot] != 0.0f0
@@ -1364,6 +1403,11 @@ end
                 death_target
             ) *
             inverse_valid
+        local_loss += 0.10f0 * (
+            max(prediction[2], 0.0f0) -
+            death_target * prediction[2] +
+            log1p(exp(-abs(prediction[2])))
+        ) * inverse_valid
         record_metrics &&
             (scratch.local_death_loss +=
                 max(prediction[2], 0.0f0) -
@@ -1383,6 +1427,12 @@ end
             -0.05f0 *
             quantile_weight *
             _huber_derivative(quantile_error) *
+            inverse_valid /
+            Float32(QUANTILES)
+        local_loss +=
+            0.05f0 *
+            quantile_weight *
+            _huber_loss(quantile_error) *
             inverse_valid /
             Float32(QUANTILES)
         record_metrics &&
@@ -1406,11 +1456,15 @@ end
             LOCAL_GEOMETRY_WEIGHT *
             _huber_derivative(residual) *
             inverse_valid
+        local_loss +=
+            LOCAL_GEOMETRY_WEIGHT *
+            _huber_loss(residual) *
+            inverse_valid
         record_metrics &&
             (scratch.local_geometry_loss +=
                 _huber_loss(residual) / 4.0f0)
     end
-    return nothing
+    return local_loss
 end
 
 function _prepare_block_signals!(
@@ -1418,6 +1472,7 @@ function _prepare_block_signals!(
     tape::DendriticTape,
     projection::Array{Float32,3},
     model,
+    parameters,
     flat::Int,
     record_metrics::Bool,
     global_signal_scale::Float32,
@@ -1450,53 +1505,139 @@ function _prepare_block_signals!(
                     LOCAL_PREDICTOR_SPIKE_SCALE * spike
             end
             for output in 1:OUTPUT_DIM
-                prediction = 0.0f0
+                prediction =
+                    parameters.local_readout_bias[output, block]
                 for coordinate in 1:model.node_dim
                     prediction = muladd(
-                        projection[coordinate, output, block],
+                        parameters.local_readout[
+                            coordinate,
+                            output,
+                            block,
+                        ],
                         scratch.block_signal[coordinate],
                         prediction,
                     )
                 end
                 scratch.local_prediction[output] = prediction
             end
-            _prepare_local_error!(
+            local_loss = _prepare_local_error!(
                 scratch,
                 base,
                 flat,
                 record_metrics,
             )
-            fill!(scratch.block_signal, 0.0f0)
             for output in 1:OUTPUT_DIM
-                combined_error =
-                    global_signal_scale *
-                    base.raw_gradient[output, flat] +
-                    local_signal_scale *
-                    scratch.local_error[output]
+                predictor_error =
+                    scratch.local_error[output] * inverse_cycles
+                scratch.gradient.local_readout_bias[output, block] +=
+                    predictor_error
                 for coordinate in 1:model.node_dim
-                    scratch.block_signal[coordinate] = muladd(
-                        projection[coordinate, output, block],
-                        combined_error,
+                    scratch.gradient.local_readout[
+                        coordinate,
+                        output,
+                        block,
+                    ] = muladd(
+                        predictor_error,
                         scratch.block_signal[coordinate],
+                        scratch.gradient.local_readout[
+                            coordinate,
+                            output,
+                            block,
+                        ],
+                    )
+                end
+            end
+            fill!(scratch.global_block_signal, 0.0f0)
+            fill!(scratch.local_block_signal, 0.0f0)
+            global_first_order = 0.0f0
+            for output in 1:OUTPUT_DIM
+                global_error = base.raw_gradient[output, flat]
+                local_error = scratch.local_error[output]
+                fixed_prediction = 0.0f0
+                for coordinate in 1:model.node_dim
+                    fixed_prediction = muladd(
+                        projection[coordinate, output, block],
+                        scratch.block_signal[coordinate],
+                        fixed_prediction,
+                    )
+                end
+                global_first_order = muladd(
+                    global_error,
+                    fixed_prediction,
+                    global_first_order,
+                )
+                for coordinate in 1:model.node_dim
+                    fixed_readout = projection[
+                        coordinate,
+                        output,
+                        block,
+                    ]
+                    local_readout = parameters.local_readout[
+                        coordinate,
+                        output,
+                        block,
+                    ]
+                    scratch.global_block_signal[coordinate] = muladd(
+                        fixed_readout,
+                        global_error,
+                        scratch.global_block_signal[coordinate],
+                    )
+                    scratch.local_block_signal[coordinate] = muladd(
+                        local_readout,
+                        local_error,
+                        scratch.local_block_signal[coordinate],
                     )
                 end
             end
 
-            advantage = 0.0f0
+            global_square_sum = 0.0f0
+            local_square_sum = 0.0f0
+            for coordinate in 1:model.node_dim
+                global_value = scratch.global_block_signal[coordinate]
+                local_value = scratch.local_block_signal[coordinate]
+                global_square_sum = muladd(
+                    global_value,
+                    global_value,
+                    global_square_sum,
+                )
+                local_square_sum = muladd(
+                    local_value,
+                    local_value,
+                    local_square_sum,
+                )
+            end
+            # Clip unusually large third factors without amplifying small
+            # errors.  Unit-RMS normalization kept e-prop updates finite even
+            # as the supervised error approached zero, which prevented exact
+            # memorization and continuously displaced a converged head.
+            global_inverse_rms = min(
+                1.0f0,
+                inv(sqrt(
+                    global_square_sum * inverse_node_dim +
+                    LOCAL_SIGNAL_RMS_EPSILON,
+                )),
+            )
+            local_inverse_rms = min(
+                1.0f0,
+                inv(sqrt(
+                    local_square_sum * inverse_node_dim +
+                    LOCAL_SIGNAL_RMS_EPSILON,
+                )),
+            )
             for coordinate in 1:model.node_dim
                 state = base.membrane[
                     offset + coordinate,
                     cycle + 1,
                     flat,
                 ]
-                signal =
-                    scratch.block_signal[coordinate] *
-                    inverse_cycles
-                advantage = muladd(
-                    signal,
-                    state,
-                    advantage,
-                )
+                scratch.block_signal[coordinate] =
+                    global_signal_scale *
+                    scratch.global_block_signal[coordinate] *
+                    global_inverse_rms +
+                    local_signal_scale *
+                    scratch.local_block_signal[coordinate] *
+                    local_inverse_rms
+                signal = scratch.block_signal[coordinate] * inverse_cycles
                 cell = _cell_for_coordinate(
                     model,
                     coordinate,
@@ -1524,7 +1665,10 @@ function _prepare_block_signals!(
                 block,
                 cycle,
                 flat,
-            ] = -advantage * inverse_node_dim
+            ] = -(
+                global_signal_scale * global_first_order +
+                local_signal_scale * local_loss
+            )
         end
     end
     return nothing
@@ -2691,6 +2835,7 @@ function dendritic_prepare_signal_candidate!(
         tape,
         projection,
         model,
+        parameters,
         flat,
         true,
         global_signal_scale,
@@ -2876,6 +3021,9 @@ mutable struct DendriticArenaTrainer{M,P,O,G}
     parameter_shards::Vector{DendriticParameterShard}
     gradient_norm_squares::Vector{Float64}
     optimizer_scale::Float32
+    recurrent_optimizer_scale::Float32
+    local_predictor_optimizer_scale::Float32
+    head_optimizer_scale::Float32
     recurrent_updates_enabled::Bool
     utility_decay::Float32
     utility_connection_cost::Float32
@@ -2883,6 +3031,7 @@ mutable struct DendriticArenaTrainer{M,P,O,G}
     branch_interval::Int
     global_signal_scale::Float32
     local_signal_scale::Float32
+    recurrent_learning_rate_multiplier::Float32
     routing_entropy_weight::Float32
     routing_entropy_floor::Float32
     routing_load_weight::Float32
@@ -2902,8 +3051,9 @@ function DendriticArenaTrainer(
     utility_connection_cost::Real=1.0f-6,
     structural_interval::Int=25,
     branch_interval::Int=128,
-    global_signal_scale::Real=0.25f0,
-    local_signal_scale::Real=4.0f0,
+    global_signal_scale::Real=1.0f0,
+    local_signal_scale::Real=1.0f0,
+    recurrent_learning_rate_multiplier::Real=0.001f0,
     routing_entropy_weight::Real=0.002f0,
     routing_entropy_floor::Real=0.70f0,
     routing_load_weight::Real=0.002f0,
@@ -2922,6 +3072,11 @@ function DendriticArenaTrainer(
         local_signal_scale >= 0 ||
         throw(ArgumentError(
             "local_signal_scale must be finite and nonnegative",
+        ))
+    isfinite(recurrent_learning_rate_multiplier) &&
+        recurrent_learning_rate_multiplier > 0 ||
+        throw(ArgumentError(
+            "recurrent_learning_rate_multiplier must be finite and positive",
         ))
     isfinite(routing_entropy_weight) &&
         routing_entropy_weight >= 0 ||
@@ -2946,6 +3101,7 @@ function DendriticArenaTrainer(
         OUTPUT_DIM,
         model.blocks,
     ) ./ sqrt(Float32(model.node_dim))
+    parameters = _with_local_predictor(parameters, projection, model)
     branch_for_edge = Matrix{UInt8}(
         undef,
         size(parameters.synapse_weight),
@@ -3004,6 +3160,9 @@ function DendriticArenaTrainer(
         shards,
         zeros(Float64, length(shards)),
         1.0f0,
+        1.0f0,
+        1.0f0,
+        1.0f0,
         true,
         Float32(utility_decay),
         Float32(utility_connection_cost),
@@ -3011,6 +3170,7 @@ function DendriticArenaTrainer(
         branch_interval,
         Float32(global_signal_scale),
         Float32(local_signal_scale),
+        Float32(recurrent_learning_rate_multiplier),
         Float32(routing_entropy_weight),
         Float32(routing_entropy_floor),
         Float32(routing_load_weight),
@@ -3507,7 +3667,7 @@ function _reduce_shard!(
         _reduce_gradient_range!(
             trainer,
             executor.workers,
-            Val(:head_weight),
+            Val(:local_readout),
             first_index,
             last_index,
             head,
@@ -3516,7 +3676,7 @@ function _reduce_shard!(
         _reduce_gradient_range!(
             trainer,
             executor.workers,
-            Val(:head_bias),
+            Val(:local_readout_bias),
             first_index,
             last_index,
             head,
@@ -3525,12 +3685,30 @@ function _reduce_shard!(
         _reduce_gradient_range!(
             trainer,
             executor.workers,
-            Val(:output_weight),
+            Val(:head_weight),
             first_index,
             last_index,
             head,
         )
     elseif field == 34
+        _reduce_gradient_range!(
+            trainer,
+            executor.workers,
+            Val(:head_bias),
+            first_index,
+            last_index,
+            head,
+        )
+    elseif field == 35
+        _reduce_gradient_range!(
+            trainer,
+            executor.workers,
+            Val(:output_weight),
+            first_index,
+            last_index,
+            head,
+        )
+    elseif field == 36
         _reduce_gradient_range!(
             trainer,
             executor.workers,
@@ -3549,16 +3727,39 @@ end
 function _finish_gradient_reduction!(
     trainer::DendriticArenaTrainer,
 )
-    square_sum = 0.0
-    @inbounds for value in trainer.gradient_norm_squares
-        square_sum += value
-    end
-    trainer.metrics.gradient_norm = sqrt(square_sum)
-    maximum_norm = 5.0
-    trainer.optimizer_scale = Float32(
-        trainer.metrics.gradient_norm > maximum_norm ?
-        maximum_norm / trainer.metrics.gradient_norm : 1.0,
+    recurrent_square_sum = 0.0
+    local_predictor_square_sum = 0.0
+    head_square_sum = 0.0
+    @inbounds for target in eachindex(
+        trainer.gradient_norm_squares,
+        trainer.parameter_shards,
     )
+        field = Int(trainer.parameter_shards[target].field)
+        value = trainer.gradient_norm_squares[target]
+        if field <= length(RECURRENT_PARAMETER_FIELDS)
+            recurrent_square_sum += value
+        elseif field <= length(RECURRENT_PARAMETER_FIELDS) +
+                        length(LOCAL_PREDICTOR_PARAMETER_FIELDS)
+            local_predictor_square_sum += value
+        else
+            head_square_sum += value
+        end
+    end
+    total_square_sum =
+        recurrent_square_sum +
+        local_predictor_square_sum +
+        head_square_sum
+    trainer.metrics.gradient_norm = sqrt(total_square_sum)
+    maximum_norm = 5.0
+    scale(square_sum) = Float32(
+        square_sum > maximum_norm^2 ?
+        maximum_norm / sqrt(square_sum) : 1.0,
+    )
+    trainer.recurrent_optimizer_scale = scale(recurrent_square_sum)
+    trainer.local_predictor_optimizer_scale =
+        scale(local_predictor_square_sum)
+    trainer.head_optimizer_scale = scale(head_square_sum)
+    trainer.optimizer_scale = 1.0f0
     return nothing
 end
 
@@ -3657,7 +3858,8 @@ end
     parameter = getproperty(trainer.parameters, F)
     gradient = getproperty(trainer.gradient, F)
     if !trainer.recurrent_updates_enabled &&
-       !(F in HEAD_PARAMETER_FIELDS)
+       !(F in HEAD_PARAMETER_FIELDS) &&
+       !(F in LOCAL_PREDICTOR_PARAMETER_FIELDS)
         @inbounds for index in first_index:last_index
             gradient[index] = 0.0f0
         end
@@ -3674,7 +3876,15 @@ end
         inv(1.0f0 - optimizer.beta2_power)
     beta1_complement = 1.0f0 - optimizer.beta1
     beta2_complement = 1.0f0 - optimizer.beta2
-    scale = trainer.optimizer_scale
+    scale = if F in RECURRENT_PARAMETER_FIELDS
+        trainer.recurrent_optimizer_scale
+    elseif F in LOCAL_PREDICTOR_PARAMETER_FIELDS
+        trainer.local_predictor_optimizer_scale
+    else
+        trainer.head_optimizer_scale
+    end
+    learning_rate_multiplier = F in RECURRENT_PARAMETER_FIELDS ?
+        trainer.recurrent_learning_rate_multiplier : 1.0f0
     norm_square = 0.0
     @inbounds for index in first_index:last_index
         grad = gradient[index] * scale
@@ -3697,11 +3907,12 @@ end
         second_moment[index] = moment2
         corrected1 = moment1 * inverse_first_bias
         corrected2 = moment2 * inverse_second_bias
-        parameter[index] -= optimizer.learning_rate * (
-            corrected1 /
-            (sqrt(corrected2) + optimizer.epsilon) +
-            optimizer.weight_decay * parameter[index]
-        )
+        parameter[index] -=
+            optimizer.learning_rate * learning_rate_multiplier * (
+                corrected1 /
+                (sqrt(corrected2) + optimizer.epsilon) +
+                optimizer.weight_decay * parameter[index]
+            )
         gradient[index] = 0.0f0
     end
     return norm_square
@@ -3776,12 +3987,16 @@ function _adam_shard!(
     elseif field == 30
         _adam_range!(trainer, Val(:workspace_decay_logit), first_index, last_index)
     elseif field == 31
-        _adam_range!(trainer, Val(:head_weight), first_index, last_index)
+        _adam_range!(trainer, Val(:local_readout), first_index, last_index)
     elseif field == 32
-        _adam_range!(trainer, Val(:head_bias), first_index, last_index)
+        _adam_range!(trainer, Val(:local_readout_bias), first_index, last_index)
     elseif field == 33
-        _adam_range!(trainer, Val(:output_weight), first_index, last_index)
+        _adam_range!(trainer, Val(:head_weight), first_index, last_index)
     elseif field == 34
+        _adam_range!(trainer, Val(:head_bias), first_index, last_index)
+    elseif field == 35
+        _adam_range!(trainer, Val(:output_weight), first_index, last_index)
+    elseif field == 36
         _adam_range!(trainer, Val(:output_bias), first_index, last_index)
     else
         error("unknown dendritic parameter field $field")
@@ -3946,35 +4161,60 @@ function _center_block_supervised_rewards!(
     tape = trainer.tape
     base = tape.base
     model = trainer.model
+    inverse_valid = inv(Float32(max(base.valid_count, 1)))
     @inbounds for state_slot in 1:base.state_batch
         count = Int(base.counts[state_slot])
         offset = (state_slot - 1) * base.width
         inverse_count = inv(Float32(count))
         for cycle in 1:model.cycles
-            for block in 1:model.blocks
-                reward_mean = 0.0f0
-                for candidate in 1:count
-                    reward_mean +=
-                        tape.block_supervised_reward[
-                            block,
-                            cycle,
-                            offset + candidate,
-                        ]
-                end
-                reward_mean *= inverse_count
-                for candidate in 1:count
-                    flat = offset + candidate
-                    tape.block_advantage[
-                        block,
-                        cycle,
-                        flat,
-                    ] =
+            reward_mean = 0.0f0
+            for candidate in 1:count
+                flat = offset + candidate
+                route_reward = 0.0f0
+                for block in 1:model.blocks
+                    route_reward = muladd(
+                        base.block_mask[block, cycle, flat],
                         tape.block_supervised_reward[
                             block,
                             cycle,
                             flat,
-                        ] -
-                        reward_mean
+                        ],
+                        route_reward,
+                    )
+                end
+                route_reward /= Float32(model.workspace_k)
+                tape.block_advantage[1, cycle, flat] = route_reward
+                reward_mean += route_reward
+            end
+            reward_mean *= inverse_count
+            reward_square_sum = 0.0f0
+            for candidate in 1:count
+                flat = offset + candidate
+                centered =
+                    tape.block_advantage[1, cycle, flat] - reward_mean
+                tape.block_advantage[1, cycle, flat] = centered
+                reward_square_sum = muladd(
+                    centered,
+                    centered,
+                    reward_square_sum,
+                )
+            end
+            inverse_reward_rms = inv(sqrt(
+                reward_square_sum * inverse_count +
+                LOCAL_SIGNAL_RMS_EPSILON,
+            ))
+            for candidate in 1:count
+                flat = offset + candidate
+                advantage =
+                    tape.block_advantage[1, cycle, flat] *
+                    inverse_reward_rms *
+                    inverse_valid
+                for block in 1:model.blocks
+                    tape.block_advantage[
+                        block,
+                        cycle,
+                        flat,
+                    ] = advantage
                 end
             end
         end
@@ -4078,7 +4318,8 @@ function _prepare_routing_regularizer!(
                     entropy_gap *
                     probability *
                     (log_probability + entropy) /
-                    log_blocks
+                    log_blocks *
+                    inverse_valid
                 load_gradient =
                     load_weight *
                     blocks_f *
@@ -4211,8 +4452,7 @@ function _dispatch!(
     elseif work.kind == UInt8(DENDRITIC_OPTIMIZER)
         shard = @inbounds trainer.parameter_shards[target]
         if executor.recurrent_signal_scale == 0.0f0 &&
-           Int(shard.field) <= length(DENDRITIC_PARAMETER_FIELDS) -
-           length(HEAD_PARAMETER_FIELDS)
+           Int(shard.field) <= length(RECURRENT_PARAMETER_FIELDS)
             _zero_gradient_shard!(trainer, target)
         else
             _adam_shard!(trainer, target)

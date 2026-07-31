@@ -20,14 +20,9 @@ const V2_DATASET_PATH = abspath(get(
 const V2_MODEL_SEED = UInt64(0x44454e4453435241)
 const V2_ROUTING_SEED = UInt64(0x524841595632524f)
 const V2_RECURRENT_FIELDS =
-    ReducedHayV2ArenaTraining.DENDRITIC_PARAMETER_FIELDS[
-        1:(
-            end -
-            length(
-                ReducedHayV2ArenaTraining.HEAD_PARAMETER_FIELDS,
-            )
-        )
-    ]
+    ReducedHayV2ArenaTraining.RECURRENT_PARAMETER_FIELDS
+const V2_LOCAL_PREDICTOR_FIELDS =
+    ReducedHayV2ArenaTraining.LOCAL_PREDICTOR_PARAMETER_FIELDS
 const V2_HEAD_FIELDS =
     ReducedHayV2ArenaTraining.HEAD_PARAMETER_FIELDS
 
@@ -130,7 +125,7 @@ parameters, _ = Lux.setup(Xoshiro(V2_MODEL_SEED), model)
     )
     scratch = ReducedHayV2ArenaTraining.DendriticWorkerScratch(
         model,
-        reference_parameters,
+        reference_trainer.parameters,
     )
     rails = Float32.(
         rand(Xoshiro(0x52454645), Bool, 1298, 1),
@@ -163,6 +158,7 @@ parameters, _ = Lux.setup(Xoshiro(V2_MODEL_SEED), model)
         branch_interval=typemax(Int),
     )
     initial = copy_tree(trained.parameters)
+    fixed_projection = copy(trained.projection)
     one_v2_update!(trained, dataset, row; workers=4)
     @test isfinite(trained.last_loss.composite_loss)
     @test trained.metrics.allocation_bytes == 0
@@ -184,10 +180,32 @@ parameters, _ = Lux.setup(Xoshiro(V2_MODEL_SEED), model)
         ) > 0.0f0,
         ReducedHayV2ArenaTraining.DENDRITIC_PARAMETER_FIELDS,
     )
+    @test trained.projection == fixed_projection
+    for cycle in 1:model.cycles
+        count = Int(trained.tape.base.counts[1])
+        advantage_mean = 0.0f0
+        for candidate in 1:count
+            route_advantage = trained.tape.block_advantage[
+                1,
+                cycle,
+                candidate,
+            ]
+            advantage_mean += route_advantage
+            @test all(
+                block -> trained.tape.block_advantage[
+                    block,
+                    cycle,
+                    candidate,
+                ] == route_advantage,
+                1:model.blocks,
+            )
+        end
+        @test abs(advantage_mean / Float32(count)) <= 2.0f-5
+    end
 
     # Zero third factor freezes every recurrent/cell group, including
-    # AdamW decay and structure consolidation, while the supervised head
-    # remains trainable.
+    # AdamW decay and structure consolidation, while the block-local
+    # predictors and supervised head remain trainable.
     frozen = DendriticArenaTrainer(
         model,
         copy_tree(parameters);
@@ -221,6 +239,23 @@ parameters, _ = Lux.setup(Xoshiro(V2_MODEL_SEED), model)
             name,
         ) > 0.0f0,
         V2_HEAD_FIELDS,
+    )
+    @test all(
+        name -> maximum_delta(
+            frozen.parameters,
+            frozen_initial,
+            name,
+        ) > 0.0f0,
+        V2_LOCAL_PREDICTOR_FIELDS,
+    )
+    @test all(
+        name -> isapprox(
+            getproperty(frozen.parameters, name),
+            getproperty(trained.parameters, name);
+            atol=2.0f-6,
+            rtol=2.0f-6,
+        ),
+        (V2_LOCAL_PREDICTOR_FIELDS..., V2_HEAD_FIELDS...),
     )
     @test frozen.gate_mask == frozen_gate_mask
     @test frozen.branch_for_edge == frozen_branches

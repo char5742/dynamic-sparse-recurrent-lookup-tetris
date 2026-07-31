@@ -106,8 +106,16 @@ function main(arguments=ARGS)
         allow_partial_dataset=false,
         geometry_cache_max_states=1,
     )
-    training_rows =
+    full_training_rows =
         Int.(findall(==(:train), dataset.predefined_split))
+    training_rows = if hasproperty(
+        payload.run_config,
+        :overfit_rows,
+    ) && !isempty(payload.run_config.overfit_rows)
+        Int.(payload.run_config.overfit_rows)
+    else
+        full_training_rows
+    end
     preset = Symbol(payload.run_config.preset)
     model = build_reduced_hay_model(preset)
     seed = parse(UInt64, String(payload.run_config.model_seed))
@@ -125,13 +133,23 @@ function main(arguments=ARGS)
         payload,
         training_rows,
     )
-    rows = stable_panel_rows(
-        dataset,
-        options.split,
-        options.states,
-        state_batch,
-        options.panel_seed,
-    )
+    rows = if options.split === :overfit
+        hasproperty(payload.run_config, :overfit_rows) &&
+            !isempty(payload.run_config.overfit_rows) ||
+            error("checkpoint has no fixed overfit panel")
+        selected = Int.(payload.run_config.overfit_rows)
+        length(selected) == options.states ||
+            error("--states must equal the stored overfit panel size")
+        selected
+    else
+        stable_panel_rows(
+            dataset,
+            options.split,
+            options.states,
+            state_batch,
+            options.panel_seed,
+        )
+    end
     executor = ReducedHayV2ArenaExecutor(
         trainer,
         dataset;
@@ -143,6 +161,8 @@ function main(arguments=ARGS)
     loss_fields = (
         :composite_loss,
         :listnet_loss,
+        :teacher_entropy,
+        :listnet_kl,
         :q_huber_loss,
         :margin_loss,
         :death_loss,
@@ -224,6 +244,8 @@ function main(arguments=ARGS)
         Tuple(loss_sums .* inverse_batches),
     )
     result = merge(losses, (;
+        excess_loss=
+            losses.composite_loss - losses.teacher_entropy,
         schema="reduced-hay-v2-fixed-panel-evaluation-v1",
         checkpoint=options.checkpoint,
         checkpoint_sha256=

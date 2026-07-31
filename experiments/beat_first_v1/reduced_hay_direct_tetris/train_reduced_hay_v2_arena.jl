@@ -22,6 +22,7 @@ const DEFAULT_OUTPUT_ROOT =
 const MODEL_SEED = UInt64(0x44454e4453435241)
 const SAMPLER_SEED = UInt64(0x44454e4453414d50)
 const ROUTING_SEED = UInt64(0x44454e44524f5554)
+const OVERFIT_PANEL_SEED = UInt64(0x4f56455246495438)
 const TRACE_HEADER = join((
     "update",
     "loss",
@@ -99,6 +100,13 @@ function parse_options(arguments)
         weight_decay=real("weight-decay", 1.0e-5),
         structural_interval=integer("structural-interval", 25),
         branch_interval=integer("branch-interval", 128),
+        credit_warmup_updates=
+            integer("credit-warmup-updates", 128),
+        credit_ramp_updates=
+            integer("credit-ramp-updates", 512),
+        recurrent_learning_rate_multiplier=
+            real("recurrent-learning-rate-multiplier", 0.001),
+        overfit_states=integer("overfit-states", 0),
         checkpoint_interval=integer("checkpoint-interval", 1_000),
         log_interval=integer("log-interval", 100),
         stochastic_routing=
@@ -130,6 +138,23 @@ function validate_options(options)
         error("checkpoint-interval must be positive")
     options.log_interval > 0 ||
         error("log-interval must be positive")
+    options.credit_warmup_updates >= 0 ||
+        error("credit-warmup-updates must be nonnegative")
+    options.credit_ramp_updates >= 0 ||
+        error("credit-ramp-updates must be nonnegative")
+    isfinite(options.recurrent_learning_rate_multiplier) &&
+        options.recurrent_learning_rate_multiplier > 0 ||
+        error(
+            "recurrent-learning-rate-multiplier must be finite and positive",
+        )
+    options.overfit_states >= 0 ||
+        error("overfit-states must be nonnegative")
+    options.overfit_states == 0 ||
+        options.overfit_states >= options.state_batch ||
+        error("overfit-states must be zero or at least state-batch")
+    options.overfit_states == 0 ||
+        mod(options.overfit_states, options.state_batch) == 0 ||
+        error("overfit-states must be a multiple of state-batch")
     options.cpuset_mode in (:none, :all, :p_only) ||
         error("cpuset-mode must be none, all, or p_only")
     options.resume === nothing ||
@@ -179,7 +204,10 @@ function reserve_run_directory(options)
         dateformat"yyyymmdd_HHMMSS",
     )
     run_id =
-        "reduced_hay_v2_decolle_eprop_scratch_" *
+        (options.overfit_states == 0 ?
+         "reduced_hay_v2_decolle_eprop_scratch_" :
+         "reduced_hay_v2_decolle_eprop_overfit_" *
+         string(options.overfit_states) * "states_") *
         stamp *
         "_u" *
         string(options.updates)
@@ -251,9 +279,12 @@ end
 function report!(window::WindowMetrics, update, trainer)
     inverse = inv(max(window.updates, 1))
     @printf(
-        "update=%d loss=%.6f window_loss=%.6f states_s=%.3f cpu=%.1f%% fire=%.6f plateau=%.6f route_H=%.6f local=(%.5f,%.5f,%.5f,%.5f) alloc=%d gc=%.6f\n",
+        "update=%d loss=%.6f excess=%.6f listnet_kl=%.6f window_loss=%.6f states_s=%.3f cpu=%.1f%% fire=%.6f plateau=%.6f route_H=%.6f local=(%.5f,%.5f,%.5f,%.5f) alloc=%d gc=%.6f\n",
         update,
         trainer.last_loss.composite_loss,
+        trainer.last_loss.composite_loss -
+        trainer.last_loss.teacher_entropy,
+        trainer.last_loss.listnet_kl,
         window.loss * inverse,
         window.states_per_second * inverse,
         100.0 * window.cpu_seconds /
@@ -332,7 +363,16 @@ function main(arguments=ARGS)
         allow_partial_dataset=false,
         geometry_cache_max_states=1,
     )
-    rows = training_rows(dataset)
+    all_training_rows = training_rows(dataset)
+    options.overfit_states <= length(all_training_rows) ||
+        error("overfit-states exceeds the training split")
+    rows = if options.overfit_states == 0
+        all_training_rows
+    else
+        selected = copy(all_training_rows)
+        shuffle!(Xoshiro(OVERFIT_PANEL_SEED), selected)
+        sort!(selected[1:options.overfit_states])
+    end
     maximum(dataset.action_counts) <= options.width ||
         error("arena width is too small for teacher candidates")
     model = build_reduced_hay_model(options.preset)
@@ -346,6 +386,8 @@ function main(arguments=ARGS)
         weight_decay=options.weight_decay,
         structural_interval=options.structural_interval,
         branch_interval=options.branch_interval,
+        recurrent_learning_rate_multiplier=
+            options.recurrent_learning_rate_multiplier,
     )
     run_config = (;
         architecture="cpu-native-reduced-hay-v2-workspace-snn",
@@ -372,6 +414,13 @@ function main(arguments=ARGS)
         weight_decay=options.weight_decay,
         structural_interval=options.structural_interval,
         branch_interval=options.branch_interval,
+        credit_warmup_updates=options.credit_warmup_updates,
+        credit_ramp_updates=options.credit_ramp_updates,
+        recurrent_learning_rate_multiplier=
+            trainer.recurrent_learning_rate_multiplier,
+        overfit_states=options.overfit_states,
+        overfit_rows=rows,
+        overfit_panel_seed=string(OVERFIT_PANEL_SEED),
         global_signal_scale=trainer.global_signal_scale,
         local_signal_scale=trainer.local_signal_scale,
         routing_entropy_weight=
@@ -448,6 +497,23 @@ function main(arguments=ARGS)
                         trainer.tape.base.rows,
                         sampler,
                     )
+                    completed = trainer.optimizer.step
+                    running.recurrent_signal_scale = if completed <
+                                                         options.credit_warmup_updates
+                        0.0f0
+                    elseif options.credit_ramp_updates == 0
+                        1.0f0
+                    else
+                        min(
+                            1.0f0,
+                            Float32(
+                                completed -
+                                options.credit_warmup_updates +
+                                1,
+                            ) /
+                            Float32(options.credit_ramp_updates),
+                        )
+                    end
                     reduced_hay_v2_arena_update!(running)
                     trainer.optimizer.step == update ||
                         error("optimizer update drift")
@@ -503,6 +569,11 @@ function main(arguments=ARGS)
             options.state_batch,
         initial_loss,
         final_loss,
+        final_teacher_entropy=trainer.last_loss.teacher_entropy,
+        final_listnet_kl=trainer.last_loss.listnet_kl,
+        final_excess_loss=
+            trainer.last_loss.composite_loss -
+            trainer.last_loss.teacher_entropy,
         total_wall_seconds,
         updates_per_second=
             trainer.optimizer.step /
