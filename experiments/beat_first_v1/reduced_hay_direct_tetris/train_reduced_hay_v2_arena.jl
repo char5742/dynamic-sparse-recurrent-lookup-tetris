@@ -419,7 +419,7 @@ function main(arguments=ARGS)
         recurrent_learning_rate_multiplier=
             trainer.recurrent_learning_rate_multiplier,
         overfit_states=options.overfit_states,
-        overfit_rows=rows,
+        overfit_rows=options.overfit_states == 0 ? Int[] : rows,
         overfit_panel_seed=string(OVERFIT_PANEL_SEED),
         global_signal_scale=trainer.global_signal_scale,
         local_signal_scale=trainer.local_signal_scale,

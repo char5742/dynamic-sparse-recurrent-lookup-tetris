@@ -4,6 +4,27 @@ This ledger records both successful and failed runs. Teacher-held rows are not
 game-validation seeds; game validation `8001:8008` and sealed seeds
 `91001:91032` remain unopened.
 
+## 2026-08-01 — Reduced Hay v2 local-credit repair and width-80 100k
+
+- DECOLLE/e-propの第三因子、ordered Plackett–Luce routing、RMS処理、
+  parameter群別clipとrecurrent trust stepを修正した。exact BPTT自体の
+  有限差分testは合格しており、修正対象は局所信用割当である。
+- 1状態deterministic full-recurrent過学習はexcess loss `0.000222683`、
+  ListNet KL `0.000150919`、top-1 `1.0`。局所学習経路は最低限の記憶能力を持つ。
+- width 80、batch 8、20 worker、100k scratchを完走した。800,000 teacher
+  state、`7.474 updates/s`、hot GC `0 s`、最終checkpoint SHA-256は
+  `4fa084e370646c02d6b04693e7663c28b2883e79a5750b8e2eaff2da1cc9277e`。
+- 同一128 validation rowでtop-1は1k `0.085938`、10k `0.164063`、
+  50k `0.132813`、100k `0.085938`。100kのloss/NDCG/pairwiseは
+  `3.767749 / 0.862767 / 0.574327`で、10k以降の延長は改善しなかった。
+- 全30 recurrent fieldは変化しmomentも非ゼロ。最終次batchのraw recurrent
+  normは`24.4459`で5へclipされる一方、local predictor/headは5以下。
+  勾配断絶ではなく、低cosineの局所信用割当とhead/output driftが残る。
+- 旧54k版のplateau `1.018187`は新100kで`0.007385`へ安定化したが、品質は
+  旧版を下回る。frozen 11-stateは適格artifact不在のため未測定。
+- 詳細：
+  `reduced_hay_direct_tetris/CREDIT_REPAIR_100K_2026-08-01.md`。
+
 ## 2026-07-30 — Reduced Hay direct-Tetris mainline
 
 - 方針変更：Hay教師→Dense Digital Twin→11状態蒸留・凍結をTetris本線の

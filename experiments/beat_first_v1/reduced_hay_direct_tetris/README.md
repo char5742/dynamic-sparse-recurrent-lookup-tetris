@@ -318,6 +318,13 @@ top-1 `0.078125`, NDCG `0.824687` and pairwise `0.508192` at
 competitive quality result; comparison with Point-SNN, DSRLN, PreAct and GRU
 requires matched 10k/100k or equal-wall-clock runs on the identical panel.
 
+The repaired width-80 local learner subsequently completed a retained 100k
+scratch run.  It peaked at 10k on the fixed 128-row panel (top-1 `0.164063`)
+and regressed to `0.085938` at 100k, while keeping plateau mean near `0.007`
+instead of the old pathological value near `1.0`.  Gradient audit, fixed-data
+memorization, exact/local claim boundaries and artifacts are recorded in
+`CREDIT_REPAIR_100K_2026-08-01.md`.
+
 Run a retained exact continuation with:
 
 ```powershell

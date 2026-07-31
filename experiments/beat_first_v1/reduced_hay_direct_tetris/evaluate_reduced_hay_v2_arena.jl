@@ -108,7 +108,11 @@ function main(arguments=ARGS)
     )
     full_training_rows =
         Int.(findall(==(:train), dataset.predefined_split))
-    training_rows = if hasproperty(
+    overfit_checkpoint = hasproperty(
+        payload.run_config,
+        :overfit_states,
+    ) && Int(payload.run_config.overfit_states) > 0
+    training_rows = if overfit_checkpoint && hasproperty(
         payload.run_config,
         :overfit_rows,
     ) && !isempty(payload.run_config.overfit_rows)
@@ -134,7 +138,8 @@ function main(arguments=ARGS)
         training_rows,
     )
     rows = if options.split === :overfit
-        hasproperty(payload.run_config, :overfit_rows) &&
+        overfit_checkpoint &&
+            hasproperty(payload.run_config, :overfit_rows) &&
             !isempty(payload.run_config.overfit_rows) ||
             error("checkpoint has no fixed overfit panel")
         selected = Int.(payload.run_config.overfit_rows)
