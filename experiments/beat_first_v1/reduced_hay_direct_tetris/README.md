@@ -26,6 +26,25 @@ learning, bounded memory and useful dynamic sparse execution.
 The older Point-SNN, detailed Hay oracle, Digital Twin and frozen distilled
 11-state implementation remain unchanged as controls and research history.
 
+The current post-failure credit repair, exact-gradient measurements, 5k
+mechanism ablations, and eight-state memorization gate are recorded in
+`CREDIT_REPAIR_V2_2026-08-01.md`.
+
+The local learner is no longer used as the architecture's quality ceiling.
+The allocation-free analytic exact-BPTT path, its 10k curve and mechanism
+ablations are recorded in `EXACT_BPTT_PERFORMANCE_CEILING_2026-08-02.md`.
+
+The two-timescale exact repair, six-stage representation probe and bounded
+brain-internal sleep shadow are recorded in
+`BRAIN_INTERNAL_SLEEP_SHADOW_2026-08-02.md`.  Sleep has not been promoted:
+the alternating route/recurrent arm failed the wake-only loss/drift gate.
+
+The subsequent meta-audit found that the shadow erased tag magnitude and task
+state identity, and that its single saturated-checkpoint comparison was below
+the measurement resolution needed for a performance claim.  The replacement
+research contract and staged gates are recorded in
+`SLEEP_LEARNING_META_RESET_2026-08-02.md`.
+
 ## Implementation audit
 
 | Existing component | Decision | Reason |
@@ -40,21 +59,24 @@ The older Point-SNN, detailed Hay oracle, Digital Twin and frozen distilled
 | 11-state distillation/freeze | control only | the final Tetris cell must not freeze internal dynamics because of lineage |
 | full Hay cell | oracle only | too expensive for mass placement; useful for mechanism ablation |
 
-There are two deliberately separate credit-assignment tracks:
+There are three deliberately separate credit-assignment tracks:
 
 ```text
 quality/reference control:
 PACK -> FORWARD -> REVERSE-TIME VJP -> AdamW
 
-CPU production candidate:
+CPU performance control:
+PACK -> FORWARD -> ANALYTIC EXACT GRAPH BPTT -> AdamW
+
+CPU local-learning experiment:
 PACK -> FORWARD -> BLOCK SIGNAL -> LOCAL REPLAY -> AdamW
 ```
 
-The direct path is retained as the teacher and quality ceiling. The production
-v2 trainer now implements the corresponding local path in
-`ReducedHayV2ArenaTraining.jl`. It uses the causal state-update-before-route
-order, located one-pulse sensory contacts, fixed-fanout recurrent structure,
-block-fixed DECOLLE projections and forward Reduced-Hay eligibility traces.
+The Zygote direct path remains the independent correctness oracle.  The
+production-width quality ceiling is `credit_mode=:exact_bptt`, implemented by
+`ReducedHayV2IntrinsicAdjoint.jl` inside the fixed-arena trainer.  The local
+path remains available as an experimental CPU credit rule, but is suspended
+for architecture-performance claims.
 
 Only hard spike, hard workspace routing, gate state and future compartment
 placement are discrete in the reference path. Continuous state and parameters
@@ -72,7 +94,8 @@ Four basal compartments each retain:
 - GABA conductance;
 - NMDA-dependent plateau.
 
-The cell also retains apical voltage, soma voltage and adaptation. This gives:
+The cell also retains one scalar apical accumulator, soma voltage and
+adaptation. This gives:
 
 ```text
 4 * (V + AMPA + NMDA + GABA + plateau)
@@ -86,8 +109,138 @@ couple to soma, workspace feedback drives the apical state, apical state
 modulates basal integration, and a hard soma event is followed by reset and
 adaptation.
 
+This is the complete state of the current reduced equation, but it is not yet
+the smallest paper-mechanism-complete cell. TwinProp's apical/basal and NMDA
+ablations motivate replacing the scalar apical accumulator with at least one
+active apical compartment carrying its own voltage, AMPA, NMDA, GABA and
+plateau state. The next equation-derived comparison is therefore four basal
+plus one active apical compartment: 27 persistent states and one spike event,
+or 28 observed coordinates per cell and 224 per eight-cell block. Those
+numbers follow from the state equation; they are not compatibility widths.
+
 Normalized voltage/time units are used intentionally. This is a Hay-derived
 CPU model, not a claim that one Tetris cycle equals a biological millisecond.
+
+## Canonical information, control and readout planes
+
+The historical 48-dimensional block interface was a compatibility dimension,
+not a dimension derived from Hay or TwinProp:
+
+```text
+8 cells/block * legacy6 coordinates/cell = 48 coordinates/block
+```
+
+`legacy6` exported only soma voltage, apical voltage and four branch voltages.
+It allowed the first dendritic implementation to reuse the Point-SNN
+workspace/head, but it hid AMPA, NMDA, GABA, plateau, adaptation and the soma
+event. No paper result supports 48 as the required or sufficient dimension.
+
+The canonical Reduced Hay observation is now `full24`. Its exact per-cell
+coordinate order is:
+
+```text
+ 1  soma voltage
+ 2  soma spike event
+ 3  apical voltage
+ 4  adaptation
+ 5  branch 1 voltage
+ 6  branch 1 AMPA conductance
+ 7  branch 1 NMDA conductance
+ 8  branch 1 GABA conductance
+ 9  branch 1 plateau
+10  branch 2 voltage
+11  branch 2 AMPA conductance
+12  branch 2 NMDA conductance
+13  branch 2 GABA conductance
+14  branch 2 plateau
+15  branch 3 voltage
+16  branch 3 AMPA conductance
+17  branch 3 NMDA conductance
+18  branch 3 GABA conductance
+19  branch 3 plateau
+20  branch 4 voltage
+21  branch 4 AMPA conductance
+22  branch 4 NMDA conductance
+23  branch 4 GABA conductance
+24  branch 4 plateau
+```
+
+Signed voltages use `tanh`; nonnegative conductance, plateau and adaptation
+states use `x/(1+x)`; the spike coordinate is retained directly. These are
+monotone observation transforms, not a reduction in coordinate count. The
+underlying SoA trajectory still retains the untransformed 23 continuous
+states. NMDA current is not an additional independent persistent state: it is
+computed from branch voltage, NMDA conductance and the learned voltage-unblock
+parameters.
+
+With eight cells per block, the natural block state is therefore:
+
+```text
+24 state coordinates/cell * 8 cells/block = 192 coordinates/block
+30 blocks * 192 coordinates/block = 5,760 exact information coordinates
+```
+
+The three current full-state layouts have distinct roles:
+
+| Preset | Information memory | Routing control | Global readout | Status |
+|---|---|---|---|---|
+| `reduced_hay_fullstate_bound_v10` | thirty 192D block states are superposed into one 192D signed-permutation workspace | the same 192D bound representation | 576D anchor/temporal/delta sketch | retained compression control |
+| `reduced_hay_exact_slots_v11` | exact `30 x 192` block slots | learned `24 -> 4` features per cell, flattened to 32D and combined with fixed Hadamard block roles | learned rank-4 state factor with explicit block/cycle/cell axes | retained CPU low-rank control |
+| `reduced_hay_exact_slots_fullrank_v12` | exact `30 x 192` block slots | the same dedicated 32D Hadamard control plane | learned `24 x 24` state transform plus explicit block/cycle/cell axes | retained nonlinear learned-basis control |
+| `reduced_hay_exact_slots_direct_v13` | exact `30 x 192` block slots | the same dedicated 32D Hadamard control plane | all 24 state coordinates directly, with no learned state projection or extra `tanh` | current information-path control; matched 10k failed the promotion gate |
+
+The exact-slot workspace never averages blocks. A selected block overwrites
+only its own 192D slot; an unselected slot decays in place. The head receives:
+
+```text
+A[b]       = complete cycle-1 state of block b
+H[t,b]     = state of block b when selected at cycle t
+Delta[b]   = final state of block b - A[b]
+```
+
+`A` and `Delta` retain all blocks, so the final state is reconstructible as
+`A + Delta`. `H` retains block and cycle identity and is sparse: only the
+`cycles * workspace_k` selected events are read. In the 30-block, six-cycle,
+top-5 coverage-first preset this normally records every block once, but it is
+not the complete six-cycle trajectory of every block and it does not retain
+route-rank order within one cycle.
+
+Routing is intentionally separated from information storage. `route_dim=32`
+is a control plane, not a replacement for the 5,760D memory. Each of the eight
+cells projects its 24 observations to four route features. Thirty distinct
+Walsh/Hadamard role codes fit in 32 dimensions; the coded block features form
+the routing query and per-block score. A separate 32D selected context returns
+global modulation to the scalar apical receiver, while each cell also reads
+its own exact 24D workspace slot.
+
+Adding a positional vector and immediately pooling was not adopted. If block
+tokens are collapsed as
+
+```text
+sum_b (x_b + p_b) = sum_b x_b + sum_b p_b
+```
+
+the content-position association disappears and the positional sum becomes a
+constant. Transformer positional encodings work because the token axis is
+retained through attention. v10's multiplicative signed-permutation binding
+retains more position information than additive pooling, but superposing 30
+block states into 192 dimensions still introduces cross-talk. v11/v12 instead
+use the block axis itself as the exact position representation.
+
+The paper/Hay boundary remains strict. [TwinProp](https://www.biorxiv.org/content/10.64898/2026.06.08.730984v1.full)
+supports the importance of spatially separated dendritic voltages,
+voltage-dependent NMDA effects, active conductances, apical/basal separation,
+E/I timing and soma integration. It does not prescribe a
+24-coordinate network interface, exact-slot workspace, Hadamard route code or
+factorized Tetris head. The detailed Hay cell has a much richer morphology and
+ion-channel set than this four-branch plateau model. `full24` is the complete
+observation of this CPU-native Reduced Hay cell, not equivalence to full Hay
+and not reproduction of TwinProp. The retained v12 10k checkpoint's eight
+learned `24 x 24` projections were numerically full rank but had effective
+ranks only about 9.8--12.7. v13 removes that transform entirely. Its matched
+result shows that the transform was not the primary bottleneck: direct
+full-state readout reduced CPU cost relative to v12 but reduced Tetris
+quality.
 
 ## Reference direct credit assignment
 
@@ -160,6 +313,11 @@ the four supervised head groups continue learning.
 | Purpose | Entrypoint |
 |---|---|
 | direct-Tetris Reduced Hay reference | `train_reduced_hay_direct.jl` |
+| width-80 barrierless analytic exact BPTT | `train_reduced_hay_v2_arena.jl --credit-mode exact_bptt --deterministic-routing` |
+| v10 full24 signed-binding control | `train_reduced_hay_v2_arena.jl --preset reduced_hay_fullstate_bound_v10 --credit-mode exact_bptt --deterministic-routing` |
+| v11 exact-slot rank-4 control | `train_reduced_hay_v2_arena.jl --preset reduced_hay_exact_slots_v11 --credit-mode exact_bptt --deterministic-routing` |
+| v12 exact-slot full-rank experiment | `train_reduced_hay_v2_arena.jl --preset reduced_hay_exact_slots_fullrank_v12 --credit-mode exact_bptt --deterministic-routing` |
+| v13 exact-slot direct-state control | `train_reduced_hay_v2_arena.jl --preset reduced_hay_exact_slots_direct_v13 --credit-mode exact_bptt --deterministic-routing` |
 | width-80 barrierless DECOLLE/e-prop training | `train_reduced_hay_v2_arena.jl` |
 | held-teacher checkpoint evaluation | `evaluate_reduced_hay_v2_arena.jl` |
 | v2 arena integration/equivalence checks | `test_reduced_hay_v2_arena_training.jl` |
@@ -169,6 +327,8 @@ the four supervised head groups continue learning.
 | shared Point/Reduced/GRU preflight | `train_budget_arm.jl` |
 | held-teacher budget validation | `validate_budget_arms.jl` |
 | exact checkpoint ablation replay | `reevaluate_budget_ablations.jl` |
+| six-stage frozen representation probe | `probe_reduced_hay_v2_representation_path.jl` |
+| brain-internal sleep A-E shadow | `compare_reduced_hay_v2_sleep_shadow.jl` |
 | TwinProp/paper reproduction history | `../paper_multicompartment_snn/` |
 
 Example:
@@ -181,7 +341,9 @@ julia --project=. --threads=1 `
 ```
 
 The canonical builder default is `:reduced_hay_scaled_v2`.  The retained
-`:tiny` and `:reduced_hay_scaled_v1` presets are legacy controls.
+`:tiny` and `:reduced_hay_scaled_v1` presets are legacy controls. The v12
+representation is an explicit experiment preset rather than the default until
+its matched learning and CPU measurements pass the promotion gate.
 
 Production scratch training:
 
@@ -191,6 +353,28 @@ julia --project=. --threads=20,0 `
   --preset reduced_hay_scaled_v2 --updates 100000 `
   --state-batch 8 --width 80 --workers 20
 ```
+
+Current exact-slot direct-state control:
+
+```powershell
+julia --project=. --threads=20,0 `
+  experiments/beat_first_v1/reduced_hay_direct_tetris/train_reduced_hay_v2_arena.jl `
+  --preset reduced_hay_exact_slots_direct_v13 --credit-mode exact_bptt `
+  --deterministic-routing --updates 1000 `
+  --state-batch 8 --width 80 --workers 20
+```
+
+This command describes the v13 information-path control. It is not promoted:
+the focused memorization gate passed, but the matched real-data 10k gate did
+not.
+
+Every new arena run now copies the actual Julia source closure plus
+`Project.toml`, `Manifest.toml` and this README under
+`output-dir/source_snapshot`, recording per-file SHA-256, the aggregate
+closure hash, Git HEAD/status and the active project. Resume verifies the live
+closure against that snapshot and fails closed on drift. The explicit
+`--allow-source-drift-on-resume` flag is an unsafe research escape hatch, not
+part of a promoted run.
 
 Held validation-panel evaluation:
 
@@ -238,6 +422,85 @@ states/s, CPU seconds, allocation/update, GC seconds, peak resident memory,
 event rate, delivered edges and effective active cells.
 
 ## Current validation status
+
+The representation mainline has advanced beyond the models used for the
+historical 1k/10k/100k results below. Those measurements remain valid for
+their named presets and checkpoints, but they are not evidence for v13 or a
+future active-apical model.
+
+The current representation status is:
+
+- `legacy6`/48D is retained only for historical compatibility;
+- v10 verifies the `full24` observation and a 192D signed-binding compression
+  arm, but that single-lane superposition is not the canonical information
+  plane;
+- v11 preserves the exact 5,760D block-slot information plane and explicit
+  block/cycle head axes, while deliberately retaining rank-4 state readout as
+  a CPU control;
+- v12 keeps the same exact slots and raises the head state factor from 4 to
+  24, removing the explicit state-axis dimensional reduction;
+- v13 deletes the learned state projection and its extra `tanh`; the head
+  directly reads all 24 state coordinates at every explicit block/cell/cycle
+  axis;
+- route32 remains a separate Hadamard-coded control plane in v11--v13; it
+  does not replace the exact block memory;
+- exact-slot v11--v13 use analytic exact BPTT. They do not silently
+  fall back to the older local-credit contract.
+
+The retained matched real-data comparison uses dataset manifest
+`1f63172f...26ded` and the same 128-state panel
+`9ad529fd...9fdc6`:
+
+| Model/checkpoint | kernel wall | Excess | KL | Top-1 | NDCG | Pairwise |
+|---|---:|---:|---:|---:|---:|---:|
+| v10 10k | `419.844 s` | `0.664228` | `0.557064` | `0.328125` | `0.945537` | `0.758950` |
+| v12 5k equal-wall | `415.441 s` | `0.699962` | `0.641884` | `0.328125` | `0.951041` | `0.767320` |
+| v12 10k | `835.210 s` | `0.685918` | `0.629623` | `0.304688` | `0.951089` | `0.772446` |
+| v13 5k equal-wall | `418.765 s` | `0.745256` | `0.691138` | `0.289063` | `0.948784` | `0.759452` |
+| v13 10k | `804.196 s` | `0.739358` | `0.686994` | `0.289063` | `0.950277` | `0.762884` |
+
+The direct-state hypothesis is therefore rejected as a promotion by itself.
+v13 preserves information and is faster than v12 in the warmed production
+benchmark (`106.541` versus `59.649 states/s`, both zero allocation/GC), but
+it loses the primary excess/KL and top-1 comparisons. The learned v12 basis
+was not merely destructive compression; it also supplied a useful nonlinear
+feature transform. v13 is retained as the clean information-path control.
+
+The v13 eight-state gate did pass: deterministic evaluation after 1,000
+updates measured excess `0.001904`, top-1 `1.0`, NDCG `0.999944` and pairwise
+`0.997571`. Thus the matched failure is not a basic gradient or memorization
+bug.
+
+The focused v12 mechanism and complete-memorization gate has now passed. The
+retained run is:
+
+```text
+D:\tetris-paper-plus\runs\reduced_hay_v2_arena\exact_slots_fullrank_v12_overfit8_exact1k_20260802
+```
+
+It trained the same eight states for 1,000 exact-BPTT updates from scratch.
+Training excess reached `0.001038`; deterministic evaluation of the retained
+checkpoint measured excess `0.000970`, top-1 `1.0`, NDCG `0.999796` and
+pairwise `0.989005`. All `37/37` parameter groups changed, including the cell,
+route, exact-slot feedback and full-rank head groups. The run processed
+`65.13 states/s`, with zero reported hot-path allocation and zero GC time.
+
+The matched v11 rank-4 control reached evaluation excess `0.004303` at
+`88.68 states/s`. Thus full-rank v12 reduced the focused excess by about
+`4.4x`, while the rank-4 control remained about `1.36x` faster. Both achieved
+top-1 `1.0` on this memorized panel; these numbers locate a readout-rank
+tradeoff rather than establish generalization.
+
+A separate warmed v12 production-shape benchmark measured `59.649 states/s`,
+again with zero hot allocation and zero GC. This establishes that the exact
+5,760D information plane and full-rank head are executable in the fixed-arena
+CPU path without reintroducing GC or hot allocation.
+
+These are focused mechanism, gradient-reachability and memorization results.
+The retained v12/v13 real-data curves above now establish the comparison, and
+neither exact-slot variant matches the v10 primary quality at equal CPU wall.
+This README therefore does not claim that either has matched DSRLN, PreAct,
+Point-SNN or GRU, nor that either is the competitive final architecture.
 
 The 1,000-update comparison is recorded in `VALIDATION_2026-07-30.md`.
 The 10,000-update learning curve is in
@@ -349,10 +612,17 @@ Paper reproduction and CPU-model claims are separate.
 
 This directory may claim that Hay-derived mechanisms were implemented and
 that a direct Tetris teacher cotangent reaches the continuous internal
-dynamics. It must not claim:
+dynamics. It may also claim that v11--v13 preserve this Reduced Hay model's
+complete 24-coordinate observation in exact block slots. It must not claim:
 
 - reproduction of TwinProp XOR/parity results;
 - equivalence to the full Hay cell;
+- that TwinProp or Hay specifies the project's `full24`, exact-slot,
+  Hadamard-routing or factorized-head design;
+- that direct full24 readout proves causal use of every mechanism or
+  competitive Tetris performance;
+- that the scalar apical accumulator is an active Hay/TwinProp apical
+  dendritic compartment;
 - a speed advantage from the current Zygote reference;
 - complete Hay-mechanism efficacy from nonzero internal activity;
 - superiority over the frozen 11-state, GRU, DSRLN or PreAct controls before a
@@ -360,13 +630,63 @@ dynamics. It must not claim:
 
 ## Next critical path
 
-1. run the same validation-panel evaluator for Point-SNN and GRU under a
+The representation gate now precedes further sleep/local-credit work:
+
+1. retain v13 as the closed lossless-information control; its exact gradients,
+   complete memorization and failed matched 10k result are all measured;
+2. compare binary rails, cycle-1 all-block state, anchor+final,
+   anchor+selected-history+final and all-block/all-cycle state with one frozen
+   v13 checkpoint and one matched probe;
+3. if all-cycle state wins, repair the cycle transition before changing the
+   head again, beginning with a spike-only versus low-bandwidth analog event
+   payload oracle;
+4. if route order is causal, compare route32 against full-state swap-advantage
+   prediction before increasing the control dimension;
+5. separately test a fixed physics-current observation basis for AMPA, NMDA,
+   GABA and plateau recruitment; derived channels belong in the head plane,
+   not duplicated persistent memory;
+6. implement the equation-derived four-basal plus one-active-apical control
+   (`28/cell`, `224/block`) only after the cycle/readout oracle, with scalar
+   apical, no-apical-NMDA/plateau and no-coincidence ablations;
+7. require equal-update and equal-wall 10k improvement over v10 before any
+   100k run;
+8. continue reporting v12/v13 as controls rather than the final architecture.
+
+The exact 5,760D information plane is not a request to make every operation
+5,760-dimensional. Routing and sparse execution may remain low-dimensional as
+long as they are labeled control planes and their selection quality is tested
+separately. Conversely, a fast rank-4 head must not be promoted merely because
+the full states exist upstream; it must match the rank-24 control closely
+enough under the same learning budget.
+
+## Deferred sleep and legacy optimization path
+
+The following path is retained as research history and remains applicable
+after the representation gate. It is not the immediate v13 critical path:
+
+1. keep the corrected exact wake multiplier at `0.001`; it reduced the retained
+   eight-state excess from `0.440186` to `0.013436`, but the full-width exact
+   10k validation curve still did not improve;
+2. do not promote the current sleep shadow: alternating route/recurrent sleep
+   initially produced the same hard-route boundary drift as simultaneous
+   control; the wake-margin guard now removes that drift, but does not improve
+   wake-only loss;
+3. retain the paired block-silencing result as a negative control: it measures
+   internal causal contribution, but its dense-positive advantage did not
+   improve awake teacher loss;
+4. replace per-array unit-RMS wake tags with raw signed, confidence-bearing,
+   state-conditioned consolidation tags captured during real wake updates;
+5. establish Float64 measurement and proposal-only task-alignment gates before
+   any further replay-length, advantage or learning-rate work;
+6. require frozen zero-rail replay to reactivate task-tagged wake prototypes,
+   not merely sustain generic firing;
+7. run short scratch sleep integration only after alternating sleep beats
+   wake-only without destructive head-input drift;
+8. run the same validation-panel evaluator for Point-SNN and GRU under a
    matched width-80/equal-wall-clock schedule;
-2. extend the retained scratch run to 10k, inspect the fixed-panel curve, then
-   proceed to 100k only if it continues improving;
-3. report direct-BPTT and DECOLLE/e-prop equal-update and equal-wall-clock
+9. report exact-BPTT and DECOLLE/e-prop equal-update and equal-wall-clock
    curves separately;
-4. tune candidate/local replay load balance if it improves states/s without
+10. tune candidate/local replay load balance if it improves states/s without
    changing serial-equivalence or zero-allocation behavior;
-5. reproduce the result on a second model/sampler/routing seed;
-6. add the frozen 11-state arm when a qualified artifact exists.
+11. reproduce any promoted result on a second model/sampler/routing seed;
+12. add the frozen 11-state arm when a qualified artifact exists.

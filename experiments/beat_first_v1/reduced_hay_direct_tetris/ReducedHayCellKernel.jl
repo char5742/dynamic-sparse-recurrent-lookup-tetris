@@ -116,7 +116,11 @@ function reduced_hay_step!(
     inhibitory::AbstractMatrix{Float32},
     apical_drive::AbstractVector{Float32},
     active::AbstractVector{Bool},
+    ;
+    apical_response::Symbol=:uncentered_v1,
 )
+    apical_response in (:uncentered_v1, :centered_v2) ||
+        throw(ArgumentError("unknown apical response $apical_response"))
     _assert_step_shapes(
         state,
         cache,
@@ -196,7 +200,11 @@ function reduced_hay_step!(
         )
         modulation =
             1.0f0 +
-            cache.apical_gain[cell] * _hard_sigmoid(next_apical)
+            cache.apical_gain[cell] *
+            (
+                _hard_sigmoid(next_apical) -
+                (apical_response === :centered_v2 ? 0.5f0 : 0.0f0)
+            )
         soma_pre =
             cache.soma_leak[cell] * old_soma +
             basal * modulation -

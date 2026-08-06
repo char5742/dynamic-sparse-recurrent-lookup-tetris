@@ -17,6 +17,21 @@ const DEFAULT_DATASET =
     raw"D:\tetris-paper-plus\datasets\beat_first_v1\teacher_v3"
 const DEFAULT_PANEL_SEED = UInt64(0x5248415956324556)
 
+function usage()
+    return """
+Usage: julia --threads=N,0 evaluate_reduced_hay_v2_arena.jl [OPTIONS]
+
+  --checkpoint PATH        v1-v5 Reduced Hay arena checkpoint (required)
+  --dataset PATH           teacher_v3 dataset directory
+  --split NAME             validation, train, or overfit
+  --states N               evaluation panel size (default: 128)
+  --workers N              barrierless worker count
+  --ablation NAME          none, edge_off, plateau_off, apical_off, or communication_off
+  --output PATH            optional JSON result path
+  --help                   show this text
+"""
+end
+
 function parse_options(arguments)
     values = Dict{String,String}()
     index = 1
@@ -45,6 +60,7 @@ function parse_options(arguments)
             get(values, "workers", string(workers_default)),
         ),
         cpuset_mode=Symbol(get(values, "cpuset-mode", "none")),
+        ablation=Symbol(get(values, "ablation", "none")),
         output=get(values, "output", ""),
     )
 end
@@ -83,6 +99,10 @@ function panel_sha256(rows)
 end
 
 function main(arguments=ARGS)
+    if any(argument -> argument in ("--help", "-h"), arguments)
+        print(usage())
+        return nothing
+    end
     Threads.nthreads(:interactive) == 0 ||
         error("launch with --threads=N,0")
     BLAS.set_num_threads(1)
@@ -95,6 +115,16 @@ function main(arguments=ARGS)
         error("workers must be in 2:$(Threads.nthreads(:default))")
     options.cpuset_mode in (:none, :all, :p_only) ||
         error("cpuset-mode must be none, all, or p_only")
+    options.ablation in (
+        :none,
+        :edge_off,
+        :plateau_off,
+        :apical_off,
+        :communication_off,
+    ) || error(
+        "ablation must be none, edge_off, plateau_off, apical_off, or " *
+        "communication_off",
+    )
 
     payload = load_reduced_hay_v2_checkpoint(options.checkpoint)
     dataset_hash = manifest_sha256(options.dataset)
@@ -137,6 +167,20 @@ function main(arguments=ARGS)
         payload,
         training_rows,
     )
+    if options.ablation in (:edge_off, :communication_off)
+        fill!(trainer.cache.gate_probability, 0.0f0)
+        fill!(trainer.cache.gate_hard, 0.0f0)
+    end
+    if options.ablation === :plateau_off
+        fill!(trainer.cache.plateau_gain, 0.0f0)
+        fill!(trainer.cache.plateau_feedback, 0.0f0)
+    elseif options.ablation in (:apical_off, :communication_off)
+        fill!(trainer.parameters.feedback_gain, 0.0f0)
+        hasproperty(trainer.parameters, :global_feedback_gain) &&
+            fill!(trainer.parameters.global_feedback_gain, 0.0f0)
+        fill!(trainer.cache.apical_leak, 0.0f0)
+        fill!(trainer.cache.apical_gain, 0.0f0)
+    end
     rows = if options.split === :overfit
         overfit_checkpoint &&
             hasproperty(payload.run_config, :overfit_rows) &&
@@ -264,6 +308,7 @@ function main(arguments=ARGS)
         panel_seed=string(options.panel_seed),
         panel_rows_sha256=panel_sha256(rows),
         deterministic_routing=true,
+        ablation=String(options.ablation),
         top1_agreement=top1_matches * inverse_states,
         ndcg=ndcg_sum * inverse_states,
         pairwise_accuracy=pairwise_sum * inverse_states,

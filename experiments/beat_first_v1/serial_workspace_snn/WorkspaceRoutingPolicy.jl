@@ -1,6 +1,7 @@
 module WorkspaceRoutingPolicy
 
 export DEFAULT_EXPLORATION,
+    DEFAULT_LOGIT_LIMIT,
     DEFAULT_NORM_EPSILON,
     counter_gumbel,
     deterministic_topk!,
@@ -12,7 +13,25 @@ export DEFAULT_EXPLORATION,
     self_test
 
 const DEFAULT_EXPLORATION = 0.05f0
+const DEFAULT_LOGIT_LIMIT = 3.0f0
 const DEFAULT_NORM_EPSILON = 1.0f-4
+
+@inline function bounded_standardized_score(
+    value::T,
+    limit::T=T(DEFAULT_LOGIT_LIMIT),
+) where {T<:AbstractFloat}
+    limit == T(Inf) && return value
+    return limit * value / (limit + abs(value))
+end
+
+@inline function bounded_standardized_derivative(
+    value::T,
+    limit::T=T(DEFAULT_LOGIT_LIMIT),
+) where {T<:AbstractFloat}
+    limit == T(Inf) && return one(T)
+    ratio = limit / (limit + abs(value))
+    return ratio * ratio
+end
 
 @inline function _check_common_lengths(
     first::AbstractVector,
@@ -33,10 +52,12 @@ end
     temperature::Real,
     exploration::Real,
     norm_epsilon::Real,
+    logit_limit::Real,
 ) where {T<:AbstractFloat}
     tau = T(temperature)
     epsilon = T(exploration)
     normalization_epsilon = T(norm_epsilon)
+    limit = T(logit_limit)
     isfinite(tau) && tau > zero(T) || throw(ArgumentError(
         "routing temperature must be finite and positive",
     ))
@@ -46,23 +67,32 @@ end
         throw(ArgumentError(
             "routing normalization epsilon must be finite and positive",
         ))
-    return tau, epsilon, normalization_epsilon
+    (isfinite(limit) && limit > zero(T)) || limit == T(Inf) ||
+        throw(ArgumentError(
+            "routing logit limit must be positive or Inf",
+        ))
+    return tau, epsilon, normalization_epsilon, limit
 end
 
 """
-Standardize raw block scores without changing their deterministic ordering.
+Standardize raw block scores and apply a monotone soft bound without changing
+their deterministic ordering.
 
 The destination is overwritten with
 
-    (score - mean(score)) / sqrt(mean(abs2, centered_score) + norm_epsilon)
+    z = (score - mean(score)) / sqrt(mean(abs2, centered_score) + norm_epsilon)
+    bounded = limit * z / (limit + abs(z))
 
-and the inverse RMS is returned. The implementation is scalar and allocation
-free after compilation.
+The soft bound prevents a single learned score outlier from making the
+Plackett-Luce policy numerically deterministic.  Unlike clipping, its
+derivative stays nonzero for every finite score.  The inverse RMS is returned.
+The implementation is scalar and allocation free after compilation.
 """
 @inline function _standardize_scores!(
     standardized::AbstractVector{T},
     scores::AbstractVector{T},
     norm_epsilon::T,
+    logit_limit::T,
 ) where {T<:AbstractFloat}
     blocks = length(scores)
     length(standardized) == blocks ||
@@ -82,7 +112,10 @@ free after compilation.
     end
     inverse_rms = inv(sqrt(square_sum / T(blocks) + norm_epsilon))
     @inbounds for block in 1:blocks
-        standardized[block] *= inverse_rms
+        standardized[block] = bounded_standardized_score(
+            standardized[block] * inverse_rms,
+            logit_limit,
+        )
     end
     return inverse_rms
 end
@@ -92,7 +125,7 @@ Prepare the routing policy in preallocated vectors.
 
 `base_probability` is the exploitation policy
 
-    pi = softmax(standardize(scores) / temperature)
+    pi = softmax(softbound(standardize(scores)) / temperature)
 
 and `policy_probability` is the policy actually sampled during training
 
@@ -110,6 +143,7 @@ function prepare_policy!(
     temperature::Real=one(T),
     exploration::Real=T(DEFAULT_EXPLORATION),
     norm_epsilon::Real=T(DEFAULT_NORM_EPSILON),
+    logit_limit::Real=T(Inf),
 ) where {T<:AbstractFloat}
     blocks = _check_common_lengths(
         standardized,
@@ -117,16 +151,18 @@ function prepare_policy!(
         policy_probability,
         scores,
     )
-    tau, epsilon, normalization_epsilon = _routing_parameters(
+    tau, epsilon, normalization_epsilon, limit = _routing_parameters(
         T,
         temperature,
         exploration,
         norm_epsilon,
+        logit_limit,
     )
     inverse_rms = _standardize_scores!(
         standardized,
         scores,
         normalization_epsilon,
+        limit,
     )
 
     maximum_logit = T(-Inf)
@@ -382,6 +418,7 @@ function ordered_score_eligibility!(
     temperature::Real=one(T),
     exploration::Real=T(DEFAULT_EXPLORATION),
     norm_epsilon::Real=T(DEFAULT_NORM_EPSILON),
+    logit_limit::Real=T(Inf),
 ) where {T<:AbstractFloat}
     blocks = _check_common_lengths(
         score_eligibility,
@@ -400,11 +437,12 @@ function ordered_score_eligibility!(
     ))
     length(route_order) >= workspace_k ||
         throw(DimensionMismatch("routing order buffer"))
-    tau, epsilon, normalization_epsilon = _routing_parameters(
+    tau, epsilon, normalization_epsilon, limit = _routing_parameters(
         T,
         temperature,
         exploration,
         norm_epsilon,
+        logit_limit,
     )
     inverse_rms = prepare_policy!(
         standardized_scratch,
@@ -414,6 +452,7 @@ function ordered_score_eligibility!(
         temperature=tau,
         exploration=epsilon,
         norm_epsilon=normalization_epsilon,
+        logit_limit=limit,
     )
 
     fill!(logweight_eligibility, zero(T))
@@ -454,6 +493,11 @@ function ordered_score_eligibility!(
     end
 
     inverse_temperature = inv(tau)
+    score_mean = zero(T)
+    @inbounds for block in 1:blocks
+        score_mean += scores[block]
+    end
+    score_mean /= T(blocks)
     mean_normalized_gradient = zero(T)
     mean_gradient_times_score = zero(T)
     @inbounds for block in 1:blocks
@@ -461,22 +505,26 @@ function ordered_score_eligibility!(
             alpha_scratch[block] * logweight_eligibility[block] -
             base_probability[block] * weighted_alpha_eligibility
         )
-        normalized_gradient = logit_gradient * inverse_temperature
+        raw_standardized = (scores[block] - score_mean) * inverse_rms
+        normalized_gradient =
+            logit_gradient * inverse_temperature *
+            bounded_standardized_derivative(raw_standardized, limit)
         score_eligibility[block] = normalized_gradient
         mean_normalized_gradient += normalized_gradient
         mean_gradient_times_score = muladd(
             normalized_gradient,
-            standardized_scratch[block],
+            raw_standardized,
             mean_gradient_times_score,
         )
     end
     mean_normalized_gradient /= T(blocks)
     mean_gradient_times_score /= T(blocks)
     @inbounds for block in 1:blocks
+        raw_standardized = (scores[block] - score_mean) * inverse_rms
         score_eligibility[block] = inverse_rms * (
             score_eligibility[block] -
             mean_normalized_gradient -
-            standardized_scratch[block] * mean_gradient_times_score
+            raw_standardized * mean_gradient_times_score
         )
     end
     return nothing
@@ -489,6 +537,7 @@ function _fixed_order_logpolicy(
     temperature::Float64,
     exploration::Float64,
     norm_epsilon::Float64,
+    logit_limit::Float64,
 )
     blocks = length(scores)
     standardized = zeros(Float64, blocks)
@@ -502,6 +551,7 @@ function _fixed_order_logpolicy(
         temperature,
         exploration,
         norm_epsilon,
+        logit_limit,
     )
     return ordered_logpolicy(
         policy_probability,
@@ -523,6 +573,7 @@ function self_test()
     temperature = 0.9
     exploration = 0.05
     norm_epsilon = 1.0e-4
+    logit_limit = 3.0
     standardized = zeros(Float64, blocks)
     base_probability = zeros(Float64, blocks)
     policy_probability = zeros(Float64, blocks)
@@ -534,6 +585,7 @@ function self_test()
         temperature,
         exploration,
         norm_epsilon,
+        logit_limit,
     )
     base_mass_error = abs(sum(base_probability) - 1.0)
     policy_mass_error = abs(sum(policy_probability) - 1.0)
@@ -586,6 +638,7 @@ function self_test()
         temperature,
         exploration,
         norm_epsilon,
+        logit_limit,
     )
     finite_difference = zeros(Float64, blocks)
     step = 1.0e-6
@@ -601,6 +654,7 @@ function self_test()
             temperature,
             exploration,
             norm_epsilon,
+            logit_limit,
         )
         minus_value = _fixed_order_logpolicy(
             minus_scores,
@@ -609,6 +663,7 @@ function self_test()
             temperature,
             exploration,
             norm_epsilon,
+            logit_limit,
         )
         finite_difference[block] =
             (plus_value - minus_value) / (2.0 * step)
@@ -616,6 +671,27 @@ function self_test()
     finite_difference_max_error =
         maximum(abs.(finite_difference .- score_eligibility))
     zero_sum_error = abs(sum(score_eligibility))
+
+    # A single score outlier is the worst case for RMS normalization: its
+    # unbounded standardized value approaches sqrt(blocks).  The monotone
+    # soft bound must keep the training policy exploratory without changing
+    # deterministic top-k ordering.
+    outlier_scores = zeros(Float64, 96)
+    outlier_scores[1] = 1000.0
+    outlier_standardized = zeros(Float64, 96)
+    outlier_base = zeros(Float64, 96)
+    outlier_policy = zeros(Float64, 96)
+    prepare_policy!(
+        outlier_standardized,
+        outlier_base,
+        outlier_policy,
+        outlier_scores;
+        temperature=1.0,
+        exploration=0.05,
+        norm_epsilon,
+        logit_limit,
+    )
+    outlier_max_probability = maximum(outlier_base)
 
     base_mass_error <= 64eps(Float64) || error(
         "base policy mass self-test failed: $base_mass_error",
@@ -634,12 +710,16 @@ function self_test()
     zero_sum_error <= 1.0e-10 || error(
         "routing eligibility zero-sum self-test failed: $zero_sum_error",
     )
+    outlier_max_probability <= 0.15 || error(
+        "routing outlier soft bound failed: $outlier_max_probability",
+    )
     return (;
         base_mass_error,
         policy_mass_error,
         minimum_floor_margin,
         finite_difference_max_error,
         zero_sum_error,
+        outlier_max_probability,
         nonce_deterministic,
         route_order=copy(route_order),
     )

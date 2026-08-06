@@ -43,11 +43,11 @@ Each cell owns `2 * branches + 3` persistent states:
   * soma voltage,
   * adaptation.
 
-The block interface remains a regular vector. With four branches, one cell
-exports six analog values (`soma`, `apical`, and four branch voltages). The
-scaled preset therefore replaces 48 point neurons per block with eight
-high-dimensional cells while preserving the 48-dimensional workspace/head
-contract.
+The block interface remains a regular vector.  The default exporter exposes
+`soma`, `apical`, and every branch voltage, but specialised cell models may
+request a wider block contract with `readout_per_cell`.  This lets a reduced
+multi-conductance cell preserve its internal state instead of being forced
+back into the historical six-values-per-cell interface.
 """
 struct DendriticWorkspaceModel <: Lux.AbstractLuxLayer
     blocks::Int
@@ -104,6 +104,7 @@ function DendriticWorkspaceModel(;
     hidden::Int=192,
     spike_temperature::Real=0.20,
     route_temperature::Real=0.35,
+    readout_per_cell::Union{Nothing,Int}=nothing,
 )
     blocks >= 2 || throw(ArgumentError("blocks must be at least two"))
     cells_per_block >= 1 ||
@@ -115,9 +116,11 @@ function DendriticWorkspaceModel(;
     1 <= workspace_k <= blocks ||
         throw(ArgumentError("workspace_k must be in 1:blocks"))
 
+    resolved_readout = something(readout_per_cell, branches + 2)
+    resolved_readout >= 1 ||
+        throw(ArgumentError("readout_per_cell must be positive"))
     cells = blocks * cells_per_block
-    readout_per_cell = branches + 2
-    node_dim = cells_per_block * readout_per_cell
+    node_dim = cells_per_block * resolved_readout
     source, destination =
         _cyclic_cell_tape(cells, fanout, cells_per_block)
     branch_for_relation =
@@ -138,7 +141,7 @@ function DendriticWorkspaceModel(;
         blocks,
         cells_per_block,
         branches,
-        readout_per_cell,
+        resolved_readout,
         node_dim,
         fanout,
         cycles,

@@ -682,13 +682,17 @@ mutable struct LossScratch
     teacher_probability::Vector{Float32}
     student_probability::Vector{Float32}
     z_cotangent::Vector{Float32}
+    state_composite::Vector{Float32}
+    state_teacher_entropy::Vector{Float32}
 end
 
-LossScratch(width::Int) = LossScratch(
+LossScratch(width::Int, state_capacity::Int=width) = LossScratch(
     zeros(Float32, width),
     zeros(Float32, width),
     zeros(Float32, width),
     zeros(Float32, width),
+    zeros(Float32, state_capacity),
+    zeros(Float32, state_capacity),
 )
 
 struct LossRecord
@@ -740,6 +744,10 @@ function loss_and_raw_gradient!(
     width = arena.width
     state_batch = arena.state_batch
     valid_total = arena.valid_count
+    state_batch <= length(scratch.state_composite) ||
+        throw(DimensionMismatch("state loss scratch"))
+    fill!(scratch.state_composite, 0.0f0)
+    fill!(scratch.state_teacher_entropy, 0.0f0)
     listnet_loss = 0.0f0
     teacher_entropy = 0.0f0
     old_q_loss = 0.0f0
@@ -752,6 +760,24 @@ function loss_and_raw_gradient!(
     cavities_loss = 0.0f0
     death_count = 0.0f0
     @inbounds for state_slot in 1:state_batch
+        count = Int(arena.counts[state_slot])
+        for candidate in 1:count
+            death_count +=
+                targets.death_mask[candidate, state_slot] != 0.0f0
+        end
+    end
+    death_denominator = max(death_count, 1.0f0)
+    @inbounds for state_slot in 1:state_batch
+        listnet_before = listnet_loss
+        teacher_entropy_before = teacher_entropy
+        old_q_before = old_q_loss
+        margin_before = margin_loss
+        death_before = death_loss
+        quantile_before = quantile_loss
+        line_before = line_clear_loss
+        height_before = max_height_loss
+        holes_before = holes_loss
+        cavities_before = cavities_loss
         count = Int(arena.counts[state_slot])
         offset = (state_slot - 1) * width
         q_mean = 0.0f0
@@ -863,7 +889,6 @@ function loss_and_raw_gradient!(
                     max(logit, 0.0f0) -
                     logit * label +
                     log1p(exp(-abs(logit)))
-                death_count += 1.0f0
             end
 
             teacher_q = targets.teacher_q[candidate, state_slot]
@@ -907,8 +932,22 @@ function loss_and_raw_gradient!(
             draw[22, flat] +=
                 geometry_gradient_scale * _huber_derivative(cavities_error)
         end
+        scratch.state_teacher_entropy[state_slot] =
+            teacher_entropy - teacher_entropy_before
+        scratch.state_composite[state_slot] =
+            (listnet_loss - listnet_before) +
+            0.25f0 * (old_q_loss - old_q_before) +
+            0.15f0 * (margin_loss - margin_before) +
+            0.10f0 * (death_loss - death_before) /
+                death_denominator +
+            0.05f0 * (quantile_loss - quantile_before) +
+            0.025f0 * (
+                line_clear_loss - line_before +
+                max_height_loss - height_before +
+                holes_loss - holes_before +
+                cavities_loss - cavities_before
+            )
     end
-    death_denominator = max(death_count, 1.0f0)
     @inbounds for state_slot in 1:state_batch
         count = Int(arena.counts[state_slot])
         offset = (state_slot - 1) * width
@@ -938,6 +977,10 @@ function loss_and_raw_gradient!(
     raw_top_gap_loss = margin_loss
     structure_loss =
         structure_weight * (gate_density - 0.50f0)^2
+    structure_per_state = structure_loss / Float32(state_batch)
+    @inbounds for state_slot in 1:state_batch
+        scratch.state_composite[state_slot] += structure_per_state
+    end
     composite_loss =
         listnet_loss +
         0.25f0 * old_q_loss +
@@ -999,6 +1042,12 @@ end
 
 function CandidateScratch(model)
     nodes = model.blocks * model.node_dim
+    head_feature_dim = hasproperty(model, :head_readout) &&
+        model.head_readout === :ordered_topk ?
+        model.node_dim * (model.workspace_k + 1) :
+        hasproperty(model, :head_readout) &&
+        model.head_readout === :anchored_temporal ?
+        3 * model.node_dim : 2 * model.node_dim
     return CandidateScratch(
         PackScratch(),
         zeros(Float32, model.blocks),
@@ -1020,8 +1069,8 @@ function CandidateScratch(model)
         zeros(Float32, model.node_dim),
         zeros(Float32, nodes),
         zeros(Float32, model.blocks),
-        zeros(Float32, 2 * model.node_dim),
-        zeros(Float32, 2 * model.node_dim),
+        zeros(Float32, head_feature_dim),
+        zeros(Float32, head_feature_dim),
         zeros(Float32, model.hidden),
         zeros(Float32, model.fanout),
         falses(model.fanout),
@@ -4118,7 +4167,7 @@ function ArenaTrainer(
             weight_decay,
         ),
         arena,
-        LossScratch(width),
+        LossScratch(width, state_batch),
         _zero_parameter_tree(parameters),
         shards,
         zeros(Float64, length(shards)),

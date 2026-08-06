@@ -37,6 +37,13 @@ const LOCAL_SIGNAL_RMS_EPSILON = 1.0f-4
 const LOCAL_GEOMETRY_WEIGHT = 0.10f0
 const GATE_SIGN_EPSILON = 1.0f-6
 const ROUTING_REWARD_SEMANTICS = :supervised_reward_surrogate
+const FEEDBACK_NOISE_SCALE = 0.025f0
+const FEEDBACK_ALIGNMENT_DECAY = 0.02f0
+const FEEDBACK_LEARNING_RATE_MULTIPLIER = 5.0f0
+const APICAL_RESIDUAL_SCALE = 0.50f0
+const BRANCH_MOVE_MARGIN = 0.25f0
+const BRANCH_CONSOLIDATION_PARTITIONS = 64
+const MAX_PARAMETER_FAMILY_GRADIENT_NORM = 5.0
 
 export DendriticArenaExecutor,
     DendriticArenaMetrics,
@@ -44,13 +51,16 @@ export DendriticArenaExecutor,
     DendriticParameterCache,
     ReducedHayV2ArenaExecutor,
     ReducedHayV2ArenaTrainer,
+    dendritic_arena_gradient!,
     dendritic_arena_output,
     dendritic_arena_update!,
     dendritic_forward_candidate!,
+    dendritic_prepare_workspace_root_signal_candidate!,
     dendritic_parameter_deltas,
     dendritic_training_arena,
     reduced_hay_v2_arena_output,
     reduced_hay_v2_arena_forward!,
+    reduced_hay_v2_arena_gradient!,
     reduced_hay_v2_arena_update!,
     reduced_hay_v2_parameter_deltas,
     reduced_hay_v2_training_arena,
@@ -89,9 +99,50 @@ const RECURRENT_PARAMETER_FIELDS = (
     :workspace_decay_logit,
 )
 
+# These two families move the hard top-k boundary directly.  They require a
+# slower trust-region timescale than the continuous cell and edge dynamics:
+# even a sub-micro parameter displacement can change the selected workspace
+# block discontinuously.
+const DIRECT_ROUTING_PARAMETER_FIELDS = (
+    :state_query_weight,
+    :workspace_key,
+)
+
+# Sensory contacts are an open-loop encoder.  They do not move the hard route
+# boundary or recurrent transition directly, so coupling them to the very slow
+# closed-loop recurrent trust region leaves the model on fixed random features.
+const SENSORY_PARAMETER_FIELDS = (
+    :input_exc_logits,
+    :input_inh_logits,
+)
+
+# Zero-initialized inter-cell and workspace-feedback paths must grow faster
+# than the sensitive intrinsic cell dynamics.  Keeping this family separate
+# lets communication emerge without moving membrane time constants and
+# thresholds on the same optimizer timescale.
+const COMMUNICATION_PARAMETER_FIELDS = (
+    :feedback_gain,
+    :synapse_weight,
+    :gate_logits,
+    :delay_logits,
+)
+
 const LOCAL_PREDICTOR_PARAMETER_FIELDS = (
     :local_readout,
     :local_readout_bias,
+)
+
+const APICAL_CREDIT_PARAMETER_FIELDS = (
+    :apical_predictor_weight,
+    :apical_predictor_bias,
+    :root_feedback,
+    :feature_feedback,
+    :output_feedback,
+)
+
+const LAYERED_FEEDBACK_PARAMETER_FIELDS = (
+    :feature_feedback,
+    :output_feedback,
 )
 
 const HEAD_PARAMETER_FIELDS = (
@@ -109,8 +160,233 @@ const MODEL_PARAMETER_FIELDS = (
 const DENDRITIC_PARAMETER_FIELDS = (
     RECURRENT_PARAMETER_FIELDS...,
     LOCAL_PREDICTOR_PARAMETER_FIELDS...,
+    APICAL_CREDIT_PARAMETER_FIELDS...,
     HEAD_PARAMETER_FIELDS...,
 )
+
+# v11 intentionally has a different, exact-BPTT-only parameter tree.  Keep it
+# separate from the historical v2-v10 registry: adding zero-sized local or
+# apical fields to the new tree would both hide accidental dependencies and
+# invalidate old checkpoint signatures.
+const V11_RECURRENT_PARAMETER_FIELDS = (
+    :input_exc_logits,
+    :input_inh_logits,
+    :branch_bias,
+    :branch_leak_logits,
+    :ampa_decay_logits,
+    :nmda_decay_logits,
+    :gaba_decay_logits,
+    :current_gain_logits,
+    :axial_gain_logits,
+    :nmda_slope_logits,
+    :nmda_half_logits,
+    :plateau_decay_logits,
+    :plateau_threshold_logits,
+    :plateau_slope_logits,
+    :plateau_gain_logits,
+    :plateau_feedback_logits,
+    :soma_coupling,
+    :apical_leak_logits,
+    :soma_leak_logits,
+    :adaptation_decay_logits,
+    :apical_gain_logits,
+    :soma_threshold_logits,
+    :adaptation_gain_logits,
+    :route_state_projection,
+    :state_query_weight,
+    :workspace_key,
+    :feedback_gain,
+    :global_feedback_gain,
+    :synapse_weight,
+    :gate_logits,
+    :delay_logits,
+    :workspace_decay_logit,
+)
+
+const V11_DIRECT_ROUTING_PARAMETER_FIELDS = (
+    :route_state_projection,
+    :state_query_weight,
+    :workspace_key,
+)
+
+const V11_COMMUNICATION_PARAMETER_FIELDS = (
+    :feedback_gain,
+    :global_feedback_gain,
+    :synapse_weight,
+    :gate_logits,
+    :delay_logits,
+)
+
+const V11_HEAD_PARAMETER_FIELDS = (
+    :head_state_projection,
+    :head_anchor_mix,
+    :head_history_mix,
+    :head_delta_mix,
+    :output_bias,
+)
+
+const V11_MODEL_PARAMETER_FIELDS = (
+    V11_RECURRENT_PARAMETER_FIELDS...,
+    V11_HEAD_PARAMETER_FIELDS...,
+)
+
+# No local predictor or apical-credit arrays are legal in the v11 arena.
+const V11_ARENA_PARAMETER_FIELDS = V11_MODEL_PARAMETER_FIELDS
+
+# v13 reads the canonical 24 exported coordinates directly.  Its recurrent
+# tree is intentionally identical to v11/v12, but there is no learned
+# head-state projection and therefore no zero-sized compatibility parameter.
+const V13_HEAD_PARAMETER_FIELDS = (
+    :head_anchor_mix,
+    :head_history_mix,
+    :head_delta_mix,
+    :output_bias,
+)
+
+const V13_MODEL_PARAMETER_FIELDS = (
+    V11_RECURRENT_PARAMETER_FIELDS...,
+    V13_HEAD_PARAMETER_FIELDS...,
+)
+
+const V13_ARENA_PARAMETER_FIELDS = V13_MODEL_PARAMETER_FIELDS
+
+@generated function _is_v11_parameter_tree(
+    ::NamedTuple{K},
+) where {K}
+    return K == V11_ARENA_PARAMETER_FIELDS ? :(true) : :(false)
+end
+
+@generated function _is_v13_parameter_tree(
+    ::NamedTuple{K},
+) where {K}
+    return K == V13_ARENA_PARAMETER_FIELDS ? :(true) : :(false)
+end
+
+@generated function _is_exact_slot_parameter_tree(
+    ::NamedTuple{K},
+) where {K}
+    return K in (
+        V11_ARENA_PARAMETER_FIELDS,
+        V13_ARENA_PARAMETER_FIELDS,
+    ) ? :(true) : :(false)
+end
+
+@inline _arena_parameter_fields(parameters) =
+    _is_v13_parameter_tree(parameters) ?
+    V13_ARENA_PARAMETER_FIELDS :
+    _is_v11_parameter_tree(parameters) ?
+    V11_ARENA_PARAMETER_FIELDS :
+    DENDRITIC_PARAMETER_FIELDS
+
+@inline _recurrent_parameter_fields(parameters) =
+    _is_exact_slot_parameter_tree(parameters) ?
+    V11_RECURRENT_PARAMETER_FIELDS : RECURRENT_PARAMETER_FIELDS
+
+@inline _head_parameter_fields(parameters) =
+    _is_v13_parameter_tree(parameters) ?
+    V13_HEAD_PARAMETER_FIELDS :
+    _is_v11_parameter_tree(parameters) ?
+    V11_HEAD_PARAMETER_FIELDS :
+    HEAD_PARAMETER_FIELDS
+
+@inline _local_predictor_parameter_fields(parameters) =
+    _is_exact_slot_parameter_tree(parameters) ? () :
+    LOCAL_PREDICTOR_PARAMETER_FIELDS
+
+@inline _apical_credit_parameter_fields(parameters) =
+    _is_exact_slot_parameter_tree(parameters) ? () :
+    APICAL_CREDIT_PARAMETER_FIELDS
+
+@generated function _is_recurrent_parameter(
+    ::NamedTuple{K},
+    ::Val{F},
+) where {K,F}
+    fields = K in (
+        V11_ARENA_PARAMETER_FIELDS,
+        V13_ARENA_PARAMETER_FIELDS,
+    ) ?
+        V11_RECURRENT_PARAMETER_FIELDS : RECURRENT_PARAMETER_FIELDS
+    return F in fields ? :(true) : :(false)
+end
+
+@generated function _is_head_parameter(
+    ::NamedTuple{K},
+    ::Val{F},
+) where {K,F}
+    fields = K == V13_ARENA_PARAMETER_FIELDS ?
+        V13_HEAD_PARAMETER_FIELDS :
+        K == V11_ARENA_PARAMETER_FIELDS ?
+        V11_HEAD_PARAMETER_FIELDS : HEAD_PARAMETER_FIELDS
+    return F in fields ? :(true) : :(false)
+end
+
+@generated function _is_local_predictor_parameter(
+    ::NamedTuple{K},
+    ::Val{F},
+) where {K,F}
+    return K in (
+        V11_ARENA_PARAMETER_FIELDS,
+        V13_ARENA_PARAMETER_FIELDS,
+    ) ?
+        :(false) : (F in LOCAL_PREDICTOR_PARAMETER_FIELDS ? :(true) : :(false))
+end
+
+@generated function _is_apical_credit_parameter(
+    ::NamedTuple{K},
+    ::Val{F},
+) where {K,F}
+    return K in (
+        V11_ARENA_PARAMETER_FIELDS,
+        V13_ARENA_PARAMETER_FIELDS,
+    ) ?
+        :(false) : (F in APICAL_CREDIT_PARAMETER_FIELDS ? :(true) : :(false))
+end
+
+@generated function _is_direct_routing_parameter(
+    ::NamedTuple{K},
+    ::Val{F},
+) where {K,F}
+    fields = K in (
+        V11_ARENA_PARAMETER_FIELDS,
+        V13_ARENA_PARAMETER_FIELDS,
+    ) ?
+        V11_DIRECT_ROUTING_PARAMETER_FIELDS :
+        DIRECT_ROUTING_PARAMETER_FIELDS
+    return F in fields ? :(true) : :(false)
+end
+
+@generated function _is_communication_parameter(
+    ::NamedTuple{K},
+    ::Val{F},
+) where {K,F}
+    fields = K in (
+        V11_ARENA_PARAMETER_FIELDS,
+        V13_ARENA_PARAMETER_FIELDS,
+    ) ?
+        V11_COMMUNICATION_PARAMETER_FIELDS :
+        COMMUNICATION_PARAMETER_FIELDS
+    return F in fields ? :(true) : :(false)
+end
+
+@generated function _recurrent_field_index(
+    ::NamedTuple{K},
+    ::Val{F},
+) where {K,F}
+    fields = K in (
+        V11_ARENA_PARAMETER_FIELDS,
+        V13_ARENA_PARAMETER_FIELDS,
+    ) ?
+        V11_RECURRENT_PARAMETER_FIELDS : RECURRENT_PARAMETER_FIELDS
+    index = findfirst(==(F), fields)
+    index === nothing && return :(0)
+    return :($index)
+end
+
+@generated function _recurrent_field_index(::Val{F}) where {F}
+    index = findfirst(==(F), RECURRENT_PARAMETER_FIELDS)
+    index === nothing && return :(0)
+    return :($index)
+end
 
 @inline _logistic_derivative(value::Float32) =
     value * (1.0f0 - value)
@@ -123,6 +399,11 @@ end
     return (-2.5f0 < value < 2.5f0) ? 0.2f0 : 0.0f0
 end
 
+@inline function _apical_activation(model, value::Float32)
+    baseline = model.apical_response === :centered_v2 ? 0.5f0 : 0.0f0
+    return _hard_sigmoid(value) - baseline
+end
+
 @inline function _spike_surrogate(
     voltage::Float32,
     threshold::Float32,
@@ -133,9 +414,11 @@ end
 end
 
 function _zero_parameter_tree(parameters)
-    keys(parameters) == DENDRITIC_PARAMETER_FIELDS || error(
-        "dendritic parameter registry changed",
-    )
+    parameter_keys = keys(parameters)
+    parameter_keys == DENDRITIC_PARAMETER_FIELDS ||
+        parameter_keys == V11_ARENA_PARAMETER_FIELDS ||
+        parameter_keys == V13_ARENA_PARAMETER_FIELDS ||
+        error("dendritic parameter registry changed")
     return NamedTuple{keys(parameters)}(
         map(array -> zeros(Float32, size(array)), values(parameters)),
     )
@@ -183,6 +466,15 @@ function _copy_parameters(parameters)
 end
 
 function _with_local_predictor(parameters, projection, model)
+    if keys(parameters) in (
+        V11_MODEL_PARAMETER_FIELDS,
+        V13_MODEL_PARAMETER_FIELDS,
+    )
+        _uses_exact_block_slots(model) || error(
+            "exact-slot parameter tree requires exact block slots",
+        )
+        return parameters
+    end
     keys(parameters) == MODEL_PARAMETER_FIELDS || error(
         "Reduced Hay v2 model parameter registry changed",
     )
@@ -194,10 +486,26 @@ function _with_local_predictor(parameters, projection, model)
         name -> getproperty(parameters, name),
         HEAD_PARAMETER_FIELDS,
     )
+    feature_dim = Model.reduced_hay_head_feature_dim(model)
+    root_feedback = zeros(Float32, feature_dim, OUTPUT_DIM)
     return NamedTuple{DENDRITIC_PARAMETER_FIELDS}((
         recurrent...,
         copy(projection),
         zeros(Float32, OUTPUT_DIM, model.blocks),
+        zeros(
+            Float32,
+            model.readout_per_cell,
+            model.readout_per_cell,
+            model.blocks * model.cells_per_block,
+        ),
+        zeros(
+            Float32,
+            model.readout_per_cell,
+            model.blocks * model.cells_per_block,
+        ),
+        root_feedback,
+        zeros(Float32, feature_dim, model.hidden),
+        zeros(Float32, model.hidden, OUTPUT_DIM),
         head...,
     ))
 end
@@ -498,15 +806,98 @@ mutable struct DendriticTape
     state_query_pre::Array{Float32,3}
     state_query::Array{Float32,3}
     state_query_inv_rms::Matrix{Float32}
+    spatial_bound_coordinate::Matrix{Int32}
+    spatial_bound_sign::Matrix{Float32}
+    spatial_inverse_coordinate::Matrix{Int32}
+    spatial_inverse_sign::Matrix{Float32}
+    temporal_bound_coordinate::Matrix{Int32}
+    temporal_bound_sign::Matrix{Float32}
+    sensory_anchor::Matrix{Float32}
+    temporal_workspace::Matrix{Float32}
+    anchor_delta::Matrix{Float32}
+    sensory_anchor_inv_rms::Vector{Float32}
+    temporal_workspace_inv_rms::Vector{Float32}
+    anchor_delta_inv_rms::Vector{Float32}
     block_supervised_reward::Array{Float32,3}
     block_advantage::Array{Float32,3}
 end
+
+@inline _uses_exact_block_slots(model) =
+    hasproperty(model, :workspace_layout) &&
+    model.workspace_layout === :exact_block_slots
+
+@inline _arena_route_dim(model) =
+    _uses_exact_block_slots(model) ? Int(model.route_dim) : model.node_dim
+
+@inline _uses_direct_axis_head(model) =
+    hasproperty(model, :head_layout) &&
+    model.head_layout === :axis_direct
 
 function DendriticTape(model, state_batch::Int, width::Int)
     base = Point.TrainingArena(model, state_batch, width)
     cells = model.blocks * model.cells_per_block
     capacity = state_batch * width
     times = model.cycles + 1
+    route_dim = _arena_route_dim(model)
+    spatial_coordinate = Matrix{Int32}(
+        undef,
+        model.node_dim,
+        model.blocks,
+    )
+    spatial_sign = Matrix{Float32}(
+        undef,
+        model.node_dim,
+        model.blocks,
+    )
+    spatial_inverse_coordinate = similar(spatial_coordinate)
+    spatial_inverse_sign = similar(spatial_sign)
+    @inbounds for block in 1:model.blocks
+        for bound_coordinate in 1:model.node_dim
+            raw_coordinate = Model.spatial_bound_coordinate(
+                model,
+                block,
+                bound_coordinate,
+            )
+            sign = Model.spatial_bound_sign(
+                model,
+                block,
+                bound_coordinate,
+            )
+            spatial_coordinate[bound_coordinate, block] =
+                Int32(raw_coordinate)
+            spatial_sign[bound_coordinate, block] = sign
+            spatial_inverse_coordinate[raw_coordinate, block] =
+                Int32(bound_coordinate)
+            spatial_inverse_sign[raw_coordinate, block] = sign
+        end
+    end
+    temporal_coordinate = Matrix{Int32}(
+        undef,
+        model.node_dim,
+        model.cycles,
+    )
+    temporal_sign = Matrix{Float32}(
+        undef,
+        model.node_dim,
+        model.cycles,
+    )
+    @inbounds for cycle in 1:model.cycles
+        for bound_coordinate in 1:model.node_dim
+            temporal_coordinate[bound_coordinate, cycle] = Int32(
+                Model.temporal_bound_coordinate(
+                    model,
+                    cycle,
+                    bound_coordinate,
+                ),
+            )
+            temporal_sign[bound_coordinate, cycle] =
+                Model.temporal_bound_sign(
+                    model,
+                    cycle,
+                    bound_coordinate,
+                )
+        end
+    end
     return DendriticTape(
         base,
         zeros(
@@ -551,17 +942,29 @@ function DendriticTape(model, state_batch::Int, width::Int)
         zeros(Float32, cells, model.cycles, capacity),
         zeros(
             Float32,
-            model.node_dim,
+            route_dim,
             model.cycles,
             capacity,
         ),
         zeros(
             Float32,
-            model.node_dim,
+            route_dim,
             model.cycles,
             capacity,
         ),
         zeros(Float32, model.cycles, capacity),
+        spatial_coordinate,
+        spatial_sign,
+        spatial_inverse_coordinate,
+        spatial_inverse_sign,
+        temporal_coordinate,
+        temporal_sign,
+        zeros(Float32, model.node_dim, capacity),
+        zeros(Float32, model.node_dim, capacity),
+        zeros(Float32, model.node_dim, capacity),
+        zeros(Float32, capacity),
+        zeros(Float32, capacity),
+        zeros(Float32, capacity),
         zeros(
             Float32,
             model.blocks,
@@ -585,6 +988,9 @@ end
 @inline _channel_for_coordinate(model, coordinate::Int) =
     mod(coordinate - 1, model.readout_per_cell) + 1
 
+@inline _positive_state_readout(value::Float32) =
+    value / (1.0f0 + value)
+
 @inline function _analog_value(
     tape::DendriticTape,
     model,
@@ -595,12 +1001,129 @@ end
 )
     cell = _cell_for_coordinate(model, coordinate, block)
     channel = _channel_for_coordinate(model, coordinate)
+    if model.cell_export === :full24
+        channel == 1 &&
+            return tanh(tape.soma[cell, time, flat])
+        channel == 2 &&
+            return time == 1 ? 0.0f0 :
+                tape.soma_spikes[cell, time - 1, flat]
+        channel == 3 &&
+            return tanh(tape.apical[cell, time, flat])
+        channel == 4 &&
+            return _positive_state_readout(
+                tape.adaptation[cell, time, flat],
+            )
+        branch = div(channel - 5, 5) + 1
+        branch_channel = mod(channel - 5, 5) + 1
+        branch_channel == 1 &&
+            return tanh(
+                tape.branch_voltage[cell, branch, time, flat],
+            )
+        branch_channel == 2 &&
+            return _positive_state_readout(
+                tape.ampa[cell, branch, time, flat],
+            )
+        branch_channel == 3 &&
+            return _positive_state_readout(
+                tape.nmda[cell, branch, time, flat],
+            )
+        branch_channel == 4 &&
+            return _positive_state_readout(
+                tape.gaba[cell, branch, time, flat],
+            )
+        return _positive_state_readout(
+            tape.plateau[cell, branch, time, flat],
+        )
+    end
     channel == 1 &&
         return tanh(tape.soma[cell, time, flat])
     channel == 2 &&
         return tanh(tape.apical[cell, time, flat])
     branch = channel - 2
     return tanh(tape.branch_voltage[cell, branch, time, flat])
+end
+
+@inline function _scatter_export_cotangent!(
+    scratch,
+    tape::DendriticTape,
+    model,
+    coordinate::Int,
+    block::Int,
+    cycle::Int,
+    flat::Int,
+    signal::Float32,
+)
+    signal == 0.0f0 && return nothing
+    cell = _cell_for_coordinate(model, coordinate, block)
+    channel = _channel_for_coordinate(model, coordinate)
+    exported = tape.base.membrane[
+        coordinate + (block - 1) * model.node_dim,
+        cycle + 1,
+        flat,
+    ]
+    if model.cell_export === :full24
+        if channel == 1
+            scratch.soma_signal[cell, cycle] +=
+                signal * (1.0f0 - exported * exported)
+        elseif channel == 2
+            # The exported event is raw.  The cell adjoint applies the soma
+            # spike surrogate exactly once when this cotangent is consumed.
+            scratch.spike_signal[cell, cycle] += signal
+        elseif channel == 3
+            scratch.apical_signal[cell, cycle] +=
+                signal * (1.0f0 - exported * exported)
+        elseif channel == 4
+            scratch.adaptation_signal[cell, cycle] +=
+                signal * (1.0f0 - exported) * (1.0f0 - exported)
+        else
+            branch = div(channel - 5, 5) + 1
+            branch_channel = mod(channel - 5, 5) + 1
+            if branch_channel == 1
+                scratch.branch_signal[cell, branch, cycle] +=
+                    signal * (1.0f0 - exported * exported)
+            elseif branch_channel == 2
+                scratch.ampa_signal[cell, branch, cycle] +=
+                    signal * (1.0f0 - exported) * (1.0f0 - exported)
+            elseif branch_channel == 3
+                scratch.nmda_signal[cell, branch, cycle] +=
+                    signal * (1.0f0 - exported) * (1.0f0 - exported)
+            elseif branch_channel == 4
+                scratch.gaba_signal[cell, branch, cycle] +=
+                    signal * (1.0f0 - exported) * (1.0f0 - exported)
+            else
+                scratch.plateau_signal[cell, branch, cycle] +=
+                    signal * (1.0f0 - exported) * (1.0f0 - exported)
+            end
+        end
+        return nothing
+    end
+
+    if channel == 1
+        scratch.soma_signal[cell, cycle] +=
+            signal * (1.0f0 - exported * exported)
+    elseif channel == 2
+        scratch.apical_signal[cell, cycle] +=
+            signal * (1.0f0 - exported * exported)
+    else
+        scratch.branch_signal[cell, channel - 2, cycle] +=
+            signal * (1.0f0 - exported * exported)
+    end
+    return nothing
+end
+
+@inline function _reset_export_signals!(scratch)
+    fill!(scratch.workspace_root_signal, 0.0f0)
+    fill!(scratch.soma_signal, 0.0f0)
+    fill!(scratch.apical_signal, 0.0f0)
+    fill!(scratch.adaptation_signal, 0.0f0)
+    fill!(scratch.branch_signal, 0.0f0)
+    fill!(scratch.ampa_signal, 0.0f0)
+    fill!(scratch.nmda_signal, 0.0f0)
+    fill!(scratch.gaba_signal, 0.0f0)
+    fill!(scratch.plateau_signal, 0.0f0)
+    fill!(scratch.spike_signal, 0.0f0)
+    fill!(scratch.route_mask_signal, 0.0f0)
+    return nothing
 end
 
 @inline function _write_exported_state!(
@@ -627,6 +1150,162 @@ end
     return nothing
 end
 
+@inline function _v11_route_block_sign(model, block::Int, route::Int)
+    return Model.reduced_hay_route_block_sign(route, block)
+end
+
+@inline function _v11_axis_project_cell!(
+    destination::Vector{Float32},
+    tape::DendriticTape,
+    model,
+    parameters,
+    block::Int,
+    local_cell::Int,
+    time::Int,
+    flat::Int,
+    subtract_time::Int=0,
+)
+    rank_count = model.head_state_rank
+    state_count = model.readout_per_cell
+    block_offset = (block - 1) * model.node_dim
+    cell_offset = block_offset + (local_cell - 1) * state_count
+    @inbounds for rank in 1:rank_count
+        destination[rank] = 0.0f0
+    end
+    @inbounds for state in 1:state_count
+        value = tape.base.membrane[cell_offset + state, time, flat]
+        if subtract_time != 0
+            value -= tape.base.membrane[
+                cell_offset + state,
+                subtract_time,
+                flat,
+            ]
+        end
+        for rank in 1:rank_count
+            destination[rank] = muladd(
+                parameters.head_state_projection[
+                    rank,
+                    state,
+                    local_cell,
+                ],
+                value,
+                destination[rank],
+            )
+        end
+    end
+    @inbounds for rank in 1:rank_count
+        destination[rank] = tanh(destination[rank])
+    end
+    return nothing
+end
+
+@inline function _v11_accumulate_axis_head!(
+    raw::Matrix{Float32},
+    flat::Int,
+    projection::Vector{Float32},
+    mix,
+    block::Int,
+    local_cell::Int,
+)
+    @inbounds for rank in eachindex(projection)
+        value = projection[rank]
+        for output in 1:OUTPUT_DIM
+            raw[output, flat] = muladd(
+                mix[output, block, local_cell, rank],
+                value,
+                raw[output, flat],
+            )
+        end
+    end
+    return nothing
+end
+
+@inline function _v11_accumulate_history_head!(
+    raw::Matrix{Float32},
+    flat::Int,
+    projection::Vector{Float32},
+    mix,
+    cycle::Int,
+    block::Int,
+    local_cell::Int,
+)
+    @inbounds for rank in eachindex(projection)
+        value = projection[rank]
+        for output in 1:OUTPUT_DIM
+            raw[output, flat] = muladd(
+                mix[output, cycle, block, local_cell, rank],
+                value,
+                raw[output, flat],
+            )
+        end
+    end
+    return nothing
+end
+
+@inline function _v13_accumulate_direct_axis_head!(
+    raw::Matrix{Float32},
+    flat::Int,
+    tape::DendriticTape,
+    model,
+    mix,
+    block::Int,
+    local_cell::Int,
+    time::Int,
+    subtract_time::Int=0,
+)
+    state_count = model.readout_per_cell
+    block_offset = (block - 1) * model.node_dim
+    cell_offset = block_offset + (local_cell - 1) * state_count
+    @inbounds for state in 1:state_count
+        value = tape.base.membrane[cell_offset + state, time, flat]
+        if subtract_time != 0
+            value -= tape.base.membrane[
+                cell_offset + state,
+                subtract_time,
+                flat,
+            ]
+        end
+        for output in 1:OUTPUT_DIM
+            raw[output, flat] = muladd(
+                mix[output, block, local_cell, state],
+                value,
+                raw[output, flat],
+            )
+        end
+    end
+    return nothing
+end
+
+@inline function _v13_accumulate_direct_history_head!(
+    raw::Matrix{Float32},
+    flat::Int,
+    tape::DendriticTape,
+    model,
+    mix,
+    cycle::Int,
+    block::Int,
+    local_cell::Int,
+)
+    state_count = model.readout_per_cell
+    block_offset = (block - 1) * model.node_dim
+    cell_offset = block_offset + (local_cell - 1) * state_count
+    @inbounds for state in 1:state_count
+        value = tape.base.membrane[
+            cell_offset + state,
+            cycle + 1,
+            flat,
+        ]
+        for output in 1:OUTPUT_DIM
+            raw[output, flat] = muladd(
+                mix[output, cycle, block, local_cell, state],
+                value,
+                raw[output, flat],
+            )
+        end
+    end
+    return nothing
+end
+
 mutable struct DendriticWorkerScratch{G}
     gradient::G
     pack::Point.PackScratch
@@ -646,31 +1325,42 @@ mutable struct DendriticWorkerScratch{G}
     local_error::Vector{Float32}
     block_signal::Vector{Float32}
     global_block_signal::Vector{Float32}
+    query_input_state::Vector{Float32}
+    exact_workspace::Array{Float32,3}
+    route_state::Matrix{Float32}
+    route_context::Matrix{Float32}
+    axis_projection::Vector{Float32}
+    slot_adjoint::Matrix{Float32}
+    route_state_signal::Matrix{Float32}
+    route_query_signal::Vector{Float32}
+    global_context_signal::Vector{Float32}
     local_block_signal::Vector{Float32}
+    root_block_signal::Matrix{Float32}
+    feedback_error::Matrix{Float32}
+    feedback_next::Matrix{Float32}
+    feedback_norm::Vector{Float32}
+    workspace_root_signal::Matrix{Float32}
     soma_signal::Matrix{Float32}
     apical_signal::Matrix{Float32}
+    adaptation_signal::Matrix{Float32}
     branch_signal::Array{Float32,3}
-    eligibility_weight_a::Matrix{Float32}
-    eligibility_weight_n::Matrix{Float32}
-    eligibility_weight_g::Matrix{Float32}
-    eligibility_weight_u::Matrix{Float32}
-    eligibility_weight_p::Matrix{Float32}
-    eligibility_weight_s::Matrix{Float32}
-    eligibility_weight_q::Matrix{Float32}
-    eligibility_gate_a::Matrix{Float32}
-    eligibility_gate_n::Matrix{Float32}
-    eligibility_gate_g::Matrix{Float32}
-    eligibility_gate_u::Matrix{Float32}
-    eligibility_gate_p::Matrix{Float32}
-    eligibility_gate_s::Matrix{Float32}
-    eligibility_gate_q::Matrix{Float32}
-    eligibility_delay_a::Matrix{Float32}
-    eligibility_delay_n::Matrix{Float32}
-    eligibility_delay_g::Matrix{Float32}
-    eligibility_delay_u::Matrix{Float32}
-    eligibility_delay_p::Matrix{Float32}
-    eligibility_delay_s::Matrix{Float32}
-    eligibility_delay_q::Matrix{Float32}
+    ampa_signal::Array{Float32,3}
+    nmda_signal::Array{Float32,3}
+    gaba_signal::Array{Float32,3}
+    plateau_signal::Array{Float32,3}
+    branch_exc_drive_signal::Array{Float32,3}
+    branch_inh_drive_signal::Array{Float32,3}
+    spike_signal::Matrix{Float32}
+    route_mask_signal::Matrix{Float32}
+    gate_cotangent::Matrix{Float32}
+    adjoint_ampa::Matrix{Float32}
+    adjoint_nmda::Matrix{Float32}
+    adjoint_gaba::Matrix{Float32}
+    adjoint_branch::Matrix{Float32}
+    adjoint_plateau::Matrix{Float32}
+    adjoint_apical::Vector{Float32}
+    adjoint_soma::Vector{Float32}
+    adjoint_adaptation::Vector{Float32}
     utility::Matrix{Float32}
     branch_utility::Array{Float32,3}
     active_edges::Vector{Int32}
@@ -680,6 +1370,10 @@ mutable struct DendriticWorkerScratch{G}
     local_death_loss::Float64
     local_quantile_loss::Float64
     local_geometry_loss::Float64
+    apical_predictor_loss::Float64
+    feedback_alignment_loss::Float64
+    burst_gate_sum::Float64
+    burst_gate_count::Int
     jobs::UInt64
     cpu_ticks::UInt64
 end
@@ -687,6 +1381,11 @@ end
 function DendriticWorkerScratch(model, parameters)
     cells = model.blocks * model.cells_per_block
     edge_shape = size(parameters.synapse_weight)
+    exact_block_slots = _uses_exact_block_slots(model)
+    route_dim = _arena_route_dim(model)
+    head_state_rank =
+        exact_block_slots && !_uses_direct_axis_head(model) ?
+        Int(model.head_state_rank) : 0
     return DendriticWorkerScratch(
         _zero_parameter_tree(parameters),
         Point.PackScratch(),
@@ -707,30 +1406,56 @@ function DendriticWorkerScratch(model, parameters)
         zeros(Float32, model.node_dim),
         zeros(Float32, model.node_dim),
         zeros(Float32, model.node_dim),
+        exact_block_slots ?
+            zeros(
+                Float32,
+                model.node_dim,
+                model.blocks,
+                model.cycles + 1,
+            ) : zeros(Float32, 0, 0, 0),
+        exact_block_slots ?
+            zeros(Float32, route_dim, model.blocks) :
+            zeros(Float32, 0, 0),
+        exact_block_slots ?
+            zeros(Float32, route_dim, model.cycles + 1) :
+            zeros(Float32, 0, 0),
+        exact_block_slots && head_state_rank > 0 ?
+            zeros(Float32, head_state_rank) : Float32[],
+        exact_block_slots ?
+            zeros(Float32, model.node_dim, model.blocks) :
+            zeros(Float32, 0, 0),
+        exact_block_slots ?
+            zeros(Float32, route_dim, model.blocks) :
+            zeros(Float32, 0, 0),
+        exact_block_slots ? zeros(Float32, route_dim) : Float32[],
+        exact_block_slots ? zeros(Float32, route_dim) : Float32[],
+        zeros(Float32, model.node_dim),
+        zeros(Float32, model.node_dim, model.blocks),
+        zeros(Float32, model.node_dim, model.blocks),
+        zeros(Float32, model.node_dim, model.blocks),
+        zeros(Float32, model.blocks),
+        zeros(Float32, model.node_dim, model.cycles),
+        zeros(Float32, cells, model.cycles),
         zeros(Float32, cells, model.cycles),
         zeros(Float32, cells, model.cycles),
         zeros(Float32, cells, model.branches, model.cycles),
+        zeros(Float32, cells, model.branches, model.cycles),
+        zeros(Float32, cells, model.branches, model.cycles),
+        zeros(Float32, cells, model.branches, model.cycles),
+        zeros(Float32, cells, model.branches, model.cycles),
+        zeros(Float32, cells, model.branches, model.cycles),
+        zeros(Float32, cells, model.branches, model.cycles),
+        zeros(Float32, cells, model.cycles),
+        zeros(Float32, model.blocks, model.cycles),
         zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
-        zeros(Float32, edge_shape),
+        zeros(Float32, cells, model.branches),
+        zeros(Float32, cells, model.branches),
+        zeros(Float32, cells, model.branches),
+        zeros(Float32, cells, model.branches),
+        zeros(Float32, cells, model.branches),
+        zeros(Float32, cells),
+        zeros(Float32, cells),
+        zeros(Float32, cells),
         zeros(Float32, edge_shape),
         zeros(
             Float32,
@@ -745,6 +1470,10 @@ function DendriticWorkerScratch(model, parameters)
         0.0,
         0.0,
         0.0,
+        0.0,
+        0.0,
+        0.0,
+        0,
         UInt64(0),
         UInt64(0),
     )
@@ -768,13 +1497,16 @@ end
     stochastic::Bool,
     nonce::UInt64,
     cycle::Int,
+    routing_temperature::Float32,
+    routing_logit_limit::Float32=Routing.DEFAULT_LOGIT_LIMIT,
 )
     Routing.prepare_policy!(
         scratch.route_standardized,
         scratch.base_route,
         scratch.soft_route,
         scratch.scores;
-        temperature=model.route_temperature,
+        temperature=routing_temperature,
+        logit_limit=routing_logit_limit,
     )
     if stochastic
         Routing.sample_plackett_luce_topk!(
@@ -804,7 +1536,8 @@ end
         scratch.scores,
         scratch.route_order,
         model.workspace_k;
-        temperature=model.route_temperature,
+        temperature=routing_temperature,
+        logit_limit=routing_logit_limit,
     )
     return nothing
 end
@@ -871,6 +1604,86 @@ end
     return nothing
 end
 
+@inline function _force_recorded_route!(
+    scratch::DendriticWorkerScratch,
+    model,
+    forced_route_order,
+    cycle::Int,
+    routing_temperature::Float32,
+    routing_logit_limit::Float32,
+)
+    fill!(scratch.selected, false)
+    @inbounds for rank in 1:model.workspace_k
+        block = Int(forced_route_order[rank, cycle])
+        1 <= block <= model.blocks || throw(ArgumentError(
+            "forced route contains an invalid block",
+        ))
+        scratch.selected[block] && throw(ArgumentError(
+            "forced route contains a duplicate block",
+        ))
+        scratch.selected[block] = true
+        scratch.route_order[rank] = Int16(block)
+    end
+    Routing.ordered_score_eligibility!(
+        scratch.route_eligibility,
+        scratch.route_logweight,
+        scratch.route_alpha,
+        scratch.route_standardized,
+        scratch.base_route,
+        scratch.soft_route,
+        scratch.scores,
+        scratch.route_order,
+        model.workspace_k;
+        temperature=routing_temperature,
+        logit_limit=routing_logit_limit,
+    )
+    return nothing
+end
+
+@inline function _apply_route_revisit_policy!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    cycle::Int,
+    flat::Int,
+)
+    model.route_revisit_policy === :allow && return nothing
+    cycle == 1 && return nothing
+    minimum_score = Inf32
+    maximum_score = -Inf32
+    @inbounds for block in 1:model.blocks
+        score = scratch.scores[block]
+        minimum_score = min(minimum_score, score)
+        maximum_score = max(maximum_score, score)
+    end
+    penalty = maximum_score - minimum_score + 1.0f0
+    @inbounds for block in 1:model.blocks
+        visited = false
+        for previous_cycle in 1:(cycle - 1)
+            if tape.base.block_mask[block, previous_cycle, flat] != 0.0f0
+                visited = true
+                break
+            end
+        end
+        visited && (scratch.scores[block] -= penalty)
+    end
+    return nothing
+end
+
+@inline function _internal_sleep_noise(
+    seed::UInt64,
+    flat::Int,
+    coordinate::Int,
+)
+    mixed = Routing.routing_mix64(
+        seed ⊻
+        UInt64(flat) * UInt64(0x9e3779b97f4a7c15) ⊻
+        UInt64(coordinate) * UInt64(0xd6e8feb86659fd93),
+    )
+    unit = Float32(mixed >> 40) / Float32(0x01000000)
+    return muladd(2.0f0, unit, -1.0f0)
+end
+
 function dendritic_forward_candidate!(
     tape::DendriticTape,
     model,
@@ -881,21 +1694,136 @@ function dendritic_forward_candidate!(
     flat::Int;
     stochastic_routing::Bool=false,
     routing_nonce::UInt64=UInt64(0),
+    routing_temperature::Real=model.route_temperature,
+    routing_logit_limit::Real=Routing.DEFAULT_LOGIT_LIMIT,
+    internal_noise_seed::Union{Nothing,UInt64}=nothing,
+    internal_noise_scale::Real=0.0f0,
+    internal_noise_block::Int=0,
+    require_zero_rails::Bool=false,
+    silenced_block::Int=0,
+    internal_state_key=nothing,
+    internal_key_fraction::Real=0.0f0,
+    internal_key_gain::Real=0.0f0,
+    forced_route_order=nothing,
 )
     base = tape.base
     cells = model.blocks * model.cells_per_block
     node_dim = model.node_dim
     readout = model.readout_per_cell
+    exact_block_slots = _uses_exact_block_slots(model)
+    direct_axis_head = _uses_direct_axis_head(model)
+    route_dim = _arena_route_dim(model)
+    route_state_rank = exact_block_slots ?
+        div(route_dim, model.cells_per_block) : 0
+    bound_workspace = model.workspace_binding !== :none
+    anchored_temporal = model.head_readout === :anchored_temporal
+    noise_scale = Float32(internal_noise_scale)
+    isfinite(noise_scale) && noise_scale >= 0.0f0 ||
+        throw(ArgumentError(
+            "internal_noise_scale must be finite and nonnegative",
+        ))
+    0 <= internal_noise_block <= model.blocks ||
+        throw(ArgumentError("internal_noise_block is outside the model"))
+    0 <= silenced_block <= model.blocks ||
+        throw(ArgumentError("silenced_block is outside the model"))
+    key_fraction = Float32(internal_key_fraction)
+    key_gain = Float32(internal_key_gain)
+    0.0f0 <= key_fraction <= 1.0f0 ||
+        throw(ArgumentError("internal_key_fraction must be in [0, 1]"))
+    0.0f0 <= key_gain <= 1.0f0 ||
+        throw(ArgumentError("internal_key_gain must be in [0, 1]"))
+    internal_state_key === nothing ||
+        length(internal_state_key) == node_dim ||
+        throw(DimensionMismatch("internal_state_key"))
+    if forced_route_order !== nothing
+        size(forced_route_order, 1) == model.workspace_k ||
+            throw(DimensionMismatch("forced route rank axis"))
+        size(forced_route_order, 2) == model.cycles ||
+            throw(DimensionMismatch("forced route cycle axis"))
+    end
+    if require_zero_rails
+        @inbounds for rail in axes(base.rails, 1)
+            base.rails[rail, flat] == 0.0f0 || error(
+                "sleep forward observed a nonzero external rail",
+            )
+        end
+    end
     @inbounds for cell in 1:cells
+        block = div(cell - 1, model.cells_per_block) + 1
+        inject =
+            internal_noise_seed !== nothing &&
+            (internal_noise_block == 0 || block == internal_noise_block)
         for branch in 1:model.branches
-            tape.branch_voltage[cell, branch, 1, flat] = 0.0f0
+            coordinate = branch + model.branches * (cell - 1)
+            initial = inject ?
+                noise_scale * _internal_sleep_noise(
+                    internal_noise_seed::UInt64,
+                    flat,
+                    coordinate,
+                ) :
+                0.0f0
+            if inject && internal_state_key !== nothing
+                local_cell = mod1(cell, model.cells_per_block)
+                branch_channel = model.cell_export === :full24 ?
+                    5 + 5 * (branch - 1) : 2 + branch
+                key_coordinate =
+                    (local_cell - 1) * readout + branch_channel
+                selector = 0.5f0 * (
+                    _internal_sleep_noise(
+                        (internal_noise_seed::UInt64) ⊻
+                        UInt64(0x4355454b45593131),
+                        flat,
+                        key_coordinate,
+                    ) + 1.0f0
+                )
+                if selector < key_fraction
+                    cue = atanh(clamp(
+                        Float32(internal_state_key[key_coordinate]),
+                        -0.95f0,
+                        0.95f0,
+                    ))
+                    initial = muladd(key_gain, cue - initial, initial)
+                end
+            end
+            tape.branch_voltage[cell, branch, 1, flat] = initial
             tape.ampa[cell, branch, 1, flat] = 0.0f0
             tape.nmda[cell, branch, 1, flat] = 0.0f0
             tape.gaba[cell, branch, 1, flat] = 0.0f0
             tape.plateau[cell, branch, 1, flat] = 0.0f0
         end
         tape.apical[cell, 1, flat] = 0.0f0
-        tape.soma[cell, 1, flat] = 0.0f0
+        soma_coordinate = model.branches * cells + cell
+        soma_initial = inject ?
+            noise_scale * _internal_sleep_noise(
+                internal_noise_seed::UInt64,
+                flat,
+                soma_coordinate,
+            ) : 0.0f0
+        if inject && internal_state_key !== nothing
+            local_cell = mod1(cell, model.cells_per_block)
+            key_coordinate = (local_cell - 1) * readout + 1
+            selector = 0.5f0 * (
+                _internal_sleep_noise(
+                    (internal_noise_seed::UInt64) ⊻
+                    UInt64(0x4355454b45593232),
+                    flat,
+                    key_coordinate,
+                ) + 1.0f0
+            )
+            if selector < key_fraction
+                cue = atanh(clamp(
+                    Float32(internal_state_key[key_coordinate]),
+                    -0.95f0,
+                    0.95f0,
+                ))
+                soma_initial = muladd(
+                    key_gain,
+                    cue - soma_initial,
+                    soma_initial,
+                )
+            end
+        end
+        tape.soma[cell, 1, flat] = soma_initial
         tape.adaptation[cell, 1, flat] = 0.0f0
     end
     _write_exported_state!(tape, model, 1, flat)
@@ -904,8 +1832,28 @@ function dendritic_forward_candidate!(
         base.workspace[coordinate, 1, flat] = 0.0f0
         base.query_pre[coordinate, flat] = 0.0f0
         base.query[coordinate, flat] = 0.0f0
+        tape.sensory_anchor[coordinate, flat] = 0.0f0
+        tape.temporal_workspace[coordinate, flat] = 0.0f0
+        tape.anchor_delta[coordinate, flat] = 0.0f0
     end
+    tape.sensory_anchor_inv_rms[flat] = 0.0f0
+    tape.temporal_workspace_inv_rms[flat] = 0.0f0
+    tape.anchor_delta_inv_rms[flat] = 0.0f0
+    if exact_block_slots
+        fill!(scratch.exact_workspace, 0.0f0)
+        fill!(scratch.route_state, 0.0f0)
+        fill!(scratch.route_context, 0.0f0)
+        @inbounds for route in 1:route_dim
+            for cycle in 1:model.cycles
+                tape.state_query_pre[route, cycle, flat] = 0.0f0
+                tape.state_query[route, cycle, flat] = 0.0f0
+            end
+        end
+    end
+    sensory_cycle_scale =
+        Model.reduced_hay_sensory_cycle_scale(model)
     sensory_normalization =
+        sensory_cycle_scale *
         inv(sqrt(Float32(model.sensory_fanin)))
     @inbounds for cycle in 1:model.cycles
         fill!(scratch.branch_inbox, 0.0f0)
@@ -939,17 +1887,69 @@ function dendritic_forward_candidate!(
             local_cell =
                 cell - (block - 1) * model.cells_per_block
             apical_drive = 0.0f0
-            for channel in 1:readout
-                coordinate =
-                    channel +
-                    (local_cell - 1) * readout
-                apical_drive = muladd(
-                    parameters.feedback_gain[coordinate, block],
-                    base.workspace[coordinate, cycle, flat],
-                    apical_drive,
-                )
+            if exact_block_slots
+                cell_offset = (local_cell - 1) * readout
+                for state in 1:readout
+                    apical_drive = muladd(
+                        parameters.feedback_gain[
+                            state,
+                            local_cell,
+                            block,
+                        ],
+                        scratch.exact_workspace[
+                            cell_offset + state,
+                            block,
+                            cycle,
+                        ],
+                        apical_drive,
+                    )
+                end
+                apical_drive /= sqrt(Float32(readout))
+                global_drive = 0.0f0
+                for route in 1:route_dim
+                    global_drive = muladd(
+                        parameters.global_feedback_gain[
+                            route,
+                            local_cell,
+                            block,
+                        ],
+                        scratch.route_context[route, cycle],
+                        global_drive,
+                    )
+                end
+                apical_drive +=
+                    global_drive / sqrt(Float32(route_dim))
+            else
+                for channel in 1:readout
+                    raw_coordinate =
+                        channel +
+                        (local_cell - 1) * readout
+                    workspace_coordinate = bound_workspace ?
+                        Int(tape.spatial_inverse_coordinate[
+                            raw_coordinate,
+                            block,
+                        ]) : raw_coordinate
+                    workspace_sign = bound_workspace ?
+                        tape.spatial_inverse_sign[
+                            raw_coordinate,
+                            block,
+                        ] : 1.0f0
+                    apical_drive = muladd(
+                        parameters.feedback_gain[
+                            raw_coordinate,
+                            block,
+                        ],
+                        workspace_sign * base.workspace[
+                            workspace_coordinate,
+                            cycle,
+                            flat,
+                        ],
+                        apical_drive,
+                    )
+                end
+                apical_drive /= bound_workspace ?
+                    sqrt(Float32(readout)) : Float32(readout)
             end
-            apical_drive /= Float32(readout)
             next_apical = muladd(
                 cache.apical_leak[cell],
                 tape.apical[cell, cycle, flat],
@@ -957,7 +1957,12 @@ function dendritic_forward_candidate!(
             )
             basal = 0.0f0
             for branch in 1:model.branches
-                sensory_exc = parameters.branch_bias[branch, cell]
+                sensory_exc =
+                    sensory_cycle_scale *
+                    Model.reduced_hay_branch_bias(
+                        model,
+                        parameters.branch_bias[branch, cell],
+                    )
                 sensory_inh = 0.0f0
                 if cycle <= model.sensory_cycles
                     for contact in 1:model.sensory_fanin
@@ -1111,7 +2116,7 @@ function dendritic_forward_candidate!(
             modulation =
                 1.0f0 +
                 cache.apical_gain[cell] *
-                _hard_sigmoid(next_apical)
+                _apical_activation(model, next_apical)
             soma_pre = muladd(
                 cache.soma_leak[cell],
                 tape.soma[cell, cycle, flat],
@@ -1132,203 +2137,666 @@ function dendritic_forward_candidate!(
             )
         end
         _write_exported_state!(tape, model, cycle + 1, flat)
-
-        query_square_sum = 0.0f0
-        for coordinate in 1:node_dim
-            global_state = 0.0f0
-            for block in 1:model.blocks
-                node = coordinate + (block - 1) * node_dim
-                global_state +=
-                    base.membrane[node, cycle + 1, flat]
+        if silenced_block != 0
+            offset = (silenced_block - 1) * node_dim
+            for coordinate in 1:node_dim
+                base.membrane[offset + coordinate, cycle + 1, flat] = 0.0f0
             end
-            global_state /= Float32(model.blocks)
-            value = 0.0f0
-            for input_coordinate in 1:node_dim
-                input_state = 0.0f0
-                for block in 1:model.blocks
-                    node =
-                        input_coordinate +
-                        (block - 1) * node_dim
-                    input_state +=
-                        base.membrane[
-                            node,
+        end
+
+        if exact_block_slots
+            fill!(scratch.route_state, 0.0f0)
+            @inbounds for block in 1:model.blocks
+                block_offset = (block - 1) * node_dim
+                for local_cell in 1:model.cells_per_block
+                    cell_offset =
+                        block_offset + (local_cell - 1) * readout
+                    route_offset =
+                        (local_cell - 1) * route_state_rank
+                    for state in 1:readout
+                        value = base.membrane[
+                            cell_offset + state,
                             cycle + 1,
                             flat,
                         ]
+                        for rank in 1:route_state_rank
+                            route = route_offset + rank
+                            scratch.route_state[route, block] = muladd(
+                                parameters.route_state_projection[
+                                    rank,
+                                    state,
+                                    local_cell,
+                                ],
+                                value,
+                                scratch.route_state[route, block],
+                            )
+                        end
+                    end
                 end
-                input_state /= Float32(model.blocks)
-                value = muladd(
-                    parameters.state_query_weight[
-                        coordinate,
-                        input_coordinate,
-                    ],
-                    input_state,
-                    value,
-                )
             end
-            tape.state_query_pre[coordinate, cycle, flat] =
-                value
-            query_square_sum = muladd(
-                value,
-                value,
-                query_square_sum,
-            )
-        end
-        query_inv_rms = inv(sqrt(
-            query_square_sum / Float32(node_dim) +
-            InputModel.RMS_NORM_EPS,
-        ))
-        tape.state_query_inv_rms[cycle, flat] =
-            query_inv_rms
-        for coordinate in 1:node_dim
-            query = tanh(
-                InputModel.QUERY_NORM_SCALE *
-                tape.state_query_pre[
-                    coordinate,
-                    cycle,
-                    flat,
-                ] *
-                query_inv_rms,
-            )
-            tape.state_query[coordinate, cycle, flat] = query
-            base.query_pre[coordinate, flat] =
-                tape.state_query_pre[
-                    coordinate,
-                    cycle,
-                    flat,
-                ]
-            base.query[coordinate, flat] = query
-        end
-        base.query_inv_rms[flat] = query_inv_rms
-
-        for block in 1:model.blocks
-            score = 0.0f0
-            magnitude = 0.0f0
-            offset = (block - 1) * node_dim
+            inverse_blocks = inv(sqrt(Float32(model.blocks)))
+            @inbounds for route in 1:route_dim
+                query_input = 0.0f0
+                for block in 1:model.blocks
+                    query_input +=
+                        _v11_route_block_sign(model, block, route) *
+                        scratch.route_state[route, block]
+                end
+                scratch.query_input_state[route] =
+                    query_input * inverse_blocks
+                tape.state_query_pre[route, cycle, flat] = 0.0f0
+            end
+            @inbounds for input_route in 1:route_dim
+                input_value = scratch.query_input_state[input_route]
+                for route in 1:route_dim
+                    tape.state_query_pre[route, cycle, flat] = muladd(
+                        parameters.state_query_weight[
+                            route,
+                            input_route,
+                        ],
+                        input_value,
+                        tape.state_query_pre[route, cycle, flat],
+                    )
+                end
+            end
+            query_square_sum = 0.0f0
+            @inbounds for route in 1:route_dim
+                value = tape.state_query_pre[route, cycle, flat]
+                query_square_sum =
+                    muladd(value, value, query_square_sum)
+            end
+            query_inv_rms = inv(sqrt(
+                query_square_sum / Float32(route_dim) +
+                InputModel.RMS_NORM_EPS,
+            ))
+            tape.state_query_inv_rms[cycle, flat] = query_inv_rms
+            @inbounds for route in 1:route_dim
+                query = tanh(
+                    InputModel.QUERY_NORM_SCALE *
+                    tape.state_query_pre[route, cycle, flat] *
+                    query_inv_rms,
+                )
+                tape.state_query[route, cycle, flat] = query
+                base.query_pre[route, flat] =
+                    tape.state_query_pre[route, cycle, flat]
+                base.query[route, flat] = query
+            end
+            base.query_inv_rms[flat] = query_inv_rms
+            inverse_route = inv(sqrt(Float32(route_dim)))
+            @inbounds for block in 1:model.blocks
+                score = 0.0f0
+                magnitude = 0.0f0
+                for route in 1:route_dim
+                    coded_state =
+                        _v11_route_block_sign(model, block, route) *
+                        scratch.route_state[route, block]
+                    score = muladd(
+                        coded_state *
+                        parameters.workspace_key[route, block],
+                        tape.state_query[route, cycle, flat],
+                        score,
+                    )
+                end
+                block_offset = (block - 1) * node_dim
+                for coordinate in 1:node_dim
+                    magnitude += abs(base.membrane[
+                        block_offset + coordinate,
+                        cycle + 1,
+                        flat,
+                    ])
+                end
+                scratch.scores[block] =
+                    score * inverse_route +
+                    0.05f0 * magnitude / Float32(node_dim)
+            end
+        else
+            block_summary_normalization = bound_workspace ?
+                sqrt(Float32(model.blocks)) : Float32(model.blocks)
             for coordinate in 1:node_dim
-                state = base.membrane[
-                    offset + coordinate,
-                    cycle + 1,
-                    flat,
-                ]
-                score = muladd(
-                    state *
-                    parameters.workspace_key[coordinate, block],
-                    tape.state_query[
+                global_state = 0.0f0
+                for block in 1:model.blocks
+                    state_coordinate = bound_workspace ?
+                        Int(tape.spatial_bound_coordinate[
+                            coordinate,
+                            block,
+                        ]) : coordinate
+                    state_sign = bound_workspace ?
+                        tape.spatial_bound_sign[coordinate, block] :
+                        1.0f0
+                    node = state_coordinate +
+                        (block - 1) * node_dim
+                    global_state = muladd(
+                        state_sign,
+                        base.membrane[node, cycle + 1, flat],
+                        global_state,
+                    )
+                end
+                scratch.global_block_signal[coordinate] =
+                    global_state / block_summary_normalization
+            end
+            # `state_query_weight` is column-major (`output, input`).  Keep
+            # each output's accumulation order unchanged while streaming each
+            # contiguous input column.
+            for coordinate in 1:node_dim
+                tape.state_query_pre[coordinate, cycle, flat] = 0.0f0
+            end
+            for input_coordinate in 1:node_dim
+                input_value = scratch.global_block_signal[input_coordinate]
+                for coordinate in 1:node_dim
+                    tape.state_query_pre[coordinate, cycle, flat] = muladd(
+                        parameters.state_query_weight[
+                            coordinate,
+                            input_coordinate,
+                        ],
+                        input_value,
+                        tape.state_query_pre[coordinate, cycle, flat],
+                    )
+                end
+            end
+            query_square_sum = 0.0f0
+            for coordinate in 1:node_dim
+                value = tape.state_query_pre[coordinate, cycle, flat]
+                query_square_sum = muladd(value, value, query_square_sum)
+            end
+            query_inv_rms = inv(sqrt(
+                query_square_sum / Float32(node_dim) +
+                InputModel.RMS_NORM_EPS,
+            ))
+            tape.state_query_inv_rms[cycle, flat] = query_inv_rms
+            for coordinate in 1:node_dim
+                query = tanh(
+                    InputModel.QUERY_NORM_SCALE *
+                    tape.state_query_pre[
                         coordinate,
                         cycle,
                         flat,
-                    ],
-                    score,
+                    ] *
+                    query_inv_rms,
                 )
-                magnitude += abs(state)
+                tape.state_query[coordinate, cycle, flat] = query
+                base.query_pre[coordinate, flat] =
+                    tape.state_query_pre[
+                        coordinate,
+                        cycle,
+                        flat,
+                    ]
+                base.query[coordinate, flat] = query
             end
-            scratch.scores[block] = score + 0.05f0 * magnitude
+            base.query_inv_rms[flat] = query_inv_rms
+
+            for block in 1:model.blocks
+                score = 0.0f0
+                magnitude = 0.0f0
+                offset = (block - 1) * node_dim
+                for coordinate in 1:node_dim
+                    state_coordinate = bound_workspace ?
+                        Int(tape.spatial_bound_coordinate[
+                            coordinate,
+                            block,
+                        ]) : coordinate
+                    state_sign = bound_workspace ?
+                        tape.spatial_bound_sign[coordinate, block] :
+                        1.0f0
+                    state = base.membrane[
+                        offset + state_coordinate,
+                        cycle + 1,
+                        flat,
+                    ] * state_sign
+                    score = muladd(
+                        state *
+                        parameters.workspace_key[coordinate, block],
+                        tape.state_query[
+                            coordinate,
+                            cycle,
+                            flat,
+                        ],
+                        score,
+                    )
+                    magnitude += abs(state)
+                end
+                scratch.scores[block] = bound_workspace ?
+                    score / sqrt(Float32(node_dim)) +
+                        0.05f0 * magnitude / Float32(node_dim) :
+                    score + 0.05f0 * magnitude
+            end
         end
+        _apply_route_revisit_policy!(
+            scratch,
+            tape,
+            model,
+            cycle,
+            flat,
+        )
         _prepare_route!(
             scratch,
             model,
             stochastic_routing,
             routing_nonce,
             cycle,
+            Float32(routing_temperature),
+            Float32(routing_logit_limit),
         )
+        if forced_route_order !== nothing &&
+           forced_route_order[1, cycle] != 0
+            _force_recorded_route!(
+                scratch,
+                model,
+                forced_route_order,
+                cycle,
+                Float32(routing_temperature),
+                Float32(routing_logit_limit),
+            )
+        end
         _record_route!(tape, scratch, model, cycle, flat)
+
+        if exact_block_slots
+            inverse_selected = inv(sqrt(Float32(model.workspace_k)))
+            @inbounds for route in 1:route_dim
+                context = 0.0f0
+                for rank in 1:model.workspace_k
+                    block = Int(base.route_order[rank, cycle, flat])
+                    context +=
+                        _v11_route_block_sign(model, block, route) *
+                        scratch.route_state[route, block]
+                end
+                scratch.route_context[route, cycle + 1] =
+                    context * inverse_selected
+            end
+        end
 
         for cell in 1:cells
             block = div(cell - 1, model.cells_per_block) + 1
             tape.cell_spikes[cell, cycle, flat] =
+                block == silenced_block ? 0.0f0 :
                 tape.soma_spikes[cell, cycle, flat] *
                 base.block_mask[block, cycle, flat]
         end
-        for coordinate in 1:node_dim
-            write = 0.0f0
-            for block in 1:model.blocks
-                node = coordinate + (block - 1) * node_dim
-                write = muladd(
-                    base.membrane[
-                        node,
+        if exact_block_slots
+            @inbounds for block in 1:model.blocks
+                selected = base.block_mask[block, cycle, flat] != 0.0f0
+                block_offset = (block - 1) * node_dim
+                for coordinate in 1:node_dim
+                    scratch.exact_workspace[
+                        coordinate,
+                        block,
+                        cycle + 1,
+                    ] = selected ?
+                        base.membrane[
+                            block_offset + coordinate,
+                            cycle + 1,
+                            flat,
+                        ] :
+                        cache.workspace_decay *
+                        scratch.exact_workspace[
+                            coordinate,
+                            block,
+                            cycle,
+                        ]
+                end
+            end
+        else
+            for coordinate in 1:node_dim
+                write = 0.0f0
+                for block in 1:model.blocks
+                    state_coordinate = bound_workspace ?
+                        Int(tape.spatial_bound_coordinate[
+                            coordinate,
+                            block,
+                        ]) : coordinate
+                    state_sign = bound_workspace ?
+                        tape.spatial_bound_sign[coordinate, block] :
+                        1.0f0
+                    node = state_coordinate +
+                        (block - 1) * node_dim
+                    write = muladd(
+                        state_sign * base.membrane[
+                            node,
+                            cycle + 1,
+                            flat,
+                        ],
+                        base.block_mask[block, cycle, flat],
+                        write,
+                    )
+                end
+                if bound_workspace
+                    write /= sqrt(Float32(model.workspace_k))
+                    base.workspace[coordinate, cycle + 1, flat] =
+                        cache.workspace_decay *
+                        base.workspace[coordinate, cycle, flat] +
+                        (1.0f0 - cache.workspace_decay) * write
+                else
+                    write /= Float32(model.workspace_k)
+                    base.workspace[coordinate, cycle + 1, flat] = tanh(
+                        cache.workspace_decay *
+                        base.workspace[coordinate, cycle, flat] +
+                        write,
+                    )
+                end
+            end
+        end
+        if anchored_temporal && !exact_block_slots
+            inverse_cycle_scale = inv(sqrt(Float32(model.cycles)))
+            for coordinate in 1:node_dim
+                cycle == 1 && (
+                    tape.sensory_anchor[coordinate, flat] =
+                        scratch.global_block_signal[coordinate]
+                )
+                source_coordinate = Int(
+                    tape.temporal_bound_coordinate[
+                        coordinate,
+                        cycle,
+                    ],
+                )
+                tape.temporal_workspace[coordinate, flat] +=
+                    tape.temporal_bound_sign[coordinate, cycle] *
+                    base.workspace[
+                        source_coordinate,
                         cycle + 1,
                         flat,
-                    ],
-                    base.block_mask[block, cycle, flat],
-                    write,
-                )
+                    ] * inverse_cycle_scale
             end
-            write /= Float32(model.workspace_k)
-            base.workspace[coordinate, cycle + 1, flat] = tanh(
-                cache.workspace_decay *
-                base.workspace[coordinate, cycle, flat] +
-                write,
-            )
         end
     end
 
-    workspace_square_sum = 0.0f0
-    pool_square_sum = 0.0f0
-    @inbounds for coordinate in 1:node_dim
-        selected_pool = 0.0f0
-        for block in 1:model.blocks
-            node = coordinate + (block - 1) * node_dim
-            selected_pool = muladd(
-                base.membrane[
-                    node,
-                    model.cycles + 1,
-                    flat,
-                ],
-                base.block_mask[block, model.cycles, flat],
-                selected_pool,
+    if exact_block_slots
+        anchor_time = 2
+        final_time = model.cycles + 1
+        @inbounds for output in 1:OUTPUT_DIM
+            base.raw[output, flat] = parameters.output_bias[output]
+        end
+        @inbounds for block in 1:model.blocks
+            for local_cell in 1:model.cells_per_block
+                if direct_axis_head
+                    _v13_accumulate_direct_axis_head!(
+                        base.raw,
+                        flat,
+                        tape,
+                        model,
+                        parameters.head_anchor_mix,
+                        block,
+                        local_cell,
+                        anchor_time,
+                    )
+                    _v13_accumulate_direct_axis_head!(
+                        base.raw,
+                        flat,
+                        tape,
+                        model,
+                        parameters.head_delta_mix,
+                        block,
+                        local_cell,
+                        final_time,
+                        anchor_time,
+                    )
+                else
+                    _v11_axis_project_cell!(
+                        scratch.axis_projection,
+                        tape,
+                        model,
+                        parameters,
+                        block,
+                        local_cell,
+                        anchor_time,
+                        flat,
+                    )
+                    _v11_accumulate_axis_head!(
+                        base.raw,
+                        flat,
+                        scratch.axis_projection,
+                        parameters.head_anchor_mix,
+                        block,
+                        local_cell,
+                    )
+                    _v11_axis_project_cell!(
+                        scratch.axis_projection,
+                        tape,
+                        model,
+                        parameters,
+                        block,
+                        local_cell,
+                        final_time,
+                        flat,
+                        anchor_time,
+                    )
+                    _v11_accumulate_axis_head!(
+                        base.raw,
+                        flat,
+                        scratch.axis_projection,
+                        parameters.head_delta_mix,
+                        block,
+                        local_cell,
+                    )
+                end
+            end
+        end
+        # The trajectory term is sparse by construction: only the T*K route
+        # events are visited, while block identity and cycle identity remain
+        # explicit axes in the mixing tensor.
+        @inbounds for cycle in 1:model.cycles
+            for route_rank in 1:model.workspace_k
+                block = Int(base.route_order[route_rank, cycle, flat])
+                for local_cell in 1:model.cells_per_block
+                    if direct_axis_head
+                        _v13_accumulate_direct_history_head!(
+                            base.raw,
+                            flat,
+                            tape,
+                            model,
+                            parameters.head_history_mix,
+                            cycle,
+                            block,
+                            local_cell,
+                        )
+                    else
+                        _v11_axis_project_cell!(
+                            scratch.axis_projection,
+                            tape,
+                            model,
+                            parameters,
+                            block,
+                            local_cell,
+                            cycle + 1,
+                            flat,
+                        )
+                        _v11_accumulate_history_head!(
+                            base.raw,
+                            flat,
+                            scratch.axis_projection,
+                            parameters.head_history_mix,
+                            cycle,
+                            block,
+                            local_cell,
+                        )
+                    end
+                end
+            end
+        end
+        return nothing
+    end
+
+    feature_dim = Model.reduced_hay_head_feature_dim(model)
+    if anchored_temporal
+        anchor_square_sum = 0.0f0
+        temporal_square_sum = 0.0f0
+        delta_square_sum = 0.0f0
+        block_normalization = sqrt(Float32(model.blocks))
+        @inbounds for coordinate in 1:node_dim
+            final_summary = 0.0f0
+            for block in 1:model.blocks
+                state_coordinate = Int(
+                    tape.spatial_bound_coordinate[
+                        coordinate,
+                        block,
+                    ],
+                )
+                final_summary = muladd(
+                    tape.spatial_bound_sign[coordinate, block],
+                    base.membrane[
+                        state_coordinate +
+                            (block - 1) * node_dim,
+                        model.cycles + 1,
+                        flat,
+                    ],
+                    final_summary,
+                )
+            end
+            final_summary /= block_normalization
+            anchor = tape.sensory_anchor[coordinate, flat]
+            temporal = tape.temporal_workspace[coordinate, flat]
+            delta = final_summary - anchor
+            tape.anchor_delta[coordinate, flat] = delta
+            anchor_square_sum = muladd(
+                anchor,
+                anchor,
+                anchor_square_sum,
+            )
+            temporal_square_sum = muladd(
+                temporal,
+                temporal,
+                temporal_square_sum,
+            )
+            delta_square_sum = muladd(
+                delta,
+                delta,
+                delta_square_sum,
             )
         end
-        selected_pool /= Float32(model.workspace_k)
-        workspace_value =
-            base.workspace[coordinate, model.cycles + 1, flat]
-        scratch.point_scratch.features[coordinate] =
-            workspace_value
-        scratch.point_scratch.features[node_dim + coordinate] =
-            selected_pool
-        workspace_square_sum = muladd(
-            workspace_value,
-            workspace_value,
-            workspace_square_sum,
-        )
-        pool_square_sum = muladd(
-            selected_pool,
-            selected_pool,
-            pool_square_sum,
-        )
+        anchor_inv_rms = inv(sqrt(
+            anchor_square_sum / Float32(node_dim) +
+            InputModel.RMS_NORM_EPS,
+        ))
+        temporal_inv_rms = inv(sqrt(
+            temporal_square_sum / Float32(node_dim) +
+            InputModel.RMS_NORM_EPS,
+        ))
+        delta_inv_rms = inv(sqrt(
+            delta_square_sum / Float32(node_dim) +
+            InputModel.RMS_NORM_EPS,
+        ))
+        tape.sensory_anchor_inv_rms[flat] = anchor_inv_rms
+        tape.temporal_workspace_inv_rms[flat] = temporal_inv_rms
+        tape.anchor_delta_inv_rms[flat] = delta_inv_rms
+        base.workspace_inv_rms[flat] = anchor_inv_rms
+        base.selected_pool_inv_rms[flat] = temporal_inv_rms
+        @inbounds for coordinate in 1:node_dim
+            scratch.point_scratch.features[coordinate] =
+                tape.sensory_anchor[coordinate, flat] *
+                anchor_inv_rms
+            scratch.point_scratch.features[
+                node_dim + coordinate
+            ] = tape.temporal_workspace[coordinate, flat] *
+                temporal_inv_rms
+            scratch.point_scratch.features[
+                2node_dim + coordinate
+            ] = tape.anchor_delta[coordinate, flat] *
+                delta_inv_rms
+        end
+    else
+        local_feature_dim = feature_dim - node_dim
+        workspace_square_sum = 0.0f0
+        local_square_sum = 0.0f0
+        @inbounds for coordinate in 1:node_dim
+            workspace_value =
+                base.workspace[coordinate, model.cycles + 1, flat]
+            scratch.point_scratch.features[coordinate] =
+                workspace_value
+            workspace_square_sum = muladd(
+                workspace_value,
+                workspace_value,
+                workspace_square_sum,
+            )
+        end
+        if model.head_readout === :pooled
+            @inbounds for coordinate in 1:node_dim
+                selected_pool = 0.0f0
+                for block in 1:model.blocks
+                    node = coordinate + (block - 1) * node_dim
+                    selected_pool = muladd(
+                        base.membrane[
+                            node,
+                            model.cycles + 1,
+                            flat,
+                        ],
+                        base.block_mask[
+                            block,
+                            model.cycles,
+                            flat,
+                        ],
+                        selected_pool,
+                    )
+                end
+                selected_pool /= Float32(model.workspace_k)
+                scratch.point_scratch.features[
+                    node_dim + coordinate
+                ] = selected_pool
+                local_square_sum = muladd(
+                    selected_pool,
+                    selected_pool,
+                    local_square_sum,
+                )
+            end
+        else
+            @inbounds for rank in 1:model.workspace_k
+                block = Int(
+                    base.route_order[rank, model.cycles, flat],
+                )
+                block_offset = (block - 1) * node_dim
+                feature_offset = node_dim * rank
+                for coordinate in 1:node_dim
+                    value = base.membrane[
+                        block_offset + coordinate,
+                        model.cycles + 1,
+                        flat,
+                    ]
+                    scratch.point_scratch.features[
+                        feature_offset + coordinate
+                    ] = value
+                    local_square_sum = muladd(
+                        value,
+                        value,
+                        local_square_sum,
+                    )
+                end
+            end
+        end
+        workspace_inv_rms = inv(sqrt(
+            workspace_square_sum / Float32(node_dim) +
+            InputModel.RMS_NORM_EPS,
+        ))
+        local_inv_rms = inv(sqrt(
+            local_square_sum / Float32(local_feature_dim) +
+            InputModel.RMS_NORM_EPS,
+        ))
+        base.workspace_inv_rms[flat] = workspace_inv_rms
+        base.selected_pool_inv_rms[flat] = local_inv_rms
+        @inbounds for coordinate in 1:node_dim
+            scratch.point_scratch.features[coordinate] *=
+                workspace_inv_rms
+        end
+        @inbounds for feature in (node_dim + 1):feature_dim
+            scratch.point_scratch.features[feature] *= local_inv_rms
+        end
     end
-    workspace_inv_rms = inv(sqrt(
-        workspace_square_sum / Float32(node_dim) +
-        InputModel.RMS_NORM_EPS,
-    ))
-    pool_inv_rms = inv(sqrt(
-        pool_square_sum / Float32(node_dim) +
-        InputModel.RMS_NORM_EPS,
-    ))
-    base.workspace_inv_rms[flat] = workspace_inv_rms
-    base.selected_pool_inv_rms[flat] = pool_inv_rms
-    @inbounds for coordinate in 1:node_dim
-        scratch.point_scratch.features[coordinate] *=
-            workspace_inv_rms
-        scratch.point_scratch.features[node_dim + coordinate] *=
-            pool_inv_rms
+    @inbounds for hidden in 1:model.hidden
+        base.hidden_pre[hidden, flat] = parameters.head_bias[hidden]
+    end
+    # `head_weight` is (`hidden, feature`), so feature-major traversal streams
+    # contiguous columns.  A fixed hidden unit still accumulates features in
+    # exactly the original order.
+    @inbounds for feature in 1:feature_dim
+        feature_value = scratch.point_scratch.features[feature]
+        for hidden in 1:model.hidden
+            base.hidden_pre[hidden, flat] = muladd(
+                parameters.head_weight[hidden, feature],
+                feature_value,
+                base.hidden_pre[hidden, flat],
+            )
+        end
     end
     hidden_square_sum = 0.0f0
     @inbounds for hidden in 1:model.hidden
-        activation = parameters.head_bias[hidden]
-        for feature in 1:(2 * node_dim)
-            activation = muladd(
-                parameters.head_weight[hidden, feature],
-                scratch.point_scratch.features[feature],
-                activation,
-            )
-        end
-        base.hidden_pre[hidden, flat] = activation
-        hidden_square_sum = muladd(
-            activation,
-            activation,
-            hidden_square_sum,
-        )
+        activation = base.hidden_pre[hidden, flat]
+        hidden_square_sum = muladd(activation, activation, hidden_square_sum)
     end
     hidden_inv_rms = inv(sqrt(
         hidden_square_sum / Float32(model.hidden) +
@@ -1343,15 +2811,17 @@ function dendritic_forward_candidate!(
         )
     end
     @inbounds for output in 1:OUTPUT_DIM
-        value = parameters.output_bias[output]
-        for hidden in 1:model.hidden
-            value = muladd(
+        base.raw[output, flat] = parameters.output_bias[output]
+    end
+    @inbounds for hidden in 1:model.hidden
+        hidden_value = base.hidden[hidden, flat]
+        for output in 1:OUTPUT_DIM
+            base.raw[output, flat] = muladd(
                 parameters.output_weight[output, hidden],
-                base.hidden[hidden, flat],
-                value,
+                hidden_value,
+                base.raw[output, flat],
             )
         end
-        base.raw[output, flat] = value
     end
     return nothing
 end
@@ -1479,9 +2949,7 @@ function _prepare_block_signals!(
     local_signal_scale::Float32,
 )
     base = tape.base
-    fill!(scratch.soma_signal, 0.0f0)
-    fill!(scratch.apical_signal, 0.0f0)
-    fill!(scratch.branch_signal, 0.0f0)
+    _reset_export_signals!(scratch)
     inverse_node_dim = inv(Float32(model.node_dim))
     inverse_cycles = inv(Float32(model.cycles))
 
@@ -1625,11 +3093,6 @@ function _prepare_block_signals!(
                 )),
             )
             for coordinate in 1:model.node_dim
-                state = base.membrane[
-                    offset + coordinate,
-                    cycle + 1,
-                    flat,
-                ]
                 scratch.block_signal[coordinate] =
                     global_signal_scale *
                     scratch.global_block_signal[coordinate] *
@@ -1638,28 +3101,16 @@ function _prepare_block_signals!(
                     scratch.local_block_signal[coordinate] *
                     local_inverse_rms
                 signal = scratch.block_signal[coordinate] * inverse_cycles
-                cell = _cell_for_coordinate(
+                _scatter_export_cotangent!(
+                    scratch,
+                    tape,
                     model,
                     coordinate,
                     block,
+                    cycle,
+                    flat,
+                    signal,
                 )
-                channel =
-                    _channel_for_coordinate(model, coordinate)
-                derivative = 1.0f0 - state * state
-                local_signal = signal * derivative
-                if channel == 1
-                    scratch.soma_signal[cell, cycle] =
-                        local_signal
-                elseif channel == 2
-                    scratch.apical_signal[cell, cycle] =
-                        local_signal
-                else
-                    scratch.branch_signal[
-                        cell,
-                        channel - 2,
-                        cycle,
-                    ] = local_signal
-                end
             end
             tape.block_supervised_reward[
                 block,
@@ -1674,21 +3125,621 @@ function _prepare_block_signals!(
     return nothing
 end
 
+@inline function _v11_accumulate_route_score_vjp!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+    cycle::Int;
+    accumulate_parameter_gradient::Bool=true,
+    accumulate_state_cotangent::Bool=true,
+)
+    base = tape.base
+    route_dim = _arena_route_dim(model)
+    route_rank = div(route_dim, model.cells_per_block)
+    inverse_route = inv(sqrt(Float32(route_dim)))
+    inverse_blocks = inv(sqrt(Float32(model.blocks)))
+    inverse_node_dim = inv(Float32(model.node_dim))
+
+    # In stochastic mode route-score parameter gradients are supplied by the
+    # ordered Plackett-Luce estimator.  The selected route context is still a
+    # continuous payload, however, so its already accumulated cotangent must
+    # update P_route even when score/query parameter gradients are suppressed.
+    if !accumulate_parameter_gradient && accumulate_state_cotangent
+        @inbounds for block in 1:model.blocks
+            block_offset = (block - 1) * model.node_dim
+            for local_cell in 1:model.cells_per_block
+                cell_offset = block_offset +
+                    (local_cell - 1) * model.readout_per_cell
+                route_offset = (local_cell - 1) * route_rank
+                for rank in 1:route_rank
+                    signal = scratch.route_state_signal[
+                        route_offset + rank,
+                        block,
+                    ]
+                    for state in 1:model.readout_per_cell
+                        scratch.gradient.route_state_projection[
+                            rank,
+                            state,
+                            local_cell,
+                        ] = muladd(
+                            signal,
+                            base.membrane[
+                                cell_offset + state,
+                                cycle + 1,
+                                flat,
+                            ],
+                            scratch.gradient.route_state_projection[
+                                rank,
+                                state,
+                                local_cell,
+                            ],
+                        )
+                    end
+                end
+            end
+        end
+    end
+
+    fill!(scratch.route_query_signal, 0.0f0)
+    @inbounds for block in 1:model.blocks
+        route_factor = scratch.route_eligibility[block]
+        block_offset = (block - 1) * model.node_dim
+        for route in 1:route_dim
+            role = _v11_route_block_sign(model, block, route)
+            route_state = scratch.route_state[route, block]
+            coded_state = role * route_state
+            query = tape.state_query[route, cycle, flat]
+            key = parameters.workspace_key[route, block]
+            score_scale = route_factor * inverse_route
+            if accumulate_parameter_gradient
+                scratch.gradient.workspace_key[route, block] = muladd(
+                    score_scale * coded_state,
+                    query,
+                    scratch.gradient.workspace_key[route, block],
+                )
+            end
+            scratch.route_query_signal[route] = muladd(
+                score_scale * coded_state,
+                key,
+                scratch.route_query_signal[route],
+            )
+            scratch.route_state_signal[route, block] = muladd(
+                score_scale * role * key,
+                query,
+                scratch.route_state_signal[route, block],
+            )
+        end
+        if accumulate_state_cotangent && route_factor != 0.0f0
+            magnitude_scale = route_factor * 0.05f0 * inverse_node_dim
+            for coordinate in 1:model.node_dim
+                value = base.membrane[
+                    block_offset + coordinate,
+                    cycle + 1,
+                    flat,
+                ]
+                value == 0.0f0 && continue
+                scratch.feedback_error[coordinate, block] +=
+                    magnitude_scale * sign(value)
+            end
+        end
+    end
+
+    projection_mean = 0.0f0
+    @inbounds for route in 1:route_dim
+        query = tape.state_query[route, cycle, flat]
+        normalized = scratch.route_query_signal[route] *
+            InputModel.QUERY_NORM_SCALE * (1.0f0 - query * query)
+        scratch.route_query_signal[route] = normalized
+        projection_mean = muladd(
+            normalized,
+            tape.state_query_pre[route, cycle, flat],
+            projection_mean,
+        )
+    end
+    projection_mean /= Float32(route_dim)
+    inverse_rms = tape.state_query_inv_rms[cycle, flat]
+    inverse_rms_squared = inverse_rms * inverse_rms
+    @inbounds for route in 1:route_dim
+        scratch.route_query_signal[route] = inverse_rms * (
+            scratch.route_query_signal[route] -
+            tape.state_query_pre[route, cycle, flat] *
+            inverse_rms_squared * projection_mean
+        )
+    end
+
+    # Reconstruct the exact query input from the current route projection.
+    @inbounds for input_route in 1:route_dim
+        value = 0.0f0
+        for block in 1:model.blocks
+            value = muladd(
+                _v11_route_block_sign(model, block, input_route),
+                scratch.route_state[input_route, block],
+                value,
+            )
+        end
+        scratch.query_input_state[input_route] = value * inverse_blocks
+    end
+    @inbounds for input_route in 1:route_dim
+        input_value = scratch.query_input_state[input_route]
+        input_signal = 0.0f0
+        for route in 1:route_dim
+            signal = scratch.route_query_signal[route]
+            if accumulate_parameter_gradient
+                scratch.gradient.state_query_weight[
+                    route,
+                    input_route,
+                ] = muladd(
+                    signal,
+                    input_value,
+                    scratch.gradient.state_query_weight[
+                        route,
+                        input_route,
+                    ],
+                )
+            end
+            input_signal = muladd(
+                parameters.state_query_weight[route, input_route],
+                signal,
+                input_signal,
+            )
+        end
+        scratch.global_context_signal[input_route] = input_signal
+    end
+    @inbounds for block in 1:model.blocks
+        for route in 1:route_dim
+            scratch.route_state_signal[route, block] = muladd(
+                _v11_route_block_sign(model, block, route) * inverse_blocks,
+                scratch.global_context_signal[route],
+                scratch.route_state_signal[route, block],
+            )
+        end
+    end
+
+    # Return the complete route-state cotangent through the shared per-cell
+    # projection.  It includes global-context, score and query paths exactly
+    # once.  The caller scatters feedback_error into the full24 cell adjoint.
+    @inbounds for block in 1:model.blocks
+        block_offset = (block - 1) * model.node_dim
+        for local_cell in 1:model.cells_per_block
+            cell_offset = block_offset +
+                (local_cell - 1) * model.readout_per_cell
+            route_offset = (local_cell - 1) * route_rank
+            for rank in 1:route_rank
+                signal = scratch.route_state_signal[
+                    route_offset + rank,
+                    block,
+                ]
+                for state in 1:model.readout_per_cell
+                    value = base.membrane[
+                        cell_offset + state,
+                        cycle + 1,
+                        flat,
+                    ]
+                    if accumulate_parameter_gradient
+                        scratch.gradient.route_state_projection[
+                            rank,
+                            state,
+                            local_cell,
+                        ] = muladd(
+                            signal,
+                            value,
+                            scratch.gradient.route_state_projection[
+                                rank,
+                                state,
+                                local_cell,
+                            ],
+                        )
+                    end
+                    if accumulate_state_cotangent
+                        coordinate =
+                            (local_cell - 1) * model.readout_per_cell + state
+                        scratch.feedback_error[coordinate, block] = muladd(
+                            parameters.route_state_projection[
+                                rank,
+                                state,
+                                local_cell,
+                            ],
+                            signal,
+                            scratch.feedback_error[coordinate, block],
+                        )
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+@inline function _v11_accumulate_pathwise_route_cycle!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+    cycle::Int,
+    routing_temperature::Float32,
+    routing_logit_limit::Float32,
+    accumulate_parameter_gradient::Bool,
+)
+    base = tape.base
+    inverse_blocks = inv(Float32(model.blocks))
+    score_mean = 0.0f0
+    expected_mask_cotangent = 0.0f0
+    @inbounds for block in 1:model.blocks
+        score_mean += base.route_score[block, cycle, flat]
+        expected_mask_cotangent = muladd(
+            base.route_base_probability[block, cycle, flat],
+            scratch.route_alpha[block],
+            expected_mask_cotangent,
+        )
+    end
+    score_mean *= inverse_blocks
+    score_square_sum = 0.0f0
+    @inbounds for block in 1:model.blocks
+        centered = base.route_score[block, cycle, flat] - score_mean
+        scratch.route_standardized[block] = centered
+        score_square_sum = muladd(centered, centered, score_square_sum)
+    end
+    score_inv_rms = inv(sqrt(
+        score_square_sum * inverse_blocks + InputModel.RMS_NORM_EPS,
+    ))
+    inverse_temperature = inv(routing_temperature)
+    normalized_mean = 0.0f0
+    normalized_projection_mean = 0.0f0
+    @inbounds for block in 1:model.blocks
+        raw_standardized =
+            scratch.route_standardized[block] * score_inv_rms
+        scratch.route_standardized[block] = raw_standardized
+        normalized = Routing.bounded_standardized_derivative(
+            raw_standardized,
+            routing_logit_limit,
+        ) * Float32(model.workspace_k) *
+            base.route_base_probability[block, cycle, flat] *
+            (scratch.route_alpha[block] - expected_mask_cotangent) *
+            inverse_temperature
+        scratch.route_eligibility[block] = normalized
+        normalized_mean += normalized
+        normalized_projection_mean = muladd(
+            normalized,
+            raw_standardized,
+            normalized_projection_mean,
+        )
+    end
+    normalized_mean *= inverse_blocks
+    normalized_projection_mean *= inverse_blocks
+    @inbounds for block in 1:model.blocks
+        scratch.route_eligibility[block] = score_inv_rms * (
+            scratch.route_eligibility[block] - normalized_mean -
+            scratch.route_standardized[block] * normalized_projection_mean
+        )
+    end
+    _v11_accumulate_route_score_vjp!(
+        scratch,
+        tape,
+        model,
+        parameters,
+        flat,
+        cycle;
+        accumulate_parameter_gradient,
+        accumulate_state_cotangent=true,
+    )
+    return nothing
+end
+
+@inline function _accumulate_pathwise_route_cycle!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+    cycle::Int,
+    routing_temperature::Float32,
+    routing_logit_limit::Float32=Routing.DEFAULT_LOGIT_LIMIT,
+    accumulate_parameter_gradient::Bool=true,
+)
+    if _uses_exact_block_slots(model)
+        return _v11_accumulate_pathwise_route_cycle!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            flat,
+            cycle,
+            routing_temperature,
+            routing_logit_limit,
+            accumulate_parameter_gradient,
+        )
+    end
+    base = tape.base
+    blocks_f = Float32(model.blocks)
+    inverse_blocks = inv(blocks_f)
+    bound_workspace = model.workspace_binding !== :none
+    score_dot_scale = bound_workspace ?
+        inv(sqrt(Float32(model.node_dim))) : 1.0f0
+    score_magnitude_scale = bound_workspace ?
+        0.05f0 / Float32(model.node_dim) : 0.05f0
+    query_input_scale = bound_workspace ?
+        inv(sqrt(blocks_f)) : inverse_blocks
+
+    # Straight-through fixed-mass softmax VJP.  The hard (possibly sampled)
+    # mask remains the forward route, while this path supplies a low-variance
+    # local derivative of the actual workspace write.  route_alpha enters as
+    # dL/d(mask_b); route_eligibility leaves as dL/d(raw_score_b).
+    score_mean = 0.0f0
+    expected_mask_cotangent = 0.0f0
+    @inbounds for block in 1:model.blocks
+        score_mean += base.route_score[block, cycle, flat]
+        expected_mask_cotangent = muladd(
+            base.route_base_probability[block, cycle, flat],
+            scratch.route_alpha[block],
+            expected_mask_cotangent,
+        )
+    end
+    score_mean *= inverse_blocks
+    score_square_sum = 0.0f0
+    @inbounds for block in 1:model.blocks
+        centered = base.route_score[block, cycle, flat] - score_mean
+        scratch.route_standardized[block] = centered
+        score_square_sum = muladd(centered, centered, score_square_sum)
+    end
+    score_inv_rms = inv(sqrt(
+        score_square_sum * inverse_blocks + InputModel.RMS_NORM_EPS,
+    ))
+    inverse_temperature = inv(routing_temperature)
+    normalized_mean = 0.0f0
+    normalized_projection_mean = 0.0f0
+    @inbounds for block in 1:model.blocks
+        raw_standardized =
+            scratch.route_standardized[block] * score_inv_rms
+        scratch.route_standardized[block] = raw_standardized
+        bounded_derivative =
+            Routing.bounded_standardized_derivative(
+                raw_standardized,
+                routing_logit_limit,
+            )
+        normalized = bounded_derivative * Float32(model.workspace_k) *
+            base.route_base_probability[block, cycle, flat] *
+            (scratch.route_alpha[block] - expected_mask_cotangent) *
+            inverse_temperature
+        scratch.route_eligibility[block] = normalized
+        normalized_mean += normalized
+        normalized_projection_mean = muladd(
+            normalized,
+            raw_standardized,
+            normalized_projection_mean,
+        )
+    end
+    normalized_mean *= inverse_blocks
+    normalized_projection_mean *= inverse_blocks
+    @inbounds for block in 1:model.blocks
+        scratch.route_eligibility[block] = score_inv_rms * (
+            scratch.route_eligibility[block] -
+            normalized_mean -
+            scratch.route_standardized[block] *
+            normalized_projection_mean
+        )
+    end
+
+    fill!(scratch.point_scratch.dquery, 0.0f0)
+    fill!(scratch.block_signal, 0.0f0)
+    @inbounds for block in 1:model.blocks
+        route_factor = scratch.route_eligibility[block]
+        offset = (block - 1) * model.node_dim
+        for coordinate in 1:model.node_dim
+            state_coordinate = bound_workspace ?
+                Int(tape.spatial_bound_coordinate[
+                    coordinate,
+                    block,
+                ]) : coordinate
+            state_sign = bound_workspace ?
+                tape.spatial_bound_sign[coordinate, block] : 1.0f0
+            state = state_sign * base.membrane[
+                offset + state_coordinate, cycle + 1, flat,
+            ]
+            query = tape.state_query[coordinate, cycle, flat]
+            key = parameters.workspace_key[coordinate, block]
+            if accumulate_parameter_gradient
+                scratch.gradient.workspace_key[coordinate, block] = muladd(
+                    route_factor * state * score_dot_scale,
+                    query,
+                    scratch.gradient.workspace_key[coordinate, block],
+                )
+            end
+            scratch.point_scratch.dquery[coordinate] = muladd(
+                route_factor * state * score_dot_scale,
+                key,
+                scratch.point_scratch.dquery[coordinate],
+            )
+            score_state_derivative =
+                key * query * score_dot_scale
+            state != 0.0f0 &&
+                (score_state_derivative +=
+                    score_magnitude_scale * sign(state))
+            scratch.feedback_error[state_coordinate, block] = muladd(
+                route_factor,
+                state_sign * score_state_derivative,
+                scratch.feedback_error[state_coordinate, block],
+            )
+        end
+    end
+
+    query_projection_mean = 0.0f0
+    @inbounds for coordinate in 1:model.node_dim
+        query = tape.state_query[coordinate, cycle, flat]
+        normalized = scratch.point_scratch.dquery[coordinate] *
+            InputModel.QUERY_NORM_SCALE * (1.0f0 - query * query)
+        scratch.point_scratch.dquery[coordinate] = normalized
+        query_projection_mean = muladd(
+            normalized,
+            tape.state_query_pre[coordinate, cycle, flat],
+            query_projection_mean,
+        )
+    end
+    query_projection_mean *= inv(Float32(model.node_dim))
+    inverse_rms = tape.state_query_inv_rms[cycle, flat]
+    inverse_rms_squared = inverse_rms * inverse_rms
+    # The query input is independent of the output coordinate.  Cache the
+    # bound all-block summary once per cycle instead of rebuilding it inside
+    # every row of the dense query VJP (O(D*B + D^2), not O(D^2*B)).  A
+    # dedicated buffer avoids aliasing `global_block_signal`, which carries
+    # the legacy workspace root between reverse cycles.
+    @inbounds for input_coordinate in 1:model.node_dim
+        global_state = 0.0f0
+        for block in 1:model.blocks
+            state_coordinate = bound_workspace ?
+                Int(tape.spatial_bound_coordinate[
+                    input_coordinate,
+                    block,
+                ]) : input_coordinate
+            state_sign = bound_workspace ?
+                tape.spatial_bound_sign[input_coordinate, block] :
+                1.0f0
+            node = state_coordinate +
+                (block - 1) * model.node_dim
+            global_state = muladd(
+                state_sign,
+                base.membrane[node, cycle + 1, flat],
+                global_state,
+            )
+        end
+        scratch.query_input_state[input_coordinate] =
+            global_state * query_input_scale
+    end
+    @inbounds for coordinate in 1:model.node_dim
+        scratch.point_scratch.dquery[coordinate] = inverse_rms * (
+            scratch.point_scratch.dquery[coordinate] -
+            tape.state_query_pre[coordinate, cycle, flat] *
+            inverse_rms_squared * query_projection_mean
+        )
+    end
+    # Julia matrices are column-major.  Keeping input_coordinate (the second
+    # matrix index) outside makes both the parameter and gradient scans
+    # contiguous while producing exactly the same outer product.
+    @inbounds for input_coordinate in 1:model.node_dim
+        global_state = scratch.query_input_state[input_coordinate]
+        state_cotangent = 0.0f0
+        for coordinate in 1:model.node_dim
+            cotangent = scratch.point_scratch.dquery[coordinate]
+            if accumulate_parameter_gradient
+                scratch.gradient.state_query_weight[
+                    coordinate, input_coordinate,
+                ] = muladd(
+                    cotangent,
+                    global_state,
+                    scratch.gradient.state_query_weight[
+                        coordinate, input_coordinate,
+                    ],
+                )
+            end
+            state_cotangent = muladd(
+                parameters.state_query_weight[
+                    coordinate, input_coordinate,
+                ],
+                cotangent,
+                state_cotangent,
+            )
+        end
+        scratch.block_signal[input_coordinate] = state_cotangent
+    end
+    @inbounds for block in 1:model.blocks
+        for coordinate in 1:model.node_dim
+            state_coordinate = bound_workspace ?
+                Int(tape.spatial_bound_coordinate[
+                    coordinate,
+                    block,
+                ]) : coordinate
+            state_sign = bound_workspace ?
+                tape.spatial_bound_sign[coordinate, block] : 1.0f0
+            scratch.feedback_error[state_coordinate, block] +=
+                state_sign * scratch.block_signal[coordinate] *
+                query_input_scale
+        end
+    end
+    return nothing
+end
+
+@inline function _v11_accumulate_pl_routing_gradients!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+    use_supervised_advantage::Bool,
+)
+    base = tape.base
+    @inbounds for cycle in 1:model.cycles
+        # Local/score-function replay can run on a different worker from the
+        # forward pass, so reconstruct the route projection from the tape.
+        _replay_v11_route_state_cycle!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            flat,
+            cycle,
+        )
+        fill!(scratch.route_state_signal, 0.0f0)
+        for block in 1:model.blocks
+            # `route_eligibility` is the derivative of the complete ordered
+            # Plackett-Luce log probability with respect to this raw score.
+            # The reward is the supervised state-level surrogate, never an
+            # environment return or a private block target.
+            scratch.route_eligibility[block] =
+                (use_supervised_advantage ?
+                 -tape.block_advantage[block, cycle, flat] *
+                 base.route_eligibility[block, cycle, flat] : 0.0f0) +
+                base.route_regularizer_gradient[block, cycle, flat]
+        end
+        _v11_accumulate_route_score_vjp!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            flat,
+            cycle;
+            accumulate_parameter_gradient=true,
+            accumulate_state_cotangent=false,
+        )
+    end
+    return nothing
+end
+
 @inline function _accumulate_routing_gradients!(
     scratch::DendriticWorkerScratch,
     tape::DendriticTape,
     model,
     parameters,
     flat::Int,
+    use_supervised_advantage::Bool=true,
 )
+    if _uses_exact_block_slots(model)
+        return _v11_accumulate_pl_routing_gradients!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            flat,
+            use_supervised_advantage,
+        )
+    end
     base = tape.base
+    bound_workspace = model.workspace_binding !== :none
+    score_dot_scale = bound_workspace ?
+        inv(sqrt(Float32(model.node_dim))) : 1.0f0
+    query_input_scale = bound_workspace ?
+        inv(sqrt(Float32(model.blocks))) :
+        inv(Float32(model.blocks))
     @inbounds for cycle in 1:model.cycles
         fill!(scratch.point_scratch.dquery, 0.0f0)
         for block in 1:model.blocks
-            # block_advantage is a candidate-centered supervised reward
-            # surrogate, not an environment return.  AdamW consumes a loss
-            # gradient, so the policy-gradient contribution carries a minus.
-            route_factor =
+            # In stochastic mode block_advantage contains the same scalar
+            # state-level supervised reward surrogate for every score
+            # component of this ordered route.  It is not an environment
+            # return.  AdamW consumes a loss gradient, so the score-function
+            # contribution carries a minus.
+            route_factor = (use_supervised_advantage ?
                 -tape.block_advantage[
                     block,
                     cycle,
@@ -1698,7 +3749,7 @@ end
                     block,
                     cycle,
                     flat,
-                ] +
+                ] : 0.0f0) +
                 base.route_regularizer_gradient[
                     block,
                     cycle,
@@ -1706,8 +3757,15 @@ end
                 ]
             offset = (block - 1) * model.node_dim
             for coordinate in 1:model.node_dim
-                state = base.membrane[
-                    offset + coordinate,
+                state_coordinate = bound_workspace ?
+                    Int(tape.spatial_bound_coordinate[
+                        coordinate,
+                        block,
+                    ]) : coordinate
+                state_sign = bound_workspace ?
+                    tape.spatial_bound_sign[coordinate, block] : 1.0f0
+                state = state_sign * base.membrane[
+                    offset + state_coordinate,
                     cycle + 1,
                     flat,
                 ]
@@ -1724,7 +3782,7 @@ end
                     coordinate,
                     block,
                 ] = muladd(
-                    route_factor * state,
+                    route_factor * state * score_dot_scale,
                     query,
                     scratch.gradient.workspace_key[
                         coordinate,
@@ -1732,7 +3790,7 @@ end
                     ],
                 )
                 scratch.point_scratch.dquery[coordinate] = muladd(
-                    route_factor * state,
+                    route_factor * state * score_dot_scale,
                     key,
                     scratch.point_scratch.dquery[coordinate],
                 )
@@ -1764,8 +3822,36 @@ end
         query_projection_mean /= Float32(model.node_dim)
         inverse_rms = tape.state_query_inv_rms[cycle, flat]
         inverse_rms_squared = inverse_rms * inverse_rms
+        @inbounds for input_coordinate in 1:model.node_dim
+            global_state = 0.0f0
+            for block in 1:model.blocks
+                state_coordinate = bound_workspace ?
+                    Int(tape.spatial_bound_coordinate[
+                        input_coordinate,
+                        block,
+                    ]) : input_coordinate
+                state_sign = bound_workspace ?
+                    tape.spatial_bound_sign[
+                        input_coordinate,
+                        block,
+                    ] : 1.0f0
+                node = state_coordinate +
+                    (block - 1) * model.node_dim
+                global_state = muladd(
+                    state_sign,
+                    base.membrane[
+                        node,
+                        cycle + 1,
+                        flat,
+                    ],
+                    global_state,
+                )
+            end
+            scratch.query_input_state[input_coordinate] =
+                global_state * query_input_scale
+        end
         for coordinate in 1:model.node_dim
-            cotangent = inverse_rms * (
+            scratch.point_scratch.dquery[coordinate] = inverse_rms * (
                 scratch.point_scratch.dquery[coordinate] -
                 tape.state_query_pre[
                     coordinate,
@@ -1775,19 +3861,11 @@ end
                 inverse_rms_squared *
                 query_projection_mean
             )
-            for input_coordinate in 1:model.node_dim
-                global_state = 0.0f0
-                for block in 1:model.blocks
-                    node =
-                        input_coordinate +
-                        (block - 1) * model.node_dim
-                    global_state += base.membrane[
-                        node,
-                        cycle + 1,
-                        flat,
-                    ]
-                end
-                global_state /= Float32(model.blocks)
+        end
+        for input_coordinate in 1:model.node_dim
+            global_state = scratch.query_input_state[input_coordinate]
+            for coordinate in 1:model.node_dim
+                cotangent = scratch.point_scratch.dquery[coordinate]
                 scratch.gradient.state_query_weight[
                     coordinate,
                     input_coordinate,
@@ -1816,7 +3894,10 @@ end
     base = tape.base
     readout = model.readout_per_cell
     cells = model.blocks * model.cells_per_block
+    sensory_cycle_scale =
+        Model.reduced_hay_sensory_cycle_scale(model)
     sensory_normalization =
+        sensory_cycle_scale *
         inv(sqrt(Float32(model.sensory_fanin)))
     @inbounds for cycle in 1:model.cycles
         fill!(scratch.point_scratch.dworkspace_a, 0.0f0)
@@ -1829,7 +3910,7 @@ end
             modulation =
                 1.0f0 +
                 cache.apical_gain[cell] *
-                _hard_sigmoid(next_apical)
+                _apical_activation(model, next_apical)
             basal = 0.0f0
             for branch in 1:model.branches
                 basal = muladd(
@@ -1883,7 +3964,7 @@ end
             scratch.gradient.apical_gain_logits[cell] +=
                 soma_pre_signal *
                 basal *
-                _hard_sigmoid(next_apical) *
+                _apical_activation(model, next_apical) *
                 cache.apical_gain_derivative[cell]
             scratch.gradient.soma_threshold_logits[cell] +=
                 scratch.soma_signal[cell, cycle] *
@@ -2198,7 +4279,7 @@ end
                     exc_drive_effect =
                         ampa_effect + 0.72f0 * nmda_effect
                     scratch.gradient.branch_bias[branch, cell] +=
-                        exc_drive_effect
+                        sensory_cycle_scale * exc_drive_effect
                     for contact in 1:model.sensory_fanin
                         exc_rail = model.excitatory_feature[
                             contact,
@@ -2270,126 +4351,6 @@ end
     return nothing
 end
 
-@inline function _update_edge_trace(
-    epsilon_a::Float32,
-    epsilon_n::Float32,
-    epsilon_g::Float32,
-    epsilon_u::Float32,
-    epsilon_p::Float32,
-    epsilon_s::Float32,
-    epsilon_q::Float32,
-    forcing::Float32,
-    recurrent_drive::Float32,
-    old_branch::Float32,
-    next_branch::Float32,
-    old_ampa::Float32,
-    next_ampa::Float32,
-    old_nmda::Float32,
-    next_nmda::Float32,
-    old_gaba::Float32,
-    next_gaba::Float32,
-    old_plateau::Float32,
-    next_plateau::Float32,
-    branch::Int,
-    destination::Int,
-    apical_modulation::Float32,
-    post_surrogate::Float32,
-    parameters,
-    cache::DendriticParameterCache,
-)
-    excitatory_forcing =
-        recurrent_drive > 0.0f0 ? forcing : 0.0f0
-    inhibitory_forcing =
-        recurrent_drive < 0.0f0 ? -forcing : 0.0f0
-    next_a = muladd(
-        cache.ampa_decay[branch, destination],
-        epsilon_a,
-        excitatory_forcing,
-    )
-    next_n = muladd(
-        cache.nmda_decay[branch, destination],
-        epsilon_n,
-        0.72f0 * excitatory_forcing,
-    )
-    next_g = muladd(
-        cache.gaba_decay[branch, destination],
-        epsilon_g,
-        inhibitory_forcing,
-    )
-    unblock = sigmoid(
-        cache.nmda_slope[branch, destination] *
-        (
-            old_branch -
-            cache.nmda_half[branch, destination]
-        ),
-    )
-    unblock_trace =
-        unblock *
-        (1.0f0 - unblock) *
-        cache.nmda_slope[branch, destination] *
-        epsilon_u
-    excitatory_trace = (
-        next_a +
-        next_n * unblock +
-        next_nmda * unblock_trace
-    ) * (1.0f0 - old_branch) -
-        (next_ampa + next_nmda * unblock) * epsilon_u
-    inhibitory_trace =
-        next_g * (-1.0f0 - old_branch) -
-        next_gaba * epsilon_u
-    raw_branch_trace =
-        cache.branch_leak[branch, destination] * epsilon_u +
-        cache.current_gain[branch, destination] *
-        (excitatory_trace + inhibitory_trace) +
-        cache.axial_gain[branch, destination] *
-        (epsilon_s - epsilon_u) +
-        cache.plateau_feedback[branch, destination] * epsilon_p
-    branch_clamp_derivative =
-        -2.0f0 < next_branch < 3.0f0 ? 1.0f0 : 0.0f0
-    next_u = raw_branch_trace * branch_clamp_derivative
-    argument =
-        cache.plateau_slope[branch, destination] *
-        (
-            next_branch -
-            cache.plateau_threshold[branch, destination]
-        )
-    coincidence = _hard_sigmoid(argument)
-    coincidence_derivative =
-        _hard_sigmoid_derivative(argument) *
-        cache.plateau_slope[branch, destination] *
-        next_u
-    raw_plateau_trace = muladd(
-        cache.plateau_decay[branch, destination],
-        epsilon_p,
-        cache.plateau_gain[branch, destination] *
-        (
-            next_n * coincidence +
-            next_nmda * coincidence_derivative
-        ),
-    )
-    plateau_clamp_derivative =
-        0.0f0 < next_plateau < 4.0f0 ? 1.0f0 : 0.0f0
-    next_p = raw_plateau_trace * plateau_clamp_derivative
-    soma_pre_trace = muladd(
-        cache.soma_leak[destination],
-        epsilon_s,
-        parameters.soma_coupling[branch, destination] *
-        (next_u + next_p) *
-        apical_modulation -
-        epsilon_q,
-    )
-    spike_trace = post_surrogate * soma_pre_trace
-    next_s = soma_pre_trace *
-        1.0f0 -
-        cache.soma_threshold[destination] * spike_trace
-    next_q = muladd(
-        cache.adaptation_decay[destination],
-        epsilon_q,
-        cache.adaptation_gain[destination] * spike_trace,
-    )
-    return next_a, next_n, next_g, next_u, next_p, next_s, next_q
-end
-
 function _accumulate_edge_eligibility!(
     scratch::DendriticWorkerScratch,
     tape::DendriticTape,
@@ -2399,30 +4360,15 @@ function _accumulate_edge_eligibility!(
     branch_for_edge::Matrix{UInt8},
     flat::Int,
 )
+    # The cell-local temporal adjoint has already converted every exported
+    # learning signal into dL/d(E-drive) and dL/d(I-drive) for each branch and
+    # cycle.  Replaying source-major edges now gives the exact local
+    # eligibility factor without walking the inter-cell graph backwards.  The
+    # previous seven-scalar trace followed only the destination branch and
+    # omitted paths through soma -> sibling branches -> soma.
     @inbounds for active_index in 1:scratch.active_edge_count
         edge = Int(scratch.active_edges[active_index])
         scratch.active_edge_mask[edge] = false
-        scratch.eligibility_weight_a[edge] = 0.0f0
-        scratch.eligibility_weight_n[edge] = 0.0f0
-        scratch.eligibility_weight_g[edge] = 0.0f0
-        scratch.eligibility_weight_u[edge] = 0.0f0
-        scratch.eligibility_weight_p[edge] = 0.0f0
-        scratch.eligibility_weight_s[edge] = 0.0f0
-        scratch.eligibility_weight_q[edge] = 0.0f0
-        scratch.eligibility_gate_a[edge] = 0.0f0
-        scratch.eligibility_gate_n[edge] = 0.0f0
-        scratch.eligibility_gate_g[edge] = 0.0f0
-        scratch.eligibility_gate_u[edge] = 0.0f0
-        scratch.eligibility_gate_p[edge] = 0.0f0
-        scratch.eligibility_gate_s[edge] = 0.0f0
-        scratch.eligibility_gate_q[edge] = 0.0f0
-        scratch.eligibility_delay_a[edge] = 0.0f0
-        scratch.eligibility_delay_n[edge] = 0.0f0
-        scratch.eligibility_delay_g[edge] = 0.0f0
-        scratch.eligibility_delay_u[edge] = 0.0f0
-        scratch.eligibility_delay_p[edge] = 0.0f0
-        scratch.eligibility_delay_s[edge] = 0.0f0
-        scratch.eligibility_delay_q[edge] = 0.0f0
     end
     scratch.active_edge_count = 0
     cells = model.blocks * model.cells_per_block
@@ -2499,197 +4445,27 @@ function _accumulate_edge_eligibility!(
                 cache.delay_derivative[source, relation]
             recurrent_drive =
                 scratch.branch_inbox[destination, branch]
-            old_branch = tape.branch_voltage[
-                destination,
-                branch,
-                cycle,
-                flat,
-            ]
-            next_branch = tape.branch_voltage[
-                destination,
-                branch,
-                cycle + 1,
-                flat,
-            ]
-            old_ampa = tape.ampa[
-                destination,
-                branch,
-                cycle,
-                flat,
-            ]
-            next_ampa = tape.ampa[
-                destination,
-                branch,
-                cycle + 1,
-                flat,
-            ]
-            old_nmda = tape.nmda[
-                destination,
-                branch,
-                cycle,
-                flat,
-            ]
-            next_nmda = tape.nmda[
-                destination,
-                branch,
-                cycle + 1,
-                flat,
-            ]
-            old_gaba = tape.gaba[
-                destination,
-                branch,
-                cycle,
-                flat,
-            ]
-            next_gaba = tape.gaba[
-                destination,
-                branch,
-                cycle + 1,
-                flat,
-            ]
-            old_plateau = tape.plateau[
-                destination,
-                branch,
-                cycle,
-                flat,
-            ]
-            next_plateau = tape.plateau[
-                destination,
-                branch,
-                cycle + 1,
-                flat,
-            ]
-            next_apical =
-                tape.apical[destination, cycle + 1, flat]
-            modulation =
-                1.0f0 +
-                cache.apical_gain[destination] *
-                _hard_sigmoid(next_apical)
-            soma_before_reset =
-                tape.soma[destination, cycle + 1, flat] +
-                tape.soma_spikes[destination, cycle, flat] *
-                cache.soma_threshold[destination]
-            post_surrogate = _spike_surrogate(
-                soma_before_reset,
-                cache.soma_threshold[destination],
-                model.spike_temperature,
-            )
-            wa, wn, wg, wu, wp, ws, wq = _update_edge_trace(
-                scratch.eligibility_weight_a[source, relation],
-                scratch.eligibility_weight_n[source, relation],
-                scratch.eligibility_weight_g[source, relation],
-                scratch.eligibility_weight_u[source, relation],
-                scratch.eligibility_weight_p[source, relation],
-                scratch.eligibility_weight_s[source, relation],
-                scratch.eligibility_weight_q[source, relation],
-                force_weight,
-                recurrent_drive,
-                old_branch,
-                next_branch,
-                old_ampa,
-                next_ampa,
-                old_nmda,
-                next_nmda,
-                old_gaba,
-                next_gaba,
-                old_plateau,
-                next_plateau,
-                branch,
-                destination,
-                modulation,
-                post_surrogate,
-                parameters,
-                cache,
-            )
-            ga, gn, gg, gu, gp, gs, gq = _update_edge_trace(
-                scratch.eligibility_gate_a[source, relation],
-                scratch.eligibility_gate_n[source, relation],
-                scratch.eligibility_gate_g[source, relation],
-                scratch.eligibility_gate_u[source, relation],
-                scratch.eligibility_gate_p[source, relation],
-                scratch.eligibility_gate_s[source, relation],
-                scratch.eligibility_gate_q[source, relation],
-                force_gate,
-                recurrent_drive,
-                old_branch,
-                next_branch,
-                old_ampa,
-                next_ampa,
-                old_nmda,
-                next_nmda,
-                old_gaba,
-                next_gaba,
-                old_plateau,
-                next_plateau,
-                branch,
-                destination,
-                modulation,
-                post_surrogate,
-                parameters,
-                cache,
-            )
-            da, dn, dg, du, dp, ds, dq = _update_edge_trace(
-                scratch.eligibility_delay_a[source, relation],
-                scratch.eligibility_delay_n[source, relation],
-                scratch.eligibility_delay_g[source, relation],
-                scratch.eligibility_delay_u[source, relation],
-                scratch.eligibility_delay_p[source, relation],
-                scratch.eligibility_delay_s[source, relation],
-                scratch.eligibility_delay_q[source, relation],
-                force_delay,
-                recurrent_drive,
-                old_branch,
-                next_branch,
-                old_ampa,
-                next_ampa,
-                old_nmda,
-                next_nmda,
-                old_gaba,
-                next_gaba,
-                old_plateau,
-                next_plateau,
-                branch,
-                destination,
-                modulation,
-                post_surrogate,
-                parameters,
-                cache,
-            )
-            scratch.eligibility_weight_a[source, relation] = wa
-            scratch.eligibility_weight_n[source, relation] = wn
-            scratch.eligibility_weight_g[source, relation] = wg
-            scratch.eligibility_weight_u[source, relation] = wu
-            scratch.eligibility_weight_p[source, relation] = wp
-            scratch.eligibility_weight_s[source, relation] = ws
-            scratch.eligibility_weight_q[source, relation] = wq
-            scratch.eligibility_gate_a[source, relation] = ga
-            scratch.eligibility_gate_n[source, relation] = gn
-            scratch.eligibility_gate_g[source, relation] = gg
-            scratch.eligibility_gate_u[source, relation] = gu
-            scratch.eligibility_gate_p[source, relation] = gp
-            scratch.eligibility_gate_s[source, relation] = gs
-            scratch.eligibility_gate_q[source, relation] = gq
-            scratch.eligibility_delay_a[source, relation] = da
-            scratch.eligibility_delay_n[source, relation] = dn
-            scratch.eligibility_delay_g[source, relation] = dg
-            scratch.eligibility_delay_u[source, relation] = du
-            scratch.eligibility_delay_p[source, relation] = dp
-            scratch.eligibility_delay_s[source, relation] = ds
-            scratch.eligibility_delay_q[source, relation] = dq
-            soma_signal =
-                scratch.soma_signal[destination, cycle]
-            branch_signal =
-                scratch.branch_signal[
-                    destination,
-                    branch,
-                    cycle,
+            drive_signal = if recurrent_drive > 0.0f0
+                scratch.branch_exc_drive_signal[
+                    destination, branch, cycle,
                 ]
-            weight_update =
-                branch_signal * wu + soma_signal * ws
-            gate_update =
-                branch_signal * gu + soma_signal * gs
-            delay_update =
-                branch_signal * du + soma_signal * ds
+            elseif recurrent_drive < 0.0f0
+                -scratch.branch_inh_drive_signal[
+                    destination, branch, cycle,
+                ]
+            else
+                0.5f0 * (
+                    scratch.branch_exc_drive_signal[
+                        destination, branch, cycle,
+                    ] -
+                    scratch.branch_inh_drive_signal[
+                        destination, branch, cycle,
+                    ]
+                )
+            end
+            weight_update = drive_signal * force_weight
+            gate_update = drive_signal * force_gate
+            delay_update = drive_signal * force_delay
             scratch.gradient.synapse_weight[source, relation] +=
                 weight_update
             scratch.gradient.gate_logits[source, relation] +=
@@ -2706,17 +4482,20 @@ function _accumulate_edge_eligibility!(
                 max(-gate_update, 0.0f0)
             end
             for counterfactual_branch in 1:model.branches
+                counterfactual_signal = max(
+                    abs(scratch.branch_exc_drive_signal[
+                        destination, counterfactual_branch, cycle,
+                    ]),
+                    abs(scratch.branch_inh_drive_signal[
+                        destination, counterfactual_branch, cycle,
+                    ]),
+                )
                 scratch.branch_utility[
                     counterfactual_branch,
                     source,
                     relation,
                 ] += abs(
-                    pre *
-                    scratch.branch_signal[
-                        destination,
-                        counterfactual_branch,
-                        cycle,
-                    ],
+                    pre * counterfactual_signal,
                 )
             end
         end
@@ -2726,55 +4505,40 @@ end
 
 function _backward_head_candidate!(
     gradient,
-    base::Point.TrainingArena,
+    source,
     model,
     parameters,
     scratch::Point.CandidateScratch,
     flat::Int,
 )
+    base = source isa DendriticTape ? source.base : source
     node_dim = model.node_dim
+    feature_dim = Model.reduced_hay_head_feature_dim(model)
     fill!(scratch.dfeatures, 0.0f0)
     fill!(scratch.dhidden, 0.0f0)
-    @inbounds for coordinate in 1:node_dim
-        selected_pool = 0.0f0
-        for block in 1:model.blocks
-            node = coordinate + (block - 1) * node_dim
-            selected_pool = muladd(
-                base.membrane[
-                    node,
-                    model.cycles + 1,
-                    flat,
-                ],
-                base.block_mask[block, model.cycles, flat],
-                selected_pool,
-            )
-        end
-        scratch.features[coordinate] =
-            base.workspace[
-                coordinate,
-                model.cycles + 1,
-                flat,
-            ] * base.workspace_inv_rms[flat]
-        scratch.features[node_dim + coordinate] =
-            selected_pool /
-            Float32(model.workspace_k) *
-            base.selected_pool_inv_rms[flat]
-    end
+    _prepare_root_features!(scratch, source, model, flat)
     @inbounds for output in 1:OUTPUT_DIM
-        cotangent = base.raw_gradient[output, flat]
-        gradient.output_bias[output] += cotangent
-        for hidden in 1:model.hidden
+        gradient.output_bias[output] += base.raw_gradient[output, flat]
+    end
+    # Stream each contiguous `output_weight[:, hidden]` column.  For every
+    # hidden unit the output cotangents are still reduced in output order.
+    @inbounds for hidden in 1:model.hidden
+        hidden_value = base.hidden[hidden, flat]
+        hidden_cotangent = 0.0f0
+        for output in 1:OUTPUT_DIM
+            output_cotangent = base.raw_gradient[output, flat]
             gradient.output_weight[output, hidden] = muladd(
-                cotangent,
-                base.hidden[hidden, flat],
+                output_cotangent,
+                hidden_value,
                 gradient.output_weight[output, hidden],
             )
-            scratch.dhidden[hidden] = muladd(
+            hidden_cotangent = muladd(
                 parameters.output_weight[output, hidden],
-                cotangent,
-                scratch.dhidden[hidden],
+                output_cotangent,
+                hidden_cotangent,
             )
         end
+        scratch.dhidden[hidden] = hidden_cotangent
     end
     projection_mean = 0.0f0
     @inbounds for hidden in 1:model.hidden
@@ -2800,20 +4564,28 @@ function _backward_head_candidate!(
             inverse_rms_squared *
             projection_mean
         )
+        scratch.dhidden[hidden] = cotangent
         gradient.head_bias[hidden] += cotangent
-        for feature in 1:(2 * node_dim)
-            value = scratch.features[feature]
+    end
+    # `head_weight[:, feature]` is contiguous.  Feature-major traversal also
+    # preserves the original hidden-order reduction into each feature root.
+    @inbounds for feature in 1:feature_dim
+        value = scratch.features[feature]
+        feature_cotangent = 0.0f0
+        for hidden in 1:model.hidden
+            hidden_cotangent = scratch.dhidden[hidden]
             gradient.head_weight[hidden, feature] = muladd(
-                cotangent,
+                hidden_cotangent,
                 value,
                 gradient.head_weight[hidden, feature],
             )
-            scratch.dfeatures[feature] = muladd(
+            feature_cotangent = muladd(
                 parameters.head_weight[hidden, feature],
-                cotangent,
-                scratch.dfeatures[feature],
+                hidden_cotangent,
+                feature_cotangent,
             )
         end
+        scratch.dfeatures[feature] = feature_cotangent
     end
     return nothing
 end
@@ -2841,7 +4613,7 @@ function dendritic_prepare_signal_candidate!(
         global_signal_scale,
         local_signal_scale,
     )
-    _accumulate_cell_parameter_gradients!(
+    _accumulate_cell_temporal_gradients!(
         scratch,
         tape,
         model,
@@ -2860,12 +4632,1667 @@ function dendritic_prepare_signal_candidate!(
     )
     _backward_head_candidate!(
         scratch.gradient,
-        tape.base,
+        tape,
         model,
         parameters,
         scratch.point_scratch,
         flat,
     )
+    return nothing
+end
+
+@inline function _alignment_sign(feature::Int, flat::Int)
+    value = UInt64(feature) * UInt64(0x9e3779b97f4a7c15) ⊻
+            UInt64(flat) * UInt64(0xbf58476d1ce4e5b9)
+    value ⊻= value >> 30
+    value *= UInt64(0xbf58476d1ce4e5b9)
+    value ⊻= value >> 27
+    value *= UInt64(0x94d049bb133111eb)
+    value ⊻= value >> 31
+    return isodd(value) ? 1.0f0 : -1.0f0
+end
+
+function _prepare_root_features!(scratch, source, model, flat::Int)
+    tape = source isa DendriticTape ? source : nothing
+    base = tape === nothing ? source : tape.base
+    node_dim = model.node_dim
+    final_time = model.cycles + 1
+    if model.head_readout === :anchored_temporal
+        tape === nothing && error(
+            "anchored-temporal features require the dendritic tape",
+        )
+        @inbounds for coordinate in 1:node_dim
+            scratch.features[coordinate] =
+                tape.sensory_anchor[coordinate, flat] *
+                tape.sensory_anchor_inv_rms[flat]
+            scratch.features[node_dim + coordinate] =
+                tape.temporal_workspace[coordinate, flat] *
+                tape.temporal_workspace_inv_rms[flat]
+            scratch.features[2node_dim + coordinate] =
+                tape.anchor_delta[coordinate, flat] *
+                tape.anchor_delta_inv_rms[flat]
+        end
+        return nothing
+    end
+    @inbounds for coordinate in 1:node_dim
+        scratch.features[coordinate] =
+            base.workspace[coordinate, final_time, flat] *
+            base.workspace_inv_rms[flat]
+    end
+    if model.head_readout === :pooled
+        @inbounds for coordinate in 1:node_dim
+            selected_pool = 0.0f0
+            for block in 1:model.blocks
+                node = coordinate + (block - 1) * node_dim
+                selected_pool = muladd(
+                    base.membrane[node, final_time, flat],
+                    base.block_mask[block, model.cycles, flat],
+                    selected_pool,
+                )
+            end
+            scratch.features[node_dim + coordinate] =
+                selected_pool / Float32(model.workspace_k) *
+                base.selected_pool_inv_rms[flat]
+        end
+    else
+        @inbounds for rank in 1:model.workspace_k
+            block = Int(base.route_order[rank, model.cycles, flat])
+            block_offset = (block - 1) * node_dim
+            feature_offset = rank * node_dim
+            for coordinate in 1:node_dim
+                scratch.features[feature_offset + coordinate] =
+                    base.membrane[
+                        block_offset + coordinate,
+                        final_time,
+                        flat,
+                    ] * base.selected_pool_inv_rms[flat]
+            end
+        end
+    end
+    return nothing
+end
+
+function _head_perturbed_raw!(
+    destination::Vector{Float32},
+    scratch,
+    model,
+    parameters,
+    flat::Int,
+    perturbation::Float32,
+)
+    feature_count = Model.reduced_hay_head_feature_dim(model)
+    @inbounds for hidden in 1:model.hidden
+        scratch.dhidden[hidden] = parameters.head_bias[hidden]
+    end
+    @inbounds for feature in 1:feature_count
+        perturbed = scratch.features[feature] +
+            perturbation * _alignment_sign(feature, flat)
+        for hidden in 1:model.hidden
+            scratch.dhidden[hidden] = muladd(
+                parameters.head_weight[hidden, feature],
+                perturbed,
+                scratch.dhidden[hidden],
+            )
+        end
+    end
+    square_sum = 0.0f0
+    @inbounds for hidden in 1:model.hidden
+        value = scratch.dhidden[hidden]
+        square_sum = muladd(value, value, square_sum)
+    end
+    inverse_rms = inv(sqrt(
+        square_sum / Float32(model.hidden) +
+        InputModel.RMS_NORM_EPS,
+    ))
+    @inbounds for hidden in 1:model.hidden
+        scratch.dhidden[hidden] = tanh(
+            InputModel.HIDDEN_NORM_SCALE *
+            scratch.dhidden[hidden] * inverse_rms,
+        )
+    end
+    @inbounds for output in 1:OUTPUT_DIM
+        destination[output] = parameters.output_bias[output]
+    end
+    @inbounds for hidden in 1:model.hidden
+        hidden_value = scratch.dhidden[hidden]
+        for output in 1:OUTPUT_DIM
+            destination[output] = muladd(
+                parameters.output_weight[output, hidden],
+                hidden_value,
+                destination[output],
+            )
+        end
+    end
+    return nothing
+end
+
+"""
+Learn the output-to-root feedback map from forward noise correlations.
+
+A zero-mean Rademacher perturbation is applied only to the real global head
+features.  Its central-difference output response estimates `J * noise`, so
+`noise * response'` is an unbiased one-sample estimate of `J'`.  No head
+weight is traversed backwards and the functional recurrent signal only reads
+the independently stored `root_feedback` matrix.
+"""
+function _accumulate_root_feedback_alignment!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+)
+    base = tape.base
+    _prepare_root_features!(scratch.point_scratch, tape, model, flat)
+    _head_perturbed_raw!(
+        scratch.local_prediction,
+        scratch.point_scratch,
+        model,
+        parameters,
+        flat,
+        FEEDBACK_NOISE_SCALE,
+    )
+    _head_perturbed_raw!(
+        scratch.local_error,
+        scratch.point_scratch,
+        model,
+        parameters,
+        flat,
+        -FEEDBACK_NOISE_SCALE,
+    )
+    inverse_difference = inv(2.0f0 * FEEDBACK_NOISE_SCALE)
+    inverse_valid = inv(Float32(max(base.valid_count, 1)))
+    @inbounds for output in 1:OUTPUT_DIM
+        response = (
+            scratch.local_prediction[output] -
+            scratch.local_error[output]
+        ) * inverse_difference
+        for feature in 1:Model.reduced_hay_head_feature_dim(model)
+            estimate = _alignment_sign(feature, flat) * response
+            residual = parameters.root_feedback[feature, output] - estimate
+            scratch.gradient.root_feedback[feature, output] +=
+                inverse_valid * (
+                    residual +
+                    FEEDBACK_ALIGNMENT_DECAY *
+                    parameters.root_feedback[feature, output]
+                )
+            scratch.feedback_alignment_loss +=
+                0.5 * Float64(residual) * Float64(residual) *
+                Float64(inverse_valid)
+        end
+    end
+    return nothing
+end
+
+"""
+Align a two-stage feedback pathway without a reverse traversal of the
+supervised head.  Each candidate perturbs one feature coordinate and one
+hidden coordinate in the forward direction.  Across a packed arena the
+coordinates are covered round-robin, producing low-variance local targets for
+the two independently stored feedback matrices.
+"""
+function _accumulate_layered_feedback_alignment!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+)
+    base = tape.base
+    _prepare_root_features!(scratch.point_scratch, tape, model, flat)
+    feature_count = Model.reduced_hay_head_feature_dim(model)
+    feature_probe = mod(flat - 1, feature_count) + 1
+    hidden_probe = mod(flat - 1, model.hidden) + 1
+    inverse_valid = inv(Float32(max(base.valid_count, 1)))
+    feature_scale = Float32(feature_count) * inverse_valid
+    hidden_scale = Float32(model.hidden) * inverse_valid
+    inverse_difference = inv(2.0f0 * FEEDBACK_NOISE_SCALE)
+
+    @inbounds for hidden in 1:model.hidden
+        positive = parameters.head_bias[hidden]
+        negative = parameters.head_bias[hidden]
+        for feature in 1:feature_count
+            value = scratch.point_scratch.features[feature]
+            if feature == feature_probe
+                positive = muladd(
+                    parameters.head_weight[hidden, feature],
+                    value + FEEDBACK_NOISE_SCALE,
+                    positive,
+                )
+                negative = muladd(
+                    parameters.head_weight[hidden, feature],
+                    value - FEEDBACK_NOISE_SCALE,
+                    negative,
+                )
+            else
+                positive = muladd(
+                    parameters.head_weight[hidden, feature],
+                    value,
+                    positive,
+                )
+                negative = muladd(
+                    parameters.head_weight[hidden, feature],
+                    value,
+                    negative,
+                )
+            end
+        end
+        response = (positive - negative) * inverse_difference
+        residual = parameters.feature_feedback[
+            feature_probe,
+            hidden,
+        ] - response
+        scratch.gradient.feature_feedback[
+            feature_probe,
+            hidden,
+        ] += feature_scale * (
+            residual +
+            FEEDBACK_ALIGNMENT_DECAY * parameters.feature_feedback[
+                feature_probe,
+                hidden,
+            ]
+        )
+        scratch.feedback_alignment_loss +=
+            0.5 * Float64(residual) * Float64(residual) *
+            Float64(feature_scale)
+    end
+
+    @inbounds for output in 1:OUTPUT_DIM
+        positive = parameters.output_bias[output]
+        negative = parameters.output_bias[output]
+        for hidden in 1:model.hidden
+            value = base.hidden[hidden, flat]
+            if hidden == hidden_probe
+                positive = muladd(
+                    parameters.output_weight[output, hidden],
+                    value + FEEDBACK_NOISE_SCALE,
+                    positive,
+                )
+                negative = muladd(
+                    parameters.output_weight[output, hidden],
+                    value - FEEDBACK_NOISE_SCALE,
+                    negative,
+                )
+            else
+                positive = muladd(
+                    parameters.output_weight[output, hidden],
+                    value,
+                    positive,
+                )
+                negative = muladd(
+                    parameters.output_weight[output, hidden],
+                    value,
+                    negative,
+                )
+            end
+        end
+        response = (positive - negative) * inverse_difference
+        residual = parameters.output_feedback[
+            hidden_probe,
+            output,
+        ] - response
+        scratch.gradient.output_feedback[
+            hidden_probe,
+            output,
+        ] += hidden_scale * (
+            residual +
+            FEEDBACK_ALIGNMENT_DECAY * parameters.output_feedback[
+                hidden_probe,
+                output,
+            ]
+        )
+        scratch.feedback_alignment_loss +=
+            0.5 * Float64(residual) * Float64(residual) *
+            Float64(hidden_scale)
+    end
+    return nothing
+end
+
+function _layered_feedback_features!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+)
+    base = tape.base
+    fill!(scratch.point_scratch.dhidden, 0.0f0)
+    fill!(scratch.point_scratch.dfeatures, 0.0f0)
+    @inbounds for output in 1:OUTPUT_DIM
+        cotangent = base.raw_gradient[output, flat]
+        for hidden in 1:model.hidden
+            scratch.point_scratch.dhidden[hidden] = muladd(
+                parameters.output_feedback[hidden, output],
+                cotangent,
+                scratch.point_scratch.dhidden[hidden],
+            )
+        end
+    end
+    projection_mean = 0.0f0
+    @inbounds for hidden in 1:model.hidden
+        hidden_value = base.hidden[hidden, flat]
+        normalized = scratch.point_scratch.dhidden[hidden] *
+            InputModel.HIDDEN_NORM_SCALE *
+            (1.0f0 - hidden_value * hidden_value)
+        scratch.point_scratch.dhidden[hidden] = normalized
+        projection_mean = muladd(
+            normalized,
+            base.hidden_pre[hidden, flat],
+            projection_mean,
+        )
+    end
+    projection_mean /= Float32(model.hidden)
+    inverse_rms = base.hidden_inv_rms[flat]
+    inverse_rms_squared = inverse_rms * inverse_rms
+    @inbounds for hidden in 1:model.hidden
+        hidden_cotangent = inverse_rms * (
+            scratch.point_scratch.dhidden[hidden] -
+            base.hidden_pre[hidden, flat] *
+            inverse_rms_squared * projection_mean
+        )
+        for feature in 1:Model.reduced_hay_head_feature_dim(model)
+            scratch.point_scratch.dfeatures[feature] = muladd(
+                parameters.feature_feedback[feature, hidden],
+                hidden_cotangent,
+                scratch.point_scratch.dfeatures[feature],
+            )
+        end
+    end
+    return nothing
+end
+
+function _apply_apical_predictive_residual!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+    cycle::Int,
+)
+    base = tape.base
+    readout = model.readout_per_cell
+    predictor_scale = inv(Float32(readout * model.cycles))
+    @inbounds for cell in 1:(model.blocks * model.cells_per_block)
+        block = div(cell - 1, model.cells_per_block) + 1
+        local_cell = cell - (block - 1) * model.cells_per_block
+        coordinate_offset = (local_cell - 1) * readout
+        plateau_mean = 0.0f0
+        for branch in 1:model.branches
+            plateau_mean += tape.plateau[
+                cell,
+                branch,
+                cycle + 1,
+                flat,
+            ]
+        end
+        plateau_mean /= Float32(model.branches)
+        plateau_event = plateau_mean / (1.0f0 + plateau_mean)
+        burst_gate = clamp(
+            0.25f0 +
+            0.50f0 * tape.soma_spikes[cell, cycle, flat] +
+            0.25f0 * plateau_event,
+            0.25f0,
+            1.0f0,
+        )
+        scratch.burst_gate_sum += Float64(burst_gate)
+        scratch.burst_gate_count += 1
+        for target_channel in 1:readout
+            target_coordinate = coordinate_offset + target_channel
+            prediction = parameters.apical_predictor_bias[
+                target_channel,
+                cell,
+            ]
+            for source_channel in 1:readout
+                source_coordinate = coordinate_offset + source_channel
+                state = base.membrane[
+                    source_coordinate + (block - 1) * model.node_dim,
+                    cycle + 1,
+                    flat,
+                ]
+                prediction = muladd(
+                    parameters.apical_predictor_weight[
+                        source_channel,
+                        target_channel,
+                        cell,
+                    ],
+                    state,
+                    prediction,
+                )
+            end
+            target = scratch.feedback_error[target_coordinate, block]
+            residual = target - prediction
+            positive = max(residual, 0.0f0)
+            negative = max(-residual, 0.0f0)
+            signed_burst_residual = burst_gate * (positive - negative)
+            scratch.feedback_error[target_coordinate, block] =
+                target + APICAL_RESIDUAL_SCALE * signed_burst_residual
+            predictor_gradient = -residual * predictor_scale
+            scratch.gradient.apical_predictor_bias[
+                target_channel,
+                cell,
+            ] += predictor_gradient
+            for source_channel in 1:readout
+                source_coordinate = coordinate_offset + source_channel
+                state = base.membrane[
+                    source_coordinate + (block - 1) * model.node_dim,
+                    cycle + 1,
+                    flat,
+                ]
+                scratch.gradient.apical_predictor_weight[
+                    source_channel,
+                    target_channel,
+                    cell,
+                ] = muladd(
+                    predictor_gradient,
+                    state,
+                    scratch.gradient.apical_predictor_weight[
+                        source_channel,
+                        target_channel,
+                        cell,
+                    ],
+                )
+            end
+            scratch.apical_predictor_loss +=
+                0.5 * Float64(residual) * Float64(residual)
+        end
+    end
+    return nothing
+end
+
+"""
+Teacher-control credit path with a single supervised root.
+
+Unlike the DECOLLE control, this path does not attach a Tetris predictor to
+every block.  The analytic head VJP is evaluated once at the global output,
+then its cotangent is transported only through the actual normalized
+workspace and selected-pool interfaces.  Earlier workspace writes receive the
+same root cotangent through the workspace decay recurrence.  The resulting
+block-state signals are combined with the existing forward eligibility traces.
+
+This deliberately remains a symmetric-head control: it establishes whether
+removing block-local labels fixes the spatial learning signal before replacing
+the root transport with an adaptive apical feedback graph.
+"""
+@inline function _propagate_reciprocal_block_credit!(
+    scratch::DendriticWorkerScratch,
+    model,
+    parameters,
+    cache::DendriticParameterCache,
+    scale::Float32,
+)
+    fill!(scratch.feedback_next, 0.0f0)
+    fill!(scratch.feedback_norm, 0.0f0)
+    cells = model.blocks * model.cells_per_block
+    @inbounds for source in 1:cells
+        source_block = div(source - 1, model.cells_per_block) + 1
+        for relation in 1:model.fanout
+            destination = model.destination_for_source[source, relation]
+            destination_block =
+                div(destination - 1, model.cells_per_block) + 1
+            source_block == destination_block && continue
+            gain = cache.gate_hard[source, relation] *
+                parameters.synapse_weight[source, relation]
+            scratch.feedback_norm[source_block] += abs(gain)
+        end
+    end
+    @inbounds for source in 1:cells
+        source_block = div(source - 1, model.cells_per_block) + 1
+        inverse_norm = inv(max(
+            scratch.feedback_norm[source_block],
+            LOCAL_SIGNAL_RMS_EPSILON,
+        ))
+        for relation in 1:model.fanout
+            destination = model.destination_for_source[source, relation]
+            destination_block =
+                div(destination - 1, model.cells_per_block) + 1
+            source_block == destination_block && continue
+            gain = scale * cache.gate_hard[source, relation] *
+                parameters.synapse_weight[source, relation] * inverse_norm
+            gain == 0.0f0 && continue
+            for coordinate in 1:model.node_dim
+                scratch.feedback_next[coordinate, source_block] = muladd(
+                    gain,
+                    scratch.feedback_error[coordinate, destination_block],
+                    scratch.feedback_next[coordinate, source_block],
+                )
+            end
+        end
+    end
+    @inbounds for index in eachindex(
+        scratch.feedback_error,
+        scratch.feedback_next,
+    )
+        scratch.feedback_error[index] += scratch.feedback_next[index]
+    end
+    return nothing
+end
+
+const _V11_HEAD_ANCHOR = UInt8(1)
+const _V11_HEAD_DELTA = UInt8(2)
+const _V11_HEAD_HISTORY = UInt8(3)
+
+@inline function _v11_axis_head_cell_vjp!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+    block::Int,
+    local_cell::Int,
+    segment::UInt8,
+    cycle::Int=0,
+)
+    base = tape.base
+    state_count = model.readout_per_cell
+    rank_count = model.head_state_rank
+    anchor_time = 2
+    final_time = model.cycles + 1
+    block_offset = (block - 1) * model.node_dim
+    cell_offset = block_offset + (local_cell - 1) * state_count
+    selected = segment == _V11_HEAD_HISTORY ?
+        base.block_mask[block, cycle, flat] : 1.0f0
+
+    # The history head is evaluated on m * x.  For an unselected block m=0,
+    # so the projected value, head-mix gradient, projection-parameter
+    # gradient, and direct state cotangent are all exactly zero.  The only
+    # surviving derivative is the counterfactual route-mask cotangent
+    #
+    #   dL/dm = sum_r dL/du_r * sum_s P[r,s,c] * x_s,
+    #
+    # because tanh'(0)=1.  Handle that case directly instead of executing the
+    # general path's zero FMAs/writes and full24 scatter for every unselected
+    # block.  This preserves the exact hard-mask straight-through derivative;
+    # it only removes algebraic zeros from the hot history reverse.
+    if segment == _V11_HEAD_HISTORY && selected == 0.0f0
+        @inbounds for rank in 1:rank_count
+            scratch.axis_projection[rank] = 0.0f0
+        end
+        # `rank` is the first (contiguous) projection axis.  Read every state
+        # once and update all four ranks, matching Julia's column-major
+        # storage instead of striding through P once per rank.
+        @inbounds for state in 1:state_count
+            current = base.membrane[
+                cell_offset + state,
+                cycle + 1,
+                flat,
+            ]
+            for rank in 1:rank_count
+                scratch.axis_projection[rank] = muladd(
+                    parameters.head_state_projection[
+                        rank,
+                        state,
+                        local_cell,
+                    ],
+                    current,
+                    scratch.axis_projection[rank],
+                )
+            end
+        end
+        @inbounds for rank in 1:rank_count
+            projected_signal = 0.0f0
+            for output in 1:OUTPUT_DIM
+                projected_signal = muladd(
+                    parameters.head_history_mix[
+                        output,
+                        cycle,
+                        block,
+                        local_cell,
+                        rank,
+                    ],
+                    base.raw_gradient[output, flat],
+                    projected_signal,
+                )
+            end
+            scratch.route_mask_signal[block, cycle] = muladd(
+                projected_signal,
+                scratch.axis_projection[rank],
+                scratch.route_mask_signal[block, cycle],
+            )
+        end
+        return nothing
+    end
+
+    @inbounds for rank in 1:rank_count
+        scratch.axis_projection[rank] = 0.0f0
+    end
+    @inbounds for state in 1:state_count
+        anchor = base.membrane[cell_offset + state, anchor_time, flat]
+        value = if segment == _V11_HEAD_ANCHOR
+            anchor
+        elseif segment == _V11_HEAD_DELTA
+            base.membrane[cell_offset + state, final_time, flat] - anchor
+        else
+            selected * base.membrane[
+                cell_offset + state,
+                cycle + 1,
+                flat,
+            ]
+        end
+        for rank in 1:rank_count
+            scratch.axis_projection[rank] = muladd(
+                parameters.head_state_projection[rank, state, local_cell],
+                value,
+                scratch.axis_projection[rank],
+            )
+        end
+    end
+    @inbounds for rank in 1:rank_count
+        scratch.axis_projection[rank] = tanh(scratch.axis_projection[rank])
+    end
+
+    @inbounds for rank in 1:rank_count
+        projected = scratch.axis_projection[rank]
+        projected_signal = 0.0f0
+        for output in 1:OUTPUT_DIM
+            output_signal = base.raw_gradient[output, flat]
+            if segment == _V11_HEAD_ANCHOR
+                scratch.gradient.head_anchor_mix[
+                    output,
+                    block,
+                    local_cell,
+                    rank,
+                ] = muladd(
+                    output_signal,
+                    projected,
+                    scratch.gradient.head_anchor_mix[
+                        output,
+                        block,
+                        local_cell,
+                        rank,
+                    ],
+                )
+                projected_signal = muladd(
+                    parameters.head_anchor_mix[
+                        output,
+                        block,
+                        local_cell,
+                        rank,
+                    ],
+                    output_signal,
+                    projected_signal,
+                )
+            elseif segment == _V11_HEAD_DELTA
+                scratch.gradient.head_delta_mix[
+                    output,
+                    block,
+                    local_cell,
+                    rank,
+                ] = muladd(
+                    output_signal,
+                    projected,
+                    scratch.gradient.head_delta_mix[
+                        output,
+                        block,
+                        local_cell,
+                        rank,
+                    ],
+                )
+                projected_signal = muladd(
+                    parameters.head_delta_mix[
+                        output,
+                        block,
+                        local_cell,
+                        rank,
+                    ],
+                    output_signal,
+                    projected_signal,
+                )
+            else
+                scratch.gradient.head_history_mix[
+                    output,
+                    cycle,
+                    block,
+                    local_cell,
+                    rank,
+                ] = muladd(
+                    output_signal,
+                    projected,
+                    scratch.gradient.head_history_mix[
+                        output,
+                        cycle,
+                        block,
+                        local_cell,
+                        rank,
+                    ],
+                )
+                projected_signal = muladd(
+                    parameters.head_history_mix[
+                        output,
+                        cycle,
+                        block,
+                        local_cell,
+                        rank,
+                    ],
+                    output_signal,
+                    projected_signal,
+                )
+            end
+        end
+        scratch.route_query_signal[rank] =
+            projected_signal * (1.0f0 - projected * projected)
+    end
+
+    @inbounds for state in 1:state_count
+        anchor = base.membrane[cell_offset + state, anchor_time, flat]
+        current = segment == _V11_HEAD_HISTORY ?
+            base.membrane[cell_offset + state, cycle + 1, flat] : 0.0f0
+        projection_input = if segment == _V11_HEAD_ANCHOR
+            anchor
+        elseif segment == _V11_HEAD_DELTA
+            base.membrane[cell_offset + state, final_time, flat] - anchor
+        else
+            selected * current
+        end
+        state_signal = 0.0f0
+        for rank in 1:rank_count
+            projection_signal = scratch.route_query_signal[rank]
+            scratch.gradient.head_state_projection[
+                rank,
+                state,
+                local_cell,
+            ] = muladd(
+                projection_signal,
+                projection_input,
+                scratch.gradient.head_state_projection[
+                    rank,
+                    state,
+                    local_cell,
+                ],
+            )
+            state_signal = muladd(
+                parameters.head_state_projection[rank, state, local_cell],
+                projection_signal,
+                state_signal,
+            )
+        end
+        coordinate = (local_cell - 1) * state_count + state
+        if segment == _V11_HEAD_ANCHOR
+            _scatter_export_cotangent!(
+                scratch,
+                tape,
+                model,
+                coordinate,
+                block,
+                1,
+                flat,
+                state_signal,
+            )
+        elseif segment == _V11_HEAD_DELTA
+            _scatter_export_cotangent!(
+                scratch,
+                tape,
+                model,
+                coordinate,
+                block,
+                model.cycles,
+                flat,
+                state_signal,
+            )
+            _scatter_export_cotangent!(
+                scratch,
+                tape,
+                model,
+                coordinate,
+                block,
+                1,
+                flat,
+                -state_signal,
+            )
+        else
+            _scatter_export_cotangent!(
+                scratch,
+                tape,
+                model,
+                coordinate,
+                block,
+                cycle,
+                flat,
+                selected * state_signal,
+            )
+            # Counterfactual route credit must be computed for every block,
+            # including blocks that were not selected in this trajectory.
+            scratch.route_mask_signal[block, cycle] = muladd(
+                state_signal,
+                current,
+                scratch.route_mask_signal[block, cycle],
+            )
+        end
+    end
+    return nothing
+end
+
+function _backward_v11_axis_head_candidate!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+)
+    base = tape.base
+    @inbounds for output in 1:OUTPUT_DIM
+        scratch.gradient.output_bias[output] +=
+            base.raw_gradient[output, flat]
+    end
+    @inbounds for block in 1:model.blocks
+        for local_cell in 1:model.cells_per_block
+            _v11_axis_head_cell_vjp!(
+                scratch,
+                tape,
+                model,
+                parameters,
+                flat,
+                block,
+                local_cell,
+                _V11_HEAD_ANCHOR,
+            )
+            _v11_axis_head_cell_vjp!(
+                scratch,
+                tape,
+                model,
+                parameters,
+                flat,
+                block,
+                local_cell,
+                _V11_HEAD_DELTA,
+            )
+        end
+    end
+    @inbounds for cycle in 1:model.cycles
+        for block in 1:model.blocks
+            for local_cell in 1:model.cells_per_block
+                _v11_axis_head_cell_vjp!(
+                    scratch,
+                    tape,
+                    model,
+                    parameters,
+                    flat,
+                    block,
+                    local_cell,
+                    _V11_HEAD_HISTORY,
+                    cycle,
+                )
+            end
+        end
+    end
+    return nothing
+end
+
+@inline function _v13_direct_head_cell_vjp!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+    block::Int,
+    local_cell::Int,
+    segment::UInt8,
+    cycle::Int=0,
+)
+    base = tape.base
+    state_count = model.readout_per_cell
+    anchor_time = 2
+    final_time = model.cycles + 1
+    block_offset = (block - 1) * model.node_dim
+    cell_offset = block_offset + (local_cell - 1) * state_count
+    history = segment == _V11_HEAD_HISTORY
+    selected = history ?
+        base.block_mask[block, cycle, flat] : 1.0f0
+    mask_cotangent = 0.0f0
+
+    @inbounds for state in 1:state_count
+        anchor = base.membrane[cell_offset + state, anchor_time, flat]
+        current = history ?
+            base.membrane[cell_offset + state, cycle + 1, flat] : 0.0f0
+        value = if segment == _V11_HEAD_ANCHOR
+            anchor
+        elseif segment == _V11_HEAD_DELTA
+            base.membrane[cell_offset + state, final_time, flat] - anchor
+        else
+            current
+        end
+        state_signal = 0.0f0
+        for output in 1:OUTPUT_DIM
+            output_signal = base.raw_gradient[output, flat]
+            if segment == _V11_HEAD_ANCHOR
+                scratch.gradient.head_anchor_mix[
+                    output,
+                    block,
+                    local_cell,
+                    state,
+                ] = muladd(
+                    output_signal,
+                    value,
+                    scratch.gradient.head_anchor_mix[
+                        output,
+                        block,
+                        local_cell,
+                        state,
+                    ],
+                )
+                state_signal = muladd(
+                    parameters.head_anchor_mix[
+                        output,
+                        block,
+                        local_cell,
+                        state,
+                    ],
+                    output_signal,
+                    state_signal,
+                )
+            elseif segment == _V11_HEAD_DELTA
+                scratch.gradient.head_delta_mix[
+                    output,
+                    block,
+                    local_cell,
+                    state,
+                ] = muladd(
+                    output_signal,
+                    value,
+                    scratch.gradient.head_delta_mix[
+                        output,
+                        block,
+                        local_cell,
+                        state,
+                    ],
+                )
+                state_signal = muladd(
+                    parameters.head_delta_mix[
+                        output,
+                        block,
+                        local_cell,
+                        state,
+                    ],
+                    output_signal,
+                    state_signal,
+                )
+            else
+                # history = mask * state.  An unselected block receives only
+                # the exact counterfactual dmask below: neither its state nor
+                # its history-mix parameter participated in the hard forward.
+                if selected != 0.0f0
+                    scratch.gradient.head_history_mix[
+                        output,
+                        cycle,
+                        block,
+                        local_cell,
+                        state,
+                    ] = muladd(
+                        output_signal,
+                        value,
+                        scratch.gradient.head_history_mix[
+                            output,
+                            cycle,
+                            block,
+                            local_cell,
+                            state,
+                        ],
+                    )
+                end
+                state_signal = muladd(
+                    parameters.head_history_mix[
+                        output,
+                        cycle,
+                        block,
+                        local_cell,
+                        state,
+                    ],
+                    output_signal,
+                    state_signal,
+                )
+            end
+        end
+
+        coordinate = (local_cell - 1) * state_count + state
+        if segment == _V11_HEAD_ANCHOR
+            _scatter_export_cotangent!(
+                scratch,
+                tape,
+                model,
+                coordinate,
+                block,
+                1,
+                flat,
+                state_signal,
+            )
+        elseif segment == _V11_HEAD_DELTA
+            _scatter_export_cotangent!(
+                scratch,
+                tape,
+                model,
+                coordinate,
+                block,
+                model.cycles,
+                flat,
+                state_signal,
+            )
+            _scatter_export_cotangent!(
+                scratch,
+                tape,
+                model,
+                coordinate,
+                block,
+                1,
+                flat,
+                -state_signal,
+            )
+        else
+            mask_cotangent = muladd(
+                state_signal,
+                current,
+                mask_cotangent,
+            )
+            selected == 0.0f0 && continue
+            _scatter_export_cotangent!(
+                scratch,
+                tape,
+                model,
+                coordinate,
+                block,
+                cycle,
+                flat,
+                state_signal,
+            )
+        end
+    end
+    if history
+        scratch.route_mask_signal[block, cycle] += mask_cotangent
+    end
+    return nothing
+end
+
+function _backward_v13_direct_head_candidate!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    flat::Int,
+)
+    base = tape.base
+    @inbounds for output in 1:OUTPUT_DIM
+        scratch.gradient.output_bias[output] +=
+            base.raw_gradient[output, flat]
+    end
+    @inbounds for block in 1:model.blocks
+        for local_cell in 1:model.cells_per_block
+            _v13_direct_head_cell_vjp!(
+                scratch,
+                tape,
+                model,
+                parameters,
+                flat,
+                block,
+                local_cell,
+                _V11_HEAD_ANCHOR,
+            )
+            _v13_direct_head_cell_vjp!(
+                scratch,
+                tape,
+                model,
+                parameters,
+                flat,
+                block,
+                local_cell,
+                _V11_HEAD_DELTA,
+            )
+        end
+    end
+    @inbounds for cycle in 1:model.cycles
+        for block in 1:model.blocks
+            for local_cell in 1:model.cells_per_block
+                _v13_direct_head_cell_vjp!(
+                    scratch,
+                    tape,
+                    model,
+                    parameters,
+                    flat,
+                    block,
+                    local_cell,
+                    _V11_HEAD_HISTORY,
+                    cycle,
+                )
+            end
+        end
+    end
+    return nothing
+end
+
+@inline function _rms_input_cotangent(
+    output_cotangent::Float32,
+    input::Float32,
+    inverse_rms::Float32,
+    projection_mean::Float32,
+)
+    return inverse_rms * (
+        output_cotangent -
+        input * inverse_rms * inverse_rms * projection_mean
+    )
+end
+
+function dendritic_prepare_workspace_root_signal_candidate!(
+    scratch::DendriticWorkerScratch,
+    tape::DendriticTape,
+    model,
+    parameters,
+    cache::DendriticParameterCache,
+    branch_for_edge::Matrix{UInt8},
+    flat::Int,
+    feedback_hops::Int=0,
+    feedback_scale::Float32=0.5f0,
+    root_feedback::Union{Nothing,Matrix{Float32}}=nothing,
+    online_feedback_alignment::Bool=false,
+    apical_predictive_credit::Bool=false,
+    routing_temperature::Float32=model.route_temperature,
+    exact_graph_bptt::Bool=false,
+    pathwise_route_parameters::Bool=true,
+)
+    base = tape.base
+    node_dim = model.node_dim
+    routing_logit_limit = exact_graph_bptt ?
+        Inf32 : Routing.DEFAULT_LOGIT_LIMIT
+    _reset_export_signals!(scratch)
+    anchored_temporal =
+        model.head_readout === :anchored_temporal
+    if anchored_temporal
+        exact_graph_bptt || error(
+            "anchored-temporal recurrent credit requires exact graph BPTT",
+        )
+        feedback_hops == 0 || error(
+            "reciprocal feedback is not defined for anchored-temporal credit",
+        )
+        online_feedback_alignment && error(
+            "online feedback alignment is not defined for anchored-temporal credit",
+        )
+        apical_predictive_credit && error(
+            "apical-predictive credit is not defined for anchored-temporal credit",
+        )
+    end
+    @inbounds for cycle in 1:model.cycles
+        for block in 1:model.blocks
+            tape.block_supervised_reward[block, cycle, flat] = 0.0f0
+        end
+    end
+
+    # Exact-slot models have no legacy pooled/anchored head representation.
+    # Their supervised roots are the three raw22 readouts over full24 state:
+    # sensory anchor, sparse temporal history and final-minus-anchor delta.
+    # Keep this branch ahead of every legacy feedback/local-credit path so an
+    # exact-slot model cannot silently fall back to the old node_dim contract.
+    if _uses_exact_block_slots(model)
+        exact_graph_bptt || error(
+            "exact block slots require exact graph BPTT",
+        )
+        feedback_hops == 0 || error(
+            "reciprocal feedback is not defined for exact block slots",
+        )
+        root_feedback === nothing || error(
+            "independent root feedback is not defined for exact block slots",
+        )
+        online_feedback_alignment && error(
+            "online feedback alignment is not defined for exact block slots",
+        )
+        apical_predictive_credit && error(
+            "apical-predictive credit is not defined for exact block slots",
+        )
+        if _uses_direct_axis_head(model)
+            _backward_v13_direct_head_candidate!(
+                scratch,
+                tape,
+                model,
+                parameters,
+                flat,
+            )
+        elseif model.head_layout === :axis_factorized
+            _backward_v11_axis_head_candidate!(
+                scratch,
+                tape,
+                model,
+                parameters,
+                flat,
+            )
+        else
+            error(
+                "unsupported exact-slot head layout $(model.head_layout)",
+            )
+        end
+        _accumulate_cell_temporal_gradients!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            cache,
+            flat;
+            routing_temperature,
+            routing_logit_limit,
+            branch_for_edge,
+            exact_graph_bptt,
+            pathwise_route_parameters,
+        )
+        return nothing
+    end
+
+    if online_feedback_alignment
+        _accumulate_layered_feedback_alignment!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            flat,
+        )
+    end
+
+    if apical_predictive_credit
+        _layered_feedback_features!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            flat,
+        )
+    elseif root_feedback === nothing
+        # This leaves dfeatures as dL/d(normalized head features).  It is the
+        # only place in the symmetric control where supervised head weights
+        # are consulted.
+        _backward_head_candidate!(
+            scratch.gradient,
+            tape,
+            model,
+            parameters,
+            scratch.point_scratch,
+            flat,
+        )
+    else
+        feature_dim = Model.reduced_hay_head_feature_dim(model)
+        size(root_feedback) == (feature_dim, OUTPUT_DIM) ||
+            throw(DimensionMismatch("root feedback"))
+        fill!(scratch.point_scratch.dfeatures, 0.0f0)
+        @inbounds for output in 1:OUTPUT_DIM
+            error = base.raw_gradient[output, flat]
+            for feature in 1:feature_dim
+                scratch.point_scratch.dfeatures[feature] = muladd(
+                    root_feedback[feature, output],
+                    error,
+                    scratch.point_scratch.dfeatures[feature],
+                )
+            end
+        end
+    end
+
+    if anchored_temporal
+        # The three head segments are normalized independently.  Reverse each
+        # normalization before separating the delta into its final-summary and
+        # sensory-anchor parents.
+        anchor_projection_mean = 0.0f0
+        temporal_projection_mean = 0.0f0
+        delta_projection_mean = 0.0f0
+        @inbounds for coordinate in 1:node_dim
+            anchor_projection_mean = muladd(
+                scratch.point_scratch.dfeatures[coordinate],
+                tape.sensory_anchor[coordinate, flat],
+                anchor_projection_mean,
+            )
+            temporal_projection_mean = muladd(
+                scratch.point_scratch.dfeatures[node_dim + coordinate],
+                tape.temporal_workspace[coordinate, flat],
+                temporal_projection_mean,
+            )
+            delta_projection_mean = muladd(
+                scratch.point_scratch.dfeatures[2node_dim + coordinate],
+                tape.anchor_delta[coordinate, flat],
+                delta_projection_mean,
+            )
+        end
+        inverse_node_dim = inv(Float32(node_dim))
+        anchor_projection_mean *= inverse_node_dim
+        temporal_projection_mean *= inverse_node_dim
+        delta_projection_mean *= inverse_node_dim
+        inverse_blocks = inv(sqrt(Float32(model.blocks)))
+        inverse_cycles = inv(sqrt(Float32(model.cycles)))
+        anchor_inverse_rms = tape.sensory_anchor_inv_rms[flat]
+        temporal_inverse_rms = tape.temporal_workspace_inv_rms[flat]
+        delta_inverse_rms = tape.anchor_delta_inv_rms[flat]
+
+        @inbounds for bound_coordinate in 1:node_dim
+            anchor_cotangent = _rms_input_cotangent(
+                scratch.point_scratch.dfeatures[bound_coordinate],
+                tape.sensory_anchor[bound_coordinate, flat],
+                anchor_inverse_rms,
+                anchor_projection_mean,
+            )
+            temporal_cotangent = _rms_input_cotangent(
+                scratch.point_scratch.dfeatures[
+                    node_dim + bound_coordinate
+                ],
+                tape.temporal_workspace[bound_coordinate, flat],
+                temporal_inverse_rms,
+                temporal_projection_mean,
+            )
+            delta_cotangent = _rms_input_cotangent(
+                scratch.point_scratch.dfeatures[
+                    2node_dim + bound_coordinate
+                ],
+                tape.anchor_delta[bound_coordinate, flat],
+                delta_inverse_rms,
+                delta_projection_mean,
+            )
+
+            # anchor = all-block bound summary at cycle 1, while
+            # delta = final all-block bound summary - anchor.
+            anchor_state_cotangent =
+                (anchor_cotangent - delta_cotangent) * inverse_blocks
+            final_state_cotangent = delta_cotangent * inverse_blocks
+            for block in 1:model.blocks
+                raw_coordinate = Int(tape.spatial_bound_coordinate[
+                    bound_coordinate,
+                    block,
+                ])
+                sign_value = tape.spatial_bound_sign[
+                    bound_coordinate,
+                    block,
+                ]
+                _scatter_export_cotangent!(
+                    scratch,
+                    tape,
+                    model,
+                    raw_coordinate,
+                    block,
+                    1,
+                    flat,
+                    sign_value * anchor_state_cotangent,
+                )
+                _scatter_export_cotangent!(
+                    scratch,
+                    tape,
+                    model,
+                    raw_coordinate,
+                    block,
+                    model.cycles,
+                    flat,
+                    sign_value * final_state_cotangent,
+                )
+            end
+
+            # temporal[bound] = sum_t sign * workspace[source,t] / sqrt(T).
+            # Store only the direct head roots here; the intrinsic adjoint
+            # combines them with later recurrence and apical-feedback roots.
+            for cycle in 1:model.cycles
+                source_coordinate = Int(tape.temporal_bound_coordinate[
+                    bound_coordinate,
+                    cycle,
+                ])
+                scratch.workspace_root_signal[
+                    source_coordinate,
+                    cycle,
+                ] += tape.temporal_bound_sign[
+                    bound_coordinate,
+                    cycle,
+                ] * temporal_cotangent * inverse_cycles
+            end
+        end
+
+        _accumulate_cell_temporal_gradients!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            cache,
+            flat;
+            routing_temperature,
+            routing_logit_limit,
+            branch_for_edge,
+            exact_graph_bptt,
+        )
+        if root_feedback !== nothing
+            # Recurrent roots above came from the independent feedback matrix;
+            # the supervised head itself always retains its analytic VJP.
+            _backward_head_candidate!(
+                scratch.gradient,
+                tape,
+                model,
+                parameters,
+                scratch.point_scratch,
+                flat,
+            )
+        end
+        return nothing
+    end
+
+    feature_dim = Model.reduced_hay_head_feature_dim(model)
+    local_feature_dim = feature_dim - node_dim
+    workspace_projection_mean = 0.0f0
+    local_projection_mean = 0.0f0
+    final_time = model.cycles + 1
+    fill!(scratch.root_block_signal, 0.0f0)
+    fill!(scratch.local_block_signal, 0.0f0)
+    @inbounds for coordinate in 1:node_dim
+        workspace_value = base.workspace[coordinate, final_time, flat]
+        workspace_projection_mean = muladd(
+            scratch.point_scratch.dfeatures[coordinate],
+            workspace_value,
+            workspace_projection_mean,
+        )
+    end
+    inverse_node_dim = inv(Float32(node_dim))
+    workspace_projection_mean *= inverse_node_dim
+    workspace_inv_rms = base.workspace_inv_rms[flat]
+    workspace_inv_rms_squared = workspace_inv_rms * workspace_inv_rms
+    local_inv_rms = base.selected_pool_inv_rms[flat]
+    local_inv_rms_squared = local_inv_rms * local_inv_rms
+    inverse_workspace_k = inv(Float32(model.workspace_k))
+    @inbounds for coordinate in 1:node_dim
+        workspace_value = base.workspace[coordinate, final_time, flat]
+        scratch.global_block_signal[coordinate] = workspace_inv_rms * (
+            scratch.point_scratch.dfeatures[coordinate] -
+            workspace_value * workspace_inv_rms_squared *
+            workspace_projection_mean
+        )
+    end
+    if model.head_readout === :pooled
+        @inbounds for coordinate in 1:node_dim
+            selected_pool = 0.0f0
+            for block in 1:model.blocks
+                node = coordinate + (block - 1) * node_dim
+                selected_pool = muladd(
+                    base.membrane[node, final_time, flat],
+                    base.block_mask[block, model.cycles, flat],
+                    selected_pool,
+                )
+            end
+            selected_pool *= inverse_workspace_k
+            scratch.block_signal[coordinate] = selected_pool
+            local_projection_mean = muladd(
+                scratch.point_scratch.dfeatures[node_dim + coordinate],
+                selected_pool,
+                local_projection_mean,
+            )
+        end
+        local_projection_mean *= inverse_node_dim
+        @inbounds for coordinate in 1:node_dim
+            selected_pool = scratch.block_signal[coordinate]
+            signal = local_inv_rms * (
+                scratch.point_scratch.dfeatures[node_dim + coordinate] -
+                selected_pool * local_inv_rms_squared *
+                local_projection_mean
+            ) * inverse_workspace_k
+            scratch.local_block_signal[coordinate] = signal
+            for block in 1:model.blocks
+                base.block_mask[block, model.cycles, flat] == 0.0f0 &&
+                    continue
+                scratch.root_block_signal[coordinate, block] = signal
+            end
+        end
+    else
+        @inbounds for rank in 1:model.workspace_k
+            block = Int(base.route_order[rank, model.cycles, flat])
+            block_offset = (block - 1) * node_dim
+            feature_offset = rank * node_dim
+            for coordinate in 1:node_dim
+                value = base.membrane[
+                    block_offset + coordinate,
+                    final_time,
+                    flat,
+                ]
+                local_projection_mean = muladd(
+                    scratch.point_scratch.dfeatures[
+                        feature_offset + coordinate
+                    ],
+                    value,
+                    local_projection_mean,
+                )
+            end
+        end
+        local_projection_mean /= Float32(local_feature_dim)
+        @inbounds for rank in 1:model.workspace_k
+            block = Int(base.route_order[rank, model.cycles, flat])
+            block_offset = (block - 1) * node_dim
+            feature_offset = rank * node_dim
+            for coordinate in 1:node_dim
+                value = base.membrane[
+                    block_offset + coordinate,
+                    final_time,
+                    flat,
+                ]
+                scratch.root_block_signal[coordinate, block] +=
+                    local_inv_rms * (
+                        scratch.point_scratch.dfeatures[
+                            feature_offset + coordinate
+                        ] -
+                        value * local_inv_rms_squared *
+                        local_projection_mean
+                    )
+            end
+        end
+    end
+
+    # The root cotangent reaches earlier blocks only through the actual
+    # workspace recurrence.  No block receives a private Tetris target.
+    @inbounds for cycle in model.cycles:-1:1
+        fill!(scratch.feedback_error, 0.0f0)
+        fill!(scratch.route_alpha, 0.0f0)
+        for coordinate in 1:node_dim
+            workspace_value = base.workspace[coordinate, cycle + 1, flat]
+            workspace_write_signal =
+                scratch.global_block_signal[coordinate] *
+                (1.0f0 - workspace_value * workspace_value)
+            scratch.gradient.workspace_decay_logit[1] +=
+                workspace_write_signal *
+                base.workspace[coordinate, cycle, flat] *
+                cache.workspace_decay_derivative
+            for block in 1:model.blocks
+                state = base.membrane[
+                    coordinate + (block - 1) * node_dim,
+                    cycle + 1,
+                    flat,
+                ]
+                scratch.route_alpha[block] = muladd(
+                    workspace_write_signal * inverse_workspace_k,
+                    state,
+                    scratch.route_alpha[block],
+                )
+                if cycle == model.cycles
+                    route_signal = model.head_readout === :pooled ?
+                        scratch.local_block_signal[coordinate] :
+                        scratch.root_block_signal[coordinate, block]
+                    scratch.route_alpha[block] = muladd(
+                        route_signal,
+                        state,
+                        scratch.route_alpha[block],
+                    )
+                end
+                selected = base.block_mask[block, cycle, flat]
+                selected == 0.0f0 && continue
+                root_signal = cycle == model.cycles ?
+                    scratch.root_block_signal[coordinate, block] : 0.0f0
+                scratch.feedback_error[coordinate, block] += root_signal +
+                    workspace_write_signal * inverse_workspace_k
+            end
+            scratch.global_block_signal[coordinate] =
+                workspace_write_signal * cache.workspace_decay
+        end
+        for block in 1:model.blocks
+            # Logged as a supervised reward surrogate for diagnostics only.
+            # The actual key/query update below is the pathwise loss VJP.
+            tape.block_supervised_reward[block, cycle, flat] =
+                -scratch.route_alpha[block]
+        end
+        _accumulate_pathwise_route_cycle!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            flat,
+            cycle,
+            routing_temperature,
+            routing_logit_limit,
+            pathwise_route_parameters,
+        )
+        for _ in 1:feedback_hops
+            _propagate_reciprocal_block_credit!(
+                scratch,
+                model,
+                parameters,
+                cache,
+                feedback_scale,
+            )
+        end
+        apical_predictive_credit && _apply_apical_predictive_residual!(
+            scratch,
+            tape,
+            model,
+            parameters,
+            flat,
+            cycle,
+        )
+        for block in 1:model.blocks
+            for coordinate in 1:node_dim
+                signal = scratch.feedback_error[coordinate, block]
+                signal == 0.0f0 && continue
+                _scatter_export_cotangent!(
+                    scratch,
+                    tape,
+                    model,
+                    coordinate,
+                    block,
+                    cycle,
+                    flat,
+                    signal,
+                )
+            end
+        end
+    end
+
+    _accumulate_cell_temporal_gradients!(
+        scratch,
+        tape,
+        model,
+        parameters,
+        cache,
+        flat;
+        routing_temperature,
+        routing_logit_limit,
+        branch_for_edge,
+        exact_graph_bptt,
+    )
+    exact_graph_bptt || _accumulate_edge_eligibility!(
+        scratch,
+        tape,
+        model,
+        parameters,
+        cache,
+        branch_for_edge,
+        flat,
+    )
+    if root_feedback !== nothing
+        # The supervised head retains its exact analytic VJP, but this call is
+        # deliberately delayed until all recurrent signals are materialized.
+        _backward_head_candidate!(
+            scratch.gradient,
+            tape,
+            model,
+            parameters,
+            scratch.point_scratch,
+            flat,
+        )
+    end
     return nothing
 end
 
@@ -2875,6 +6302,7 @@ function dendritic_local_candidate!(
     model,
     parameters,
     flat::Int,
+    use_supervised_advantage::Bool=true,
 )
     _accumulate_routing_gradients!(
         scratch,
@@ -2882,6 +6310,7 @@ function dendritic_local_candidate!(
         model,
         parameters,
         flat,
+        use_supervised_advantage,
     )
     return nothing
 end
@@ -2897,7 +6326,10 @@ function _parameter_shards(
     elements_per_shard::Int=4096,
 )
     shards = DendriticParameterShard[]
-    for (field, name) in enumerate(DENDRITIC_PARAMETER_FIELDS)
+    parameter_fields = _arena_parameter_fields(parameters)
+    keys(parameters) == parameter_fields ||
+        error("arena parameter registry changed")
+    for (field, name) in enumerate(parameter_fields)
         length_array = length(getproperty(parameters, name))
         first_index = 1
         while first_index <= length_array
@@ -2976,6 +6408,9 @@ mutable struct DendriticArenaMetrics
     local_death_loss::Float64
     local_quantile_loss::Float64
     local_geometry_loss::Float64
+    apical_predictor_loss::Float64
+    feedback_alignment_loss::Float64
+    burst_gate_mean::Float64
     gradient_norm::Float64
     structural_flips::Int
     branch_moves::Int
@@ -2985,6 +6420,9 @@ DendriticArenaMetrics() = DendriticArenaMetrics(
     0.0,
     0.0,
     Int128(0),
+    0.0,
+    0.0,
+    0.0,
     0.0,
     0.0,
     0.0,
@@ -3013,6 +6451,7 @@ mutable struct DendriticArenaTrainer{M,P,O,G}
     tape::DendriticTape
     loss_scratch::Point.LossScratch
     gradient::G
+    recurrent_gradient_accumulator::G
     projection::Array{Float32,3}
     branch_for_edge::Matrix{UInt8}
     gate_mask::BitMatrix
@@ -3020,9 +6459,12 @@ mutable struct DendriticArenaTrainer{M,P,O,G}
     branch_utility::Array{Float32,3}
     parameter_shards::Vector{DendriticParameterShard}
     gradient_norm_squares::Vector{Float64}
+    recurrent_field_norm_squares::Vector{Float64}
+    recurrent_optimizer_scales::Vector{Float32}
     optimizer_scale::Float32
     recurrent_optimizer_scale::Float32
     local_predictor_optimizer_scale::Float32
+    apical_credit_optimizer_scale::Float32
     head_optimizer_scale::Float32
     recurrent_updates_enabled::Bool
     utility_decay::Float32
@@ -3032,6 +6474,14 @@ mutable struct DendriticArenaTrainer{M,P,O,G}
     global_signal_scale::Float32
     local_signal_scale::Float32
     recurrent_learning_rate_multiplier::Float32
+    sensory_learning_rate_multiplier::Float32
+    routing_learning_rate_multiplier::Float32
+    communication_learning_rate_multiplier::Float32
+    recurrent_accumulation_steps::Int
+    recurrent_accumulation_count::Int
+    recurrent_beta1_power::Float32
+    recurrent_beta2_power::Float32
+    recurrent_optimizer_due::Bool
     routing_entropy_weight::Float32
     routing_entropy_floor::Float32
     routing_load_weight::Float32
@@ -3049,20 +6499,36 @@ function DendriticArenaTrainer(
     weight_decay::Real=1.0f-5,
     utility_decay::Real=0.99f0,
     utility_connection_cost::Real=1.0f-6,
-    structural_interval::Int=25,
-    branch_interval::Int=128,
+    # The wake trainer learns continuous gate and branch utilities, while
+    # discrete mask/location integration is opt-in.  The production schedule
+    # performs those non-stationary changes during the slower sleep phase.
+    structural_interval::Int=typemax(Int),
+    branch_interval::Int=typemax(Int),
     global_signal_scale::Real=1.0f0,
     local_signal_scale::Real=1.0f0,
     recurrent_learning_rate_multiplier::Real=0.001f0,
-    routing_entropy_weight::Real=0.002f0,
-    routing_entropy_floor::Real=0.70f0,
-    routing_load_weight::Real=0.002f0,
+    sensory_learning_rate_multiplier::Real=
+        recurrent_learning_rate_multiplier,
+    routing_learning_rate_multiplier::Real=
+        recurrent_learning_rate_multiplier,
+    communication_learning_rate_multiplier::Real=
+        recurrent_learning_rate_multiplier,
+    recurrent_accumulation_steps::Int=1,
+    routing_entropy_weight::Real=4.0f0,
+    routing_entropy_floor::Real=0.85f0,
+    routing_load_weight::Real=0.10f0,
     projection_seed::Integer=0x44454e4450524f4a,
 )
     model.variant === :causal_recurrent_v2 ||
         throw(ArgumentError(
             "ReducedHayV2ArenaTrainer requires causal_recurrent_v2",
         ))
+    structural_interval > 0 || throw(ArgumentError(
+        "structural_interval must be positive",
+    ))
+    branch_interval > 0 || throw(ArgumentError(
+        "branch_interval must be positive",
+    ))
     isfinite(global_signal_scale) &&
         global_signal_scale >= 0 ||
         throw(ArgumentError(
@@ -3073,10 +6539,29 @@ function DendriticArenaTrainer(
         throw(ArgumentError(
             "local_signal_scale must be finite and nonnegative",
         ))
+    isfinite(sensory_learning_rate_multiplier) &&
+        sensory_learning_rate_multiplier >= 0 ||
+        throw(ArgumentError(
+            "sensory learning-rate multiplier must be finite and nonnegative",
+        ))
     isfinite(recurrent_learning_rate_multiplier) &&
         recurrent_learning_rate_multiplier > 0 ||
         throw(ArgumentError(
             "recurrent_learning_rate_multiplier must be finite and positive",
+        ))
+    isfinite(routing_learning_rate_multiplier) &&
+        routing_learning_rate_multiplier > 0 ||
+        throw(ArgumentError(
+            "routing_learning_rate_multiplier must be finite and positive",
+        ))
+    isfinite(communication_learning_rate_multiplier) &&
+        communication_learning_rate_multiplier >= 0 ||
+        throw(ArgumentError(
+            "communication_learning_rate_multiplier must be finite and nonnegative",
+        ))
+    recurrent_accumulation_steps > 0 ||
+        throw(ArgumentError(
+            "recurrent_accumulation_steps must be positive",
         ))
     isfinite(routing_entropy_weight) &&
         routing_entropy_weight >= 0 ||
@@ -3094,14 +6579,19 @@ function DendriticArenaTrainer(
         ))
     tape = DendriticTape(model, state_batch, width)
     rng = Xoshiro(UInt64(projection_seed))
-    projection = randn(
-        rng,
-        Float32,
-        model.node_dim,
-        OUTPUT_DIM,
-        model.blocks,
-    ) ./ sqrt(Float32(model.node_dim))
+    exact_block_slots = _uses_exact_block_slots(model)
+    projection = exact_block_slots ?
+        zeros(Float32, 0, 0, 0) :
+        randn(
+            rng,
+            Float32,
+            model.node_dim,
+            OUTPUT_DIM,
+            model.blocks,
+        ) ./ sqrt(Float32(model.node_dim))
     parameters = _with_local_predictor(parameters, projection, model)
+    recurrent_parameter_fields =
+        _recurrent_parameter_fields(parameters)
     branch_for_edge = Matrix{UInt8}(
         undef,
         size(parameters.synapse_weight),
@@ -3145,7 +6635,8 @@ function DendriticArenaTrainer(
             weight_decay,
         ),
         tape,
-        Point.LossScratch(width),
+        Point.LossScratch(width, state_batch),
+        _zero_parameter_tree(parameters),
         _zero_parameter_tree(parameters),
         projection,
         branch_for_edge,
@@ -3159,6 +6650,9 @@ function DendriticArenaTrainer(
         ),
         shards,
         zeros(Float64, length(shards)),
+        zeros(Float64, length(recurrent_parameter_fields)),
+        ones(Float32, length(recurrent_parameter_fields)),
+        1.0f0,
         1.0f0,
         1.0f0,
         1.0f0,
@@ -3171,6 +6665,14 @@ function DendriticArenaTrainer(
         Float32(global_signal_scale),
         Float32(local_signal_scale),
         Float32(recurrent_learning_rate_multiplier),
+        Float32(sensory_learning_rate_multiplier),
+        Float32(routing_learning_rate_multiplier),
+        Float32(communication_learning_rate_multiplier),
+        recurrent_accumulation_steps,
+        0,
+        1.0f0,
+        1.0f0,
+        false,
         Float32(routing_entropy_weight),
         Float32(routing_entropy_floor),
         Float32(routing_load_weight),
@@ -3249,6 +6751,10 @@ mutable struct DendriticArenaExecutor{W,T,D}
     dataset::D
     stochastic_routing::Bool
     routing_seed::UInt64
+    routing_temperature::Float32
+    credit_mode::Symbol
+    root_feedback::Matrix{Float32}
+    head_updates_enabled::Bool
     recurrent_signal_scale::Float32
     generation::Base.Threads.Atomic{UInt32}
     remaining::Base.Threads.Atomic{Int}
@@ -3271,6 +6777,12 @@ function DendriticArenaExecutor(
     queue_capacity::Int=2048,
     stochastic_routing::Bool=true,
     routing_seed::Integer=0x44454e44524f5554,
+    routing_temperature::Real=trainer.model.route_temperature,
+    credit_mode::Symbol=
+        _is_exact_slot_parameter_tree(trainer.parameters) ?
+        :exact_bptt : :block_teacher,
+    root_feedback=nothing,
+    head_updates_enabled::Bool=true,
     recurrent_signal_scale::Real=1.0f0,
 )
     julia_workers = Base.Threads.nthreads(:default)
@@ -3290,6 +6802,40 @@ function DendriticArenaExecutor(
     isfinite(scale) && scale >= 0.0f0 || throw(ArgumentError(
         "recurrent_signal_scale must be finite and nonnegative",
     ))
+    temperature = Float32(routing_temperature)
+    isfinite(temperature) && temperature > 0.0f0 ||
+        throw(ArgumentError(
+            "routing_temperature must be finite and positive",
+        ))
+    credit_mode in (
+        :block_teacher,
+        :workspace_root_control,
+        :workspace_root_reciprocal_control,
+        :workspace_root_adaptive_control,
+        :apical_predictive_online,
+        :exact_bptt,
+    ) ||
+        throw(ArgumentError(
+            "unsupported credit_mode $credit_mode",
+        ))
+    exact_slot = _is_exact_slot_parameter_tree(trainer.parameters)
+    exact_slot && credit_mode !== :exact_bptt &&
+        throw(ArgumentError(
+            "exact-slot arena supports only credit_mode=:exact_bptt",
+        ))
+    if exact_slot && root_feedback !== nothing
+        throw(ArgumentError(
+            "exact-slot arena has no apical root_feedback parameter",
+        ))
+    elseif root_feedback !== nothing
+        supplied_feedback = Matrix{Float32}(root_feedback)
+        size(supplied_feedback) ==
+            size(trainer.parameters.root_feedback) ||
+            throw(DimensionMismatch("root_feedback"))
+        copyto!(trainer.parameters.root_feedback, supplied_feedback)
+    end
+    feedback = exact_slot ?
+        zeros(Float32, 0, 0) : trainer.parameters.root_feedback
     workers = [
         DendriticWorkerScratch(trainer.model, trainer.parameters)
         for _ in 1:active_workers
@@ -3307,6 +6853,10 @@ function DendriticArenaExecutor(
         dataset,
         stochastic_routing,
         UInt64(routing_seed),
+        temperature,
+        credit_mode,
+        feedback,
+        head_updates_enabled,
         scale,
         Base.Threads.Atomic{UInt32}(0),
         Base.Threads.Atomic{Int}(0),
@@ -3333,6 +6883,10 @@ function _clear_worker_accumulators!(
         worker.local_death_loss = 0.0
         worker.local_quantile_loss = 0.0
         worker.local_geometry_loss = 0.0
+        worker.apical_predictor_loss = 0.0
+        worker.feedback_alignment_loss = 0.0
+        worker.burst_gate_sum = 0.0
+        worker.burst_gate_count = 0
         worker.jobs = UInt64(0)
         worker.cpu_ticks = UInt64(0)
     end
@@ -3382,6 +6936,37 @@ end
     return square_sum
 end
 
+# Compile one direct Val-specialized branch per v11 field.  The shard index is
+# runtime data, but every leaf call remains statically dispatched; no Symbol
+# lookup or dynamic getproperty is introduced in the reduction hot path.
+@generated function _reduce_parameter_field!(
+    trainer::DendriticArenaTrainer,
+    workers,
+    ::Val{FIELDS},
+    field::Int,
+    first_index::Int,
+    last_index::Int,
+    scale::Float32,
+) where {FIELDS}
+    branches = [
+        quote
+            field == $index && return _reduce_gradient_range!(
+                trainer,
+                workers,
+                Val($(QuoteNode(name))),
+                first_index,
+                last_index,
+                scale,
+            )
+        end
+        for (index, name) in enumerate(FIELDS)
+    ]
+    return quote
+        $(branches...)
+        error("unknown static parameter field $field")
+    end
+end
+
 function _reduce_shard!(
     executor::DendriticArenaExecutor,
     target::Int,
@@ -3393,6 +6978,35 @@ function _reduce_shard!(
     last_index = Int(shard.last)
     recurrent = executor.recurrent_signal_scale
     head = 1.0f0
+    if _is_v13_parameter_tree(trainer.parameters)
+        scale = field <= length(V11_RECURRENT_PARAMETER_FIELDS) ?
+            recurrent : head
+        trainer.gradient_norm_squares[target] =
+            _reduce_parameter_field!(
+                trainer,
+                executor.workers,
+                Val(V13_ARENA_PARAMETER_FIELDS),
+                field,
+                first_index,
+                last_index,
+                scale,
+            )
+        return nothing
+    elseif _is_v11_parameter_tree(trainer.parameters)
+        scale = field <= length(V11_RECURRENT_PARAMETER_FIELDS) ?
+            recurrent : head
+        trainer.gradient_norm_squares[target] =
+            _reduce_parameter_field!(
+                trainer,
+                executor.workers,
+                Val(V11_ARENA_PARAMETER_FIELDS),
+                field,
+                first_index,
+                last_index,
+                scale,
+            )
+        return nothing
+    end
     square_sum = if field == 1
         _reduce_gradient_range!(
             trainer,
@@ -3685,7 +7299,7 @@ function _reduce_shard!(
         _reduce_gradient_range!(
             trainer,
             executor.workers,
-            Val(:head_weight),
+            Val(:apical_predictor_weight),
             first_index,
             last_index,
             head,
@@ -3694,7 +7308,7 @@ function _reduce_shard!(
         _reduce_gradient_range!(
             trainer,
             executor.workers,
-            Val(:head_bias),
+            Val(:apical_predictor_bias),
             first_index,
             last_index,
             head,
@@ -3703,12 +7317,57 @@ function _reduce_shard!(
         _reduce_gradient_range!(
             trainer,
             executor.workers,
-            Val(:output_weight),
+            Val(:root_feedback),
             first_index,
             last_index,
             head,
         )
     elseif field == 36
+        _reduce_gradient_range!(
+            trainer,
+            executor.workers,
+            Val(:feature_feedback),
+            first_index,
+            last_index,
+            head,
+        )
+    elseif field == 37
+        _reduce_gradient_range!(
+            trainer,
+            executor.workers,
+            Val(:output_feedback),
+            first_index,
+            last_index,
+            head,
+        )
+    elseif field == 38
+        _reduce_gradient_range!(
+            trainer,
+            executor.workers,
+            Val(:head_weight),
+            first_index,
+            last_index,
+            head,
+        )
+    elseif field == 39
+        _reduce_gradient_range!(
+            trainer,
+            executor.workers,
+            Val(:head_bias),
+            first_index,
+            last_index,
+            head,
+        )
+    elseif field == 40
+        _reduce_gradient_range!(
+            trainer,
+            executor.workers,
+            Val(:output_weight),
+            first_index,
+            last_index,
+            head,
+        )
+    elseif field == 41
         _reduce_gradient_range!(
             trainer,
             executor.workers,
@@ -3727,8 +7386,15 @@ end
 function _finish_gradient_reduction!(
     trainer::DendriticArenaTrainer,
 )
+    recurrent_fields = _recurrent_parameter_fields(trainer.parameters)
+    local_predictor_fields =
+        _local_predictor_parameter_fields(trainer.parameters)
+    apical_credit_fields =
+        _apical_credit_parameter_fields(trainer.parameters)
+    fill!(trainer.recurrent_field_norm_squares, 0.0)
     recurrent_square_sum = 0.0
     local_predictor_square_sum = 0.0
+    apical_credit_square_sum = 0.0
     head_square_sum = 0.0
     @inbounds for target in eachindex(
         trainer.gradient_norm_squares,
@@ -3736,11 +7402,16 @@ function _finish_gradient_reduction!(
     )
         field = Int(trainer.parameter_shards[target].field)
         value = trainer.gradient_norm_squares[target]
-        if field <= length(RECURRENT_PARAMETER_FIELDS)
+        if field <= length(recurrent_fields)
             recurrent_square_sum += value
-        elseif field <= length(RECURRENT_PARAMETER_FIELDS) +
-                        length(LOCAL_PREDICTOR_PARAMETER_FIELDS)
+            trainer.recurrent_field_norm_squares[field] += value
+        elseif field <= length(recurrent_fields) +
+                        length(local_predictor_fields)
             local_predictor_square_sum += value
+        elseif field <= length(recurrent_fields) +
+                        length(local_predictor_fields) +
+                        length(apical_credit_fields)
+            apical_credit_square_sum += value
         else
             head_square_sum += value
         end
@@ -3748,16 +7419,30 @@ function _finish_gradient_reduction!(
     total_square_sum =
         recurrent_square_sum +
         local_predictor_square_sum +
+        apical_credit_square_sum +
         head_square_sum
     trainer.metrics.gradient_norm = sqrt(total_square_sum)
-    maximum_norm = 5.0
+    maximum_norm = MAX_PARAMETER_FAMILY_GRADIENT_NORM
     scale(square_sum) = Float32(
         square_sum > maximum_norm^2 ?
         maximum_norm / sqrt(square_sum) : 1.0,
     )
-    trainer.recurrent_optimizer_scale = scale(recurrent_square_sum)
+    @inbounds for field in eachindex(
+        trainer.recurrent_optimizer_scales,
+        trainer.recurrent_field_norm_squares,
+    )
+        trainer.recurrent_optimizer_scales[field] =
+            scale(trainer.recurrent_field_norm_squares[field])
+    end
+    # Retain the scalar as a conservative diagnostic for older callers.  The
+    # optimizer itself uses the per-family values so a large branch-bias
+    # adjoint cannot starve routing, edge, leak, or workspace updates.
+    trainer.recurrent_optimizer_scale =
+        minimum(trainer.recurrent_optimizer_scales)
     trainer.local_predictor_optimizer_scale =
         scale(local_predictor_square_sum)
+    trainer.apical_credit_optimizer_scale =
+        scale(apical_credit_square_sum)
     trainer.head_optimizer_scale = scale(head_square_sum)
     trainer.optimizer_scale = 1.0f0
     return nothing
@@ -3857,9 +7542,17 @@ end
 ) where {F}
     parameter = getproperty(trainer.parameters, F)
     gradient = getproperty(trainer.gradient, F)
+    recurrent_field =
+        _is_recurrent_parameter(trainer.parameters, Val(F))
+    head_field = _is_head_parameter(trainer.parameters, Val(F))
+    local_predictor_field =
+        _is_local_predictor_parameter(trainer.parameters, Val(F))
+    apical_credit_field =
+        _is_apical_credit_parameter(trainer.parameters, Val(F))
     if !trainer.recurrent_updates_enabled &&
-       !(F in HEAD_PARAMETER_FIELDS) &&
-       !(F in LOCAL_PREDICTOR_PARAMETER_FIELDS)
+       !head_field &&
+       !local_predictor_field &&
+       !apical_credit_field
         @inbounds for index in first_index:last_index
             gradient[index] = 0.0f0
         end
@@ -3870,22 +7563,60 @@ end
     second_moment =
         getproperty(trainer.optimizer.second_moment, F)
     optimizer = trainer.optimizer
-    inverse_first_bias =
-        inv(1.0f0 - optimizer.beta1_power)
-    inverse_second_bias =
-        inv(1.0f0 - optimizer.beta2_power)
+    inverse_first_bias = inv(
+        1.0f0 - (
+            recurrent_field ?
+            trainer.recurrent_beta1_power : optimizer.beta1_power
+        ),
+    )
+    inverse_second_bias = inv(
+        1.0f0 - (
+            recurrent_field ?
+            trainer.recurrent_beta2_power : optimizer.beta2_power
+        ),
+    )
     beta1_complement = 1.0f0 - optimizer.beta1
     beta2_complement = 1.0f0 - optimizer.beta2
-    scale = if F in RECURRENT_PARAMETER_FIELDS
-        trainer.recurrent_optimizer_scale
-    elseif F in LOCAL_PREDICTOR_PARAMETER_FIELDS
+    scale = if recurrent_field
+        field_index = _recurrent_field_index(
+            trainer.parameters,
+            Val(F),
+        )
+        @inbounds trainer.recurrent_optimizer_scales[field_index]
+    elseif local_predictor_field
         trainer.local_predictor_optimizer_scale
+    elseif apical_credit_field
+        trainer.apical_credit_optimizer_scale
     else
         trainer.head_optimizer_scale
     end
-    learning_rate_multiplier = F in RECURRENT_PARAMETER_FIELDS ?
-        trainer.recurrent_learning_rate_multiplier : 1.0f0
+    learning_rate_multiplier = if _is_direct_routing_parameter(
+        trainer.parameters,
+        Val(F),
+    )
+        trainer.routing_learning_rate_multiplier
+    elseif F in SENSORY_PARAMETER_FIELDS
+        trainer.sensory_learning_rate_multiplier
+    elseif _is_communication_parameter(
+        trainer.parameters,
+        Val(F),
+    )
+        trainer.communication_learning_rate_multiplier
+    elseif recurrent_field
+        trainer.recurrent_learning_rate_multiplier
+    elseif F in LAYERED_FEEDBACK_PARAMETER_FIELDS
+        FEEDBACK_LEARNING_RATE_MULTIPLIER
+    else
+        1.0f0
+    end
     norm_square = 0.0
+    accumulator = recurrent_field ? getproperty(
+        trainer.recurrent_gradient_accumulator,
+        F,
+    ) : gradient
+    accumulation_inverse = recurrent_field &&
+        trainer.recurrent_optimizer_due ?
+        inv(Float32(trainer.recurrent_accumulation_count)) : 1.0f0
     @inbounds for index in first_index:last_index
         grad = gradient[index] * scale
         norm_square = muladd(
@@ -3893,6 +7624,17 @@ end
             Float64(grad),
             norm_square,
         )
+        if recurrent_field
+            accumulated = accumulator[index] + grad
+            if trainer.recurrent_optimizer_due
+                grad = accumulated * accumulation_inverse
+                accumulator[index] = 0.0f0
+            else
+                accumulator[index] = accumulated
+                gradient[index] = 0.0f0
+                continue
+            end
+        end
         moment1 = muladd(
             optimizer.beta1,
             first_moment[index],
@@ -3918,6 +7660,30 @@ end
     return norm_square
 end
 
+@generated function _adam_parameter_field!(
+    trainer::DendriticArenaTrainer,
+    ::Val{FIELDS},
+    field::Int,
+    first_index::Int,
+    last_index::Int,
+) where {FIELDS}
+    branches = [
+        quote
+            field == $index && return _adam_range!(
+                trainer,
+                Val($(QuoteNode(name))),
+                first_index,
+                last_index,
+            )
+        end
+        for (index, name) in enumerate(FIELDS)
+    ]
+    return quote
+        $(branches...)
+        error("unknown static Adam parameter field $field")
+    end
+end
+
 function _adam_shard!(
     trainer::DendriticArenaTrainer,
     target::Int,
@@ -3926,6 +7692,27 @@ function _adam_shard!(
     field = Int(shard.field)
     first_index = Int(shard.first)
     last_index = Int(shard.last)
+    if _is_v13_parameter_tree(trainer.parameters)
+        trainer.gradient_norm_squares[target] =
+            _adam_parameter_field!(
+                trainer,
+                Val(V13_ARENA_PARAMETER_FIELDS),
+                field,
+                first_index,
+                last_index,
+            )
+        return nothing
+    elseif _is_v11_parameter_tree(trainer.parameters)
+        trainer.gradient_norm_squares[target] =
+            _adam_parameter_field!(
+                trainer,
+                Val(V11_ARENA_PARAMETER_FIELDS),
+                field,
+                first_index,
+                last_index,
+            )
+        return nothing
+    end
     norm_square = if field == 1
         _adam_range!(trainer, Val(:input_exc_logits), first_index, last_index)
     elseif field == 2
@@ -3991,32 +7778,27 @@ function _adam_shard!(
     elseif field == 32
         _adam_range!(trainer, Val(:local_readout_bias), first_index, last_index)
     elseif field == 33
-        _adam_range!(trainer, Val(:head_weight), first_index, last_index)
+        _adam_range!(trainer, Val(:apical_predictor_weight), first_index, last_index)
     elseif field == 34
-        _adam_range!(trainer, Val(:head_bias), first_index, last_index)
+        _adam_range!(trainer, Val(:apical_predictor_bias), first_index, last_index)
     elseif field == 35
-        _adam_range!(trainer, Val(:output_weight), first_index, last_index)
+        _adam_range!(trainer, Val(:root_feedback), first_index, last_index)
     elseif field == 36
+        _adam_range!(trainer, Val(:feature_feedback), first_index, last_index)
+    elseif field == 37
+        _adam_range!(trainer, Val(:output_feedback), first_index, last_index)
+    elseif field == 38
+        _adam_range!(trainer, Val(:head_weight), first_index, last_index)
+    elseif field == 39
+        _adam_range!(trainer, Val(:head_bias), first_index, last_index)
+    elseif field == 40
+        _adam_range!(trainer, Val(:output_weight), first_index, last_index)
+    elseif field == 41
         _adam_range!(trainer, Val(:output_bias), first_index, last_index)
     else
         error("unknown dendritic parameter field $field")
     end
     trainer.gradient_norm_squares[target] = norm_square
-    return nothing
-end
-
-@inline function _zero_gradient_shard!(
-    trainer::DendriticArenaTrainer,
-    target::Int,
-)
-    shard = @inbounds trainer.parameter_shards[target]
-    field = Int(shard.field)
-    name = DENDRITIC_PARAMETER_FIELDS[field]
-    gradient = getproperty(trainer.gradient, name)
-    @inbounds for index in Int(shard.first):Int(shard.last)
-        gradient[index] = 0.0f0
-    end
-    trainer.gradient_norm_squares[target] = 0.0
     return nothing
 end
 
@@ -4110,7 +7892,10 @@ function _consolidate_structure!(
         end
     end
     if step % trainer.branch_interval == 0
-        @inbounds for source in 1:cells
+        partitions = min(BRANCH_CONSOLIDATION_PARTITIONS, cells)
+        event = div(step, trainer.branch_interval)
+        partition = mod(event - 1, partitions) + 1
+        @inbounds for source in partition:partitions:cells
             best_relation = 0
             best_branch = 0
             best_gain = 0.0f0
@@ -4136,11 +7921,18 @@ function _consolidate_structure!(
                     end
                 end
             end
-            if best_relation != 0
+            if best_relation != 0 && best_gain > BRANCH_MOVE_MARGIN
                 trainer.branch_for_edge[
                     source,
                     best_relation,
                 ] = UInt8(best_branch)
+                for branch in 1:trainer.model.branches
+                    trainer.branch_utility[
+                        branch,
+                        source,
+                        best_relation,
+                    ] = 0.0f0
+                end
                 _reset_edge_moments!(
                     trainer,
                     source,
@@ -4167,54 +7959,97 @@ function _center_block_supervised_rewards!(
         offset = (state_slot - 1) * base.width
         inverse_count = inv(Float32(count))
         for cycle in 1:model.cycles
-            reward_mean = 0.0f0
-            for candidate in 1:count
-                flat = offset + candidate
-                route_reward = 0.0f0
-                for block in 1:model.blocks
-                    route_reward = muladd(
-                        base.block_mask[block, cycle, flat],
-                        tape.block_supervised_reward[
-                            block,
-                            cycle,
-                            flat,
-                        ],
-                        route_reward,
+            reward_square_sum = 0.0f0
+            for block in 1:model.blocks
+                reward_mean = 0.0f0
+                for candidate in 1:count
+                    flat = offset + candidate
+                    reward_mean += tape.block_supervised_reward[
+                        block,
+                        cycle,
+                        flat,
+                    ]
+                end
+                reward_mean *= inverse_count
+                for candidate in 1:count
+                    flat = offset + candidate
+                    centered = tape.block_supervised_reward[
+                        block,
+                        cycle,
+                        flat,
+                    ] - reward_mean
+                    tape.block_advantage[block, cycle, flat] = centered
+                    reward_square_sum = muladd(
+                        centered,
+                        centered,
+                        reward_square_sum,
                     )
                 end
-                route_reward /= Float32(model.workspace_k)
-                tape.block_advantage[1, cycle, flat] = route_reward
-                reward_mean += route_reward
-            end
-            reward_mean *= inverse_count
-            reward_square_sum = 0.0f0
-            for candidate in 1:count
-                flat = offset + candidate
-                centered =
-                    tape.block_advantage[1, cycle, flat] - reward_mean
-                tape.block_advantage[1, cycle, flat] = centered
-                reward_square_sum = muladd(
-                    centered,
-                    centered,
-                    reward_square_sum,
-                )
             end
             inverse_reward_rms = inv(sqrt(
-                reward_square_sum * inverse_count +
+                reward_square_sum * inverse_count /
+                Float32(model.blocks) +
                 LOCAL_SIGNAL_RMS_EPSILON,
             ))
-            for candidate in 1:count
-                flat = offset + candidate
-                advantage =
-                    tape.block_advantage[1, cycle, flat] *
-                    inverse_reward_rms *
-                    inverse_valid
-                for block in 1:model.blocks
+            for block in 1:model.blocks
+                for candidate in 1:count
+                    flat = offset + candidate
                     tape.block_advantage[
                         block,
                         cycle,
                         flat,
-                    ] = advantage
+                    ] *= inverse_reward_rms * inverse_valid
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+Prepare the scalar third factor required by an ordered Plackett-Luce route.
+
+`route_eligibility[:, cycle, flat]` is the gradient of the log probability of
+the complete ordered top-k sample, not a collection of independent per-block
+log probabilities.  It must therefore be multiplied by one scalar reward for
+that joint route.  The reward here is the negative supervised state excess
+loss.  It is a model-level supervised reward surrogate, never an environment
+return and never a private Tetris target attached to a block.
+
+The leave-one-state-out baseline is independent of the current state's route
+sample, so it reduces variance without changing the expected score-function
+gradient.  A one-state diagnostic batch falls back to the raw negative excess.
+"""
+function _prepare_state_supervised_route_advantages!(
+    trainer::DendriticArenaTrainer,
+)
+    tape = trainer.tape
+    base = tape.base
+    model = trainer.model
+    scratch = trainer.loss_scratch
+    states = base.state_batch
+    total_excess = 0.0f0
+    @inbounds for state_slot in 1:states
+        total_excess +=
+            scratch.state_composite[state_slot] -
+            scratch.state_teacher_entropy[state_slot]
+    end
+    inverse_other = states > 1 ? inv(Float32(states - 1)) : 0.0f0
+    @inbounds for state_slot in 1:states
+        excess =
+            scratch.state_composite[state_slot] -
+            scratch.state_teacher_entropy[state_slot]
+        baseline = states > 1 ?
+            (total_excess - excess) * inverse_other : 0.0f0
+        supervised_reward_surrogate = -(excess - baseline)
+        count = Int(base.counts[state_slot])
+        offset = (state_slot - 1) * base.width
+        for candidate in 1:count
+            flat = offset + candidate
+            for cycle in 1:model.cycles
+                for block in 1:model.blocks
+                    tape.block_advantage[block, cycle, flat] =
+                        supervised_reward_surrogate
                 end
             end
         end
@@ -4224,6 +8059,7 @@ end
 
 function _prepare_routing_regularizer!(
     trainer::DendriticArenaTrainer,
+    routing_temperature::Float32=trainer.model.route_temperature,
 )
     base = trainer.tape.base
     model = trainer.model
@@ -4254,7 +8090,7 @@ function _prepare_routing_regularizer!(
     inverse_blocks = inv(blocks_f)
     inverse_valid = inv(Float32(valid_count))
     log_blocks = log(blocks_f)
-    inverse_temperature = inv(model.route_temperature)
+    inverse_temperature = inv(routing_temperature)
     @inbounds for target in 1:valid_count
         flat = Int(base.valid_flats[target])
         for cycle in 1:model.cycles
@@ -4329,9 +8165,18 @@ function _prepare_routing_regularizer!(
                         trainer.route_load[block, cycle] -
                         load_projection
                     )
+                raw_standardized =
+                    (
+                        base.route_score[block, cycle, flat] -
+                        score_mean
+                    ) * score_inv_rms
                 normalized_gradient =
                     (entropy_gradient + load_gradient) *
-                    inverse_temperature
+                    inverse_temperature *
+                    Routing.bounded_standardized_derivative(
+                        raw_standardized,
+                        Routing.DEFAULT_LOGIT_LIMIT,
+                    )
                 base.route_regularizer_gradient[
                     block,
                     cycle,
@@ -4423,21 +8268,58 @@ function _dispatch!(
             flat;
             stochastic_routing=executor.stochastic_routing,
             routing_nonce=nonce,
+            routing_temperature=executor.routing_temperature,
+            routing_logit_limit=
+                executor.credit_mode === :exact_bptt ?
+                Inf32 : Routing.DEFAULT_LOGIT_LIMIT,
         )
     elseif work.kind == UInt8(DENDRITIC_SIGNAL)
         flat = Int(trainer.tape.base.valid_flats[target])
-        dendritic_prepare_signal_candidate!(
-            worker,
-            trainer.tape,
-            trainer.projection,
-            trainer.model,
-            trainer.parameters,
-            trainer.cache,
-            trainer.branch_for_edge,
-            flat,
-            trainer.global_signal_scale,
-            trainer.local_signal_scale,
+        if executor.credit_mode in (
+            :workspace_root_control,
+            :workspace_root_reciprocal_control,
+            :workspace_root_adaptive_control,
+            :apical_predictive_online,
+            :exact_bptt,
         )
+            dendritic_prepare_workspace_root_signal_candidate!(
+                worker,
+                trainer.tape,
+                trainer.model,
+                trainer.parameters,
+                trainer.cache,
+                trainer.branch_for_edge,
+                flat,
+                executor.credit_mode ===
+                    :workspace_root_reciprocal_control ? 2 : 0,
+                0.5f0,
+                (
+                    executor.credit_mode ===
+                        :workspace_root_adaptive_control ||
+                    executor.credit_mode ===
+                        :apical_predictive_online
+                ) ?
+                    executor.root_feedback : nothing,
+                executor.credit_mode === :apical_predictive_online,
+                executor.credit_mode === :apical_predictive_online,
+                executor.routing_temperature,
+                executor.credit_mode === :exact_bptt,
+                !executor.stochastic_routing,
+            )
+        else
+            dendritic_prepare_signal_candidate!(
+                worker,
+                trainer.tape,
+                trainer.projection,
+                trainer.model,
+                trainer.parameters,
+                trainer.cache,
+                trainer.branch_for_edge,
+                flat,
+                trainer.global_signal_scale,
+                trainer.local_signal_scale,
+            )
+        end
     elseif work.kind == UInt8(DENDRITIC_LOCAL)
         flat = Int(trainer.tape.base.valid_flats[target])
         dendritic_local_candidate!(
@@ -4446,14 +8328,48 @@ function _dispatch!(
             trainer.model,
             trainer.parameters,
             flat,
+            executor.stochastic_routing,
         )
     elseif work.kind == UInt8(DENDRITIC_REDUCE)
         _reduce_shard!(executor, target)
     elseif work.kind == UInt8(DENDRITIC_OPTIMIZER)
         shard = @inbounds trainer.parameter_shards[target]
+        field = Int(shard.field)
+        recurrent_count =
+            length(_recurrent_parameter_fields(trainer.parameters))
+        local_count = length(
+            _local_predictor_parameter_fields(trainer.parameters),
+        )
+        apical_count = length(
+            _apical_credit_parameter_fields(trainer.parameters),
+        )
+        recurrent_field = field <= recurrent_count
+        local_predictor_field =
+            recurrent_count < field <= recurrent_count + local_count
+        apical_credit_field =
+            recurrent_count + local_count < field <=
+            recurrent_count + local_count + apical_count
+        head_field = field >
+            recurrent_count + local_count + apical_count
         if executor.recurrent_signal_scale == 0.0f0 &&
-           Int(shard.field) <= length(RECURRENT_PARAMETER_FIELDS)
-            _zero_gradient_shard!(trainer, target)
+           recurrent_field
+            # Keep dispatch type-stable.  The older Symbol/getproperty zeroing
+            # helper allocated once per recurrent shard during head-only
+            # phases; `_adam_shard!` reaches the generated Val-specialized
+            # early-zero path without touching moments or parameters.
+            _adam_shard!(trainer, target)
+        elseif executor.credit_mode !== :block_teacher &&
+               local_predictor_field
+            # Root-feedback modes do not use the block-local Tetris
+            # predictors.  Freeze both their gradients and AdamW decay so a
+            # control run cannot silently depend on them.
+            nothing
+        elseif executor.credit_mode !== :apical_predictive_online &&
+               apical_credit_field
+            nothing
+        elseif !executor.head_updates_enabled &&
+               head_field
+            nothing
         else
             _adam_shard!(trainer, target)
         end
@@ -4612,11 +8528,19 @@ function _refresh_dendritic_metrics!(
     local_death_loss = 0.0
     local_quantile_loss = 0.0
     local_geometry_loss = 0.0
+    apical_predictor_loss = 0.0
+    feedback_alignment_loss = 0.0
+    burst_gate_sum = 0.0
+    burst_gate_count = 0
     @inbounds for worker in executor.workers
         local_q_loss += worker.local_q_loss
         local_death_loss += worker.local_death_loss
         local_quantile_loss += worker.local_quantile_loss
         local_geometry_loss += worker.local_geometry_loss
+        apical_predictor_loss += worker.apical_predictor_loss
+        feedback_alignment_loss += worker.feedback_alignment_loss
+        burst_gate_sum += worker.burst_gate_sum
+        burst_gate_count += worker.burst_gate_count
     end
     trainer.metrics.local_q_loss =
         local_q_loss / local_count
@@ -4626,6 +8550,21 @@ function _refresh_dendritic_metrics!(
         local_quantile_loss / local_count
     trainer.metrics.local_geometry_loss =
         local_geometry_loss / local_count
+    trainer.metrics.apical_predictor_loss =
+        apical_predictor_loss /
+        max(base.valid_count * model.cycles * model.blocks, 1)
+    feedback_parameter_count =
+        _is_exact_slot_parameter_tree(trainer.parameters) ? 0 :
+        length(trainer.parameters.feature_feedback) +
+        length(trainer.parameters.output_feedback)
+    trainer.metrics.feedback_alignment_loss =
+        feedback_alignment_loss /
+        max(
+            base.valid_count * feedback_parameter_count,
+            1,
+        )
+    trainer.metrics.burst_gate_mean =
+        burst_gate_sum / max(burst_gate_count, 1)
     return nothing
 end
 
@@ -4682,6 +8621,131 @@ function reduced_hay_v2_arena_forward!(
         trainer.tape.base.state_batch /
         max(wall_seconds, eps(Float64))
     _refresh_dendritic_metrics!(executor)
+    return trainer
+end
+
+function _refresh_exact_gate_mask!(
+    trainer::DendriticArenaTrainer,
+)
+    mask = trainer.gate_mask
+    logits = trainer.parameters.gate_logits
+    keep = trainer.model.fixed_recurrent_fanout
+    fill!(mask, false)
+    @inbounds for source in axes(logits, 1)
+        for _ in 1:keep
+            best_relation = 0
+            best_logit = -Inf32
+            for relation in axes(logits, 2)
+                mask[source, relation] && continue
+                value = logits[source, relation]
+                if value > best_logit
+                    best_logit = value
+                    best_relation = relation
+                end
+            end
+            best_relation != 0 || error("exact gate top-k underflow")
+            mask[source, best_relation] = true
+        end
+    end
+    trainer.metrics.structural_flips = 0
+    trainer.metrics.branch_moves = 0
+    return trainer
+end
+
+"""
+Populate `trainer.gradient` for the current batch without advancing Adam or
+changing any trainable parameter.  This is the diagnostic counterpart of
+`dendritic_arena_update!`: it executes the identical pack, forward, loss,
+signal, local replay, and deterministic reduction phases, then stops before
+the optimizer and structural consolidation phases.
+
+The returned gradient is the raw loss derivative before family clipping,
+learning-rate multipliers, Adam moments, and weight decay.  Callers that need
+an update direction must therefore use `-gradient`.
+"""
+function dendritic_arena_gradient!(
+    executor::DendriticArenaExecutor,
+)
+    executor.started ||
+        error("dendritic team is not running")
+    trainer = executor.trainer
+    _clear_worker_accumulators!(executor)
+    generation =
+        Base.Threads.atomic_add!(
+            executor.generation,
+            UInt32(1),
+        ) + UInt32(1)
+
+    Point.prepare_batch_metadata!(
+        trainer.tape.base,
+        executor.dataset,
+    )
+    _run_phase!(
+        executor,
+        DENDRITIC_PACK,
+        trainer.tape.base.valid_count,
+        generation,
+    )
+    _run_phase!(
+        executor,
+        DENDRITIC_FORWARD,
+        trainer.tape.base.valid_count,
+        generation,
+    )
+    gate_sum = 0.0f0
+    @inbounds for value in trainer.cache.gate_probability
+        gate_sum += value
+    end
+    gate_density =
+        gate_sum /
+        Float32(length(trainer.cache.gate_probability))
+    trainer.last_loss = Point.loss_and_raw_gradient!(
+        trainer.tape.base,
+        trainer.loss_scratch,
+        gate_density,
+        0.0f0,
+    )
+    _run_phase!(
+        executor,
+        DENDRITIC_SIGNAL,
+        trainer.tape.base.valid_count,
+        generation,
+    )
+    if executor.stochastic_routing
+        _prepare_state_supervised_route_advantages!(trainer)
+    else
+        _center_block_supervised_rewards!(trainer)
+    end
+    if executor.stochastic_routing
+        _prepare_routing_regularizer!(
+            trainer,
+            executor.routing_temperature,
+        )
+    else
+        fill!(trainer.tape.base.route_regularizer_gradient, 0.0f0)
+    end
+    if executor.credit_mode !== :exact_bptt ||
+       executor.stochastic_routing
+        _run_phase!(
+            executor,
+            DENDRITIC_LOCAL,
+            trainer.tape.base.valid_count,
+            generation,
+        )
+    end
+    trainer.recurrent_updates_enabled =
+        executor.recurrent_signal_scale != 0.0f0
+    _run_phase!(
+        executor,
+        DENDRITIC_REDUCE,
+        length(trainer.parameter_shards),
+        generation,
+    )
+    _finish_gradient_reduction!(trainer)
+    isfinite(trainer.last_loss.composite_loss) ||
+        error("non-finite dendritic loss")
+    isfinite(trainer.metrics.gradient_norm) ||
+        error("non-finite dendritic gradient")
     return trainer
 end
 
@@ -4742,14 +8806,36 @@ function dendritic_arena_update!(
         trainer.tape.base.valid_count,
         generation,
     )
-    _center_block_supervised_rewards!(trainer)
-    _prepare_routing_regularizer!(trainer)
-    local_replay_seconds = _run_phase!(
-        executor,
-        DENDRITIC_LOCAL,
-        trainer.tape.base.valid_count,
-        generation,
-    )
+    if executor.stochastic_routing
+        _prepare_state_supervised_route_advantages!(trainer)
+    else
+        _center_block_supervised_rewards!(trainer)
+    end
+    if executor.stochastic_routing
+        _prepare_routing_regularizer!(
+            trainer,
+            executor.routing_temperature,
+        )
+    else
+        fill!(trainer.tape.base.route_regularizer_gradient, 0.0f0)
+    end
+    # Exact BPTT already accumulates the complete pathwise route VJP during
+    # DENDRITIC_SIGNAL.  With deterministic routing the supervised
+    # score-function term is disabled and the route regularizer above is
+    # exactly zero, so DENDRITIC_LOCAL would only rescan the dense query
+    # matrices and add zeros.
+    local_replay_seconds =
+        if executor.credit_mode === :exact_bptt &&
+           !executor.stochastic_routing
+            0.0
+        else
+            _run_phase!(
+                executor,
+                DENDRITIC_LOCAL,
+                trainer.tape.base.valid_count,
+                generation,
+            )
+        end
     trainer.recurrent_updates_enabled =
         executor.recurrent_signal_scale != 0.0f0
     reduction_seconds = _run_phase!(
@@ -4768,15 +8854,41 @@ function dendritic_arena_update!(
     trainer.optimizer.step += 1
     trainer.optimizer.beta1_power *= trainer.optimizer.beta1
     trainer.optimizer.beta2_power *= trainer.optimizer.beta2
+    if trainer.recurrent_updates_enabled
+        trainer.recurrent_accumulation_count += 1
+        trainer.recurrent_optimizer_due =
+            trainer.recurrent_accumulation_count >=
+            trainer.recurrent_accumulation_steps
+        if trainer.recurrent_optimizer_due
+            trainer.recurrent_beta1_power *= trainer.optimizer.beta1
+            trainer.recurrent_beta2_power *= trainer.optimizer.beta2
+        end
+    else
+        trainer.recurrent_optimizer_due = false
+    end
     optimizer_seconds = _run_phase!(
         executor,
         DENDRITIC_OPTIMIZER,
         length(trainer.parameter_shards),
         generation,
     )
+    if trainer.recurrent_optimizer_due
+        trainer.recurrent_accumulation_count = 0
+        trainer.recurrent_optimizer_due = false
+    end
     if executor.recurrent_signal_scale == 0.0f0
         trainer.metrics.structural_flips = 0
         trainer.metrics.branch_moves = 0
+    elseif executor.credit_mode === :exact_bptt
+        # Exact wake credit must obey the same two-timescale structural
+        # contract as local credit.  Re-selecting hard fanout every optimizer
+        # step silently bypassed the wake structural freeze.
+        if trainer.optimizer.step % trainer.structural_interval == 0
+            _refresh_exact_gate_mask!(trainer)
+        else
+            trainer.metrics.structural_flips = 0
+            trainer.metrics.branch_moves = 0
+        end
     else
         _consolidate_structure!(trainer)
     end
@@ -4940,11 +9052,14 @@ run_with_dendritic_team!(
 
 const ReducedHayV2ArenaExecutor = DendriticArenaExecutor
 const ReducedHayV2ArenaTrainer = DendriticArenaTrainer
+const reduced_hay_v2_arena_gradient! = dendritic_arena_gradient!
 const reduced_hay_v2_arena_output = dendritic_arena_output
 const reduced_hay_v2_arena_update! = dendritic_arena_update!
 const reduced_hay_v2_parameter_deltas =
     dendritic_parameter_deltas
 const reduced_hay_v2_training_arena =
     dendritic_training_arena
+
+include(joinpath(@__DIR__, "ReducedHayV2IntrinsicAdjoint.jl"))
 
 end # module

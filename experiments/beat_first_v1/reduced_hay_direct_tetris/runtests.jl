@@ -242,6 +242,36 @@ end
         @test tree_norm(gradient_v2.delay_logits) > 0.0
     end
 
+    @testset "quiet communication starts harmless and remains trainable" begin
+        quiet_model = build_reduced_hay_model(:tiny_structured_quiet_v7)
+        quiet_parameters, _ =
+            Lux.setup(MersenneTwister(42), quiet_model)
+        @test quiet_model.communication_init === :zero
+        @test all(iszero, quiet_parameters.synapse_weight)
+        @test all(iszero, quiet_parameters.feedback_gain)
+        quiet_raw = reduced_hay_raw(
+            quiet_model,
+            rails,
+            quiet_parameters,
+        )
+        disabled_raw = reduced_hay_raw(
+            quiet_model,
+            rails,
+            quiet_parameters;
+            recurrent_scale=0.0f0,
+            apical_scale=0.0f0,
+        )
+        @test quiet_raw ≈ disabled_raw atol=2.0f-6 rtol=2.0f-6
+        quiet_objective(ps) =
+            sum(abs2, reduced_hay_raw(quiet_model, rails, ps))
+        quiet_gradient = only(Zygote.gradient(
+            quiet_objective,
+            quiet_parameters,
+        ))
+        @test tree_norm(quiet_gradient.synapse_weight) > 0.0
+        @test tree_norm(quiet_gradient.feedback_gain) > 0.0
+    end
+
     @testset "causal v2 sparse kernels preserve reference BPTT" begin
         recurrent_model =
             build_reduced_hay_model(:tiny_recurrent_v2)
@@ -594,6 +624,27 @@ end
     inhibitory = matrix(0.04)
     apical_drive = vector(0.02)
     active = trues(cells)
+    uncentered_state = ReducedHaySoA(branches, cells)
+    centered_state = ReducedHaySoA(branches, cells)
+    zero_apical_drive = zeros(Float32, cells)
+    reduced_hay_step!(
+        uncentered_state,
+        cache,
+        excitatory,
+        inhibitory,
+        zero_apical_drive,
+        active,
+    )
+    reduced_hay_step!(
+        centered_state,
+        cache,
+        excitatory,
+        inhibitory,
+        zero_apical_drive,
+        active;
+        apical_response=:centered_v2,
+    )
+    @test maximum(uncentered_state.soma) > maximum(centered_state.soma)
     reduced_hay_step!(
         state,
         cache,
@@ -640,3 +691,9 @@ end
     @test sum(event_exc) ≈ 1.2f0
     @test sum(event_inh) ≈ 0.9f0
 end
+
+include(joinpath(@__DIR__, "test_reduced_hay_v11_exact_slots.jl"))
+include(joinpath(@__DIR__, "test_reduced_hay_v13_registry.jl"))
+include(joinpath(@__DIR__, "test_reduced_hay_v11_exact_adjoint.jl"))
+include(joinpath(@__DIR__, "test_reduced_hay_v13_axis_direct.jl"))
+include(joinpath(@__DIR__, "test_reduced_hay_v13_exact_adjoint.jl"))

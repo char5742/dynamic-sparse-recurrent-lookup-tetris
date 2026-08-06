@@ -16,13 +16,34 @@ const MODEL_SEED = UInt64(0x44454e4453435241)
 const SAMPLER_SEED = UInt64(0x44454e4453414d50)
 const ROUTING_SEED = UInt64(0x44454e44524f5554)
 
+function usage()
+    return """
+Usage: julia --threads=N,0 benchmark_reduced_hay_v2_arena.jl [OPTIONS]
+
+  --preset NAME             required; choose the model architecture explicitly
+  --dataset PATH            teacher_v3 dataset directory
+  --warmup N                warm-up updates (default: 8)
+  --repetitions N           measured updates (default: 32)
+  --workers N               barrierless worker count
+  --credit-mode NAME        exact_bptt or block_teacher
+  --stochastic-routing      enable stochastic routing (not valid with exact_bptt)
+  --help                    show this text
+"""
+end
+
 function parse_options(arguments)
     values = Dict{String,String}()
+    flags = Set{String}()
     index = 1
     while index <= length(arguments)
         argument = arguments[index]
         startswith(argument, "--") ||
             error("unexpected positional argument: $argument")
+        if argument == "--stochastic-routing"
+            push!(flags, argument[3:end])
+            index += 1
+            continue
+        end
         index < length(arguments) ||
             error("missing value for $argument")
         values[argument[3:end]] = arguments[index + 1]
@@ -30,13 +51,13 @@ function parse_options(arguments)
     end
     integer(name, default) =
         parse(Int, get(values, name, string(default)))
+    haskey(values, "preset") || error(
+        "--preset is required; choose the architecture explicitly",
+    )
+    preset = Symbol(values["preset"])
     return (;
         dataset=abspath(get(values, "dataset", DEFAULT_DATASET)),
-        preset=Symbol(get(
-            values,
-            "preset",
-            "reduced_hay_scaled_v2",
-        )),
+        preset,
         warmup=integer("warmup", 8),
         repetitions=integer("repetitions", 32),
         state_batch=integer("state-batch", 8),
@@ -45,10 +66,25 @@ function parse_options(arguments)
             "workers",
             min(20, Threads.nthreads(:default)),
         ),
+        credit_mode=Symbol(get(
+            values,
+            "credit-mode",
+            preset in (
+                :reduced_hay_fullstate_bound_v10,
+                :reduced_hay_exact_slots_v11,
+                :reduced_hay_exact_slots_fullrank_v12,
+                :reduced_hay_exact_slots_direct_v13,
+            ) ? "exact_bptt" : "block_teacher",
+        )),
+        stochastic_routing="stochastic-routing" in flags,
     )
 end
 
 function main(arguments=ARGS)
+    if any(argument -> argument in ("--help", "-h"), arguments)
+        print(usage())
+        return nothing
+    end
     options = parse_options(arguments)
     options.state_batch == 8 ||
         error("production benchmark fixes state batch at 8")
@@ -60,6 +96,18 @@ function main(arguments=ARGS)
         error("repetitions must be positive")
     2 <= options.workers <= Threads.nthreads(:default) ||
         error("invalid worker count")
+    options.credit_mode in (:exact_bptt, :block_teacher) ||
+        error("credit-mode must be exact_bptt or block_teacher")
+    options.preset in (
+        :reduced_hay_exact_slots_v11,
+        :reduced_hay_exact_slots_fullrank_v12,
+        :reduced_hay_exact_slots_direct_v13,
+    ) &&
+        options.credit_mode !== :exact_bptt &&
+        error("exact-slot v11/v12/v13 requires exact_bptt")
+    options.credit_mode === :exact_bptt &&
+        options.stochastic_routing &&
+        error("exact_bptt does not support stochastic routing")
 
     BLAS.set_num_threads(1)
     dataset = load_teacher_dataset(
@@ -86,8 +134,9 @@ function main(arguments=ARGS)
         trainer,
         dataset;
         active_workers=options.workers,
-        stochastic_routing=true,
+        stochastic_routing=options.stochastic_routing,
         routing_seed=ROUTING_SEED,
+        credit_mode=options.credit_mode,
     )
 
     wall = 0.0
@@ -131,11 +180,13 @@ function main(arguments=ARGS)
     cpu_utilization =
         cpu / (wall * Float64(options.workers))
     @printf(
-        "preset=%s batch=%d width=%d workers=%d warmup=%d repetitions=%d\n",
+        "preset=%s batch=%d width=%d workers=%d route=%s credit=%s warmup=%d repetitions=%d\n",
         String(options.preset),
         options.state_batch,
         options.width,
         options.workers,
+        options.stochastic_routing ? "stochastic" : "deterministic",
+        String(options.credit_mode),
         options.warmup,
         options.repetitions,
     )
