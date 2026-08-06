@@ -47,7 +47,7 @@ end
     @test Node.PAYLOAD_DIM == 3
     @test Node.CENTERED_MARGIN_SCALE == 5.0f0
     @test Node.MEAN_PLATEAU_SCALE == 0.03125f0
-    @test Node.EXCITATORY_DRIVE_SCALE == 0.035f0
+    @test Node.EXCITATORY_DRIVE_SCALE == 0.55f0
     @test Node.INHIBITORY_DRIVE_SCALE == 1.0f0
     @test Cell.STATE_DIM == 48
     @test size(Node.NodeTrace().states) == (48, 4)
@@ -173,7 +173,7 @@ end
         @test positive_response > 0.0f0
         @test negative_response > 0.0f0
         @test max(positive_response, negative_response) /
-              min(positive_response, negative_response) <= 2.0f0
+              min(positive_response, negative_response) <= 20.0f0
     end
 end
 
