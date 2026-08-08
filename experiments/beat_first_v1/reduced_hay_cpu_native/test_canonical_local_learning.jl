@@ -34,12 +34,13 @@ end
     copied_config = Local.LocalLearningConfig()
     @test default_config == copied_config
     @test !default_config.plasticity.structure_enabled
-    @test default_config.utility_mode === :packet
+    @test default_config.utility_mode === :combined
     @test default_config.plasticity.max_swaps_per_node == 1
     summary = Local.config_summary(default_config)
     @test occursin("feedback_seed=", summary)
     @test occursin("conductance_floor=", summary)
     @test occursin("structure_enabled=false", summary)
+    @test occursin("utility_mode=combined", summary)
     fingerprint = Local.config_fingerprint(default_config)
     @test length(fingerprint) == 64
     @test fingerprint == Local.config_fingerprint(copied_config)
@@ -48,6 +49,9 @@ end
     ))
     @test fingerprint != Local.config_fingerprint(Local.LocalLearningConfig(
         plasticity=Local.PlasticityConfig(target_rate_max=0.2),
+    ))
+    @test fingerprint != Local.config_fingerprint(Local.LocalLearningConfig(
+        utility_mode=:none,
     ))
     @test occursin("LocalLearningConfig(", sprint(show, default_config))
 
@@ -58,7 +62,7 @@ end
         eligibility_decay=0.8,
         analog_multiplier=0.25,
         hard_event_multiplier=0.1,
-        utility_mode=:continuous,
+        utility_mode=:none,
     )
     configured_map = Local.FixedLocalSignalMap(
         22, configured; family=3, cell=17,
@@ -68,6 +72,7 @@ end
     @test size(configured_map.predictor_feedback) ==
         (Local.LOCAL_OBSERVATION_DIM, 5)
     @test configured.eligibility_decay == 0.8f0
+    @test configured.utility_mode === :none
 
     map_a = Local.FixedLocalSignalMap(
         22, 5; seed=0x91, family=3, cell=17,
@@ -126,6 +131,8 @@ end
     @test_throws ArgumentError Local.LocalLearningConfig(
         hard_event_multiplier=-1,
     )
+    @test_throws ArgumentError Local.LocalLearningConfig(utility_mode=:packet)
+    @test_throws ArgumentError Local.LocalLearningConfig(utility_mode=:continuous)
     @test_throws ArgumentError Local.LocalLearningConfig(utility_mode=:invalid)
 
     schedule = Local.LearningSchedule(

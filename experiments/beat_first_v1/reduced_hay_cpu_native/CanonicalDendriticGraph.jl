@@ -41,6 +41,7 @@ export CORE_NODE_COUNT,
        ReplayProvenance,
        ModelLocalSignalMaps,
        ModelLocalLearner,
+       LocalPlasticityObservation,
        LocalReplayCounters,
        LocalReplayReport,
        COMMON_BEFORE,
@@ -55,6 +56,7 @@ export CORE_NODE_COUNT,
        initialize_local_signal_maps,
        initialize_local_learner,
        begin_local_microbatch!,
+       local_plasticity_observation,
        local_replay_candidate!,
        local_replay_state_common!,
        reset_candidate_set!,
@@ -295,6 +297,67 @@ end
 TrajectorySignature() = TrajectorySignature(
     UInt64(0), UInt64(0), UInt64(0), UInt64(0), 0, 0, 0, true, false,
 )
+
+"""Model-shared, seed-fixed two-block local feedback maps."""
+struct ModelLocalSignalMaps
+    config::Local.LocalLearningConfig
+    continuous::Vector{Local.FixedLocalSignalMap{Float32}}
+    packet::Vector{Local.FixedLocalSignalMap{Float32}}
+end
+
+mutable struct LocalReplayCounters
+    candidate_replays::Int
+    common_replays::Int
+    visited_transitions::Int
+    conditional_pullbacks::Int
+    signal_nonzero::Int
+    nonspiking_transitions::Int
+    semantic_parameter_updates::Int
+    event_receiver_updates::Int
+    utility_updates::Int
+    output_replays::Int
+end
+
+LocalReplayCounters() = LocalReplayCounters(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+"""
+Fixed publication payload for the most recently replayed logical world.
+
+Cell observations are teacher-free trajectory statistics. Event-contact
+utility is accumulated per physical delivery *before* shared-parameter
+contributions can cancel. The vectors cover the 2,120 anatomical contacts;
+the five trainable shared kind gains are explicitly non-rewirable and absent.
+"""
+mutable struct LocalPlasticityObservation
+    spike_count::Vector{UInt8}
+    visit_count::Vector{UInt8}
+    activity_sum::Vector{Float32}
+    incoming_conductance_sum::Vector{Float32}
+    task_utility_sum::Vector{Float32}
+    contact_activity_sum::Vector{Float32}
+end
+
+struct LocalReplayReport
+    signature::TrajectorySignature
+    visited_transitions::Int
+    conditional_pullbacks::Int
+    signal_nonzero::Int
+    nonspiking_transitions::Int
+    semantic_parameter_updates::Int
+    event_receiver_updates::Int
+    utility_updates::Int
+    output_replays::Int
+end
+
+mutable struct ModelLocalLearner
+    signals::ModelLocalSignalMaps
+    arena::Local.ContractedAdjointArena{Float32}
+    scratch::Local.ContractedAdjointScratch{Float32}
+    continuous_signal::Vector{Float32}
+    packet_signal::Vector{Float32}
+    plasticity::LocalPlasticityObservation
+    counters::LocalReplayCounters
+end
 
 mutable struct ModelState
     initial_core::Matrix{Float32}
@@ -614,6 +677,7 @@ mutable struct ModelWorker
     motif_incidence::Topology.CandidateMotifIncidence
     closure::Topology.AffectedClosure
     arena::Events.EventArena{Float32}
+    common_replay_state::ModelState
     dynamic_overlay::Events.DynamicSourceMajorOverlay
     packet_by_slot::Matrix{Float32}
     event_by_slot::Matrix{UInt8}
@@ -986,6 +1050,7 @@ function initialize_worker(model::CanonicalModel)
         Topology.CandidateMotifIncidence(),
         Topology.AffectedClosure(),
         arena,
+        initialize_state(model),
         Events.DynamicSourceMajorOverlay(
             CORE_NODE_COUNT,
             Cell.INPUT_DIM,
@@ -1068,6 +1133,119 @@ function sync_state_common!(
         worker.prepared_cache_revision = model.cache.revision
     end
     return worker
+end
+
+function initialize_local_signal_maps(
+    ::CanonicalModel,
+    config::Local.LocalLearningConfig=Local.LocalLearningConfig(),
+)
+    config.predictor_dim == 0 || throw(ArgumentError(
+        "canonical local replay requires predictor_dim == 0",
+    ))
+    iszero(config.hard_event_multiplier) || throw(ArgumentError(
+        "hard-event control is disconnected; hard_event_multiplier must be zero",
+    ))
+    config.utility_mode in (:combined, :none) || throw(ArgumentError(
+        "factorized two-block replay supports utility_mode=:combined or :none",
+    ))
+    continuous_scale = config.feedback_scale /
+        sqrt(Float32(2 * Local.LOCAL_OBSERVATION_DIM))
+    packet_scale = config.feedback_scale /
+        sqrt(Float32(2 * Axon.PACKET_DIM))
+    continuous = Vector{Local.FixedLocalSignalMap{Float32}}(
+        undef,
+        CORE_NODE_COUNT,
+    )
+    packet = similar(continuous)
+    @inbounds for node in 1:CORE_NODE_COUNT
+        continuous[node] = Local.FixedLocalSignalMap(
+            Output.OUTPUT_DIM,
+            0;
+            observation_dim=Local.LOCAL_OBSERVATION_DIM,
+            seed=config.feedback_seed,
+            family=1,
+            cell=node,
+            scale=continuous_scale,
+            predictor_scale=0.0f0,
+            T=Float32,
+        )
+        packet[node] = Local.FixedLocalSignalMap(
+            Output.OUTPUT_DIM,
+            0;
+            observation_dim=Axon.PACKET_DIM,
+            seed=config.feedback_seed,
+            family=2,
+            cell=node,
+            scale=packet_scale,
+            predictor_scale=0.0f0,
+            T=Float32,
+        )
+    end
+    return ModelLocalSignalMaps(config, continuous, packet)
+end
+
+function initialize_local_learner(
+    model::CanonicalModel,
+    signals::ModelLocalSignalMaps,
+)
+    length(signals.continuous) == CORE_NODE_COUNT || throw(DimensionMismatch(
+        "continuous local-map population does not match the graph",
+    ))
+    length(signals.packet) == CORE_NODE_COUNT || throw(DimensionMismatch(
+        "packet local-map population does not match the graph",
+    ))
+    return ModelLocalLearner(
+        signals,
+        Local.ContractedAdjointArena(CORE_NODE_COUNT; T=Float32),
+        Local.ContractedAdjointScratch(; T=Float32),
+        zeros(Float32, Local.LOCAL_OBSERVATION_DIM),
+        zeros(Float32, Axon.PACKET_DIM),
+        LocalPlasticityObservation(
+            zeros(UInt8, TOTAL_NODE_COUNT),
+            zeros(UInt8, TOTAL_NODE_COUNT),
+            zeros(Float32, TOTAL_NODE_COUNT),
+            zeros(Float32, TOTAL_NODE_COUNT),
+            zeros(
+                Float32,
+                event_parameter_count(model) - EVENT_KIND_PARAMETER_COUNT,
+            ),
+            zeros(
+                Float32,
+                event_parameter_count(model) - EVENT_KIND_PARAMETER_COUNT,
+            ),
+        ),
+        LocalReplayCounters(),
+    )
+end
+
+local_plasticity_observation(learner::ModelLocalLearner) = learner.plasticity
+
+function _reset_local_plasticity!(learner::ModelLocalLearner)
+    observation = learner.plasticity
+    fill!(observation.spike_count, UInt8(0))
+    fill!(observation.visit_count, UInt8(0))
+    fill!(observation.activity_sum, 0.0f0)
+    fill!(observation.incoming_conductance_sum, 0.0f0)
+    fill!(observation.task_utility_sum, 0.0f0)
+    fill!(observation.contact_activity_sum, 0.0f0)
+    return observation
+end
+
+function begin_local_microbatch!(learner::ModelLocalLearner)
+    counters = learner.counters
+    counters.candidate_replays = 0
+    counters.common_replays = 0
+    counters.visited_transitions = 0
+    counters.conditional_pullbacks = 0
+    counters.signal_nonzero = 0
+    counters.nonspiking_transitions = 0
+    counters.semantic_parameter_updates = 0
+    counters.event_receiver_updates = 0
+    counters.utility_updates = 0
+    counters.output_replays = 0
+    Local.reset_adjoint_arena!(learner.arena)
+    _reset_local_plasticity!(learner)
+    return learner
 end
 
 stored_parameter_count(model::CanonicalModel) =
@@ -3269,19 +3447,301 @@ function _reverse_event_input!(
     return nothing
 end
 
-"""Exact continuous reverse conditional on the replayed hard trajectory."""
-function conditional_reverse_candidate!(
+function _scatter_local_input_parameters!(
+    model::CanonicalModel,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    record::Int,
+    input_cotangent::AbstractVector{Float32},
+)
+    provenance = worker.provenance
+    phase = TransitionPhase(@inbounds worker.tape.phase[record])
+    if phase == EVENT_WAVE
+        delivery = record_event_delivery_head(provenance, record)
+        while delivery != 0
+            @inbounds begin
+                channel = Int(provenance.event_resolved_channel[delivery])
+                scale = provenance.event_scale[delivery]
+                raw_index = Int(provenance.event_contact_parameter[delivery])
+                kind_index = Int(provenance.event_kind_parameter[delivery])
+            end
+            local_bar = @inbounds(input_cotangent[channel]) * scale
+            if !iszero(local_bar)
+                contact_weight = @inbounds model.cache.event_weight[raw_index]
+                kind_weight = @inbounds model.cache.event_weight[kind_index]
+                contact_contribution =
+                    local_bar * kind_weight *
+                    _softplus_derivative(model.parameters.event_raw[raw_index])
+                kind_contribution =
+                    local_bar * contact_weight *
+                    _softplus_derivative(model.parameters.event_raw[kind_index])
+                @inbounds worker.gradient.event_raw[raw_index] +=
+                    contact_contribution
+                @inbounds worker.gradient.event_raw[kind_index] +=
+                    kind_contribution
+                # Structural utility is anatomical-contact only. Shared kind
+                # gains remain trainable but are explicitly non-rewirable.
+                learner.counters.event_receiver_updates += 1
+                if learner.signals.config.utility_mode === :combined
+                    @inbounds learner.plasticity.task_utility_sum[raw_index] +=
+                        abs(contact_contribution)
+                    learner.counters.utility_updates += 1
+                end
+            end
+            delivery = next_event_delivery_record(provenance, delivery)
+        end
+        return nothing
+    end
+
+    first, count = record_analog_deposit_range(provenance, record)
+    count == 0 && return nothing
+    @inbounds for deposit in first:(first + count - 1)
+        AnalogDepositKind(provenance.analog_kind[deposit]) ==
+            SEMANTIC_PACKET_DEPOSIT || continue
+        branch = Int(provenance.analog_branch[deposit])
+        role = Int(provenance.analog_semantic_role[deposit])
+        semantic_class = Int(provenance.analog_semantic_class[deposit])
+        changed = false
+        for receptor in 1:Cell.INPUT_CHANNELS
+            local_bar = input_cotangent[Cell.input_index(branch, receptor)]
+            iszero(local_bar) && continue
+            for group in 1:Axon.GROUP_COUNT
+                lane = Axon.packet_lane(group, receptor)
+                worker.gradient.semantic_projection_raw[
+                    group, receptor, role, semantic_class,
+                ] += local_bar * provenance.analog_packet[lane, deposit] *
+                     model.cache.semantic_projection_derivative[
+                         group, receptor, role, semantic_class,
+                     ]
+            end
+            changed = true
+        end
+        changed && (learner.counters.semantic_parameter_updates += 1)
+    end
+    return nothing
+end
+
+function _collect_local_plasticity!(
+    model::CanonicalModel,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    output_tape::Output.OutputPopulationTape{Float32},
+    first_output_cell::Int,
+    last_output_cell::Int,
+)
+    observation = _reset_local_plasticity!(learner)
+    maximum_visits = UInt8(1 + model.config.max_event_waves)
+    @inbounds for node in 1:CORE_NODE_COUNT
+        record = Int(worker.tape.latest_record[node])
+        while record != 0
+            visits = observation.visit_count[node]
+            visits < maximum_visits || error(
+                "logical cell visit count exceeds the configured event horizon",
+            )
+            observation.visit_count[node] = visits + UInt8(1)
+            observation.spike_count[node] += UInt8(
+                !iszero(worker.tape.event_mask[record] & UInt8(0x01)),
+            )
+            observation.activity_sum[node] += Cell.spike_surrogate_value(
+                Cell.spike_margin_from_transition(
+                    @view(worker.tape.previous_state[:, record]),
+                    @view(worker.tape.next_state[:, record]),
+                    model.cache.core_cell[node],
+                ),
+            )
+            phase = TransitionPhase(worker.tape.phase[record])
+            if phase in (COMMON_BEFORE, CANDIDATE_AFTER, MANDATORY_DAG) &&
+               Topology.node_class(model.topology, node) == Topology.SPATIAL_CLASS
+                observation.incoming_conductance_sum[node] +=
+                    Float32(Cell.INPUT_DIM)
+            end
+            record = Int(worker.tape.previous_record[record])
+        end
+    end
+
+    provenance = worker.provenance
+    structural_contacts = length(observation.contact_activity_sum)
+    @inbounds for deposit in 1:provenance.analog_count
+        destination_record = Int(provenance.analog_destination_record[deposit])
+        destination_node = Int(worker.tape.node[destination_record])
+        kind = AnalogDepositKind(provenance.analog_kind[deposit])
+        if kind == BINARY_PACKET_DEPOSIT
+            # Ordered binary anatomy has one fixed unit conductance for every
+            # packet group/receptor lane.
+            observation.incoming_conductance_sum[destination_node] +=
+                Float32(Axon.PACKET_DIM)
+        else
+            role = Int(provenance.analog_semantic_role[deposit])
+            semantic_class = Int(provenance.analog_semantic_class[deposit])
+            physical = 0.0f0
+            for receptor in 1:Cell.INPUT_CHANNELS, group in 1:Axon.GROUP_COUNT
+                physical += model.cache.semantic_projection[
+                    group, receptor, role, semantic_class,
+                ]
+            end
+            observation.incoming_conductance_sum[destination_node] += physical
+        end
+    end
+    @inbounds for delivery in 1:provenance.event_count
+        raw_index = Int(provenance.event_contact_parameter[delivery])
+        1 <= raw_index <= structural_contacts || error(
+            "event delivery references a non-anatomical contact parameter",
+        )
+        kind_index = Int(provenance.event_kind_parameter[delivery])
+        delivered = abs(
+            provenance.event_scale[delivery] *
+            model.cache.event_weight[kind_index],
+        )
+        observation.contact_activity_sum[raw_index] += delivered
+        destination_record = Int(provenance.event_destination_record[delivery])
+        destination_node = Int(worker.tape.node[destination_record])
+        observation.incoming_conductance_sum[destination_node] +=
+            delivered * model.cache.event_weight[raw_index]
+    end
+
+    @inbounds for output_cell in first_output_cell:last_output_cell
+        node = CORE_NODE_COUNT + output_cell
+        observation.visit_count[node] = UInt8(1)
+        observation.spike_count[node] = UInt8(
+            !iszero(output_tape.event[output_cell]),
+        )
+        observation.activity_sum[node] =
+            Cell.spike_surrogate_value(output_tape.margin[output_cell])
+        observation.incoming_conductance_sum[node] = 0.0f0
+    end
+    @inbounds for binding in 1:provenance.output_count
+        output_cell = Int(provenance.output_cell[binding])
+        first_output_cell <= output_cell <= last_output_cell || continue
+        role = Output.cell_role(output_cell)
+        node = CORE_NODE_COUNT + output_cell
+        for receptor in 1:Cell.INPUT_CHANNELS, group in 1:Axon.GROUP_COUNT
+            observation.incoming_conductance_sum[node] +=
+                model.cache.output.projection[group, receptor, role]
+        end
+    end
+    return observation
+end
+
+function _contract_local_records!(
+    model::CanonicalModel,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    raw_delta::AbstractVector{Float32},
+)
+    length(raw_delta) == Output.OUTPUT_DIM || throw(DimensionMismatch(
+        "local raw derivative must have length 22",
+    ))
+    all(isfinite, raw_delta) || throw(ArgumentError(
+        "local raw derivative must be finite",
+    ))
+    Local.reset_adjoint_arena!(learner.arena)
+    visited_before = learner.counters.visited_transitions
+    pullbacks_before = learner.counters.conditional_pullbacks
+    @inbounds for node in 1:CORE_NODE_COUNT
+        terminal_record = Int(worker.tape.latest_record[node])
+        terminal_record == 0 && continue
+        Local.project_learning_signal!(
+            learner.continuous_signal,
+            learner.signals.continuous[node],
+            raw_delta,
+        )
+        Local.project_learning_signal!(
+            learner.packet_signal,
+            learner.signals.packet[node],
+            raw_delta,
+        )
+        (_has_nonzero(learner.continuous_signal) ||
+         _has_nonzero(learner.packet_signal)) &&
+            (learner.counters.signal_nonzero += 1)
+        Local.begin_local_adjoint!(learner.arena, node, terminal_record)
+        record = terminal_record
+        while record != 0
+            predecessor = Int(worker.tape.previous_record[record])
+            link = Local.ChronologicalTransitionLink(
+                record,
+                predecessor,
+                record,
+            )
+            Local.contract_replayed_transition!(
+                learner.arena,
+                node,
+                learner.scratch,
+                link,
+                @view(worker.tape.previous_state[:, record]),
+                @view(worker.tape.input[:, record]),
+                model.cache.core_cell[node],
+                model.cache.core_derivative[node],
+                @view(worker.tape.next_state[:, record]),
+                learner.continuous_signal,
+                learner.packet_signal;
+                touched=true,
+                eligibility_scale=learner.signals.config.analog_multiplier,
+            )
+            draw = Local.raw_parameter_cotangent(learner.scratch)
+            for parameter in 1:Cell.PARAM_DIM
+                worker.gradient.core_cell_raw[parameter, node] += draw[parameter]
+            end
+            _scatter_local_input_parameters!(
+                model,
+                worker,
+                learner,
+                record,
+                Local.input_cotangent(learner.scratch),
+            )
+            learner.counters.visited_transitions += 1
+            learner.counters.conditional_pullbacks += 1
+            iszero(worker.tape.event_mask[record] & UInt8(0x01)) &&
+                (learner.counters.nonspiking_transitions += 1)
+            record = predecessor
+        end
+        Local.finish_local_adjoint!(learner.arena, node, 0)
+    end
+    learner.counters.visited_transitions - visited_before ==
+        learner.counters.conditional_pullbacks - pullbacks_before || error(
+            "local replay must execute one conditional pullback per transition",
+        )
+    return nothing
+end
+
+@inline function _local_report(
+    signature::TrajectorySignature,
+    counters::LocalReplayCounters,
+    before::NTuple{8,Int},
+)
+    return LocalReplayReport(
+        signature,
+        counters.visited_transitions - before[1],
+        counters.conditional_pullbacks - before[2],
+        counters.signal_nonzero - before[3],
+        counters.nonspiking_transitions - before[4],
+        counters.semantic_parameter_updates - before[5],
+        counters.event_receiver_updates - before[6],
+        counters.utility_updates - before[7],
+        counters.output_replays - before[8],
+    )
+end
+
+@inline function _local_counter_snapshot(counters::LocalReplayCounters)
+    return (
+        counters.visited_transitions,
+        counters.conditional_pullbacks,
+        counters.signal_nonzero,
+        counters.nonspiking_transitions,
+        counters.semantic_parameter_updates,
+        counters.event_receiver_updates,
+        counters.utility_updates,
+        counters.output_replays,
+    )
+end
+
+function _replay_candidate_world!(
     model::CanonicalModel,
     state::ModelState,
     worker::ModelWorker,
     input,
-    component_bar::Output.OutputComponentGradient{Float32};
-    expected_signature::Union{Nothing,TrajectorySignature}=nothing,
-    mode::Symbol=:cow,
+    expected_signature::Union{Nothing,TrajectorySignature},
+    mode::Symbol,
 )
-    iszero(component_bar.value) || throw(ArgumentError(
-        "candidate reverse must not credit shared V(s); use state-value reverse once",
-    ))
     saved_candidate_count = worker.candidate_count
     restore_slot = saved_candidate_count > 0
     saved_component = worker.components[1]
@@ -3314,10 +3774,29 @@ function conditional_reverse_candidate!(
         end
     end
     expected_signature === nothing || replay_signature == expected_signature ||
-        throw(ArgumentError("conditional replay hard trajectory changed"))
+        throw(ArgumentError("candidate replay hard trajectory changed"))
     worker.provenance.sealed || error("candidate replay provenance was not sealed")
     worker.provenance.parameter_digest == model.cache.parameter_digest ||
         throw(ArgumentError("candidate replay parameter snapshot changed"))
+    return replay_signature
+end
+
+"""Exact continuous reverse conditional on the replayed hard trajectory."""
+function conditional_reverse_candidate!(
+    model::CanonicalModel,
+    state::ModelState,
+    worker::ModelWorker,
+    input,
+    component_bar::Output.OutputComponentGradient{Float32};
+    expected_signature::Union{Nothing,TrajectorySignature}=nothing,
+    mode::Symbol=:cow,
+)
+    iszero(component_bar.value) || throw(ArgumentError(
+        "candidate reverse must not credit shared V(s); use state-value reverse once",
+    ))
+    _replay_candidate_world!(
+        model, state, worker, input, expected_signature, mode,
+    )
     fill!(worker.core_packet_bar, 0.0f0)
     fill!(worker.core_state_bar, 0.0f0)
     @views fill!(worker.record_packet_bar[:, 1:worker.tape.count], 0.0f0)
@@ -3418,12 +3897,80 @@ function conditional_reverse_candidate!(
 end
 
 """
+Replay one candidate with seed-fixed teacher-free local adjoints.
+
+`raw_delta` drives only the two fixed feedback blocks. `component_bar` is the
+exact private output-population VJP; its returned evidence cotangent is not
+propagated into the recurrent graph. The candidate anatomical/common root is
+a stop-gradient boundary.
+"""
+function local_replay_candidate!(
+    model::CanonicalModel,
+    state::ModelState,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    input,
+    raw_delta::AbstractVector{Float32},
+    component_bar::Output.OutputComponentGradient{Float32},
+    due::Local.DuePlasticityClocks;
+    expected_signature::TrajectorySignature,
+    mode::Symbol=:cow,
+)
+    length(raw_delta) == Output.OUTPUT_DIM || throw(DimensionMismatch(
+        "candidate local raw derivative must have length 22",
+    ))
+    all(isfinite, raw_delta) || throw(ArgumentError(
+        "candidate local raw derivative must be finite",
+    ))
+    iszero(component_bar.value) || throw(ArgumentError(
+        "candidate local replay cannot credit shared V(s)",
+    ))
+    before = _local_counter_snapshot(learner.counters)
+    signature = _replay_candidate_world!(
+        model,
+        state,
+        worker,
+        input,
+        expected_signature,
+        mode,
+    )
+    _collect_local_plasticity!(
+        model,
+        worker,
+        learner,
+        worker.output_tape,
+        first(Output.ADVANTAGE_CELLS),
+        Output.OUTPUT_CELLS,
+    )
+    Output.candidate_output_population_pullback!(
+        worker.output_dbase,
+        worker.output_devidence,
+        worker.gradient.output,
+        worker.output_scratch,
+        worker.output_tape,
+        model.parameters.output,
+        model.cache.output,
+        component_bar,
+    )
+    Output.candidate_output_initial_state_pullback!(
+        worker.gradient.output,
+        worker.output_scratch,
+        worker.output_dbase,
+        model.cache.output,
+    )
+    learner.counters.output_replays += 1
+    due.analog && _contract_local_records!(model, worker, learner, raw_delta)
+    learner.counters.candidate_replays += 1
+    return _local_report(signature, learner.counters, before)
+end
+
+"""
 Regenerate the full state-common mandatory/event chronology in the worker's
 single reusable tape without retaining a trajectory per state.
 
-The prepared arrays are deterministically overwritten with the same values;
-the authoritative epoch and candidate bookkeeping remain unchanged.  A hard
-signature mismatch fails before any reverse update.
+The regeneration targets `worker.common_replay_state`; the authoritative
+pass-one `state` is read-only even when replay or signature validation fails.
+A hard signature mismatch fails before any reverse update.
 """
 function replay_state_common!(
     model::CanonicalModel,
@@ -3435,27 +3982,44 @@ function replay_state_common!(
     state.ready || throw(ArgumentError(
         "prepare_state_common! must run before common replay",
     ))
-    saved_epoch = state.epoch
-    saved_ready = state.ready
+    state.prepared_revision == model.cache.revision || throw(ArgumentError(
+        "state-common replay parameter revision differs from pass one",
+    ))
     saved_candidate_count = worker.candidate_count
     saved_value_bits = reinterpret(UInt32, state.state_value)
-    prepare_state_common!(model, state, worker, input)
-    replay_signature = state.common_signature
-    state.epoch = saved_epoch
-    state.ready = saved_ready
-    worker.candidate_count = saved_candidate_count
-    worker.prepared_state_epoch = saved_epoch
-    worker.prepared_state_fingerprint = state.fingerprint
-    worker.prepared_cache_revision = model.cache.revision
+    replay = worker.common_replay_state
+    try
+        prepare_state_common!(model, replay, worker, input)
+    finally
+        worker.candidate_count = saved_candidate_count
+    end
+    replay_signature = replay.common_signature
     replay_signature == expected_signature || throw(ArgumentError(
         "state-common replay hard trajectory changed",
     ))
     worker.provenance.sealed || error("state-common replay provenance was not sealed")
     worker.provenance.parameter_digest == model.cache.parameter_digest ||
         throw(ArgumentError("state-common replay parameter snapshot changed"))
-    reinterpret(UInt32, state.state_value) == saved_value_bits || throw(
+    replay.fingerprint == state.fingerprint || throw(ArgumentError(
+        "state-common replay input fingerprint changed",
+    ))
+    reinterpret(UInt32, replay.state_value) == saved_value_bits || throw(
         ArgumentError("state-common replay continuous value changed"),
     )
+    @inbounds for node in 1:CORE_NODE_COUNT
+        for field in 1:Cell.STATE_DIM
+            reinterpret(UInt32, replay.common_state[field, node]) ==
+                reinterpret(UInt32, state.common_state[field, node]) || throw(
+                    ArgumentError("state-common replay continuous state changed"),
+                )
+        end
+        for lane in 1:Axon.PACKET_DIM
+            reinterpret(UInt32, replay.common_packet[lane, node]) ==
+                reinterpret(UInt32, state.common_packet[lane, node]) || throw(
+                    ArgumentError("state-common replay packet changed"),
+                )
+        end
+    end
     return replay_signature
 end
 
@@ -3543,6 +4107,7 @@ function conditional_reverse_state_value!(
         input;
         expected_signature=expected_signature,
     )
+    replay = worker.common_replay_state
     fill!(worker.core_packet_bar, 0.0f0)
     fill!(worker.core_state_bar, 0.0f0)
     @views fill!(worker.record_packet_bar[:, 1:worker.tape.count], 0.0f0)
@@ -3555,7 +4120,7 @@ function conditional_reverse_state_value!(
         worker.output_devidence,
         worker.gradient.output,
         worker.output_scratch,
-        state.state_value_tape,
+        replay.state_value_tape,
         model.parameters.output,
         model.cache.output,
         component_bar,
@@ -3581,6 +4146,79 @@ function conditional_reverse_state_value!(
     end
     _reverse_common_records!(model, worker)
     return worker.gradient
+end
+
+"""
+Replay the state-common chronology exactly once with the loss-normalized sum
+of candidate raw derivatives. Shared V(s) receives its exact private output
+credit once; its evidence cotangent is deliberately discarded from the local
+recurrent objective.
+"""
+function local_replay_state_common!(
+    model::CanonicalModel,
+    state::ModelState,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    input,
+    aggregate_raw_delta::AbstractVector{Float32},
+    shared_value_bar::Float32,
+    due::Local.DuePlasticityClocks;
+    expected_signature::TrajectorySignature,
+)
+    length(aggregate_raw_delta) == Output.OUTPUT_DIM || throw(DimensionMismatch(
+        "common local raw derivative must have length 22",
+    ))
+    all(isfinite, aggregate_raw_delta) || throw(ArgumentError(
+        "common local raw derivative must be finite",
+    ))
+    isfinite(shared_value_bar) || throw(ArgumentError(
+        "shared value cotangent must be finite",
+    ))
+    before = _local_counter_snapshot(learner.counters)
+    signature = replay_state_common!(
+        model,
+        state,
+        worker,
+        input;
+        expected_signature,
+    )
+    replay = worker.common_replay_state
+    _collect_local_plasticity!(
+        model,
+        worker,
+        learner,
+        replay.state_value_tape,
+        first(Output.VALUE_CELLS),
+        last(Output.VALUE_CELLS),
+    )
+    component_bar = worker.component_bars[1]
+    Output.clear_component_gradient!(component_bar)
+    component_bar.value = shared_value_bar
+    Output.value_output_population_pullback!(
+        worker.output_dbase,
+        worker.output_devidence,
+        worker.gradient.output,
+        worker.output_scratch,
+        replay.state_value_tape,
+        model.parameters.output,
+        model.cache.output,
+        component_bar,
+    )
+    Output.value_output_initial_state_pullback!(
+        worker.gradient.output,
+        worker.output_scratch,
+        worker.output_dbase,
+        model.cache.output,
+    )
+    learner.counters.output_replays += 1
+    due.analog && _contract_local_records!(
+        model,
+        worker,
+        learner,
+        aggregate_raw_delta,
+    )
+    learner.counters.common_replays += 1
+    return _local_report(signature, learner.counters, before)
 end
 
 

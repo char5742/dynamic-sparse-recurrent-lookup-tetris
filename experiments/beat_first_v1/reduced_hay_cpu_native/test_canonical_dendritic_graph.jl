@@ -9,6 +9,7 @@ for (name, file) in (
     (:ActiveApicalCell, "ActiveApicalCell.jl"),
     (:CanonicalTetrisInput, "CanonicalTetrisInput.jl"),
     (:DendriticAxonPacket, "DendriticAxonPacket.jl"),
+    (:CanonicalLocalLearning, "CanonicalLocalLearning.jl"),
     (:OrderedMultiscaleTopology, "OrderedMultiscaleTopology.jl"),
     (:DendriticOutputPopulation, "DendriticOutputPopulation.jl"),
     (:CanonicalEventArena, "CanonicalEventArena.jl"),
@@ -25,6 +26,7 @@ const CDGOutput = Main.DendriticOutputPopulation
 const CDGCell = Main.ActiveApicalCell
 const CDGPacket = Main.DendriticAxonPacket
 const CDGEvents = Main.CanonicalEventArena
+const CDGLocal = Main.CanonicalLocalLearning
 
 struct CDGAllFireStaticAdapter end
 
@@ -172,6 +174,84 @@ function cdg_high_candidate_input()
     return CDGInput.TeacherSufficientInput(cdg_state_observation(), candidate)
 end
 
+function cdg_dynamic_contact_coverage_input()
+    before = fill(CDGInput.EMPTY, CDGInput.BOARD_ROWS, CDGInput.BOARD_COLUMNS)
+    positions = ((5, 4), (6, 5), (7, 6), (8, 7))
+    @inbounds for (centre_row, centre_column) in positions,
+                  delta_column in -1:1,
+                  delta_row in -1:1
+        iszero(delta_row) && iszero(delta_column) && continue
+        row = centre_row + delta_row
+        column = centre_column + delta_column
+        1 <= row <= CDGInput.BOARD_ROWS || continue
+        1 <= column <= CDGInput.BOARD_COLUMNS || continue
+        (row, column) in positions && continue
+        before[row, column] = CDGInput.OCCUPIED
+    end
+    state = CDGInput.StateObservation(
+        before,
+        CDGInput.StateMeta(
+            CDGInput.NONE,
+            (
+                CDGInput.PIECE_I,
+                CDGInput.PIECE_O,
+                CDGInput.PIECE_T,
+                CDGInput.PIECE_S,
+                CDGInput.PIECE_Z,
+            ),
+            0,
+            CDGInput.FALSE_VALUE,
+        ),
+    )
+    placement = fill(
+        CDGInput.ABSENT,
+        CDGInput.BOARD_ROWS,
+        CDGInput.BOARD_COLUMNS,
+    )
+    @inbounds for (row, column) in positions
+        placement[row, column] = CDGInput.PRESENT
+    end
+    candidate = CDGInput.CandidateObservation(
+        placement,
+        CDGInput.CandidateMeta(CDGInput.FALSE_VALUE),
+    )
+    return CDGInput.TeacherSufficientInput(state, candidate)
+end
+
+function cdg_configure_high_plateau!(model; node_limit::Int)
+    low = (
+        :ampa_decay,
+        :nmda_decay,
+        :plateau_decay,
+        :nmda_half_voltage,
+        :nmda_slope,
+        :plateau_threshold,
+        :plateau_slope,
+    )
+    high = (
+        :basal_dt,
+        :ampa_max,
+        :nmda_max,
+        :plateau_gain,
+        ntuple(
+            index -> Symbol("basal_dt_multiplier_", index),
+            CDGCell.N_BASAL,
+        )...,
+    )
+    @inbounds for name in low
+        index = findfirst(==(name), CDGCell.PARAMETER_NAMES)
+        index === nothing && error("missing Reduced-Hay parameter $name")
+        model.parameters.core_cell_raw[index, 1:node_limit] .= -20.0f0
+    end
+    @inbounds for name in high
+        index = findfirst(==(name), CDGCell.PARAMETER_NAMES)
+        index === nothing && error("missing Reduced-Hay parameter $name")
+        model.parameters.core_cell_raw[index, 1:node_limit] .= 20.0f0
+    end
+    CDGGraph.refresh_cache!(model)
+    return model
+end
+
 function cdg_snapshot(worker, state)
     core_state = Matrix{Float32}(
         undef,
@@ -279,6 +359,61 @@ function cdg_same_gradient_bits(left, right)
         reinterpret(UInt32, vec(getproperty(right, field)))
         for field in propertynames(left)
     )
+end
+
+function cdg_hot_local_candidate!(
+    model,
+    state,
+    worker,
+    learner,
+    input,
+    raw_delta,
+    component_bar,
+    due,
+    signature,
+)
+    CDGGraph.clear_gradient!(worker)
+    CDGGraph.begin_local_microbatch!(learner)
+    CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        worker,
+        learner,
+        input,
+        raw_delta,
+        component_bar,
+        due;
+        expected_signature=signature,
+        mode=:cow,
+    )
+    return nothing
+end
+
+function cdg_hot_local_common!(
+    model,
+    state,
+    worker,
+    learner,
+    input,
+    raw_delta,
+    value_bar,
+    due,
+    signature,
+)
+    CDGGraph.clear_gradient!(worker)
+    CDGGraph.begin_local_microbatch!(learner)
+    CDGGraph.local_replay_state_common!(
+        model,
+        state,
+        worker,
+        learner,
+        input,
+        raw_delta,
+        value_bar,
+        due;
+        expected_signature=signature,
+    )
+    return nothing
 end
 
 @testset "canonical graph dimensions, ownership and typed fixture" begin
@@ -1068,4 +1203,586 @@ end
     @test plus_signature == minus_signature
     finite_difference = (plus_value - minus_value) / (2.0f0 * h)
     @test isapprox(analytic, finite_difference; rtol=1.0f-3, atol=3.0f-5)
+end
+
+@testset "contracted local replay is factorized, typed and clock-safe" begin
+    model = CDGGraph.initialize_model(
+        MersenneTwister(0x10ca1),
+        CDGGraph.GraphConfig(2, 7, 12_288, :error),
+    )
+    input = first(cdg_fixture(; order=(:t,)))
+    state = CDGGraph.initialize_state(model)
+    worker = CDGGraph.initialize_worker(model)
+    CDGGraph.prepare_state_common!(model, state, worker, input)
+    _, signature = CDGGraph.forward_candidate!(
+        model, state, worker, input; mode=:cow,
+    )
+    pass_one = cdg_component_snapshot(worker, 1)
+    common_state = copy(state.common_state)
+    common_packet = copy(state.common_packet)
+
+    config = CDGLocal.LocalLearningConfig(
+        feedback_seed=0x51a7,
+        feedback_scale=0.4,
+        utility_mode=:combined,
+    )
+    signals = CDGGraph.initialize_local_signal_maps(model, config)
+    learner = CDGGraph.initialize_local_learner(model, signals)
+    second_learner = CDGGraph.initialize_local_learner(model, signals)
+    @test learner.signals === signals
+    @test second_learner.signals === signals
+    expected_continuous =
+        (config.feedback_scale /
+         sqrt(Float32(2 * CDGLocal.LOCAL_OBSERVATION_DIM))) /
+        sqrt(Float32(CDGOutput.OUTPUT_DIM))
+    expected_packet =
+        (config.feedback_scale /
+         sqrt(Float32(2 * CDGPacket.PACKET_DIM))) /
+        sqrt(Float32(CDGOutput.OUTPUT_DIM))
+    @test all(
+        value -> abs(value) == expected_continuous,
+        signals.continuous[1].global_feedback,
+    )
+    @test all(
+        value -> abs(value) == expected_packet,
+        signals.packet[1].global_feedback,
+    )
+    @test isapprox(
+        sum(abs2, signals.continuous[1].global_feedback),
+        config.feedback_scale^2 / 2.0f0;
+        rtol=8.0f0 * eps(Float32),
+    )
+    @test isapprox(
+        sum(abs2, signals.packet[1].global_feedback),
+        config.feedback_scale^2 / 2.0f0;
+        rtol=8.0f0 * eps(Float32),
+    )
+    @test signals.continuous[1].global_feedback[1:CDGPacket.PACKET_DIM, :] !=
+          signals.packet[1].global_feedback[1:CDGPacket.PACKET_DIM, :]
+    @test_throws ArgumentError CDGGraph.initialize_local_signal_maps(
+        model,
+        CDGLocal.LocalLearningConfig(predictor_dim=1),
+    )
+    @test_throws ArgumentError CDGGraph.initialize_local_signal_maps(
+        model,
+        CDGLocal.LocalLearningConfig(hard_event_multiplier=0.1),
+    )
+
+    raw_delta = fill(0.01f0, CDGOutput.OUTPUT_DIM)
+    component_bar = cdg_component_bar(1.0f0)
+    analog_due = CDGLocal.DuePlasticityClocks(true, false, false, false)
+    CDGGraph.clear_gradient!(worker)
+    CDGGraph.begin_local_microbatch!(learner)
+    report = CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        worker,
+        learner,
+        input,
+        raw_delta,
+        component_bar,
+        analog_due;
+        expected_signature=signature,
+        mode=:cow,
+    )
+    observation = CDGGraph.local_plasticity_observation(learner)
+    @test report.signature == signature
+    @test report.visited_transitions == report.conditional_pullbacks > 0
+    @test report.signal_nonzero > 0
+    @test report.nonspiking_transitions > 0
+    @test report.semantic_parameter_updates > 0
+    @test report.event_receiver_updates == report.utility_updates > 0
+    @test report.output_replays == 1
+    @test sum(observation.visit_count[1:CDGGraph.CORE_NODE_COUNT]) ==
+          report.visited_transitions
+    @test all(iszero, observation.visit_count[
+        (CDGGraph.CORE_NODE_COUNT + 1):(CDGGraph.CORE_NODE_COUNT + 2)
+    ])
+    @test all(==(UInt8(1)), observation.visit_count[
+        (CDGGraph.CORE_NODE_COUNT + 3):CDGGraph.TOTAL_NODE_COUNT
+    ])
+    @test length(observation.spike_count) == CDGGraph.TOTAL_NODE_COUNT
+    @test length(observation.task_utility_sum) ==
+          CDGGraph.event_parameter_count(model) - 5 == 2_120
+    @test sum(observation.activity_sum) > 0.0f0
+    @test sum(observation.incoming_conductance_sum) > 0.0f0
+    candidate_spatial = Int[
+        node for node in 1:CDGGraph.CORE_NODE_COUNT
+        if CDGTopology.node_class(model.topology, node) ==
+           CDGTopology.SPATIAL_CLASS && !iszero(observation.visit_count[node])
+    ]
+    @test !isempty(candidate_spatial)
+    @test all(
+        node -> observation.incoming_conductance_sum[node] ==
+            Float32(CDGCell.INPUT_DIM),
+        candidate_spatial,
+    )
+    @test sum(observation.contact_activity_sum) > 0.0f0
+    @test sum(observation.task_utility_sum) > 0.0f0
+    @test sum(observation.task_utility_sum) >=
+          sum(abs, worker.gradient.event_raw[1:2_120])
+    @test all(
+        contact -> iszero(observation.contact_activity_sum[contact]) ?
+            iszero(observation.task_utility_sum[contact]) : true,
+        eachindex(observation.task_utility_sum),
+    )
+    @test sum(abs, worker.gradient.core_cell_raw) > 0.0f0
+    @test sum(abs, worker.gradient.semantic_projection_raw) > 0.0f0
+    @test sum(abs, worker.gradient.event_raw[1:2_120]) > 0.0f0
+    @test sum(abs, worker.gradient.event_raw[2_121:2_125]) > 0.0f0
+    delivered_contacts = Set(
+        Int(worker.provenance.event_contact_parameter[index])
+        for index in 1:worker.provenance.event_count
+    )
+    @test any(
+        contact -> contact > 2_040 &&
+            !iszero(worker.gradient.event_raw[contact]) &&
+            !iszero(observation.task_utility_sum[contact]),
+        delivered_contacts,
+    )
+    @test all(
+        contact -> contact in delivered_contacts ||
+            (iszero(worker.gradient.event_raw[contact]) &&
+             iszero(observation.task_utility_sum[contact])),
+        1:2_120,
+    )
+    @test all(iszero, @view(worker.gradient.output.cell_raw[:, 1:2]))
+    @test sum(abs, @view(worker.gradient.output.cell_raw[:, 3:22])) > 0.0f0
+    @test cdg_component_snapshot(worker, 1) == pass_one
+    @test reinterpret(UInt32, vec(state.common_state)) ==
+          reinterpret(UInt32, vec(common_state))
+    @test reinterpret(UInt32, vec(state.common_packet)) ==
+          reinterpret(UInt32, vec(common_packet))
+
+    # The exact output head bar never becomes a recurrent local cotangent.
+    recurrent_core = copy(worker.gradient.core_cell_raw)
+    recurrent_semantic = copy(worker.gradient.semantic_projection_raw)
+    recurrent_event = copy(worker.gradient.event_raw)
+    CDGGraph.clear_gradient!(worker)
+    CDGGraph.begin_local_microbatch!(learner)
+    CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        worker,
+        learner,
+        input,
+        raw_delta,
+        CDGOutput.OutputComponentGradient(Float32),
+        analog_due;
+        expected_signature=signature,
+        mode=:cow,
+    )
+    @test reinterpret(UInt32, vec(worker.gradient.core_cell_raw)) ==
+          reinterpret(UInt32, vec(recurrent_core))
+    @test reinterpret(UInt32, vec(worker.gradient.semantic_projection_raw)) ==
+          reinterpret(UInt32, vec(recurrent_semantic))
+    @test reinterpret(UInt32, vec(worker.gradient.event_raw)) ==
+          reinterpret(UInt32, vec(recurrent_event))
+    @test all(iszero, worker.gradient.output.cell_raw)
+
+    # The output head updates every optimization step. The recurrent
+    # contracted adjoint and its task utility alone obey the analog clock.
+    not_due = CDGLocal.DuePlasticityClocks(false, false, false, false)
+    CDGGraph.clear_gradient!(worker)
+    CDGGraph.begin_local_microbatch!(learner)
+    off_report = CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        worker,
+        learner,
+        input,
+        raw_delta,
+        component_bar,
+        not_due;
+        expected_signature=signature,
+        mode=:cow,
+    )
+    off_observation = CDGGraph.local_plasticity_observation(learner)
+    @test off_report.output_replays == 1
+    @test off_report.visited_transitions == 0
+    @test off_report.conditional_pullbacks == 0
+    @test off_report.signal_nonzero == 0
+    @test off_report.utility_updates == 0
+    @test sum(off_observation.visit_count) > 0
+    @test sum(off_observation.contact_activity_sum) > 0.0f0
+    @test all(iszero, off_observation.task_utility_sum)
+    @test all(iszero, worker.gradient.core_cell_raw)
+    @test all(iszero, worker.gradient.semantic_projection_raw)
+    @test all(iszero, worker.gradient.event_raw)
+    @test sum(abs, @view(worker.gradient.output.cell_raw[:, 3:22])) > 0.0f0
+
+    # M=0 and eligibility_scale=0 independently stop every recurrent update.
+    zero_bar = CDGOutput.OutputComponentGradient(Float32)
+    zero_delta = zeros(Float32, CDGOutput.OUTPUT_DIM)
+    CDGGraph.clear_gradient!(worker)
+    CDGGraph.begin_local_microbatch!(learner)
+    zero_report = CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        worker,
+        learner,
+        input,
+        zero_delta,
+        zero_bar,
+        analog_due;
+        expected_signature=signature,
+        mode=:cow,
+    )
+    @test zero_report.visited_transitions > 0
+    @test zero_report.signal_nonzero == 0
+    @test zero_report.utility_updates == 0
+    @test all(iszero, CDGGraph.gradient_components(worker.gradient).core_cell_raw)
+    @test all(iszero, worker.gradient.semantic_projection_raw)
+    @test all(iszero, worker.gradient.event_raw)
+    @test all(iszero, worker.gradient.output.cell_raw)
+    @test all(iszero,
+              CDGGraph.local_plasticity_observation(learner).task_utility_sum)
+
+    zero_eligibility_config = CDGLocal.LocalLearningConfig(
+        feedback_seed=0x51a7,
+        analog_multiplier=0.0,
+        utility_mode=:combined,
+    )
+    zero_eligibility = CDGGraph.initialize_local_learner(
+        model,
+        CDGGraph.initialize_local_signal_maps(model, zero_eligibility_config),
+    )
+    CDGGraph.clear_gradient!(worker)
+    eligibility_report = CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        worker,
+        zero_eligibility,
+        input,
+        raw_delta,
+        zero_bar,
+        analog_due;
+        expected_signature=signature,
+        mode=:cow,
+    )
+    @test eligibility_report.signal_nonzero > 0
+    @test eligibility_report.visited_transitions > 0
+    @test eligibility_report.utility_updates == 0
+    @test all(iszero, worker.gradient.core_cell_raw)
+    @test all(iszero, worker.gradient.semantic_projection_raw)
+    @test all(iszero, worker.gradient.event_raw)
+
+    no_utility_config = CDGLocal.LocalLearningConfig(
+        feedback_seed=0x51a7,
+        utility_mode=:none,
+    )
+    no_utility = CDGGraph.initialize_local_learner(
+        model,
+        CDGGraph.initialize_local_signal_maps(model, no_utility_config),
+    )
+    CDGGraph.clear_gradient!(worker)
+    no_utility_report = CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        worker,
+        no_utility,
+        input,
+        raw_delta,
+        zero_bar,
+        analog_due;
+        expected_signature=signature,
+        mode=:cow,
+    )
+    @test no_utility_report.event_receiver_updates > 0
+    @test no_utility_report.utility_updates == 0
+    @test sum(abs, worker.gradient.event_raw) > 0.0f0
+    @test all(iszero,
+              CDGGraph.local_plasticity_observation(no_utility).task_utility_sum)
+end
+
+@testset "common local replay is private, once-only and value-owned" begin
+    model = CDGGraph.initialize_model(
+        MersenneTwister(0xc011ec7),
+        CDGGraph.GraphConfig(2, 7, 12_288, :error),
+    )
+    input = first(cdg_fixture(; order=(:t,)))
+    state = CDGGraph.initialize_state(model)
+    worker = CDGGraph.initialize_worker(model)
+    CDGGraph.prepare_state_common!(model, state, worker, input)
+    signature = state.common_signature
+    state_bits = reinterpret(UInt32, vec(copy(state.common_state)))
+    packet_bits = reinterpret(UInt32, vec(copy(state.common_packet)))
+    value_bits = reinterpret(UInt32, state.state_value)
+    epoch = state.epoch
+    config = CDGLocal.LocalLearningConfig(
+        feedback_seed=0xc011ec7,
+        utility_mode=:combined,
+    )
+    signals = CDGGraph.initialize_local_signal_maps(model, config)
+    learner = CDGGraph.initialize_local_learner(model, signals)
+    due = CDGLocal.DuePlasticityClocks(true, false, false, false)
+    aggregate_delta = fill(0.015f0, CDGOutput.OUTPUT_DIM)
+
+    CDGGraph.clear_gradient!(worker)
+    CDGGraph.begin_local_microbatch!(learner)
+    report = CDGGraph.local_replay_state_common!(
+        model,
+        state,
+        worker,
+        learner,
+        input,
+        aggregate_delta,
+        0.6f0,
+        due;
+        expected_signature=signature,
+    )
+    observation = CDGGraph.local_plasticity_observation(learner)
+    @test report.signature == signature
+    @test report.visited_transitions == report.conditional_pullbacks ==
+          sum(observation.visit_count[1:CDGGraph.CORE_NODE_COUNT])
+    @test report.signal_nonzero > 0
+    @test report.nonspiking_transitions > 0
+    @test report.event_receiver_updates == report.utility_updates > 0
+    @test report.output_replays == 1
+    @test all(==(UInt8(1)), observation.visit_count[
+        (CDGGraph.CORE_NODE_COUNT + 1):(CDGGraph.CORE_NODE_COUNT + 2)
+    ])
+    @test all(iszero, observation.visit_count[
+        (CDGGraph.CORE_NODE_COUNT + 3):CDGGraph.TOTAL_NODE_COUNT
+    ])
+    @test sum(observation.task_utility_sum) > 0.0f0
+    common_spatial = Int[
+        node for node in 1:CDGGraph.CORE_NODE_COUNT
+        if CDGTopology.node_class(model.topology, node) ==
+           CDGTopology.SPATIAL_CLASS && !iszero(observation.visit_count[node])
+    ]
+    @test length(common_spatial) == 480
+    @test all(
+        node -> observation.incoming_conductance_sum[node] ==
+            Float32(CDGCell.INPUT_DIM),
+        common_spatial,
+    )
+    @test all(1:2) do output_cell
+        role = CDGOutput.cell_role(output_cell)
+        physical_per_binding = sum(
+            @view model.cache.output.projection[:, :, role]
+        )
+        node = CDGGraph.CORE_NODE_COUNT + output_cell
+        observation.incoming_conductance_sum[node] ==
+            8.0f0 * physical_per_binding
+    end
+    @test sum(abs, @view(worker.gradient.output.cell_raw[:, 1:2])) > 0.0f0
+    @test all(iszero, @view(worker.gradient.output.cell_raw[:, 3:22]))
+    @test worker.common_replay_state !== state
+    @test worker.common_replay_state.state_value_tape !== state.state_value_tape
+    @test reinterpret(UInt32, vec(state.common_state)) == state_bits
+    @test reinterpret(UInt32, vec(state.common_packet)) == packet_bits
+    @test reinterpret(UInt32, state.state_value) == value_bits
+    @test state.epoch == epoch
+    @test learner.counters.common_replays == 1
+
+    # A rejected replay may overwrite only worker-private scratch.
+    CDGGraph.clear_gradient!(worker)
+    @test_throws ArgumentError CDGGraph.local_replay_state_common!(
+        model,
+        state,
+        worker,
+        learner,
+        input,
+        aggregate_delta,
+        0.6f0,
+        due;
+        expected_signature=CDGGraph.TrajectorySignature(),
+    )
+    @test reinterpret(UInt32, vec(state.common_state)) == state_bits
+    @test reinterpret(UInt32, vec(state.common_packet)) == packet_bits
+    @test reinterpret(UInt32, state.state_value) == value_bits
+    @test state.epoch == epoch
+    @test all(iszero, worker.gradient.core_cell_raw)
+    @test all(iszero, worker.gradient.output.cell_raw)
+
+    # A stale pass-one parameter revision is rejected before private replay.
+    model.parameters.output.cell_raw[1, 3] += 0.01f0
+    CDGGraph.refresh_cache!(model)
+    @test_throws ArgumentError CDGGraph.replay_state_common!(
+        model,
+        state,
+        worker,
+        input;
+        expected_signature=signature,
+    )
+    @test reinterpret(UInt32, vec(state.common_state)) == state_bits
+    @test state.epoch == epoch
+end
+
+@testset "all compact dynamic contacts receive natural local credit" begin
+    model = CDGGraph.initialize_model(
+        MersenneTwister(0xd1a80),
+        CDGGraph.GraphConfig(2, 7, 12_288, :error),
+    )
+    source_limit = CDGTopology.SPATIAL_COUNT +
+        CDGTopology.ROW_INTERNAL_COUNT + CDGTopology.COLUMN_INTERNAL_COUNT
+    cdg_configure_high_plateau!(model; node_limit=source_limit)
+    input = cdg_dynamic_contact_coverage_input()
+    state = CDGGraph.initialize_state(model)
+    worker = CDGGraph.initialize_worker(model)
+    CDGGraph.prepare_state_common!(model, state, worker, input)
+    _, signature = CDGGraph.forward_candidate!(
+        model, state, worker, input; mode=:cow,
+    )
+    first_dynamic = CDGEvents.edge_count(model.cache.event_graph) + 1
+    last_dynamic = first_dynamic +
+        CDGGraph.dynamic_event_contact_count(model) - 1
+    delivered = falses(CDGGraph.event_parameter_count(model))
+    @inbounds for delivery in 1:worker.provenance.event_count
+        delivered[Int(worker.provenance.event_contact_parameter[delivery])] = true
+    end
+    @test all(delivered[first_dynamic:last_dynamic])
+
+    signals = CDGGraph.initialize_local_signal_maps(
+        model,
+        CDGLocal.LocalLearningConfig(
+            feedback_seed=0xd1a80,
+            utility_mode=:combined,
+        ),
+    )
+    learner = CDGGraph.initialize_local_learner(model, signals)
+    CDGGraph.clear_gradient!(worker)
+    report = CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        worker,
+        learner,
+        input,
+        fill(0.02f0, CDGOutput.OUTPUT_DIM),
+        CDGOutput.OutputComponentGradient(Float32),
+        CDGLocal.DuePlasticityClocks(true, false, false, false);
+        expected_signature=signature,
+        mode=:cow,
+    )
+    observation = CDGGraph.local_plasticity_observation(learner)
+    @test report.event_receiver_updates == report.utility_updates > 0
+    @test all(
+        parameter -> !iszero(worker.gradient.event_raw[parameter]),
+        first_dynamic:last_dynamic,
+    )
+    @test all(
+        parameter -> !iszero(observation.task_utility_sum[parameter]),
+        first_dynamic:last_dynamic,
+    )
+    family2_branch2 = CDGGraph.dynamic_event_parameter_index(model, 2, 1, 2)
+    family2_branch3 = CDGGraph.dynamic_event_parameter_index(model, 2, 1, 3)
+    @test (family2_branch2, family2_branch3) == (2_043, 2_044)
+    @test all(delivered[[family2_branch2, family2_branch3]])
+    @test all(!iszero, worker.gradient.event_raw[
+        [family2_branch2, family2_branch3]
+    ])
+    @test all(!iszero, observation.task_utility_sum[
+        [family2_branch2, family2_branch3]
+    ])
+end
+
+@testset "contracted local COW/full and hot replay are exact" begin
+    model = CDGGraph.initialize_model(
+        MersenneTwister(0xa110c),
+        CDGGraph.GraphConfig(2, 7, 12_288, :error),
+    )
+    input = first(cdg_fixture(; order=(:t,)))
+    state = CDGGraph.initialize_state(model)
+    common_worker = CDGGraph.initialize_worker(model)
+    CDGGraph.prepare_state_common!(model, state, common_worker, input)
+    _, signature = CDGGraph.forward_candidate!(
+        model, state, common_worker, input; mode=:cow,
+    )
+    config = CDGLocal.LocalLearningConfig(
+        feedback_seed=0xa110c,
+        utility_mode=:combined,
+    )
+    signals = CDGGraph.initialize_local_signal_maps(model, config)
+    raw_delta = fill(0.02f0, CDGOutput.OUTPUT_DIM)
+    component_bar = cdg_component_bar(0.75f0)
+    due = CDGLocal.DuePlasticityClocks(true, false, false, false)
+
+    function replay_in_mode(mode::Symbol)
+        worker = CDGGraph.initialize_worker(model)
+        learner = CDGGraph.initialize_local_learner(model, signals)
+        CDGGraph.clear_gradient!(worker)
+        report = CDGGraph.local_replay_candidate!(
+            model,
+            state,
+            worker,
+            learner,
+            input,
+            raw_delta,
+            component_bar,
+            due;
+            expected_signature=signature,
+            mode,
+        )
+        observation = CDGGraph.local_plasticity_observation(learner)
+        return (
+            report,
+            cdg_gradient_snapshot(worker.gradient),
+            copy(observation.spike_count),
+            copy(observation.visit_count),
+            copy(observation.activity_sum),
+            copy(observation.incoming_conductance_sum),
+            copy(observation.task_utility_sum),
+            copy(observation.contact_activity_sum),
+        )
+    end
+
+    cow = replay_in_mode(:cow)
+    full = replay_in_mode(:full)
+    @test cow[1] == full[1]
+    @test cdg_same_gradient_bits(cow[2], full[2])
+    @test cow[3] == full[3]
+    @test cow[4] == full[4]
+    @test all(
+        reinterpret(UInt32, vec(cow[index])) ==
+        reinterpret(UInt32, vec(full[index]))
+        for index in 5:length(cow)
+    )
+
+    hot_worker = CDGGraph.initialize_worker(model)
+    hot_learner = CDGGraph.initialize_local_learner(model, signals)
+    cdg_hot_local_candidate!(
+        model,
+        state,
+        hot_worker,
+        hot_learner,
+        input,
+        raw_delta,
+        component_bar,
+        due,
+        signature,
+    )
+    @test @allocated(cdg_hot_local_candidate!(
+        model,
+        state,
+        hot_worker,
+        hot_learner,
+        input,
+        raw_delta,
+        component_bar,
+        due,
+        signature,
+    )) == 0
+    cdg_hot_local_common!(
+        model,
+        state,
+        hot_worker,
+        hot_learner,
+        input,
+        raw_delta,
+        0.5f0,
+        due,
+        state.common_signature,
+    )
+    @test @allocated(cdg_hot_local_common!(
+        model,
+        state,
+        hot_worker,
+        hot_learner,
+        input,
+        raw_delta,
+        0.5f0,
+        due,
+        state.common_signature,
+    )) == 0
 end

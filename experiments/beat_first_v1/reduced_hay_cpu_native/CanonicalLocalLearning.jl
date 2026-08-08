@@ -508,8 +508,12 @@ The single checkpointed owner of canonical local-learning controls.
 `eligibility_decay` applies only to the optional hard-event synaptic tag. The
 continuous multi-compartment e-prop state already contains the physical Hay
 decays through its local Jacobian and is never silently decayed a second time.
-`utility_mode` selects `:packet`, `:continuous`, or `:none`; utility collection
-may run in shadow while `plasticity.structure_enabled` remains false.
+The factorized local objective is the explicit sum of the 47-dimensional
+continuous term and the 12-dimensional packet term. Accordingly,
+`utility_mode` is either `:combined`, which collects the absolute per-use
+contribution of that same summed objective, or `:none`, which disables utility
+collection. Utility collection may run in shadow while
+`plasticity.structure_enabled` remains false.
 """
 struct LocalLearningConfig
     schedule::LearningSchedule
@@ -536,7 +540,7 @@ function LocalLearningConfig(;
     # Fail closed until a causal continuation/energy estimator and fused
     # analog/event cell VJP are connected.
     hard_event_multiplier::Real=0.0,
-    utility_mode::Symbol=:packet,
+    utility_mode::Symbol=:combined,
     plasticity::PlasticityConfig=PlasticityConfig(),
 )
     feedback_seed >= 0 || throw(ArgumentError(
@@ -565,8 +569,8 @@ function LocalLearningConfig(;
     isfinite(hard_event) && hard_event >= 0.0f0 || throw(ArgumentError(
         "hard-event multiplier must be finite and nonnegative",
     ))
-    utility_mode in (:packet, :continuous, :none) || throw(ArgumentError(
-        "utility mode must be :packet, :continuous, or :none",
+    utility_mode in (:combined, :none) || throw(ArgumentError(
+        "utility mode must be :combined or :none",
     ))
     return LocalLearningConfig(
         schedule,
@@ -1419,9 +1423,13 @@ end
 
 """
 Update slow structural utility from an already-contracted parameter
-contribution. Since each contribution is `m * eligibility`, zero third factor
-or zero eligibility independently produces zero utility. Shared parameters are
-updated once after the graph owner has deterministically reduced all uses.
+contribution. Canonical callers in `:combined` mode pass the per-use sum of the
+47-dimensional continuous and 12-dimensional packet objective contributions;
+the two terms are never selected independently. Callers in `:none` mode must
+leave utility strictly zero. Since each combined contribution is
+`m * eligibility`, zero third factor or zero eligibility independently produces
+zero utility. Shared parameters are updated once after the graph owner has
+deterministically reduced all uses.
 """
 function update_structural_utility!(
     state::StructuralUtilityState{T},
