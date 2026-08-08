@@ -42,7 +42,11 @@ export CANONICAL_MAX_WAVES,
        advance_event_cell!,
        run_event_waves!
 
-const CANONICAL_MAX_WAVES = 4
+# Exact topology bound: the fixed binary information spine has depth five and
+# a candidate-dependent column-root -> motif -> evidence path extends it to
+# seven. A larger scheduler cap would be arbitrary; a smaller one truncates a
+# reachable canonical path.
+const CANONICAL_MAX_WAVES = 7
 const NO_EVENT = UInt8(0)
 
 const OVERFLOW_ERROR = UInt8(1)
@@ -928,6 +932,23 @@ end
     end
 end
 
+@inline function _has_outgoing_contact(
+    graph::SourceMajorAdjacency,
+    overlay::Nothing,
+    source::Int,
+)
+    return @inbounds graph.offsets[source] != graph.offsets[source + 1]
+end
+
+@inline function _has_outgoing_contact(
+    graph::SourceMajorAdjacency,
+    overlay::DynamicSourceMajorOverlay,
+    source::Int,
+)
+    return @inbounds(graph.offsets[source] != graph.offsets[source + 1]) ||
+        @inbounds(overlay.offsets[source] != overlay.offsets[source + 1])
+end
+
 @inline function _touch_wave_destination!(
     arena::EventArena{T},
     destination::Int,
@@ -959,7 +980,7 @@ end
 end
 
 """
-    run_event_waves!(arena, graph, adapter; max_waves=4)
+    run_event_waves!(arena, graph, adapter; max_waves=7)
 
 Run candidate-local Jacobi waves. Current sources are sorted before every
 delivery. All matching edges accumulate first; each unique destination is then
@@ -1172,6 +1193,13 @@ function _run_event_waves!(
             event_mask = _mask_from_result(result)
             destination_updates += 1
             if !iszero(event_mask)
+                emitted_events += 1
+                # The event itself is already represented by the updated
+                # destination state/mask. A source with no sealed static or
+                # dynamic outgoing contact cannot affect a later wave, so
+                # enqueueing it would only add an empty drain wave and inflate
+                # the exact topology depth by one.
+                _has_outgoing_contact(graph, overlay, destination) || continue
                 requested = arena.next_count + 1
                 # Unique destinations are advanced once, so next events are
                 # unique without another generation table.
@@ -1198,7 +1226,6 @@ function _run_event_waves!(
                 arena.next_nodes[requested] = UInt16(destination)
                 arena.next_masks[requested] = event_mask
                 arena.next_count = requested
-                emitted_events += 1
             end
         end
         waves_executed = wave

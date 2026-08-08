@@ -143,6 +143,15 @@ function chain_graph()
     )
 end
 
+function seven_wave_chain_graph()
+    # Seven delivered edges are required to reach node eight.
+    return graph(
+        8,
+        UInt32[1, 2, 3, 4, 5, 6, 7, 8, 8],
+        UInt16[2, 3, 4, 5, 6, 7, 8],
+    )
+end
+
 function run_chain!(arena, waves)
     begin_candidate!(arena)
     seed_event!(arena, 1, 0x01)
@@ -519,12 +528,55 @@ end
 
     complete = run_chain!(arena, 4)
     @test candidate_state(arena, 4, 1) == 1.0f0
-    @test complete.waves_executed == 4
+    # Node four has no outgoing contact. Its event/state is retained, but no
+    # empty fourth drain wave is scheduled.
+    @test complete.waves_executed == 3
     @test complete.terminated_empty
     @test !complete.hit_wave_limit
-    @test complete.visited_sources == 4
+    @test complete.visited_sources == 3
     @test complete.scanned_edges == 3
     @test complete.delivered_edges == 3
+end
+
+function run_seven_wave_chain!(arena, fixed, waves)
+    begin_candidate!(arena)
+    seed_event!(arena, 1, 0x01)
+    return run_event_waves!(
+        arena,
+        fixed,
+        ThresholdAdapter(0.5f0);
+        max_waves=waves,
+    )
+end
+
+@testset "topology-derived seven-wave bound" begin
+    @test CANONICAL_MAX_WAVES == 7
+    fixed = seven_wave_chain_graph()
+    arena = EventArena(8, 2, 1, Float32)
+    six = run_seven_wave_chain!(arena, fixed, 6)
+    @test candidate_state(arena, 7, 1) == 1.0f0
+    @test candidate_state(arena, 8, 1) == 0.0f0
+    @test six.waves_executed == 6
+    @test six.hit_wave_limit
+
+    seven = run_seven_wave_chain!(arena, fixed, CANONICAL_MAX_WAVES)
+    @test candidate_state(arena, 8, 1) == 1.0f0
+    @test seven.waves_executed == 7
+    @test seven.visited_sources == 7
+    @test seven.scanned_edges == 7
+    @test seven.delivered_edges == 7
+    @test seven.emitted_events == 7
+    @test seven.terminated_empty
+    @test !seven.hit_wave_limit
+
+    run_seven_wave_chain!(arena, fixed, CANONICAL_MAX_WAVES)
+    @test @allocated(run_seven_wave_chain!(
+        arena, fixed, CANONICAL_MAX_WAVES,
+    )) == 0
+    @test_throws ArgumentError run_seven_wave_chain!(arena, fixed, 0)
+    @test_throws ArgumentError run_seven_wave_chain!(
+        arena, fixed, CANONICAL_MAX_WAVES + 1,
+    )
 end
 
 @testset "unique destination, sorted accumulation, order determinism" begin
