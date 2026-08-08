@@ -3,9 +3,10 @@ module CanonicalPlasticity
 """
 Graph-independent slow plasticity for the canonical dendritic model.
 
-Candidate workers only publish teacher-free activity and the product inputs for
-task-tagged utility into logical candidate slots.  The coordinator is the sole
-owner of persistent EMAs, utility, intrinsic parameter changes, and structural
+Workers publish logical per-cell visits, teacher-free activity, and the already
+chronologically accumulated `sum(abs(M * local_contribution))` task utility
+into fixed state-common or candidate slots.  The coordinator is the sole owner
+of persistent EMAs, utility, intrinsic parameter changes, and structural
 changes.  Consequently plasticity never depends on which native worker happened
 to execute a candidate.
 """
@@ -17,18 +18,130 @@ using ..CanonicalOptimizer
 const Cell = ActiveApicalCell
 const Local = CanonicalLocalLearning
 const Optimizer = CanonicalOptimizer
+const MAX_LOGICAL_VISITS = UInt8(8) # mandatory transition + seven event waves
 
-export CandidatePlasticityBatch,
+export CommonRole,
+       CandidateRole,
+       CanonicalPlasticityBatch,
+       CandidatePlasticityBatch,
        PlasticityState,
        PlasticityBatchStats,
        OptimizerMomentReset,
        begin_plasticity_batch!,
+       record_state_common_plasticity!,
        record_candidate_plasticity!,
+       preflight_canonical_plasticity,
+       reduce_canonical_plasticity!,
        reduce_candidate_plasticity!,
        apply_intrinsic_homeostasis!,
        apply_synaptic_scaling!,
        rewire_one_optional_contact!,
        cell_physical_parameter
+
+"""
+Fixed publication arena for the trajectory shared by every candidate of a
+state.  Column `s` belongs only to logical state slot `s`.
+
+The role is deliberately a concrete owner rather than a tag on candidate
+storage: common observations and the common replay's already loss-normalized
+task contribution must be consumed exactly once per state.
+"""
+mutable struct CommonRole{T<:AbstractFloat}
+    spike_count::Matrix{UInt32}
+    visit_count::Matrix{UInt8}
+    activity_sum::Matrix{T}
+    incoming_conductance_sum::Matrix{T}
+    utility_product_sum::Matrix{T}
+    contact_activity_sum::Matrix{T}
+    stamp::Vector{UInt32}
+end
+
+"""
+Fixed publication arena for candidate-specific alternative trajectories.
+
+Columns are global logical candidate slots.  The recorded state and ordinal
+are checked against the reducer's CSR offsets before any persistent state is
+changed; native worker identity and publication order are never represented.
+"""
+mutable struct CandidateRole{T<:AbstractFloat}
+    spike_count::Matrix{UInt32}
+    visit_count::Matrix{UInt8}
+    activity_sum::Matrix{T}
+    incoming_conductance_sum::Matrix{T}
+    utility_product_sum::Matrix{T}
+    contact_activity_sum::Matrix{T}
+    state_slot::Vector{UInt32}
+    candidate_ordinal::Vector{UInt32}
+    stamp::Vector{UInt32}
+end
+
+"""
+Canonical coordinator-owned slow-plasticity publication batch.
+
+`common` has one fixed slot per state and `candidate` has one fixed slot per
+logical alternative.  Both roles share one generation.  Stamps are written
+last by publishers after all validation and payload writes; the coordinator
+must join workers before calling `reduce_canonical_plasticity!`.
+"""
+mutable struct CanonicalPlasticityBatch{T<:AbstractFloat}
+    common::CommonRole{T}
+    candidate::CandidateRole{T}
+    generation::UInt32
+end
+
+function CanonicalPlasticityBatch(
+    cell_count::Integer,
+    contact_count::Integer,
+    state_capacity::Integer,
+    candidate_capacity::Integer;
+    T::Type{<:AbstractFloat}=Float32,
+)
+    cells = Int(cell_count)
+    contacts = Int(contact_count)
+    states = Int(state_capacity)
+    candidates = Int(candidate_capacity)
+    cells > 0 || throw(ArgumentError("cell_count must be positive"))
+    contacts >= 0 || throw(ArgumentError("contact_count must be nonnegative"))
+    0 < states <= typemax(UInt32) || throw(ArgumentError(
+        "state_capacity must fit a positive UInt32 slot",
+    ))
+    0 < candidates <= typemax(UInt32) || throw(ArgumentError(
+        "candidate_capacity must fit a positive UInt32 slot",
+    ))
+    common = CommonRole{T}(
+        zeros(UInt32, cells, states),
+        zeros(UInt8, cells, states),
+        zeros(T, cells, states),
+        zeros(T, cells, states),
+        zeros(T, contacts, states),
+        zeros(T, contacts, states),
+        zeros(UInt32, states),
+    )
+    candidate = CandidateRole{T}(
+        zeros(UInt32, cells, candidates),
+        zeros(UInt8, cells, candidates),
+        zeros(T, cells, candidates),
+        zeros(T, cells, candidates),
+        zeros(T, contacts, candidates),
+        zeros(T, contacts, candidates),
+        zeros(UInt32, candidates),
+        zeros(UInt32, candidates),
+        zeros(UInt32, candidates),
+    )
+    return CanonicalPlasticityBatch{T}(common, candidate, UInt32(0))
+end
+
+"""Begin a canonical generation without clearing either large role arena."""
+function begin_plasticity_batch!(batch::CanonicalPlasticityBatch)
+    if batch.generation == typemax(UInt32)
+        fill!(batch.common.stamp, UInt32(0))
+        fill!(batch.candidate.stamp, UInt32(0))
+        batch.generation = UInt32(1)
+    else
+        batch.generation += UInt32(1)
+    end
+    return batch
+end
 
 """
 Fixed, coordinator-owned publication arena.
@@ -113,6 +226,237 @@ end
         _require_finite(values[index], name)
     end
     return nothing
+end
+
+@inline function _preflight_role_publication(
+    role,
+    slot::Int,
+    spike_count::AbstractVector{<:Integer},
+    visit_count::AbstractVector{<:Integer},
+    activity_sum::AbstractVector{<:Real},
+    incoming_conductance_sum::AbstractVector{<:Real},
+    task_utility_sum::AbstractVector{<:Real},
+    contact_activity_sum::AbstractVector{<:Real},
+    ::Type{T},
+) where {T<:AbstractFloat}
+    checkbounds(role.stamp, slot)
+    cells = size(role.spike_count, 1)
+    contacts = size(role.utility_product_sum, 1)
+    length(spike_count) == cells || throw(DimensionMismatch(
+        "spike_count has the wrong length",
+    ))
+    length(visit_count) == cells || throw(DimensionMismatch(
+        "visit_count has the wrong length",
+    ))
+    total_visits = UInt64(0)
+    @inbounds for cell in 1:cells
+        count = spike_count[cell]
+        visits = visit_count[cell]
+        0 <= visits <= MAX_LOGICAL_VISITS || throw(DomainError(
+            visits,
+            "visit_count must lie in [0, MAX_LOGICAL_VISITS]",
+        ))
+        0 <= count <= visits || throw(DomainError(
+            count,
+            "spike_count must lie in [0, visit_count]",
+        ))
+        count <= typemax(UInt32) || throw(ArgumentError(
+            "spike_count exceeds UInt32 publication storage",
+        ))
+        total_visits += UInt64(visits)
+    end
+    total_visits > UInt64(0) || throw(ArgumentError(
+        "a publication must contain at least one logical cell visit",
+    ))
+    _preflight_nonnegative(activity_sum, cells, "activity_sum")
+    _preflight_nonnegative(
+        incoming_conductance_sum,
+        cells,
+        "incoming_conductance_sum",
+    )
+    _preflight_nonnegative(task_utility_sum, contacts, "task_utility_sum")
+    _preflight_nonnegative(
+        contact_activity_sum,
+        contacts,
+        "contact_activity_sum",
+    )
+    @inbounds for cell in 1:cells
+        visits = visit_count[cell]
+        isfinite(T(activity_sum[cell])) || throw(DomainError(
+            activity_sum[cell],
+            "activity_sum is outside publication storage range",
+        ))
+        isfinite(T(incoming_conductance_sum[cell])) || throw(DomainError(
+            incoming_conductance_sum[cell],
+            "incoming_conductance_sum is outside publication storage range",
+        ))
+        if iszero(visits)
+            iszero(activity_sum[cell]) || throw(DomainError(
+                activity_sum[cell],
+                "unvisited cells must publish zero activity",
+            ))
+            iszero(incoming_conductance_sum[cell]) || throw(DomainError(
+                incoming_conductance_sum[cell],
+                "unvisited cells must publish zero incoming conductance",
+            ))
+        end
+    end
+    @inbounds for contact in 1:contacts
+        isfinite(T(task_utility_sum[contact])) || throw(DomainError(
+            task_utility_sum[contact],
+            "task_utility_sum is outside publication storage range",
+        ))
+        isfinite(T(contact_activity_sum[contact])) || throw(DomainError(
+            contact_activity_sum[contact],
+            "contact_activity_sum is outside publication storage range",
+        ))
+    end
+    return nothing
+end
+
+@inline function _write_role_publication!(
+    role,
+    slot::Int,
+    spike_count::AbstractVector{<:Integer},
+    visit_count::AbstractVector{<:Integer},
+    activity_sum::AbstractVector{<:Real},
+    incoming_conductance_sum::AbstractVector{<:Real},
+    task_utility_sum::AbstractVector{<:Real},
+    contact_activity_sum::AbstractVector{<:Real},
+    ::Type{T},
+) where {T<:AbstractFloat}
+    @inbounds for cell in axes(role.spike_count, 1)
+        role.spike_count[cell, slot] = UInt32(spike_count[cell])
+        role.visit_count[cell, slot] = UInt8(visit_count[cell])
+        role.activity_sum[cell, slot] = T(activity_sum[cell])
+        role.incoming_conductance_sum[cell, slot] =
+            T(incoming_conductance_sum[cell])
+    end
+    @inbounds for contact in axes(role.utility_product_sum, 1)
+        role.utility_product_sum[contact, slot] = T(task_utility_sum[contact])
+        role.contact_activity_sum[contact, slot] =
+            T(contact_activity_sum[contact])
+    end
+    return nothing
+end
+
+"""
+Publish the common trajectory of logical state `state_slot` exactly once.
+
+`task_utility_sum[e]` must already equal the chronological per-use sum
+`sum_t abs(M[t,e] * local_contribution[t,e])` from the one common replay seeded
+with the aggregate candidate loss signal.  Multiplication cannot be deferred
+until after transition aggregation because opposite signs would erase utility.
+The supplied sum is scalar-loss normalized and is not divided by the candidate
+count during canonical reduction.
+"""
+function record_state_common_plasticity!(
+    batch::CanonicalPlasticityBatch{T},
+    state_slot::Integer,
+    spike_count::AbstractVector{<:Integer},
+    visit_count::AbstractVector{<:Integer},
+    activity_sum::AbstractVector{<:Real},
+    incoming_conductance_sum::AbstractVector{<:Real},
+    task_utility_sum::AbstractVector{<:Real},
+    contact_activity_sum::AbstractVector{<:Real},
+) where {T<:AbstractFloat}
+    state = Int(state_slot)
+    checkbounds(batch.common.stamp, state)
+    batch.generation != UInt32(0) || throw(ArgumentError(
+        "begin_plasticity_batch! must precede publication",
+    ))
+    @inbounds batch.common.stamp[state] != batch.generation || throw(
+        ArgumentError("logical state $state was published twice"),
+    )
+    _preflight_role_publication(
+        batch.common,
+        state,
+        spike_count,
+        visit_count,
+        activity_sum,
+        incoming_conductance_sum,
+        task_utility_sum,
+        contact_activity_sum,
+        T,
+    )
+    _write_role_publication!(
+        batch.common,
+        state,
+        spike_count,
+        visit_count,
+        activity_sum,
+        incoming_conductance_sum,
+        task_utility_sum,
+        contact_activity_sum,
+        T,
+    )
+    # Release/publication marker: write only after the whole payload is valid.
+    @inbounds batch.common.stamp[state] = batch.generation
+    return batch
+end
+
+"""
+Publish one candidate alternative into a global logical slot.
+
+`state_slot` and one-based `candidate_ordinal` are stored as part of the sealed
+publication.  `reduce_canonical_plasticity!` checks them against the supplied
+zero-based CSR offsets, so a missing, duplicate, shifted, or worker-owned slot
+cannot silently enter persistent plasticity state.  `task_utility_sum` has the
+same chronological per-use contract as the common publisher.
+"""
+function record_candidate_plasticity!(
+    batch::CanonicalPlasticityBatch{T},
+    logical_candidate::Integer,
+    state_slot::Integer,
+    candidate_ordinal::Integer,
+    spike_count::AbstractVector{<:Integer},
+    visit_count::AbstractVector{<:Integer},
+    activity_sum::AbstractVector{<:Real},
+    incoming_conductance_sum::AbstractVector{<:Real},
+    task_utility_sum::AbstractVector{<:Real},
+    contact_activity_sum::AbstractVector{<:Real},
+) where {T<:AbstractFloat}
+    candidate = Int(logical_candidate)
+    state = Int(state_slot)
+    ordinal = Int(candidate_ordinal)
+    checkbounds(batch.candidate.stamp, candidate)
+    checkbounds(batch.common.stamp, state)
+    0 < ordinal <= typemax(UInt32) || throw(ArgumentError(
+        "candidate_ordinal must fit a positive UInt32 value",
+    ))
+    batch.generation != UInt32(0) || throw(ArgumentError(
+        "begin_plasticity_batch! must precede publication",
+    ))
+    @inbounds batch.candidate.stamp[candidate] != batch.generation || throw(
+        ArgumentError("logical candidate $candidate was published twice"),
+    )
+    _preflight_role_publication(
+        batch.candidate,
+        candidate,
+        spike_count,
+        visit_count,
+        activity_sum,
+        incoming_conductance_sum,
+        task_utility_sum,
+        contact_activity_sum,
+        T,
+    )
+    _write_role_publication!(
+        batch.candidate,
+        candidate,
+        spike_count,
+        visit_count,
+        activity_sum,
+        incoming_conductance_sum,
+        task_utility_sum,
+        contact_activity_sum,
+        T,
+    )
+    batch.candidate.state_slot[candidate] = UInt32(state)
+    batch.candidate.candidate_ordinal[candidate] = UInt32(ordinal)
+    # Release/publication marker: metadata is part of the sealed payload.
+    batch.candidate.stamp[candidate] = batch.generation
+    return batch
 end
 
 """
@@ -256,10 +600,494 @@ function PlasticityState(
     )
 end
 
+"""
+Reduction summary.  For the canonical reducer, `observations` is the raw count
+of published logical cell visits (before the within-state candidate weighting).
+The legacy reducer retains its historical trajectory-observation count.
+"""
 struct PlasticityBatchStats
     candidates::Int
     observations::UInt64
     utility_nonzero::Int
+end
+
+@inline function _preflight_sealed_slot(role, slot::Int)
+    total_visits = UInt64(0)
+    @inbounds for cell in axes(role.spike_count, 1)
+        visits = role.visit_count[cell, slot]
+        visits <= MAX_LOGICAL_VISITS || throw(DomainError(
+            visits,
+            "sealed visit count exceeds MAX_LOGICAL_VISITS",
+        ))
+        count = role.spike_count[cell, slot]
+        count <= visits || throw(DomainError(
+            count,
+            "sealed spike count exceeds visit count",
+        ))
+        activity = role.activity_sum[cell, slot]
+        incoming = role.incoming_conductance_sum[cell, slot]
+        isfinite(activity) && activity >= zero(activity) || throw(DomainError(
+            activity,
+            "sealed activity sum must be finite and nonnegative",
+        ))
+        isfinite(incoming) && incoming >= zero(incoming) || throw(DomainError(
+            incoming,
+            "sealed incoming-conductance sum must be finite and nonnegative",
+        ))
+        if iszero(visits)
+            iszero(activity) || throw(DomainError(
+                activity,
+                "sealed unvisited cell has nonzero activity",
+            ))
+            iszero(incoming) || throw(DomainError(
+                incoming,
+                "sealed unvisited cell has nonzero incoming conductance",
+            ))
+        end
+        total_visits += UInt64(visits)
+    end
+    @inbounds for contact in axes(role.utility_product_sum, 1)
+        utility = role.utility_product_sum[contact, slot]
+        activity = role.contact_activity_sum[contact, slot]
+        isfinite(utility) && utility >= zero(utility) || throw(DomainError(
+            utility,
+            "sealed utility product must be finite and nonnegative",
+        ))
+        isfinite(activity) && activity >= zero(activity) || throw(DomainError(
+            activity,
+            "sealed contact activity must be finite and nonnegative",
+        ))
+    end
+    total_visits > UInt64(0) || throw(ArgumentError(
+        "sealed plasticity publication has no logical cell visits",
+    ))
+    return total_visits
+end
+
+@inline function _canonical_offset(
+    offsets::AbstractVector{<:Integer},
+    index::Int,
+    capacity::Int,
+)
+    value = @inbounds offsets[index]
+    0 <= value <= capacity || throw(ArgumentError(
+        "state_candidate_offsets must lie inside candidate capacity",
+    ))
+    return Int(value)
+end
+
+@inline function _preflight_role_dimensions(
+    role,
+    cells::Int,
+    contacts::Int,
+    slots::Int,
+)
+    size(role.spike_count, 1) == cells &&
+        size(role.spike_count, 2) == slots &&
+        size(role.visit_count, 1) == cells &&
+        size(role.visit_count, 2) == slots &&
+        size(role.activity_sum, 1) == cells &&
+        size(role.activity_sum, 2) == slots &&
+        size(role.incoming_conductance_sum, 1) == cells &&
+        size(role.incoming_conductance_sum, 2) == slots || throw(
+            DimensionMismatch("canonical cell publication arena is malformed"),
+        )
+    size(role.utility_product_sum, 1) == contacts &&
+        size(role.utility_product_sum, 2) == slots &&
+        size(role.contact_activity_sum, 1) == contacts &&
+        size(role.contact_activity_sum, 2) == slots || throw(
+            DimensionMismatch(
+                "canonical contact publication arena is malformed",
+            ),
+        )
+    return nothing
+end
+
+function _preflight_canonical_batch(
+    state::PlasticityState,
+    batch::CanonicalPlasticityBatch,
+    state_candidate_offsets::AbstractVector{<:Integer},
+)
+    batch.generation != UInt32(0) || throw(ArgumentError(
+        "begin_plasticity_batch! must precede reduction",
+    ))
+    cells = length(state.firing_rate)
+    contacts = length(state.utility)
+    length(state.activity_ema) == cells &&
+        length(state.incoming_conductance_ema) == cells || throw(
+            DimensionMismatch("persistent plasticity cell state is malformed"),
+        )
+    common_capacity = length(batch.common.stamp)
+    candidate_capacity = length(batch.candidate.stamp)
+    _preflight_role_dimensions(
+        batch.common,
+        cells,
+        contacts,
+        common_capacity,
+    )
+    _preflight_role_dimensions(
+        batch.candidate,
+        cells,
+        contacts,
+        candidate_capacity,
+    )
+    length(batch.candidate.state_slot) == candidate_capacity &&
+        length(batch.candidate.candidate_ordinal) == candidate_capacity ||
+        throw(DimensionMismatch(
+            "canonical candidate metadata arena is malformed",
+        ))
+    firstindex(state_candidate_offsets) == 1 || throw(ArgumentError(
+        "state_candidate_offsets must use conventional one-based indexing",
+    ))
+    states = length(state_candidate_offsets) - 1
+    states > 0 || throw(ArgumentError(
+        "state_candidate_offsets must describe at least one state",
+    ))
+    states <= common_capacity || throw(ArgumentError(
+        "state_candidate_offsets exceed common state capacity",
+    ))
+    _canonical_offset(state_candidate_offsets, 1, candidate_capacity) == 0 ||
+        throw(ArgumentError("state_candidate_offsets must start at zero"))
+
+    previous = 0
+    generation = batch.generation
+    @inbounds for state_slot in 1:states
+        left = _canonical_offset(
+            state_candidate_offsets,
+            state_slot,
+            candidate_capacity,
+        )
+        right = _canonical_offset(
+            state_candidate_offsets,
+            state_slot + 1,
+            candidate_capacity,
+        )
+        left == previous || throw(ArgumentError(
+            "state_candidate_offsets must be contiguous",
+        ))
+        right > left || throw(ArgumentError(
+            "every state must have at least one candidate",
+        ))
+        batch.common.stamp[state_slot] == generation || throw(ArgumentError(
+            "missing common publication for logical state $state_slot",
+        ))
+        ordinal = 0
+        for candidate in (left + 1):right
+            ordinal += 1
+            batch.candidate.stamp[candidate] == generation || throw(
+                ArgumentError(
+                    "missing candidate publication for logical slot $candidate",
+                ),
+            )
+            batch.candidate.state_slot[candidate] == UInt32(state_slot) ||
+                throw(ArgumentError(
+                    "candidate $candidate was published for the wrong state",
+                ))
+            batch.candidate.candidate_ordinal[candidate] == UInt32(ordinal) ||
+                throw(ArgumentError(
+                    "candidate $candidate has a noncontiguous ordinal",
+                ))
+        end
+        previous = right
+    end
+    candidates = previous
+    @inbounds for state_slot in (states + 1):length(batch.common.stamp)
+        batch.common.stamp[state_slot] != generation || throw(ArgumentError(
+            "common publication lies outside state_candidate_offsets",
+        ))
+    end
+    @inbounds for candidate in (candidates + 1):candidate_capacity
+        batch.candidate.stamp[candidate] != generation || throw(ArgumentError(
+            "candidate publication lies outside state_candidate_offsets",
+        ))
+    end
+
+    raw_observations = UInt64(0)
+    @inbounds for state_slot in 1:states
+        common_observations = _preflight_sealed_slot(
+            batch.common,
+            state_slot,
+        )
+        raw_observations <= typemax(UInt64) - UInt64(common_observations) ||
+            throw(OverflowError("raw plasticity observation count overflow"))
+        raw_observations += UInt64(common_observations)
+        left = Int(state_candidate_offsets[state_slot])
+        right = Int(state_candidate_offsets[state_slot + 1])
+        for candidate in (left + 1):right
+            observations = _preflight_sealed_slot(
+                batch.candidate,
+                candidate,
+            )
+            raw_observations <= typemax(UInt64) - UInt64(observations) ||
+                throw(OverflowError(
+                    "raw plasticity observation count overflow",
+                ))
+            raw_observations += UInt64(observations)
+        end
+    end
+    return states, candidates, raw_observations
+end
+
+@inline function _canonical_effective_cell(
+    batch::CanonicalPlasticityBatch,
+    offsets::AbstractVector{<:Integer},
+    states::Int,
+    cell::Int,
+)
+    visits = 0.0
+    spikes = 0.0
+    activity = 0.0
+    incoming = 0.0
+    @inbounds for state_slot in 1:states
+        left = Int(offsets[state_slot])
+        right = Int(offsets[state_slot + 1])
+        inverse_candidates = inv(Float64(right - left))
+        candidate_visits = 0.0
+        candidate_spikes = 0.0
+        candidate_activity = 0.0
+        candidate_incoming = 0.0
+        for candidate in (left + 1):right
+            candidate_visits += Float64(
+                batch.candidate.visit_count[cell, candidate],
+            )
+            candidate_spikes += Float64(
+                batch.candidate.spike_count[cell, candidate],
+            )
+            candidate_activity += Float64(
+                batch.candidate.activity_sum[cell, candidate],
+            )
+            candidate_incoming += Float64(
+                batch.candidate.incoming_conductance_sum[cell, candidate],
+            )
+        end
+        visits += Float64(batch.common.visit_count[cell, state_slot]) +
+            inverse_candidates * candidate_visits
+        spikes += Float64(batch.common.spike_count[cell, state_slot]) +
+            inverse_candidates * candidate_spikes
+        activity += Float64(batch.common.activity_sum[cell, state_slot]) +
+            inverse_candidates * candidate_activity
+        incoming += Float64(
+            batch.common.incoming_conductance_sum[cell, state_slot],
+        ) + inverse_candidates * candidate_incoming
+        isfinite(visits) && isfinite(spikes) && isfinite(activity) &&
+            isfinite(incoming) || throw(
+            OverflowError("effective canonical cell measure overflow"),
+        )
+    end
+    return visits, spikes, activity, incoming
+end
+
+@inline function _canonical_contact_contribution(
+    batch::CanonicalPlasticityBatch,
+    offsets::AbstractVector{<:Integer},
+    states::Int,
+    contact::Int,
+    connection_cost::Float64,
+)
+    # Task terms already contain scalar-loss normalization.  In particular the
+    # common term came from one aggregate-delta replay, so neither role is
+    # divided again here.
+    task = 0.0
+    averaged_activity = 0.0
+    @inbounds for state_slot in 1:states
+        left = Int(offsets[state_slot])
+        right = Int(offsets[state_slot + 1])
+        inverse_candidates = inv(Float64(right - left))
+        candidate_activity = 0.0
+        task += Float64(
+            batch.common.utility_product_sum[contact, state_slot],
+        )
+        averaged_activity += Float64(
+            batch.common.contact_activity_sum[contact, state_slot],
+        )
+        for candidate in (left + 1):right
+            task += Float64(
+                batch.candidate.utility_product_sum[contact, candidate],
+            )
+            candidate_activity += Float64(
+                batch.candidate.contact_activity_sum[contact, candidate],
+            )
+        end
+        averaged_activity += inverse_candidates * candidate_activity
+        isfinite(task) && isfinite(averaged_activity) || throw(OverflowError(
+            "canonical utility accumulation overflow",
+        ))
+    end
+    averaged_activity /= Float64(states)
+    cost = connection_cost * averaged_activity
+    isfinite(cost) || throw(OverflowError(
+        "canonical connection-cost accumulation overflow",
+    ))
+    contribution = max(0.0, task - cost)
+    isfinite(contribution) || throw(OverflowError(
+        "canonical utility contribution overflow",
+    ))
+    return contribution
+end
+
+"""
+Reduce the canonical common/candidate publication contract.
+
+`state_candidate_offsets` is a zero-based CSR boundary vector: state `s` owns
+global candidate slots `(offsets[s] + 1):offsets[s + 1]`.  Every state has one
+common publication and a positive, contiguous candidate range.
+
+For each cell's spike, activity, and incoming-conductance measures, candidate
+alternatives are first averaged within each state while logical visit mass is
+retained: `X_eff = sum_s(X_common + sum_k(X_candidate)/K_s)` and likewise for
+that cell's `N_eff`; its EMA observation is `X_eff / N_eff`.  A cell with
+`N_eff == 0` is bitwise unchanged.  Task utility is already normalized by
+the scalar loss and is summed without another state/candidate divisor.  Only
+connection activity is averaged by state and candidate before its cost is
+subtracted.  All layout, payload, overflow, and resulting-state checks complete
+before the first persistent mutation.  Call `preflight_canonical_plasticity`
+before an optimizer transaction that must know this reducer can commit.  This
+is the production canonical reducer; `reduce_candidate_plasticity!` below is a
+legacy focused oracle.
+"""
+function preflight_canonical_plasticity(
+    state::PlasticityState{T},
+    batch::CanonicalPlasticityBatch,
+    config::Local.PlasticityConfig,
+    state_candidate_offsets::AbstractVector{<:Integer},
+) where {T<:AbstractFloat}
+    states, candidates, raw_observations =
+        _preflight_canonical_batch(
+            state,
+            batch,
+            state_candidate_offsets,
+        )
+    state.reduced_batches != typemax(UInt64) || throw(OverflowError(
+        "reduced_batches counter overflow",
+    ))
+    decay = T(config.firing_ema_decay)
+    complement = one(T) - decay
+
+    # Complete dry pass: no late NaN or Float32 narrowing failure may leave an
+    # optimizer/plasticity transaction half committed.
+    @inbounds for cell in eachindex(state.firing_rate)
+        firing = state.firing_rate[cell]
+        activity_ema = state.activity_ema[cell]
+        incoming_ema = state.incoming_conductance_ema[cell]
+        isfinite(firing) && isfinite(activity_ema) && isfinite(incoming_ema) ||
+            throw(DomainError(
+                cell,
+                "persistent cell plasticity state is nonfinite",
+            ))
+        visits, spikes, activity, incoming = _canonical_effective_cell(
+            batch,
+            state_candidate_offsets,
+            states,
+            cell,
+        )
+        iszero(visits) && continue
+        inverse_visits = inv(visits)
+        spike_measure = T(spikes * inverse_visits)
+        activity_measure = T(activity * inverse_visits)
+        incoming_measure = T(incoming * inverse_visits)
+        isfinite(spike_measure) && isfinite(activity_measure) &&
+            isfinite(incoming_measure) || throw(OverflowError(
+                "canonical cell measure is outside persistent storage range",
+            ))
+        isfinite(muladd(decay, firing, complement * spike_measure)) &&
+            isfinite(muladd(decay, activity_ema, complement * activity_measure)) &&
+            isfinite(muladd(decay, incoming_ema, complement * incoming_measure)) ||
+            throw(OverflowError("canonical cell EMA update overflow"))
+    end
+
+    utility_decay = T(config.utility_decay)
+    connection_cost = Float64(config.connection_cost)
+    utility_nonzero = 0
+    @inbounds for contact in eachindex(state.utility)
+        old_utility = state.utility[contact]
+        isfinite(old_utility) || throw(DomainError(
+            old_utility,
+            "persistent structural utility is nonfinite",
+        ))
+        contribution = _canonical_contact_contribution(
+            batch,
+            state_candidate_offsets,
+            states,
+            contact,
+            connection_cost,
+        )
+        stored_contribution = T(contribution)
+        isfinite(stored_contribution) || throw(OverflowError(
+            "canonical utility is outside persistent storage range",
+        ))
+        isfinite(muladd(utility_decay, old_utility, stored_contribution)) ||
+            throw(OverflowError("canonical utility update overflow"))
+        utility_nonzero += !iszero(contribution)
+    end
+    UInt64(utility_nonzero) <= typemax(UInt64) - state.utility_updates || throw(
+        OverflowError("utility_updates counter overflow"),
+    )
+    return PlasticityBatchStats(candidates, raw_observations, utility_nonzero)
+end
+
+function reduce_canonical_plasticity!(
+    state::PlasticityState{T},
+    batch::CanonicalPlasticityBatch,
+    config::Local.PlasticityConfig,
+    state_candidate_offsets::AbstractVector{<:Integer},
+) where {T<:AbstractFloat}
+    stats = preflight_canonical_plasticity(
+        state,
+        batch,
+        config,
+        state_candidate_offsets,
+    )
+    states = length(state_candidate_offsets) - 1
+    decay = T(config.firing_ema_decay)
+    complement = one(T) - decay
+    utility_decay = T(config.utility_decay)
+    connection_cost = Float64(config.connection_cost)
+
+    # Commit phase: all inputs and every resulting element were validated by
+    # the pure preflight above.  On validated, joined publication arenas this
+    # phase has no error path and performs no allocation.
+    @inbounds for cell in eachindex(state.firing_rate)
+        visits, spikes, activity, incoming = _canonical_effective_cell(
+            batch,
+            state_candidate_offsets,
+            states,
+            cell,
+        )
+        iszero(visits) && continue
+        inverse_visits = inv(visits)
+        state.firing_rate[cell] = muladd(
+            decay,
+            state.firing_rate[cell],
+            complement * T(spikes * inverse_visits),
+        )
+        state.activity_ema[cell] = muladd(
+            decay,
+            state.activity_ema[cell],
+            complement * T(activity * inverse_visits),
+        )
+        state.incoming_conductance_ema[cell] = muladd(
+            decay,
+            state.incoming_conductance_ema[cell],
+            complement * T(incoming * inverse_visits),
+        )
+    end
+    @inbounds for contact in eachindex(state.utility)
+        contribution = T(_canonical_contact_contribution(
+            batch,
+            state_candidate_offsets,
+            states,
+            contact,
+            connection_cost,
+        ))
+        state.utility[contact] = muladd(
+            utility_decay,
+            state.utility[contact],
+            contribution,
+        )
+    end
+    state.reduced_batches += UInt64(1)
+    state.utility_updates += UInt64(stats.utility_nonzero)
+    return stats
 end
 
 """

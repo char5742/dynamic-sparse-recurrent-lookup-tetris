@@ -452,6 +452,584 @@ end
     @test state.rewires == 1
 end
 
+function publish_duplicate_invariant_fixture!(batch, candidates, order)
+    common_spikes = UInt32[1, 0]
+    common_activity = Float32[2, 4]
+    common_incoming = Float32[6, 8]
+    common_task_utility = Float32[2, 0, 0]
+    common_contact_activity = Float32[4, 2, 0]
+    Plasticity.record_state_common_plasticity!(
+        batch,
+        1,
+        common_spikes,
+        UInt8[2, 2],
+        common_activity,
+        common_incoming,
+        common_task_utility,
+        common_contact_activity,
+    )
+    candidate_spikes = UInt32[2, 4]
+    candidate_activity = Float32[8, 12]
+    candidate_incoming = Float32[16, 20]
+    # The scalar loss has already assigned each duplicate its 1/K share.
+    candidate_task_utility = Float32[inv(Float32(candidates)), 0, 0]
+    candidate_contact_activity = Float32[8, 4, 0]
+    for logical_slot in order
+        Plasticity.record_candidate_plasticity!(
+            batch,
+            logical_slot,
+            1,
+            logical_slot,
+            candidate_spikes,
+            UInt8[4, 4],
+            candidate_activity,
+            candidate_incoming,
+            candidate_task_utility,
+            candidate_contact_activity,
+        )
+    end
+    return batch
+end
+
+function plasticity_state_bits(state)
+    return (
+        copy(reinterpret(UInt8, state.firing_rate)),
+        copy(reinterpret(UInt8, state.activity_ema)),
+        copy(reinterpret(UInt8, state.incoming_conductance_ema)),
+        copy(reinterpret(UInt8, state.utility)),
+        state.reduced_batches,
+        state.homeostasis_events,
+        state.synaptic_scaling_events,
+        state.utility_updates,
+        state.rewires,
+    )
+end
+
+@testset "canonical common/candidate reduction and duplicate invariance" begin
+    config = Local.PlasticityConfig(
+        firing_ema_decay=0.0,
+        utility_decay=0.0,
+        connection_cost=0.1,
+    )
+    k1 = Plasticity.CanonicalPlasticityBatch(2, 3, 1, 1)
+    k4 = Plasticity.CanonicalPlasticityBatch(2, 3, 1, 4)
+    Plasticity.begin_plasticity_batch!(k1)
+    Plasticity.begin_plasticity_batch!(k4)
+    publish_duplicate_invariant_fixture!(k1, 1, (1,))
+    publish_duplicate_invariant_fixture!(k4, 4, (4, 2, 1, 3))
+    state_k1 = Plasticity.PlasticityState(config, 2, 3)
+    state_k4 = Plasticity.PlasticityState(config, 2, 3)
+    stats_k1 = Plasticity.reduce_canonical_plasticity!(
+        state_k1,
+        k1,
+        config,
+        Int[0, 1],
+    )
+    stats_k4 = Plasticity.reduce_canonical_plasticity!(
+        state_k4,
+        k4,
+        config,
+        Int[0, 4],
+    )
+    @test reinterpret(UInt32, state_k1.firing_rate) ==
+        reinterpret(UInt32, state_k4.firing_rate)
+    @test reinterpret(UInt32, state_k1.activity_ema) ==
+        reinterpret(UInt32, state_k4.activity_ema)
+    @test reinterpret(UInt32, state_k1.incoming_conductance_ema) ==
+        reinterpret(UInt32, state_k4.incoming_conductance_ema)
+    @test reinterpret(UInt32, state_k1.utility) ==
+        reinterpret(UInt32, state_k4.utility)
+    @test state_k1.firing_rate == Float32[0.5, 2 / 3]
+    @test state_k1.activity_ema == Float32[10 / 6, 16 / 6]
+    @test state_k1.incoming_conductance_ema == Float32[22 / 6, 28 / 6]
+    @test state_k1.utility == Float32[1.8, 0, 0]
+    @test stats_k1.candidates == 1
+    @test stats_k4.candidates == 4
+    @test stats_k1.observations == 12
+    @test stats_k4.observations == 36
+    @test stats_k1.utility_nonzero == stats_k4.utility_nonzero == 1
+end
+
+@testset "canonical effective observation mass precedes the ratio" begin
+    config = Local.PlasticityConfig(
+        firing_ema_decay=0.0,
+        utility_decay=0.0,
+        connection_cost=0.0,
+    )
+    batch = Plasticity.CanonicalPlasticityBatch(1, 0, 2, 3)
+    Plasticity.begin_plasticity_batch!(batch)
+    empty = Float32[]
+    Plasticity.record_state_common_plasticity!(
+        batch, 1, UInt32[1], UInt8[2], Float32[2], Float32[4],
+        empty, empty,
+    )
+    Plasticity.record_state_common_plasticity!(
+        batch, 2, UInt32[4], UInt8[4], Float32[8], Float32[12],
+        empty, empty,
+    )
+    Plasticity.record_candidate_plasticity!(
+        batch, 1, 1, 1, UInt32[1], UInt8[2], Float32[4], Float32[6],
+        empty, empty,
+    )
+    for candidate in 2:3
+        Plasticity.record_candidate_plasticity!(
+            batch, candidate, 2, candidate - 1, UInt32[0], UInt8[8],
+            Float32[16], Float32[20], empty, empty,
+        )
+    end
+    state = Plasticity.PlasticityState(config, 1, 0)
+    stats = Plasticity.reduce_canonical_plasticity!(
+        state,
+        batch,
+        config,
+        Int[0, 1, 3],
+    )
+    # X_eff/N_eff, not the mean of the two per-state rates.
+    @test state.firing_rate[1] == Float32(6 / 16)
+    @test state.activity_ema[1] == Float32(30 / 16)
+    @test state.incoming_conductance_ema[1] == Float32(42 / 16)
+    @test stats.observations == 24
+end
+
+@testset "unvisited logical cells are COW/full invariant and unchanged" begin
+    config = Local.PlasticityConfig(
+        firing_ema_decay=0.5,
+        utility_decay=0.0,
+        connection_cost=0.0,
+    )
+    cow = Plasticity.CanonicalPlasticityBatch(2, 0, 1, 1)
+    full = Plasticity.CanonicalPlasticityBatch(2, 0, 1, 1)
+    empty = Float32[]
+    for batch in (cow, full)
+        Plasticity.begin_plasticity_batch!(batch)
+        Plasticity.record_state_common_plasticity!(
+            batch, 1, UInt32[1, 0], UInt8[1, 0],
+            Float32[2, 0], Float32[3, 0], empty, empty,
+        )
+        Plasticity.record_candidate_plasticity!(
+            batch, 1, 1, 1, UInt32[0, 0], UInt8[1, 0],
+            Float32[4, 0], Float32[5, 0], empty, empty,
+        )
+    end
+    state_cow = Plasticity.PlasticityState(config, 2, 0)
+    state_full = Plasticity.PlasticityState(config, 2, 0)
+    state_cow.firing_rate .= Float32[0.2, 0.7]
+    state_cow.activity_ema .= Float32[0.3, 0.8]
+    state_cow.incoming_conductance_ema .= Float32[0.4, 0.9]
+    state_full.firing_rate .= state_cow.firing_rate
+    state_full.activity_ema .= state_cow.activity_ema
+    state_full.incoming_conductance_ema .= state_cow.incoming_conductance_ema
+    before_preflight = plasticity_state_bits(state_cow)
+    preflight_stats = Plasticity.preflight_canonical_plasticity(
+        state_cow, cow, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(state_cow) == before_preflight
+    stats_cow = Plasticity.reduce_canonical_plasticity!(
+        state_cow, cow, config, Int[0, 1],
+    )
+    stats_full = Plasticity.reduce_canonical_plasticity!(
+        state_full, full, config, Int[0, 1],
+    )
+    @test preflight_stats == stats_cow == stats_full
+    @test plasticity_state_bits(state_cow) == plasticity_state_bits(state_full)
+    @test reinterpret(UInt32, state_cow.firing_rate[2]) ==
+        reinterpret(UInt32, Float32(0.7))
+    @test reinterpret(UInt32, state_cow.activity_ema[2]) ==
+        reinterpret(UInt32, Float32(0.8))
+    @test reinterpret(UInt32, state_cow.incoming_conductance_ema[2]) ==
+        reinterpret(UInt32, Float32(0.9))
+
+    invalid_work = Plasticity.CanonicalPlasticityBatch(2, 0, 1, 1)
+    Plasticity.begin_plasticity_batch!(invalid_work)
+    @test_throws DomainError Plasticity.record_state_common_plasticity!(
+        invalid_work, 1, UInt32[0, 0], UInt8[1, 0],
+        Float32[0, 1], Float32[0, 0], empty, empty,
+    )
+    @test invalid_work.common.stamp[1] == UInt32(0)
+end
+
+function publish_order_fixture!(batch, publication_order)
+    common_spikes = (UInt32[1], UInt32[0])
+    common_activity = (Float32[1], Float32[3])
+    common_incoming = (Float32[2], Float32[4])
+    candidate_spikes = (UInt32[0], UInt32[1], UInt32[1], UInt32[0])
+    candidate_activity = (
+        Float32[2], Float32[4], Float32[6], Float32[8],
+    )
+    candidate_incoming = (
+        Float32[3], Float32[5], Float32[7], Float32[9],
+    )
+    zero_contact = Float32[0]
+    one_contact = Float32[1]
+    for encoded in publication_order
+        if encoded < 0
+            state_slot = -encoded
+            Plasticity.record_state_common_plasticity!(
+                batch, state_slot, common_spikes[state_slot], UInt8[2],
+                common_activity[state_slot], common_incoming[state_slot],
+                one_contact, zero_contact,
+            )
+        else
+            state_slot = encoded <= 2 ? 1 : 2
+            ordinal = encoded <= 2 ? encoded : encoded - 2
+            Plasticity.record_candidate_plasticity!(
+                batch, encoded, state_slot, ordinal,
+                candidate_spikes[encoded], UInt8[2],
+                candidate_activity[encoded], candidate_incoming[encoded],
+                Float32[0.25], zero_contact,
+            )
+        end
+    end
+    return batch
+end
+
+@testset "canonical reduction is bit-stable under worker publication order" begin
+    config = Local.PlasticityConfig(
+        firing_ema_decay=0.25,
+        utility_decay=0.5,
+        connection_cost=0.0,
+    )
+    forward = Plasticity.CanonicalPlasticityBatch(1, 1, 2, 4)
+    scrambled = Plasticity.CanonicalPlasticityBatch(1, 1, 2, 4)
+    Plasticity.begin_plasticity_batch!(forward)
+    Plasticity.begin_plasticity_batch!(scrambled)
+    publish_order_fixture!(forward, (-1, 1, 2, -2, 3, 4))
+    publish_order_fixture!(scrambled, (4, 2, -2, 1, -1, 3))
+    state_forward = Plasticity.PlasticityState(config, 1, 1)
+    state_scrambled = Plasticity.PlasticityState(config, 1, 1)
+    stats_forward = Plasticity.reduce_canonical_plasticity!(
+        state_forward, forward, config, Int[0, 2, 4],
+    )
+    stats_scrambled = Plasticity.reduce_canonical_plasticity!(
+        state_scrambled, scrambled, config, Int[0, 2, 4],
+    )
+    @test stats_forward == stats_scrambled
+    @test reinterpret(UInt32, state_forward.firing_rate) ==
+        reinterpret(UInt32, state_scrambled.firing_rate)
+    @test reinterpret(UInt32, state_forward.activity_ema) ==
+        reinterpret(UInt32, state_scrambled.activity_ema)
+    @test reinterpret(UInt32, state_forward.incoming_conductance_ema) ==
+        reinterpret(UInt32, state_scrambled.incoming_conductance_ema)
+    @test reinterpret(UInt32, state_forward.utility) ==
+        reinterpret(UInt32, state_scrambled.utility)
+    @test state_forward.reduced_batches == state_scrambled.reduced_batches == 1
+end
+
+function canonical_single_state_batch(; states=1, candidates=1, T=Float32)
+    batch = Plasticity.CanonicalPlasticityBatch(
+        1, 2, states, candidates; T=T,
+    )
+    Plasticity.begin_plasticity_batch!(batch)
+    return batch
+end
+
+function publish_common_one!(batch, state_slot=1)
+    Plasticity.record_state_common_plasticity!(
+        batch, state_slot, UInt32[0], UInt8[1], Float32[0], Float32[0],
+        Float32[0, 0], Float32[0, 0],
+    )
+    return batch
+end
+
+function publish_candidate_one!(
+    batch,
+    logical_slot=1,
+    state_slot=1,
+    ordinal=1,
+)
+    Plasticity.record_candidate_plasticity!(
+        batch, logical_slot, state_slot, ordinal,
+        UInt32[0], UInt8[1], Float32[0], Float32[0],
+        Float32[0, 0], Float32[0, 0],
+    )
+    return batch
+end
+
+@testset "canonical publication cardinality and slot failures are atomic" begin
+    config = Local.PlasticityConfig(
+        firing_ema_decay=0.0,
+        utility_decay=0.0,
+        connection_cost=0.0,
+    )
+
+    duplicate_common = canonical_single_state_batch()
+    publish_common_one!(duplicate_common)
+    common_payload = copy(duplicate_common.common.activity_sum)
+    @test_throws ArgumentError publish_common_one!(duplicate_common)
+    @test duplicate_common.common.activity_sum == common_payload
+
+    duplicate_candidate = canonical_single_state_batch()
+    publish_common_one!(duplicate_candidate)
+    publish_candidate_one!(duplicate_candidate)
+    candidate_payload = copy(duplicate_candidate.candidate.activity_sum)
+    @test_throws ArgumentError publish_candidate_one!(duplicate_candidate)
+    @test duplicate_candidate.candidate.activity_sum == candidate_payload
+
+    missing_common = canonical_single_state_batch()
+    publish_candidate_one!(missing_common)
+    missing_common_state = Plasticity.PlasticityState(config, 1, 2)
+    missing_common_before = plasticity_state_bits(missing_common_state)
+    @test_throws ArgumentError Plasticity.reduce_canonical_plasticity!(
+        missing_common_state, missing_common, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(missing_common_state) == missing_common_before
+
+    missing_candidate = canonical_single_state_batch()
+    publish_common_one!(missing_candidate)
+    missing_candidate_state = Plasticity.PlasticityState(config, 1, 2)
+    missing_candidate_before = plasticity_state_bits(missing_candidate_state)
+    @test_throws ArgumentError Plasticity.reduce_canonical_plasticity!(
+        missing_candidate_state, missing_candidate, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(missing_candidate_state) ==
+        missing_candidate_before
+
+    wrong_slot = canonical_single_state_batch(candidates=2)
+    publish_common_one!(wrong_slot)
+    publish_candidate_one!(wrong_slot, 1, 1, 2)
+    publish_candidate_one!(wrong_slot, 2, 1, 1)
+    wrong_slot_state = Plasticity.PlasticityState(config, 1, 2)
+    wrong_slot_before = plasticity_state_bits(wrong_slot_state)
+    @test_throws ArgumentError Plasticity.reduce_canonical_plasticity!(
+        wrong_slot_state, wrong_slot, config, Int[0, 2],
+    )
+    @test plasticity_state_bits(wrong_slot_state) == wrong_slot_before
+
+    extra_common = canonical_single_state_batch(states=2)
+    publish_common_one!(extra_common, 1)
+    publish_common_one!(extra_common, 2)
+    publish_candidate_one!(extra_common)
+    extra_state = Plasticity.PlasticityState(config, 1, 2)
+    extra_before = plasticity_state_bits(extra_state)
+    @test_throws ArgumentError Plasticity.reduce_canonical_plasticity!(
+        extra_state, extra_common, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(extra_state) == extra_before
+
+    stale = canonical_single_state_batch()
+    publish_common_one!(stale)
+    publish_candidate_one!(stale)
+    Plasticity.begin_plasticity_batch!(stale)
+    stale_state = Plasticity.PlasticityState(config, 1, 2)
+    stale_before = plasticity_state_bits(stale_state)
+    @test_throws ArgumentError Plasticity.reduce_canonical_plasticity!(
+        stale_state, stale, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(stale_state) == stale_before
+
+    rollover = canonical_single_state_batch()
+    rollover.generation = typemax(UInt32)
+    fill!(rollover.common.stamp, typemax(UInt32))
+    fill!(rollover.candidate.stamp, typemax(UInt32))
+    Plasticity.begin_plasticity_batch!(rollover)
+    @test rollover.generation == UInt32(1)
+    @test all(iszero, rollover.common.stamp)
+    @test all(iszero, rollover.candidate.stamp)
+end
+
+@testset "per-use utility survives signed cancellation; common delta cancels" begin
+    config = Local.PlasticityConfig(
+        firing_ema_decay=0.0,
+        utility_decay=0.0,
+        connection_cost=0.0,
+    )
+    batch = canonical_single_state_batch(candidates=2)
+    # The common replay sees (+delta) + (-delta) == 0 and therefore publishes
+    # zero task utility.  Candidate signed gradients may cancel in the actual
+    # parameter gradient, while their chronological abs(M*e) utility remains.
+    Plasticity.record_state_common_plasticity!(
+        batch, 1, UInt32[0], UInt8[1], Float32[0], Float32[0],
+        Float32[0, 0], Float32[0, 0],
+    )
+    Plasticity.record_candidate_plasticity!(
+        batch, 1, 1, 1, UInt32[0], UInt8[1], Float32[0], Float32[0],
+        Float32[2, 0], Float32[0, 0],
+    )
+    Plasticity.record_candidate_plasticity!(
+        batch, 2, 1, 2, UInt32[0], UInt8[1], Float32[0], Float32[0],
+        Float32[2, 0], Float32[0, 0],
+    )
+    state = Plasticity.PlasticityState(config, 1, 2)
+    Plasticity.reduce_canonical_plasticity!(
+        state, batch, config, Int[0, 2],
+    )
+    @test batch.common.utility_product_sum[:, 1] == Float32[0, 0]
+    @test state.utility == Float32[4, 0]
+    @test state.utility_updates == 1
+end
+
+@testset "canonical NaN, narrowing, and reduction overflow fail atomically" begin
+    config = Local.PlasticityConfig(
+        firing_ema_decay=0.0,
+        utility_decay=0.0,
+        connection_cost=0.0,
+    )
+    invalid = canonical_single_state_batch()
+    invalid_common_before = copy(invalid.common.activity_sum)
+    @test_throws DomainError Plasticity.record_state_common_plasticity!(
+        invalid, 1, UInt32[0], UInt8[1], Float32[NaN], Float32[0],
+        Float32[0, 0], Float32[0, 0],
+    )
+    @test invalid.common.activity_sum == invalid_common_before
+    @test invalid.common.stamp[1] == UInt32(0)
+    @test_throws DomainError Plasticity.record_candidate_plasticity!(
+        invalid, 1, 1, 1, UInt32[0], UInt8[1], Float64[0], Float64[0],
+        Float64[1.0e100, 0], Float64[0, 0],
+    )
+    @test invalid.candidate.stamp[1] == UInt32(0)
+    @test_throws DomainError Plasticity.record_state_common_plasticity!(
+        invalid, 1, UInt32[0], UInt8[9], Float32[0], Float32[0],
+        Float32[0, 0], Float32[0, 0],
+    )
+    @test_throws DomainError Plasticity.record_state_common_plasticity!(
+        invalid, 1, UInt32[2], UInt8[1], Float32[0], Float32[0],
+        Float32[0, 0], Float32[0, 0],
+    )
+
+    corrupted = canonical_single_state_batch()
+    publish_common_one!(corrupted)
+    publish_candidate_one!(corrupted)
+    corrupted.common.incoming_conductance_sum[1, 1] = NaN32
+    corrupted_state = Plasticity.PlasticityState(config, 1, 2)
+    corrupted_before = plasticity_state_bits(corrupted_state)
+    @test_throws DomainError Plasticity.preflight_canonical_plasticity(
+        corrupted_state, corrupted, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(corrupted_state) == corrupted_before
+    @test_throws DomainError Plasticity.reduce_canonical_plasticity!(
+        corrupted_state, corrupted, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(corrupted_state) == corrupted_before
+
+    overflow = canonical_single_state_batch(T=Float64)
+    Plasticity.record_state_common_plasticity!(
+        overflow, 1, UInt32[0], UInt8[1], Float64[0], Float64[0],
+        Float64[1, 1], Float64[0, 0],
+    )
+    Plasticity.record_candidate_plasticity!(
+        overflow, 1, 1, 1, UInt32[0], UInt8[1], Float64[0], Float64[0],
+        Float64[1, 1], Float64[0, 0],
+    )
+    overflow.common.utility_product_sum[1, 1] = 1.0e308
+    overflow.candidate.utility_product_sum[1, 1] = 1.0e308
+    overflow_state = Plasticity.PlasticityState(
+        config, 1, 2; T=Float64,
+    )
+    overflow_before = plasticity_state_bits(overflow_state)
+    @test_throws OverflowError Plasticity.preflight_canonical_plasticity(
+        overflow_state, overflow, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(overflow_state) == overflow_before
+    @test_throws OverflowError Plasticity.reduce_canonical_plasticity!(
+        overflow_state, overflow, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(overflow_state) == overflow_before
+
+    persistent = canonical_single_state_batch()
+    publish_common_one!(persistent)
+    publish_candidate_one!(persistent)
+    persistent_state = Plasticity.PlasticityState(config, 1, 2)
+    persistent_state.utility[2] = NaN32
+    persistent_before = deepcopy(persistent_state)
+    @test_throws DomainError Plasticity.reduce_canonical_plasticity!(
+        persistent_state, persistent, config, Int[0, 1],
+    )
+    @test isequal(persistent_state.firing_rate, persistent_before.firing_rate)
+    @test isequal(persistent_state.activity_ema, persistent_before.activity_ema)
+    @test isequal(
+        persistent_state.incoming_conductance_ema,
+        persistent_before.incoming_conductance_ema,
+    )
+    @test isequal(persistent_state.utility, persistent_before.utility)
+    @test persistent_state.reduced_batches == persistent_before.reduced_batches
+
+    exhausted = canonical_single_state_batch()
+    publish_common_one!(exhausted)
+    publish_candidate_one!(exhausted)
+    exhausted_state = Plasticity.PlasticityState(config, 1, 2)
+    exhausted_state.reduced_batches = typemax(UInt64)
+    exhausted_before = plasticity_state_bits(exhausted_state)
+    @test_throws OverflowError Plasticity.preflight_canonical_plasticity(
+        exhausted_state, exhausted, config, Int[0, 1],
+    )
+    @test plasticity_state_bits(exhausted_state) == exhausted_before
+end
+
+function canonical_allocation_probe()
+    config = Local.PlasticityConfig(
+        firing_ema_decay=0.5,
+        utility_decay=0.5,
+        connection_cost=0.1,
+    )
+    batch = Plasticity.CanonicalPlasticityBatch(2, 2, 2, 4)
+    state = Plasticity.PlasticityState(config, 2, 2)
+    offsets = Int[0, 2, 4]
+    spikes = UInt32[1, 0]
+    visits = UInt8[1, 0]
+    activity = Float32[0.2, 0]
+    incoming = Float32[0.4, 0]
+    task_utility = Float32[0.25, 0]
+    contact_activity = Float32[0.1, 0]
+
+    # Compile every canonical path before measuring.
+    Plasticity.begin_plasticity_batch!(batch)
+    for state_slot in 1:2
+        Plasticity.record_state_common_plasticity!(
+            batch, state_slot, spikes, visits, activity, incoming,
+            task_utility, contact_activity,
+        )
+    end
+    for candidate in 1:4
+        state_slot = candidate <= 2 ? 1 : 2
+        ordinal = candidate <= 2 ? candidate : candidate - 2
+        Plasticity.record_candidate_plasticity!(
+            batch, candidate, state_slot, ordinal,
+            spikes, visits, activity, incoming,
+            task_utility, contact_activity,
+        )
+    end
+    Plasticity.preflight_canonical_plasticity(state, batch, config, offsets)
+    Plasticity.reduce_canonical_plasticity!(state, batch, config, offsets)
+
+    begin_bytes = @allocated Plasticity.begin_plasticity_batch!(batch)
+    common_bytes = @allocated begin
+        for state_slot in 1:2
+            Plasticity.record_state_common_plasticity!(
+                batch, state_slot, spikes, visits, activity, incoming,
+                task_utility, contact_activity,
+            )
+        end
+    end
+    candidate_bytes = @allocated begin
+        for candidate in 1:4
+            state_slot = candidate <= 2 ? 1 : 2
+            ordinal = candidate <= 2 ? candidate : candidate - 2
+            Plasticity.record_candidate_plasticity!(
+                batch, candidate, state_slot, ordinal,
+                spikes, visits, activity, incoming,
+                task_utility, contact_activity,
+            )
+        end
+    end
+    preflight_bytes = @allocated Plasticity.preflight_canonical_plasticity(
+        state, batch, config, offsets,
+    )
+    reduce_bytes = @allocated Plasticity.reduce_canonical_plasticity!(
+        state, batch, config, offsets,
+    )
+    return (
+        begin_bytes,
+        common_bytes,
+        candidate_bytes,
+        preflight_bytes,
+        reduce_bytes,
+    )
+end
+
+@testset "canonical publication, preflight, and reduction allocate zero bytes" begin
+    @test canonical_allocation_probe() == (0, 0, 0, 0, 0)
+end
+
 function allocation_probe()
     config = Local.PlasticityConfig(
         firing_ema_decay=0.5,
