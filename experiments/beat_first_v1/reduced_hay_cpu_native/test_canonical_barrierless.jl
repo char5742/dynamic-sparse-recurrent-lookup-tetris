@@ -50,6 +50,9 @@ mutable struct FakeAdapter <: Parallel.AbstractCanonicalGraphAdapter
     listnet_states::Int
     listnet_ready::Bool
     replay_before_listnet::Int
+    candidate_replay_finishes::Int
+    candidate_replay_finished::Bool
+    common_before_candidate_finish::Int
     updates::Int
     fail_ordinal::Int
 end
@@ -69,6 +72,9 @@ function FakeAdapter(
         zeros(Int64, max_microbatches + states),
         0,
         100_000,
+        0,
+        false,
+        0,
         0,
         false,
         0,
@@ -108,6 +114,9 @@ function Parallel.prepare_batch!(adapter::FakeAdapter, batch::FakeBatch)
     adapter.listnet_states = 0
     adapter.listnet_ready = false
     adapter.replay_before_listnet = 0
+    adapter.candidate_replay_finishes = 0
+    adapter.candidate_replay_finished = false
+    adapter.common_before_candidate_finish = 0
     return nothing
 end
 
@@ -233,6 +242,25 @@ function Parallel.reduce_worker!(
     return nothing
 end
 
+function Parallel.finish_candidate_replay_phase!(
+    adapter::FakeAdapter,
+    ::FakeBatch,
+    microbatch_count::Int,
+)
+    all(==(1), adapter.replay_seen) || error(
+        "candidate replay completion observed an incomplete replay set",
+    )
+    microbatch_count <= length(adapter.partials) || throw(BoundsError(
+        adapter.partials, microbatch_count,
+    ))
+    adapter.candidate_replay_finishes += 1
+    adapter.candidate_replay_finishes == 1 || error(
+        "candidate replay phase was finalized more than once",
+    )
+    adapter.candidate_replay_finished = true
+    return nothing
+end
+
 function Parallel.replay_state_common!(
     adapter::FakeAdapter,
     ::FakeArena,
@@ -240,6 +268,10 @@ function Parallel.replay_state_common!(
     state::Int,
     reduction_slot::Int,
 )
+    if !adapter.candidate_replay_finished
+        adapter.common_before_candidate_finish += 1
+        error("state-common replay crossed the candidate replay boundary")
+    end
     @inbounds adapter.state_replay_seen[state] += 1
     @inbounds adapter.partials[reduction_slot] = Int64(10_000 * state)
     return nothing
@@ -309,6 +341,9 @@ end
     @test all(!iszero, adapter.candidate_worker)
     @test adapter.listnet_states == 3
     @test adapter.replay_before_listnet == 0
+    @test adapter.candidate_replay_finishes == 1
+    @test adapter.candidate_replay_finished
+    @test adapter.common_before_candidate_finish == 0
     @test executor.microbatch_total == 5
 
     report = Parallel.scheduler_report(session)

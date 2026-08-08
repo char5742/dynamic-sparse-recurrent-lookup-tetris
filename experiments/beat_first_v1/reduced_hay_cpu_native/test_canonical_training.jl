@@ -133,11 +133,16 @@ end
 
     first_result = Barrierless.serial_reference_update!(executor)
     @test first_result.update == 1
+    @test first_result.optimizer isa Optimizer.DualOptimizerStepStats
+    @test first_result.optimizer.hard_event_gradient_norm == 0.0
+    @test first_result.optimizer.hard_event_clip_scale == 1.0f0
     @test adapter.clocks.update == 1
     @test adapter.optimizer_state.group_steps == UInt64[0, 0, 0, 1, 1]
     @test adapter.registry.groups[1].parameter == core_before
     @test adapter.registry.groups[4].parameter != output_before
     @test first_result.mechanisms.decolle_signal_nonzero == 0
+    @test first_result.mechanisms.hard_event_control_updates == 0
+    @test adapter.hard_event_deliveries == 0
     @test reinterpret(UInt32, adapter.plasticity_state.utility) == utility_before
     @test adapter.plasticity_state.utility_updates == utility_updates_before
     @test all(!state.ready for state in adapter.common_states)
@@ -179,6 +184,7 @@ end
     @test second_result.mechanisms.decolle_signal_nonzero > 0
     @test second_result.mechanisms.subthreshold_updates > 0
     @test second_result.mechanisms.nonspiking_updates > 0
+    @test second_result.mechanisms.hard_event_control_updates == 0
     @test second_result.mechanisms.homeostasis_events > 0
     @test second_result.mechanisms.synaptic_scaling_events > 0
     @test second_result.mechanisms.utility_updates > 0
@@ -188,13 +194,67 @@ end
     common_slot = cld(batch.input.valid_count, adapter.candidate_chunk_size) + 1
     @test adapter.slot_generation[common_slot] == adapter.active_generation
     @test adapter.slot_kind[common_slot] == 0x02
-    @test adapter.slot_logical_first[common_slot] == 1
-    @test adapter.slot_logical_last[common_slot] == 1
+    @test adapter.slot_logical_first[common_slot] == 0
+    @test adapter.slot_logical_last[common_slot] == 0
     @test all(==(adapter.plasticity_batch.generation),
               adapter.plasticity_batch.common.stamp[1:1])
     @test all(==(adapter.plasticity_batch.generation),
               adapter.plasticity_batch.candidate.stamp[1:2])
     @test all(!state.ready for state in adapter.common_states)
+end
+
+@testset "hard-event training storage preserves the sealed slot ABI" begin
+    batch = tiny_canonical_batch()
+    config = Training.CanonicalTrainingConfig(
+        local_learning=Local.LocalLearningConfig(
+            schedule=Local.LearningSchedule(
+                analog_interval=2,
+                hard_event_interval=1,
+            ),
+            hard_event_multiplier=0.25f0,
+            hard_event_energy_cost=0.125f0,
+        ),
+    )
+    model = Graph.initialize_model(MersenneTwister(0x48415244))
+    chunk = 2
+    adapter = Training.DendriticTrainingAdapter(
+        model, batch, config; candidate_chunk_size=chunk,
+    )
+    expected_seed_capacity =
+        chunk * Graph.MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE
+    @test length(adapter.hard_delta_slots) == adapter.slot_capacity
+    @test all(
+        length(delta.seed_state_id) == expected_seed_capacity
+        for delta in adapter.hard_delta_slots
+    )
+    @test size(adapter.common_hard_seed) ==
+        (5, Graph.CORE_NODE_COUNT, batch.input.state_batch)
+
+    analog = Graph.gradient_components(adapter.reduced_gradient)
+    hard = Graph.hard_gradient_components(adapter.reduced_hard_gradient)
+    @test adapter.analog_full_buffers.buffers == (
+        analog.core_cell_raw,
+        analog.semantic_projection_raw,
+        analog.event_raw,
+        analog.output_cell_raw,
+        analog.output_projection_raw,
+    )
+    @test adapter.analog_output_buffers.buffers == (
+        nothing,
+        nothing,
+        nothing,
+        analog.output_cell_raw,
+        analog.output_projection_raw,
+    )
+    @test adapter.hard_recurrent_buffers.buffers == (
+        hard.core_cell_raw,
+        hard.semantic_projection_raw,
+        hard.event_raw,
+        nothing,
+        nothing,
+    )
+    @test adapter.hard_zero_buffers.buffers ==
+        (nothing, nothing, nothing, nothing, nothing)
 end
 
 @testset "utility mode none freezes persistent utility on analog ticks" begin
@@ -348,16 +408,75 @@ end
 
 @testset "mechanism counters fail closed before a production mutation" begin
     expected = Training.MechanismActivation(
-        true, true, true, false, false, true, false,
+        true, true, true, false, false, false, true, false,
     )
-    missing = Training.MechanismCounters(1, 2, 0, 0, 0, 4, 0)
+    missing = Training.MechanismCounters(1, 2, 0, 0, 0, 0, 4, 0)
     @test_throws ErrorException Training._assert_mechanisms!(
         expected, missing; include_slow=false,
     )
-    complete = Training.MechanismCounters(1, 2, 3, 0, 0, 4, 0)
+    complete = Training.MechanismCounters(1, 2, 3, 0, 0, 0, 4, 0)
     @test isnothing(Training._assert_mechanisms!(
         expected, complete; include_slow=false,
     ))
+    hard_expected = Training.MechanismActivation(
+        false, false, false, true, false, false, false, false,
+    )
+    @test_throws ErrorException Training._assert_mechanisms!(
+        hard_expected,
+        Training.MechanismCounters();
+        include_slow=false,
+    )
+end
+
+@testset "hard control telemetry fails before optimizer mutation" begin
+    batch = tiny_canonical_batch()
+    config = Training.CanonicalTrainingConfig(
+        local_learning=Local.LocalLearningConfig(
+            schedule=Local.LearningSchedule(hard_event_interval=1),
+            hard_event_multiplier=0.25f0,
+            hard_event_energy_cost=0.125f0,
+        ),
+    )
+    model = Graph.initialize_model(MersenneTwister(0x4641494c))
+    adapter = Training.DendriticTrainingAdapter(
+        model, batch, config; candidate_chunk_size=2,
+    )
+    Barrierless.prepare_batch!(adapter, batch)
+    adapter.expected = Training.MechanismActivation(
+        false, false, false, true, false, false, false, false,
+    )
+    parameters = map(group -> copy(group.parameter), adapter.registry.groups)
+    first_moments = map(
+        moment -> copy(moment.first), adapter.optimizer_state.moments,
+    )
+    second_moments = map(
+        moment -> copy(moment.second), adapter.optimizer_state.moments,
+    )
+    group_steps = copy(adapter.optimizer_state.group_steps)
+    total_step = adapter.optimizer_state.total_step
+    clocks = deepcopy(adapter.clocks)
+    updates = adapter.updates
+    boundaries = adapter.optimizer_boundaries
+
+    adapter.mechanisms = Training.MechanismCounters()
+    adapter.hard_event_deliveries = 1
+    @test_throws ErrorException Barrierless.apply_update!(adapter, batch)
+    adapter.mechanisms = Training.MechanismCounters(0, 0, 0, 1, 0, 0, 0, 0)
+    adapter.hard_event_deliveries = 0
+    @test_throws ErrorException Barrierless.apply_update!(adapter, batch)
+
+    @test map(group -> group.parameter, adapter.registry.groups) == parameters
+    @test map(moment -> moment.first, adapter.optimizer_state.moments) ==
+        first_moments
+    @test map(moment -> moment.second, adapter.optimizer_state.moments) ==
+        second_moments
+    @test adapter.optimizer_state.group_steps == group_steps
+    @test adapter.optimizer_state.total_step == total_step
+    @test adapter.clocks.update == clocks.update
+    @test adapter.clocks.analog_ticks == clocks.analog_ticks
+    @test adapter.clocks.hard_event_ticks == clocks.hard_event_ticks
+    @test adapter.updates == updates
+    @test adapter.optimizer_boundaries == boundaries
 end
 
 @testset "production API contains no exact or arbitrary graph mode" begin

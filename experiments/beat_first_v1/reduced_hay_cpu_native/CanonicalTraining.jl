@@ -8,6 +8,7 @@ using ..CanonicalListNet
 using ..CanonicalLocalLearning
 using ..CanonicalOptimizer
 using ..CanonicalPlasticity
+using ..DendriticAxonPacket
 using ..DendriticOutputPopulation
 
 const Barrierless = CanonicalBarrierless
@@ -17,6 +18,7 @@ const ListNet = CanonicalListNet
 const Local = CanonicalLocalLearning
 const Optimizer = CanonicalOptimizer
 const Plasticity = CanonicalPlasticity
+const Axon = DendriticAxonPacket
 const Output = DendriticOutputPopulation
 
 export AuxiliaryLossConfig,
@@ -48,6 +50,7 @@ const _MECHANISM_KEYS = (
     :decolle_signal_nonzero,
     :subthreshold_updates,
     :nonspiking_updates,
+    :hard_event_control_updates,
     :homeostasis_events,
     :synaptic_scaling_events,
     :utility_updates,
@@ -228,6 +231,7 @@ struct MechanismActivation
     decolle_signal_nonzero::Bool
     subthreshold_updates::Bool
     nonspiking_updates::Bool
+    hard_event_control_updates::Bool
     homeostasis_events::Bool
     synaptic_scaling_events::Bool
     utility_updates::Bool
@@ -235,7 +239,7 @@ struct MechanismActivation
 end
 
 MechanismActivation() = MechanismActivation(
-    false, false, false, false, false, false, false,
+    false, false, false, false, false, false, false, false,
 )
 
 """Immutable per-update mechanism telemetry."""
@@ -243,12 +247,13 @@ struct MechanismCounters
     decolle_signal_nonzero::Int64
     subthreshold_updates::Int64
     nonspiking_updates::Int64
+    hard_event_control_updates::Int64
     homeostasis_events::Int64
     synaptic_scaling_events::Int64
     utility_updates::Int64
     rewires::Int64
 
-    function MechanismCounters(values::Vararg{Integer,7})
+    function MechanismCounters(values::Vararg{Integer,8})
         all(value -> value >= 0, values) || throw(ArgumentError(
             "mechanism counters must be nonnegative",
         ))
@@ -256,20 +261,21 @@ struct MechanismCounters
     end
 end
 
-MechanismCounters() = MechanismCounters(0, 0, 0, 0, 0, 0, 0)
+MechanismCounters() = MechanismCounters(0, 0, 0, 0, 0, 0, 0, 0)
 
 """Mutable worker-local accumulator; no hot-path atomics are required."""
 mutable struct MechanismCounterState
     decolle_signal_nonzero::Int64
     subthreshold_updates::Int64
     nonspiking_updates::Int64
+    hard_event_control_updates::Int64
     homeostasis_events::Int64
     synaptic_scaling_events::Int64
     utility_updates::Int64
     rewires::Int64
 end
 
-MechanismCounterState() = MechanismCounterState(0, 0, 0, 0, 0, 0, 0)
+MechanismCounterState() = MechanismCounterState(0, 0, 0, 0, 0, 0, 0, 0)
 
 @inline function _reset!(state::MechanismCounterState)
     @inbounds for name in _MECHANISM_KEYS
@@ -282,6 +288,7 @@ end
     state.decolle_signal_nonzero,
     state.subthreshold_updates,
     state.nonspiking_updates,
+    state.hard_event_control_updates,
     state.homeostasis_events,
     state.synaptic_scaling_events,
     state.utility_updates,
@@ -293,6 +300,7 @@ end
         left.decolle_signal_nonzero + right.decolle_signal_nonzero,
         left.subthreshold_updates + right.subthreshold_updates,
         left.nonspiking_updates + right.nonspiking_updates,
+        left.hard_event_control_updates + right.hard_event_control_updates,
         left.homeostasis_events + right.homeostasis_events,
         left.synaptic_scaling_events + right.synaptic_scaling_events,
         left.utility_updates + right.utility_updates,
@@ -304,6 +312,8 @@ end
     state.decolle_signal_nonzero += Int64(report.signal_nonzero)
     state.subthreshold_updates += Int64(report.conditional_pullbacks)
     state.nonspiking_updates += Int64(report.nonspiking_transitions)
+    state.hard_event_control_updates +=
+        Int64(report.event_control_source_transitions)
     state.utility_updates += Int64(report.utility_updates)
     return state
 end
@@ -321,7 +331,7 @@ end
 struct TrainingUpdateResult
     loss::CanonicalLossResult
     mechanisms::MechanismCounters
-    optimizer::Optimizer.OptimizerStepStats
+    optimizer::Optimizer.DualOptimizerStepStats
     update::UInt64
 end
 
@@ -330,10 +340,11 @@ mutable struct DendriticTrainingWorker{G,L}
     local_learner::L
     delta22::Vector{Float32}
     counters::MechanismCounterState
+    hard_event_deliveries::Int64
     worker_slot::UInt16
 end
 
-mutable struct DendriticTrainingAdapter{C,R,A,S,PB,PS} <:
+mutable struct DendriticTrainingAdapter{C,R,A,S,PB,PS,AF,AO,HR,HZ} <:
                Barrierless.AbstractCanonicalGraphAdapter
     model::Graph.CanonicalModel
     config::C
@@ -364,6 +375,13 @@ mutable struct DendriticTrainingAdapter{C,R,A,S,PB,PS} <:
     loss::CanonicalLossResult
     reduced_gradient::Graph.ModelGradient
     gradient_slots::Vector{Graph.ModelGradient}
+    reduced_hard_gradient::Graph.ModelHardEventGradient
+    hard_delta_slots::Vector{Graph.ModelHardEventDelta}
+    common_hard_seed::Array{Float32,3}
+    common_hard_seed_generation::Vector{UInt64}
+    common_hard_seed_consumed::Vector{UInt8}
+    hard_delivery_slots::Vector{Int64}
+    hard_event_deliveries::Int64
     plasticity_batch::PB
     plasticity_state::PS
     event_destination::Vector{UInt16}
@@ -380,6 +398,10 @@ mutable struct DendriticTrainingAdapter{C,R,A,S,PB,PS} <:
     due::Local.DuePlasticityClocks
     registry::R
     optimizer_state::A
+    analog_full_buffers::AF
+    analog_output_buffers::AO
+    hard_recurrent_buffers::HR
+    hard_zero_buffers::HZ
     candidate_chunk_size::Int
     candidate_slot_capacity::Int
     slot_capacity::Int
@@ -454,6 +476,21 @@ function _parameter_registry(
     )
 end
 
+@inline function _hard_event_due(adapter::DendriticTrainingAdapter)
+    local_config = adapter.config.local_learning
+    return adapter.due.hard_event &&
+        local_config.hard_event_multiplier > 0.0f0
+end
+
+function _hard_event_gradient(model::Graph.CanonicalModel)
+    parameters = model.parameters
+    return Graph.ModelHardEventGradient(
+        zeros(Float32, size(parameters.core_cell_raw)),
+        zeros(Float32, size(parameters.semantic_projection_raw)),
+        zeros(Float32, length(parameters.event_raw)),
+    )
+end
+
 function DendriticTrainingAdapter(
     model::Graph.CanonicalModel,
     batch::Data.CanonicalBatch,
@@ -470,14 +507,14 @@ function DendriticTrainingAdapter(
     model.config.max_candidates >= chunk || throw(ArgumentError(
         "graph candidate scratch must hold one scheduler microbatch",
     ))
-    iszero(config.local_learning.hard_event_multiplier) || throw(ArgumentError(
-        "hard-event causal credit is not connected; hard_event_multiplier must be zero",
-    ))
     config.local_learning.plasticity.structure_enabled && throw(ArgumentError(
         "canonical fixed-spine training requires structure_enabled=false",
     ))
     candidate_slot_capacity = cld(capacity, chunk)
     slot_capacity = candidate_slot_capacity + states
+    hard_seed_capacity = Base.checked_mul(
+        chunk, Graph.MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE,
+    )
     local_signals = Graph.initialize_local_signal_maps(
         model, config.local_learning,
     )
@@ -486,8 +523,39 @@ function DendriticTrainingAdapter(
     gradient_slots = [
         Graph.initialize_gradient(model) for _ in 1:slot_capacity
     ]
+    reduced_hard_gradient = _hard_event_gradient(model)
+    hard_delta_slots = [
+        Graph.initialize_hard_event_delta(model, hard_seed_capacity)
+        for _ in 1:slot_capacity
+    ]
     registry = _parameter_registry(model, reduced_gradient, config.groups)
     optimizer_state = Optimizer.AdamWState(registry)
+    analog = Graph.gradient_components(reduced_gradient)
+    hard = Graph.hard_gradient_components(reduced_hard_gradient)
+    analog_full_buffers = Optimizer.GradientBufferSet(registry, (
+        analog.core_cell_raw,
+        analog.semantic_projection_raw,
+        analog.event_raw,
+        analog.output_cell_raw,
+        analog.output_projection_raw,
+    ))
+    analog_output_buffers = Optimizer.GradientBufferSet(registry, (
+        nothing,
+        nothing,
+        nothing,
+        analog.output_cell_raw,
+        analog.output_projection_raw,
+    ))
+    hard_recurrent_buffers = Optimizer.GradientBufferSet(registry, (
+        hard.core_cell_raw,
+        hard.semantic_projection_raw,
+        hard.event_raw,
+        nothing,
+        nothing,
+    ))
+    hard_zero_buffers = Optimizer.GradientBufferSet(
+        registry, (nothing, nothing, nothing, nothing, nothing),
+    )
     event_parameter_total = Graph.event_parameter_count(model)
     event_destination = Vector{UInt16}(undef, event_parameter_total)
     contact_count = 0
@@ -548,6 +616,13 @@ function DendriticTrainingAdapter(
         zero_loss,
         reduced_gradient,
         gradient_slots,
+        reduced_hard_gradient,
+        hard_delta_slots,
+        zeros(Float32, Axon.EVENT_DIM, Graph.CORE_NODE_COUNT, states),
+        zeros(UInt64, states),
+        zeros(UInt8, states),
+        zeros(Int64, slot_capacity),
+        Int64(0),
         plasticity_batch,
         plasticity_state,
         event_destination,
@@ -564,6 +639,10 @@ function DendriticTrainingAdapter(
         Local.DuePlasticityClocks(false, false, false, false),
         registry,
         optimizer_state,
+        analog_full_buffers,
+        analog_output_buffers,
+        hard_recurrent_buffers,
+        hard_zero_buffers,
         chunk,
         candidate_slot_capacity,
         slot_capacity,
@@ -579,12 +658,21 @@ function Barrierless.create_worker_arena(
 )
     worker_slot >= 1 || throw(ArgumentError("worker_slot must be positive"))
     graph = Graph.initialize_worker(adapter.model)
-    learner = Graph.initialize_local_learner(adapter.model, adapter.local_signals)
+    hard_seed_capacity = Base.checked_mul(
+        adapter.candidate_chunk_size,
+        Graph.MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE,
+    )
+    learner = Graph.initialize_local_learner(
+        adapter.model,
+        adapter.local_signals;
+        hard_event_seed_capacity=hard_seed_capacity,
+    )
     return DendriticTrainingWorker(
         graph,
         learner,
         zeros(Float32, OUTPUT_DIM),
         MechanismCounterState(),
+        Int64(0),
         UInt16(worker_slot),
     )
 end
@@ -698,6 +786,17 @@ function Barrierless.prepare_batch!(
     required_slots + input.state_batch <= adapter.slot_capacity || error(
         "state-common slot storage is smaller than the scheduler partition",
     )
+    fill!(adapter.hard_delivery_slots, Int64(0))
+    adapter.hard_event_deliveries = Int64(0)
+    Graph.clear_hard_event_gradient!(adapter.reduced_hard_gradient)
+    if _hard_event_due(adapter)
+        fill!(adapter.common_hard_seed, 0.0f0)
+        fill!(adapter.common_hard_seed_generation, UInt64(0))
+        fill!(adapter.common_hard_seed_consumed, UInt8(0))
+        @inbounds for slot in 1:(required_slots + input.state_batch)
+            Graph.clear_hard_event_delta!(adapter.hard_delta_slots[slot])
+        end
+    end
     return adapter
 end
 
@@ -773,6 +872,7 @@ function Barrierless.begin_microbatch!(
         Graph.clear_gradient!(worker.graph)
         Graph.begin_local_microbatch!(worker.local_learner)
         _reset!(worker.counters)
+        worker.hard_event_deliveries = Int64(0)
     elseif phase != Barrierless.FORWARD_PASS
         throw(ArgumentError("unknown canonical training phase $phase"))
     end
@@ -968,10 +1068,12 @@ function _expected_mechanisms(
         )
     utility = due.analog && local_config.analog_multiplier > 0.0f0 &&
         has_signal && local_config.utility_mode !== :none
+    hard_event = _hard_event_due(adapter)
     return MechanismActivation(
         analog,
         analog,
         analog,
+        hard_event,
         false,
         false,
         utility,
@@ -1067,8 +1169,14 @@ function Barrierless.replay_candidate!(
         adapter.due;
         expected_signature=adapter.forward_signature[ordinal],
         mode=:cow,
+        hard_state_id=state,
+        hard_candidate_ordinal=ordinal,
     )
     _accumulate_local_report!(worker.counters, report)
+    worker.hard_event_deliveries = Base.checked_add(
+        worker.hard_event_deliveries,
+        Int64(report.event_control_deliveries),
+    )
     observation = Graph.local_plasticity_observation(worker.local_learner)
     Plasticity.record_candidate_plasticity!(
         adapter.plasticity_batch,
@@ -1106,8 +1214,18 @@ end
     destination = @inbounds adapter.gradient_slots[slot]
     Graph.clear_gradient!(destination)
     Graph.accumulate_gradient!(destination, worker.graph.gradient)
+    if _hard_event_due(adapter)
+        Graph.publish_hard_event_delta!(
+            @inbounds(adapter.hard_delta_slots[slot]),
+            worker.local_learner,
+            adapter.model,
+            logical_first,
+            logical_last,
+        )
+    end
     @inbounds begin
         adapter.mechanism_slots[slot] = _snapshot(worker.counters)
+        adapter.hard_delivery_slots[slot] = worker.hard_event_deliveries
         adapter.slot_kind[slot] = kind
         adapter.slot_logical_first[slot] = Int32(logical_first)
         adapter.slot_logical_last[slot] = Int32(logical_last)
@@ -1141,6 +1259,61 @@ function Barrierless.reduce_worker!(
 end
 
 
+function Barrierless.finish_candidate_replay_phase!(
+    adapter::DendriticTrainingAdapter,
+    batch::Data.CanonicalBatch,
+    microbatch_count::Int,
+)
+    _hard_event_due(adapter) || return nothing
+    expected_count = cld(
+        batch.input.valid_count, adapter.candidate_chunk_size,
+    )
+    microbatch_count == expected_count || throw(DimensionMismatch(
+        "candidate replay phase reported the wrong microbatch count",
+    ))
+    microbatch_count <= adapter.candidate_slot_capacity || throw(BoundsError(
+        adapter.hard_delta_slots, microbatch_count,
+    ))
+    generation = adapter.active_generation
+    @inbounds for state in 1:batch.input.state_batch
+        adapter.common_hard_seed_generation[state] != generation || error(
+            "candidate hard-event seed phase was finalized twice",
+        )
+        iszero(adapter.common_hard_seed_consumed[state]) || error(
+            "candidate hard-event seed phase observed a consumed state",
+        )
+    end
+    @inbounds for slot in 1:microbatch_count
+        first = (slot - 1) * adapter.candidate_chunk_size + 1
+        last = min(
+            slot * adapter.candidate_chunk_size,
+            batch.input.valid_count,
+        )
+        _preflight_reduction_slot!(
+            adapter,
+            slot,
+            _CANDIDATE_REDUCTION_SLOT,
+            first,
+            last,
+        )
+        delta = adapter.hard_delta_slots[slot]
+        Graph.accumulate_common_hard_event_seeds!(
+            adapter.common_hard_seed,
+            delta,
+            adapter.model;
+            expected_first_candidate=first,
+            expected_last_candidate=last,
+        )
+    end
+    @inbounds for state in 1:batch.input.state_batch
+        # Per-state readiness is published only after every candidate slot has
+        # been reduced in ascending logical/physical delivery order.
+        adapter.common_hard_seed_generation[state] = generation
+    end
+    return nothing
+end
+
+
 function Barrierless.replay_state_common!(
     adapter::DendriticTrainingAdapter,
     worker::DendriticTrainingWorker,
@@ -1155,10 +1328,28 @@ function Barrierless.replay_state_common!(
         adapter.active_generation || error(
             "state-common replay observed an unprepared state $state",
         )
+    hard_due = _hard_event_due(adapter)
+    if hard_due
+        @inbounds adapter.common_hard_seed_generation[state] ==
+            adapter.active_generation || error(
+                "state-common hard-event seed slab is missing or stale for state $state",
+            )
+        @inbounds iszero(adapter.common_hard_seed_consumed[state]) || error(
+            "state-common hard-event seed slab was already consumed for state $state",
+        )
+    end
     Graph.reset_candidate_set!(worker.graph)
     Graph.clear_gradient!(worker.graph)
     Graph.begin_local_microbatch!(worker.local_learner)
     _reset!(worker.counters)
+    worker.hard_event_deliveries = Int64(0)
+    if hard_due
+        Graph.load_common_hard_event_seeds!(
+            worker.local_learner,
+            @view(adapter.common_hard_seed[:, :, state]),
+            state,
+        )
+    end
     common = @inbounds adapter.common_states[state]
     value_delta = @inbounds adapter.state_value_delta[state]
     expected_signature = @inbounds adapter.common_signature[state]
@@ -1172,10 +1363,26 @@ function Barrierless.replay_state_common!(
         value_delta,
         adapter.due;
         expected_signature,
+        hard_state_id=state,
     )
     report.signature == expected_signature || error(
         "state-common replay signature changed after ListNet boundary",
     )
+    worker.hard_event_deliveries = Base.checked_add(
+        worker.hard_event_deliveries,
+        Int64(report.event_control_deliveries),
+    )
+    if hard_due
+        !Graph.common_hard_event_seed_loaded(worker.local_learner) || error(
+            "state-common hard-event replay left its seed slab loaded",
+        )
+        Graph.common_hard_event_seed_consumed(worker.local_learner) || error(
+            "state-common hard-event replay did not consume its seed slab",
+        )
+        !Graph.common_hard_event_seed_poisoned(worker.local_learner) || error(
+            "state-common hard-event replay left a poisoned seed slab",
+        )
+    end
     _accumulate_local_report!(worker.counters, report)
     observation = Graph.local_plasticity_observation(worker.local_learner)
     Plasticity.record_state_common_plasticity!(
@@ -1193,9 +1400,10 @@ function Barrierless.replay_state_common!(
         worker,
         reduction_slot,
         _STATE_COMMON_REDUCTION_SLOT,
-        state,
-        state,
+        0,
+        0,
     )
+    hard_due && (@inbounds adapter.common_hard_seed_consumed[state] = 0x01)
     return nothing
 end
 
@@ -1224,6 +1432,30 @@ end
         )
     end
     return nothing
+end
+
+@inline function _accumulate_hard_event_array!(destination, source)
+    axes(destination) == axes(source) || throw(DimensionMismatch(
+        "hard-event gradient groups have different axes",
+    ))
+    @inbounds @simd for index in eachindex(destination, source)
+        destination[index] += source[index]
+    end
+    return destination
+end
+
+@inline function _accumulate_hard_event_gradient!(
+    destination::Graph.ModelHardEventGradient,
+    source::Graph.ModelHardEventGradient,
+)
+    _accumulate_hard_event_array!(
+        destination.core_cell_raw, source.core_cell_raw,
+    )
+    _accumulate_hard_event_array!(
+        destination.semantic_projection_raw, source.semantic_projection_raw,
+    )
+    _accumulate_hard_event_array!(destination.event_raw, source.event_raw)
+    return destination
 end
 
 function Barrierless.deterministic_reduce!(
@@ -1262,22 +1494,75 @@ function Barrierless.deterministic_reduce!(
             adapter,
             microbatch_count + state,
             _STATE_COMMON_REDUCTION_SLOT,
-            state,
-            state,
+            0,
+            0,
         )
+    end
+
+    hard_due = _hard_event_due(adapter)
+    if hard_due
+        @inbounds for slot in 1:microbatch_count
+            delta = adapter.hard_delta_slots[slot]
+            Graph.hard_event_delta_sealed(delta) || error(
+                "candidate hard-event delta slot $slot is not sealed",
+            )
+            Graph.hard_event_delta_candidate_range(delta) == (
+                (slot - 1) * adapter.candidate_chunk_size + 1,
+                min(
+                    slot * adapter.candidate_chunk_size,
+                    batch.input.valid_count,
+                ),
+            ) || error(
+                "candidate hard-event delta slot $slot has the wrong range",
+            )
+            delta.reduced || error(
+                "candidate hard-event delta slot $slot missed phase reduction",
+            )
+        end
+        @inbounds for state in 1:state_total
+            adapter.common_hard_seed_generation[state] ==
+                adapter.active_generation || error(
+                    "state-common hard-event seed slab $state is missing or stale",
+                )
+            adapter.common_hard_seed_consumed[state] == 0x01 || error(
+                "state-common hard-event seed slab $state was not consumed exactly once",
+            )
+            slot = microbatch_count + state
+            delta = adapter.hard_delta_slots[slot]
+            Graph.accumulate_common_hard_event_seeds!(
+                adapter.common_hard_seed,
+                delta,
+                adapter.model;
+                expected_first_candidate=0,
+                expected_last_candidate=0,
+            )
+        end
     end
 
     # No reduction scratch is touched until every worker publication has been
     # validated against this attempt generation and its logical owner.
     Graph.clear_gradient!(adapter.reduced_gradient)
+    Graph.clear_hard_event_gradient!(adapter.reduced_hard_gradient)
     mechanisms = MechanismCounters()
+    hard_event_deliveries = Int64(0)
     @inbounds for slot in 1:total_slots
         Graph.accumulate_gradient!(
             adapter.reduced_gradient, adapter.gradient_slots[slot],
         )
+        if hard_due
+            _accumulate_hard_event_gradient!(
+                adapter.reduced_hard_gradient,
+                Graph.hard_event_gradient(adapter.hard_delta_slots[slot]),
+            )
+            hard_event_deliveries = Base.checked_add(
+                hard_event_deliveries,
+                adapter.hard_delivery_slots[slot],
+            )
+        end
         mechanisms = _add(mechanisms, adapter.mechanism_slots[slot])
     end
     adapter.mechanisms = mechanisms
+    adapter.hard_event_deliveries = hard_event_deliveries
     return adapter.reduced_gradient
 end
 
@@ -1309,6 +1594,11 @@ function _assert_mechanisms!(
         :nonspiking_updates,
     )
     _assert_counter(
+        expected.hard_event_control_updates,
+        counts.hard_event_control_updates,
+        :hard_event_control_updates,
+    )
+    _assert_counter(
         expected.utility_updates,
         counts.utility_updates,
         :utility_updates,
@@ -1334,7 +1624,26 @@ end
     analog = adapter.due.analog && local_config.analog_multiplier > 0.0f0
     hard = adapter.due.hard_event &&
         local_config.hard_event_multiplier > 0.0f0
-    return (analog, analog, analog || hard, true, true)
+    recurrent = analog || hard
+    return (recurrent, recurrent, recurrent, true, true)
+end
+
+@inline function _apply_dual_optimizer_boundary!(
+    adapter::DendriticTrainingAdapter,
+    analog_buffers,
+    hard_buffers,
+    due_mask::Tuple,
+)
+    return Optimizer.apply_dual_optimizer_boundary!(
+        adapter.optimizer_state,
+        adapter.registry,
+        analog_buffers,
+        hard_buffers,
+        adapter.config.optimizer;
+        analog_gradient_scale=1.0f0,
+        hard_event_gradient_scale=1.0f0,
+        due_mask,
+    )
 end
 
 @noinline function _nonfinite_optimizer_state(value, group::Symbol, field::Symbol)
@@ -1474,6 +1783,7 @@ end
         current.decolle_signal_nonzero,
         current.subthreshold_updates,
         current.nonspiking_updates,
+        current.hard_event_control_updates,
         homeostasis,
         scaling,
         current.utility_updates,
@@ -1498,6 +1808,11 @@ function Barrierless.apply_update!(
     _assert_mechanisms!(
         adapter.expected, adapter.mechanisms; include_slow=false,
     )
+    if adapter.expected.hard_event_control_updates
+        adapter.hard_event_deliveries > 0 || error(
+            "hard-event control was active but evaluated zero deliveries",
+        )
+    end
     adapter.updates != typemax(UInt64) || throw(OverflowError(
         "canonical training update counter overflow",
     ))
@@ -1544,12 +1859,41 @@ function Barrierless.apply_update!(
     ) == 0 || error("synaptic-scaling preflight mutated parameters")
 
     # The transaction begins only after every fallible persistent-state check.
-    optimizer_stats = Optimizer.apply_optimizer_boundary!(
-        adapter.optimizer_state,
-        adapter.registry,
-        adapter.config.optimizer;
-        due_mask,
-    )
+    local_config = adapter.config.local_learning
+    analog_due = adapter.due.analog &&
+        local_config.analog_multiplier > 0.0f0
+    hard_due = _hard_event_due(adapter)
+    optimizer_stats = if analog_due
+        if hard_due
+            _apply_dual_optimizer_boundary!(
+                adapter,
+                adapter.analog_full_buffers,
+                adapter.hard_recurrent_buffers,
+                due_mask,
+            )
+        else
+            _apply_dual_optimizer_boundary!(
+                adapter,
+                adapter.analog_full_buffers,
+                adapter.hard_zero_buffers,
+                due_mask,
+            )
+        end
+    elseif hard_due
+        _apply_dual_optimizer_boundary!(
+            adapter,
+            adapter.analog_output_buffers,
+            adapter.hard_recurrent_buffers,
+            due_mask,
+        )
+    else
+        _apply_dual_optimizer_boundary!(
+            adapter,
+            adapter.analog_output_buffers,
+            adapter.hard_zero_buffers,
+            due_mask,
+        )
+    end
     adapter.optimizer_boundaries = 1
     committed_stats = Plasticity.reduce_canonical_plasticity!(
         adapter.plasticity_state,
@@ -1589,7 +1933,7 @@ function Barrierless.apply_update!(
     adapter.mechanisms = _add(
         adapter.mechanisms,
         MechanismCounters(
-            0, 0, 0, homeostasis_events, scaling_events, 0, 0,
+            0, 0, 0, 0, homeostasis_events, scaling_events, 0, 0,
         ),
     )
     _assert_mechanisms!(

@@ -17,6 +17,7 @@ export AbstractCanonicalGraphAdapter,
        create_worker_arena,
        deterministic_reduce!,
        finalize_listnet!,
+       finish_candidate_replay_phase!,
        finish_state_common_phase!,
        finish_forward_microbatch!,
        prepare_batch!,
@@ -65,6 +66,7 @@ function run_candidate! end
 function finish_forward_microbatch! end
 function finalize_listnet! end
 function replay_candidate! end
+function finish_candidate_replay_phase! end
 function replay_state_common! end
 function reduce_worker! end
 function deterministic_reduce! end
@@ -313,7 +315,9 @@ The two global mathematical boundaries are explicit:
 
 1. every state-common prefix is complete before candidate forward;
 2. every candidate forward is complete before `finalize_listnet!`; and
-3. every candidate and state-common replay is committed before ascending-slot
+3. every candidate replay is committed before the candidate-phase completion
+   hook seals state-common hard-event seeds;
+4. every state-common replay is committed before ascending-slot
    `deterministic_reduce!` and `apply_update!`.
 
 `finalize_listnet!` must use `state_candidate_bounds` and finalize each state
@@ -360,6 +364,11 @@ function train_update!(session::CanonicalSession)
             1,
             executor.candidate_total;
             chunk_size=executor.candidate_chunk_size,
+        )
+        finish_candidate_replay_phase!(
+            executor.adapter,
+            executor.batch,
+            executor.microbatch_total,
         )
         SchedulerCore.run_phase!(
             session.scheduler,
@@ -414,6 +423,11 @@ function serial_reference_update!(executor::CanonicalExecutor)
             _replay_microbatch!(executor, 1, first, last)
             first = last + 1
         end
+        finish_candidate_replay_phase!(
+            executor.adapter,
+            executor.batch,
+            executor.microbatch_total,
+        )
         @inbounds for state_slot in 1:executor.state_total
             _replay_common_state!(executor, 1, state_slot, state_slot)
         end

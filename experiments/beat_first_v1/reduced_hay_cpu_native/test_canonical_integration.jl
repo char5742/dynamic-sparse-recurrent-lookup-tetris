@@ -4092,7 +4092,7 @@ end
     @test full.plasticity == first_signal.plasticity
 end
 
-@testset "delivered typed events receive analog-local credit only" begin
+@testset "delivered typed events receive receiver analog credit" begin
     input = dynamic_contact_coverage_fixture()
     dynamic_source_limit = Topology.SPATIAL_COUNT +
         Topology.ROW_INTERNAL_COUNT + Topology.COLUMN_INTERNAL_COUNT
@@ -4257,16 +4257,9 @@ end
     @test iszero(zero_factor.worker.gradient.event_raw[target_raw])
     @test iszero(zero_utility[target_raw])
 
-    # This is receiver-amplitude credit through the continuous Hay VJP.  It
-    # is not a hard-control surrogate: any nonzero/connected continuation
-    # control and any canonical nonzero hard-event multiplier fail closed.
-    bad_config = LocalLearning.LocalLearningConfig(
-        hard_event_multiplier=0.1,
-    )
-    @test_throws ArgumentError Graph.initialize_local_signal_maps(
-        model,
-        bad_config,
-    )
+    # This scalar analog primitive deliberately rejects connected event
+    # control. Production hard-source credit uses the fused paired primitive
+    # and a separate hard gradient lane.
     event_record = findfirst(
         ==(UInt8(Graph.EVENT_WAVE)),
         credited.worker.tape.phase[1:credited.worker.tape.count],
@@ -4578,6 +4571,36 @@ function training_gradient_snapshot(gradient::Graph.ModelGradient)
     return map(copy, components)
 end
 
+function training_hard_gradient_snapshot(
+    gradient::Graph.ModelHardEventGradient,
+)
+    return map(copy, Graph.hard_gradient_components(gradient))
+end
+
+function training_hard_delta_snapshot(delta::Graph.ModelHardEventDelta)
+    count = Graph.hard_event_seed_count(delta)
+    return (
+        gradient=training_hard_gradient_snapshot(
+            Graph.hard_event_gradient(delta),
+        ),
+        seed_state_id=copy(delta.seed_state_id[1:count]),
+        seed_candidate_ordinal=copy(
+            delta.seed_candidate_ordinal[1:count],
+        ),
+        seed_delivery_ordinal=copy(delta.seed_delivery_ordinal[1:count]),
+        seed_source_node=copy(delta.seed_source_node[1:count]),
+        seed_lane=copy(delta.seed_lane[1:count]),
+        seed_advantage=copy(delta.seed_advantage[1:count]),
+        seed_count=count,
+        parameter_digest=delta.parameter_digest,
+        logical_range=Graph.hard_event_delta_candidate_range(delta),
+        seed_identity_digest=delta.seed_identity_digest,
+        hard_gradient_digest=delta.hard_gradient_digest,
+        sealed=Graph.hard_event_delta_sealed(delta),
+        reduced=delta.reduced,
+    )
+end
+
 function training_registry_snapshot(adapter::Training.DendriticTrainingAdapter)
     return map(adapter.registry.groups) do group
         (
@@ -4610,6 +4633,140 @@ function training_optimizer_snapshot(adapter::Training.DendriticTrainingAdapter)
         group_steps=copy(state.group_steps),
         total_step=state.total_step,
     )
+end
+
+@inline training_lane_norm_squared(::Tuple{}) = 0.0
+
+@inline function training_lane_norm_squared(buffers::Tuple)
+    buffer = first(buffers)
+    local_sum = 0.0
+    if buffer !== nothing
+        @inbounds @simd for value in buffer
+            value64 = Float64(value)
+            local_sum = muladd(value64, value64, local_sum)
+        end
+    end
+    return local_sum + training_lane_norm_squared(Base.tail(buffers))
+end
+
+@inline training_combined_norm_squared(::Tuple{}) = 0.0
+
+@inline function training_combined_norm_squared(buffers::Tuple)
+    buffer = first(buffers)
+    local_sum = 0.0
+    @inbounds for value in buffer
+        value64 = Float64(value)
+        local_sum = muladd(value64, value64, local_sum)
+    end
+    return local_sum + training_combined_norm_squared(Base.tail(buffers))
+end
+
+function training_combined_array(
+    analog::AbstractArray{Float32},
+    hard::Union{Nothing,AbstractArray{Float32}},
+    analog_scale::Float32,
+    hard_scale::Float32,
+)
+    destination = similar(analog)
+    @inbounds for index in eachindex(destination, analog)
+        analog_clipped = analog[index] * analog_scale
+        hard_clipped = hard === nothing ?
+            0.0f0 : hard[index] * hard_scale
+        destination[index] = analog_clipped + hard_clipped
+    end
+    return destination
+end
+
+function training_expected_combined_gradient(snapshot, stats)
+    analog = snapshot.reduced_gradient
+    hard = snapshot.reduced_hard_gradient
+    analog_scale = stats.analog_clip_scale
+    hard_scale = stats.hard_event_clip_scale
+    return (
+        core_cell_raw=training_combined_array(
+            analog.core_cell_raw,
+            hard.core_cell_raw,
+            analog_scale,
+            hard_scale,
+        ),
+        semantic_projection_raw=training_combined_array(
+            analog.semantic_projection_raw,
+            hard.semantic_projection_raw,
+            analog_scale,
+            hard_scale,
+        ),
+        event_raw=training_combined_array(
+            analog.event_raw,
+            hard.event_raw,
+            analog_scale,
+            hard_scale,
+        ),
+        output_cell_raw=training_combined_array(
+            analog.output_cell_raw,
+            nothing,
+            analog_scale,
+            hard_scale,
+        ),
+        output_projection_raw=training_combined_array(
+            analog.output_projection_raw,
+            nothing,
+            analog_scale,
+            hard_scale,
+        ),
+    )
+end
+
+function validate_training_dual_boundary!(snapshot, result, clip_norm::Float32)
+    stats = result.optimizer
+    stats isa Optimizer.DualOptimizerStepStats || error(
+        "training did not use the dual optimizer boundary",
+    )
+    analog_buffers = Tuple(snapshot.reduced_gradient)
+    hard_buffers = (
+        snapshot.reduced_hard_gradient.core_cell_raw,
+        snapshot.reduced_hard_gradient.semantic_projection_raw,
+        snapshot.reduced_hard_gradient.event_raw,
+        nothing,
+        nothing,
+    )
+    analog_norm = sqrt(training_lane_norm_squared(analog_buffers))
+    hard_norm = sqrt(training_lane_norm_squared(hard_buffers))
+    training_same_bits(analog_norm, stats.analog_gradient_norm) || error(
+        "training analog norm differs from its independent buffer norm",
+    )
+    training_same_bits(hard_norm, stats.hard_event_gradient_norm) || error(
+        "training hard-event norm differs from its independent buffer norm",
+    )
+    stats.analog_clip_scale == Float32(min(
+        1.0,
+        Float64(clip_norm) / max(analog_norm, eps(Float64)),
+    )) || error("training analog clip scale is not independently owned")
+    stats.hard_event_clip_scale == Float32(min(
+        1.0,
+        Float64(clip_norm) / max(hard_norm, eps(Float64)),
+    )) || error("training hard-event clip scale is not independently owned")
+
+    combined = training_expected_combined_gradient(snapshot, stats)
+    combined_norm = sqrt(training_combined_norm_squared(Tuple(combined)))
+    training_same_bits(combined_norm, stats.combined_gradient_norm) || error(
+        "training combined norm differs from analog_clipped + hard_clipped",
+    )
+    @inbounds for group in eachindex(snapshot.optimizer.moments)
+        first_moment = snapshot.optimizer.moments[group].first
+        expected = combined[group]
+        training_same_bits(first_moment, expected) || error(
+            "training first moment differs from g_total in group $group",
+        )
+        second_moment = snapshot.optimizer.moments[group].second
+        for index in eachindex(second_moment, expected)
+            training_same_bits(
+                second_moment[index], expected[index] * expected[index],
+            ) || error(
+                "training second moment differs from g_total^2 in group $group",
+            )
+        end
+    end
+    return nothing
 end
 
 function training_adapter_snapshot(
@@ -4664,6 +4821,20 @@ function training_adapter_snapshot(
             adapter.gradient_slots[1:used_slots],
         ),
         reduced_gradient=training_gradient_snapshot(adapter.reduced_gradient),
+        hard_delta_slots=map(
+            training_hard_delta_snapshot,
+            adapter.hard_delta_slots[1:used_slots],
+        ),
+        reduced_hard_gradient=training_hard_gradient_snapshot(
+            adapter.reduced_hard_gradient,
+        ),
+        common_hard_seed=copy(adapter.common_hard_seed),
+        common_hard_seed_generation=
+            copy(adapter.common_hard_seed_generation),
+        common_hard_seed_consumed=
+            copy(adapter.common_hard_seed_consumed),
+        hard_delivery_slots=copy(adapter.hard_delivery_slots[1:used_slots]),
+        hard_event_deliveries=adapter.hard_event_deliveries,
         plasticity_batch=deepcopy(adapter.plasticity_batch),
         plasticity_state=deepcopy(adapter.plasticity_state),
         event_destination=copy(adapter.event_destination),
@@ -4704,6 +4875,8 @@ function validate_training_publications!(
         error("candidate slot capacity is not fixed from batch capacity")
     adapter.slot_capacity == adapter.candidate_slot_capacity + states ||
         error("state-common reduction slots are not separately reserved")
+    hard_due = adapter.due.hard_event &&
+        adapter.config.local_learning.hard_event_multiplier > 0.0f0
     @inbounds for state in 1:states
         adapter.common_prepare_generation[state] == generation || error(
             "state-common preparation generation is stale",
@@ -4730,6 +4903,17 @@ function validate_training_publications!(
         1 <= adapter.slot_owner[slot] <= worker_count || error(
             "candidate reduction owner is outside the active team",
         )
+        if hard_due
+            delta = adapter.hard_delta_slots[slot]
+            Graph.hard_event_delta_sealed(delta) || error(
+                "candidate hard-event delta is not sealed",
+            )
+            Graph.hard_event_delta_candidate_range(delta) == (first, last) ||
+                error("candidate hard-event delta has the wrong range")
+            delta.reduced || error(
+                "candidate hard-event delta was not phase-reduced",
+            )
+        end
     end
     @inbounds for state in 1:states
         slot = candidate_slots + state
@@ -4739,19 +4923,52 @@ function validate_training_publications!(
         adapter.slot_kind[slot] == 0x02 || error(
             "state-common reduction slot has the wrong kind",
         )
-        adapter.slot_logical_first[slot] == state || error(
+        adapter.slot_logical_first[slot] == 0 || error(
             "state-common reduction slot has the wrong logical first",
         )
-        adapter.slot_logical_last[slot] == state || error(
+        adapter.slot_logical_last[slot] == 0 || error(
             "state-common reduction slot has the wrong logical last",
         )
         1 <= adapter.slot_owner[slot] <= worker_count || error(
             "state-common reduction owner is outside the active team",
         )
+        if hard_due
+            adapter.common_hard_seed_generation[state] == generation || error(
+                "state-common hard-event seed generation is stale",
+            )
+            adapter.common_hard_seed_consumed[state] == 0x01 || error(
+                "state-common hard-event seeds were not consumed exactly once",
+            )
+            delta = adapter.hard_delta_slots[slot]
+            Graph.hard_event_delta_sealed(delta) || error(
+                "state-common hard-event delta is not sealed",
+            )
+            Graph.hard_event_delta_candidate_range(delta) == (0, 0) || error(
+                "state-common hard-event delta has the wrong zero range",
+            )
+            iszero(Graph.hard_event_seed_count(delta)) || error(
+                "state-common hard-event delta published candidate seeds",
+            )
+            delta.reduced || error(
+                "state-common hard-event delta was not validated in reduction",
+            )
+        end
     end
     @inbounds for slot in (used_slots + 1):adapter.slot_capacity
         adapter.slot_generation[slot] != generation || error(
             "unused reduction slot was published in the active generation",
+        )
+    end
+    if hard_due
+        sum(adapter.hard_delivery_slots[1:used_slots]) ==
+            adapter.hard_event_deliveries || error(
+                "hard-event delivery slot reduction changed its total",
+            )
+        adapter.hard_event_deliveries > 0 || error(
+            "hard-event update evaluated zero physical deliveries",
+        )
+        adapter.mechanisms.hard_event_control_updates > 0 || error(
+            "hard-event update credited zero source transitions",
         )
     end
     return nothing
@@ -4835,18 +5052,21 @@ function run_parallel_training_arm(
     graph_config::Graph.GraphConfig,
     seed::Integer;
     measure_hot::Bool,
+    candidate_chunk_size::Int,
 )
-    model = Graph.initialize_model(MersenneTwister(seed), graph_config)
+    model = configure_high_plateau!(
+        Graph.initialize_model(MersenneTwister(seed), graph_config),
+    )
     initial_parameters = map(copy, Graph.parameter_components(model.parameters))
     initial_cache = deepcopy(model.cache)
     adapter = Training.DendriticTrainingAdapter(
-        model, batch, config; candidate_chunk_size=1,
+        model, batch, config; candidate_chunk_size,
     )
     executor = Barrierless.CanonicalExecutor(
         adapter,
         batch;
         worker_capacity=worker_count,
-        candidate_chunk_size=1,
+        candidate_chunk_size,
     )
     session_slot = Ref{Any}(nothing)
     allocation_slot = Ref{Int}(-1)
@@ -4916,14 +5136,15 @@ end
     local_config = LocalLearning.LocalLearningConfig(
         schedule=LocalLearning.LearningSchedule(
             analog_interval=1,
-            hard_event_interval=4,
-            homeostasis_interval=1,
+            hard_event_interval=1,
+            homeostasis_interval=32,
             structure_interval=32,
         ),
         feedback_seed=0x71a11,
         feedback_scale=0.75f0,
         analog_multiplier=1.0f0,
-        hard_event_multiplier=0.0f0,
+        hard_event_multiplier=0.25f0,
+        hard_event_energy_cost=0.125f0,
         utility_mode=:combined,
         plasticity=LocalLearning.PlasticityConfig(
             target_rate_min=0.90f0,
@@ -4934,7 +5155,16 @@ end
             structure_enabled=false,
         ),
     )
-    config = Training.CanonicalTrainingConfig(local_learning=local_config)
+    optimizer_config = Optimizer.AdamWConfig(
+        beta1=0.0f0,
+        beta2=0.0f0,
+        clip_norm=1.0f-4,
+        weight_decay=0.0f0,
+    )
+    config = Training.CanonicalTrainingConfig(
+        local_learning=local_config,
+        optimizer=optimizer_config,
+    )
     graph_config = Graph.GraphConfig(
         max_candidates=3,
         max_event_waves=Events.CANONICAL_MAX_WAVES,
@@ -4943,32 +5173,50 @@ end
         event_overflow=:error,
     )
     seed = 0x71a11
-    serial_model = Graph.initialize_model(MersenneTwister(seed), graph_config)
+    candidate_chunk_size = 2
+    serial_model = configure_high_plateau!(
+        Graph.initialize_model(MersenneTwister(seed), graph_config),
+    )
     initial_parameters = map(copy, Graph.parameter_components(
         serial_model.parameters,
     ))
     initial_cache = deepcopy(serial_model.cache)
 
     serial_adapter = Training.DendriticTrainingAdapter(
-        serial_model, batch, config; candidate_chunk_size=1,
+        serial_model, batch, config; candidate_chunk_size,
     )
     serial_executor = Barrierless.CanonicalExecutor(
         serial_adapter,
         batch;
         worker_capacity=1,
-        candidate_chunk_size=1,
+        candidate_chunk_size,
     )
     serial_result_1 = Barrierless.serial_reference_update!(serial_executor)
     validate_training_publications!(serial_adapter, batch, 1)
     serial_snapshot_1 = training_adapter_snapshot(serial_adapter, batch)
+    validate_training_dual_boundary!(
+        serial_snapshot_1, serial_result_1, optimizer_config.clip_norm,
+    )
     serial_post_1 = post_update_forward_snapshot(serial_model, batch)
     serial_result_2 = Barrierless.serial_reference_update!(serial_executor)
     validate_training_publications!(serial_adapter, batch, 1)
     serial_snapshot_2 = training_adapter_snapshot(serial_adapter, batch)
+    validate_training_dual_boundary!(
+        serial_snapshot_2, serial_result_2, optimizer_config.clip_norm,
+    )
     serial_post_2 = post_update_forward_snapshot(serial_model, batch)
     expected_jobs_per_update = 2 * batch.input.state_batch +
-        2 * cld(batch.input.valid_count, 1)
+        2 * cld(batch.input.valid_count, candidate_chunk_size)
     expected_jobs = 2 * expected_jobs_per_update
+    @test serial_adapter.ordinal_state[3] != serial_adapter.ordinal_state[4]
+    @test serial_adapter.slot_logical_first[2] == 3
+    @test serial_adapter.slot_logical_last[2] == 4
+    @test serial_result_1.mechanisms.hard_event_control_updates > 0
+    @test serial_result_2.mechanisms.hard_event_control_updates > 0
+    @test serial_result_1.optimizer.analog_gradient_norm > 0.0
+    @test serial_result_1.optimizer.hard_event_gradient_norm > 0.0
+    @test serial_result_1.optimizer.analog_clip_scale < 1.0f0
+    @test serial_result_1.optimizer.hard_event_clip_scale < 1.0f0
     for worker_count in (1, 2, 4)
         arm = run_parallel_training_arm(
             worker_count,
@@ -4977,11 +5225,22 @@ end
             graph_config,
             seed;
             measure_hot=worker_count == 4,
+            candidate_chunk_size,
         )
         @test training_same_bits(arm.initial_parameters, initial_parameters)
         @test training_same_bits(arm.initial_cache, initial_cache)
         @test training_same_bits(arm.first_result, serial_result_1)
         @test training_same_bits(arm.second_result, serial_result_2)
+        validate_training_dual_boundary!(
+            arm.first_snapshot,
+            arm.first_result,
+            optimizer_config.clip_norm,
+        )
+        validate_training_dual_boundary!(
+            arm.second_snapshot,
+            arm.second_result,
+            optimizer_config.clip_norm,
+        )
         difference_1 = training_first_bit_difference(
             arm.first_snapshot,
             serial_snapshot_1,
