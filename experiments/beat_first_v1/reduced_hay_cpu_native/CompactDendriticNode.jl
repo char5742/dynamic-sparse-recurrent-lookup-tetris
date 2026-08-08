@@ -46,10 +46,11 @@ Semantic input calibration for positive AMPA/NMDA evidence.
 
 The underlying conductance transform gives one unit of positive signed drive
 two excitatory receptor paths, while negative evidence has one GABA path.
-This fixed boundary calibration equalizes their three-phase soma-margin
-effect without changing the Reduced Hay cell equation.
+Calibration equalizing three-phase soma-margin around rest (0.035) moved the
+canonical workload far below the NMDA/plateau operating region and caused
+64-state capacity collapse with zero hard events. Use symmetric drive scaling.
 """
-const EXCITATORY_DRIVE_SCALE = 0.035f0
+const EXCITATORY_DRIVE_SCALE = 0.55f0
 
 """Negative signed evidence is the reference GABA drive scale."""
 const INHIBITORY_DRIVE_SCALE = 1.0f0

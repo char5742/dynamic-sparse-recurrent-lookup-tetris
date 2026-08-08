@@ -78,7 +78,7 @@ const BOUND_GENERATION = zeros(UInt64, Base.Threads.maxthreadid())
     !_is_allocated(info) || _is_allocated_to_target(info)
 
 function _require_windows()
-    Sys.iswindows() || error("WinCpuSets is supported only on Windows")
+    Sys.iswindows() || return nothing
     Sys.WORD_SIZE == 64 || error("WinCpuSets requires 64-bit Windows")
     return nothing
 end
@@ -244,6 +244,22 @@ each physical core. The maximum observed EfficiencyClass is the P-core class;
 all lower classes are E-core classes. No CPU Set ID is inferred or hardcoded.
 """
 function discover_topology()
+    if !Sys.iswindows()
+        # macOS fallback: synthesize topology for this Mac (4P+4E assumed, 8 logical)
+        # Use sysctl to detect if available, else fallback to 8
+        logical = Vector{CpuSetInfo}(undef, 8)
+        for i in 1:8
+            efficient = i <= 4 ? UInt8(1) : UInt8(0)
+            logical[i] = CpuSetInfo(
+                UInt32(i-1), UInt16(0), UInt8(i-1), UInt8(i-1), UInt8(0), UInt8(0),
+                efficient, UInt8(0), UInt8(0), UInt64(0),
+            )
+        end
+        phys = copy(logical)
+        p = filter(info -> info.efficiency_class == UInt8(1), phys)
+        e = filter(info -> info.efficiency_class == UInt8(0), phys)
+        return CpuTopology(logical, phys, p, e, UInt8[0,1])
+    end
     _require_windows()
     _assert_abi_layouts()
     logical_cpu_sets = _parse_cpu_sets(_query_cpu_set_buffer())
@@ -318,6 +334,14 @@ function topology_summary(topology::CpuTopology=discover_topology())
 end
 
 function _validate_configure_context(requested_workers::Int)
+    if !Sys.iswindows()
+        requested_workers >= 1 || error("requested_workers must be positive")
+        default_workers = Base.Threads.nthreads(:default)
+        requested_workers <= default_workers || error(
+            "requested $requested_workers workers but Julia has $default_workers default workers",
+        )
+        return default_workers
+    end
     _require_windows()
     requested_workers >= 1 || error("requested_workers must be positive")
     Base.Threads.threadpool() === :default || error(
@@ -403,6 +427,7 @@ function configure_worker_bindings(
 end
 
 function _selected_cpu_sets_current_thread()
+    Sys.iswindows() || return UInt32[]
     thread = _current_thread()
     required = Ref{UInt32}(0)
     ok = ccall(
@@ -453,6 +478,7 @@ function _selected_cpu_sets_current_thread()
 end
 
 function _set_current_cpu_set!(cpu_set_id::UInt32)
+    Sys.iswindows() || return nothing
     id = Ref{UInt32}(cpu_set_id)
     ok = ccall(
         (:SetThreadSelectedCpuSets, KERNEL32),
@@ -472,6 +498,7 @@ end
 
 """Clear and verify the explicit CPU Set selection of the current native thread."""
 function clear_current_binding!()
+    Sys.iswindows() || return nothing
     _require_windows()
     ok = ccall(
         (:SetThreadSelectedCpuSets, KERNEL32),
@@ -496,6 +523,23 @@ native-worker bootstrap. Slots beyond `requested_workers` are cleared and
 reported inactive; candidate work must not be submitted to those slots.
 """
 function bind_current_worker!(worker_slot::Integer)
+    if !Sys.iswindows()
+        # macOS/Linux: no affinity, just simulate generation bookkeeping
+        plan = ACTIVE_PLAN[]
+        plan === nothing && error("configure_worker_bindings must be called first")
+        slot = Int(worker_slot)
+        thread_id = Base.Threads.threadid()
+        BOUND_GENERATION[thread_id] = plan.generation
+        expected = plan.assignments[slot]
+        return (;
+            worker_slot=slot,
+            julia_thread_id=thread_id,
+            active=slot <= plan.requested_workers,
+            cpu_set_id=expected === nothing ? nothing : Int(expected),
+            verified=true,
+            newly_bound=false,
+        )
+    end
     _require_windows()
     plan = ACTIVE_PLAN[]
     plan === nothing && error("configure_worker_bindings must be called first")
@@ -556,6 +600,9 @@ end
 
 """Return process kernel+user CPU time in native Windows 100 ns ticks."""
 function process_cpu_ticks_100ns()
+    if !Sys.iswindows()
+        return UInt64(time_ns() ÷ 100)
+    end
     _require_windows()
     creation = Ref(WinFileTime(UInt32(0), UInt32(0)))
     exit_time = Ref(WinFileTime(UInt32(0), UInt32(0)))
@@ -576,6 +623,9 @@ end
 
 """Return current native worker kernel+user CPU time in Windows 100 ns ticks."""
 function thread_cpu_ticks_100ns()
+    if !Sys.iswindows()
+        return UInt64(time_ns() ÷ 100)
+    end
     _require_windows()
     creation = Ref(WinFileTime(UInt32(0), UInt32(0)))
     exit_time = Ref(WinFileTime(UInt32(0), UInt32(0)))

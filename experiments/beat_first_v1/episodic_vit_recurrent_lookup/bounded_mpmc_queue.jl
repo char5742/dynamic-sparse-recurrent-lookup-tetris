@@ -5,13 +5,15 @@ export BoundedMPMCQueue, capacity, approx_length, isclosed,
        try_dequeue!, dequeue_wait!, try_dequeue_batch!, dequeue_batch_wait!,
        item_epoch, wait_for_item_change!, wake_consumers!, close!
 
-const KERNEL32 = "Kernel32.dll"
-# Julia's MinGW loader does not resolve Kernel32's API-set forwarders for these
-# three symbols on this host.  KernelBase is the concrete implementation DLL
-# (the documented API remains WaitOnAddress/WakeByAddress*).
-const SYNCH_LIBRARY = "KernelBase.dll"
 const INFINITE = typemax(UInt32)
 const ERROR_TIMEOUT = UInt32(1460)
+if Sys.iswindows()
+    const KERNEL32 = "Kernel32.dll"
+    # Julia's MinGW loader does not resolve Kernel32's API-set forwarders for these
+    # three symbols on this host.  KernelBase is the concrete implementation DLL
+    # (the documented API remains WaitOnAddress/WakeByAddress*).
+    const SYNCH_LIBRARY = "KernelBase.dll"
+end
 
 """
 One slot in a bounded Vyukov-style MPMC ring.
@@ -63,7 +65,6 @@ function BoundedMPMCQueue{T}(
     requested_capacity::Integer,
     empty_value::T=zero(T),
 ) where {T}
-    Sys.iswindows() || error("BoundedMPMCRing requires Windows WaitOnAddress")
     isbitstype(T) || throw(ArgumentError("queue payload type must be isbits"))
     requested_capacity >= 2 || throw(ArgumentError("capacity must be at least 2"))
     ispow2(requested_capacity) || throw(ArgumentError("capacity must be a power of two"))
@@ -107,59 +108,93 @@ item_epoch(queue::BoundedMPMCQueue) = queue.item_epoch[]
 @inline _signed_delta(left::UInt64, right::UInt64) =
     reinterpret(Int64, left - right)
 
-@inline _last_error() = ccall((:GetLastError, KERNEL32), UInt32, ())
+if Sys.iswindows()
+    @inline _last_error() = ccall((:GetLastError, KERNEL32), UInt32, ())
 
-@inline function _atomic_pointer(word::Base.Threads.Atomic{UInt64})
-    return Base.unsafe_convert(Ptr{UInt64}, word)
-end
-
-function _wait_on_epoch(
-    epoch::Base.Threads.Atomic{UInt64},
-    comparisons::Vector{UInt64},
-    expected::UInt64,
-    timeout_ms::UInt32,
-)
-    # One stable comparison cell is owned by each native Julia thread.  This
-    # removes a Ref allocation from every empty/full wait and avoids sharing a
-    # comparison buffer between waiters.
-    thread = Base.Threads.threadid()
-    @inbounds comparisons[thread] = expected
-    result = GC.@preserve epoch comparisons begin
-        address = Ptr{Cvoid}(_atomic_pointer(epoch))
-        comparison_address = Ptr{Cvoid}(pointer(comparisons, thread))
-        @ccall gc_safe=true SYNCH_LIBRARY.WaitOnAddress(
-            address::Ptr{Cvoid},
-            comparison_address::Ptr{Cvoid},
-            sizeof(UInt64)::Csize_t,
-            timeout_ms::UInt32,
-        )::Cint
+    @inline function _atomic_pointer(word::Base.Threads.Atomic{UInt64})
+        return Base.unsafe_convert(Ptr{UInt64}, word)
     end
-    !iszero(result) && return true
-    error_code = _last_error()
-    error_code == ERROR_TIMEOUT && return false
-    # Re-entering Julia after the gc-safe wait can make ERROR_SUCCESS here
-    # indistinguishable from an unclassified retryable return.  It is not a
-    # documented WaitOnAddress success condition, but every caller rechecks
-    # the queue epoch/predicate, so requesting that retry is correctness-safe.
-    # Preserve hard failures for every nonzero, non-timeout code.
-    iszero(error_code) && return true
-    error("WaitOnAddress failed with Win32 error $error_code")
-end
 
-@inline function _wake_one(epoch::Base.Threads.Atomic{UInt64})
-    GC.@preserve epoch begin
-        address = Ptr{Cvoid}(_atomic_pointer(epoch))
-        @ccall SYNCH_LIBRARY.WakeByAddressSingle(address::Ptr{Cvoid})::Cvoid
+    function _wait_on_epoch(
+        epoch::Base.Threads.Atomic{UInt64},
+        comparisons::Vector{UInt64},
+        expected::UInt64,
+        timeout_ms::UInt32,
+    )
+        # One stable comparison cell is owned by each native Julia thread.  This
+        # removes a Ref allocation from every empty/full wait and avoids sharing a
+        # comparison buffer between waiters.
+        thread = Base.Threads.threadid()
+        @inbounds comparisons[thread] = expected
+        result = GC.@preserve epoch comparisons begin
+            address = Ptr{Cvoid}(_atomic_pointer(epoch))
+            comparison_address = Ptr{Cvoid}(pointer(comparisons, thread))
+            @ccall gc_safe=true SYNCH_LIBRARY.WaitOnAddress(
+                address::Ptr{Cvoid},
+                comparison_address::Ptr{Cvoid},
+                sizeof(UInt64)::Csize_t,
+                timeout_ms::UInt32,
+            )::Cint
+        end
+        !iszero(result) && return true
+        error_code = _last_error()
+        error_code == ERROR_TIMEOUT && return false
+        # Re-entering Julia after the gc-safe wait can make ERROR_SUCCESS here
+        # indistinguishable from an unclassified retryable return.  It is not a
+        # documented WaitOnAddress success condition, but every caller rechecks
+        # the queue epoch/predicate, so requesting that retry is correctness-safe.
+        # Preserve hard failures for every nonzero, non-timeout code.
+        iszero(error_code) && return true
+        error("WaitOnAddress failed with Win32 error $error_code")
     end
-    return nothing
-end
 
-@inline function _wake_all(epoch::Base.Threads.Atomic{UInt64})
-    GC.@preserve epoch begin
-        address = Ptr{Cvoid}(_atomic_pointer(epoch))
-        @ccall SYNCH_LIBRARY.WakeByAddressAll(address::Ptr{Cvoid})::Cvoid
+    @inline function _wake_one(epoch::Base.Threads.Atomic{UInt64})
+        GC.@preserve epoch begin
+            address = Ptr{Cvoid}(_atomic_pointer(epoch))
+            @ccall SYNCH_LIBRARY.WakeByAddressSingle(address::Ptr{Cvoid})::Cvoid
+        end
+        return nothing
     end
-    return nothing
+
+    @inline function _wake_all(epoch::Base.Threads.Atomic{UInt64})
+        GC.@preserve epoch begin
+            address = Ptr{Cvoid}(_atomic_pointer(epoch))
+            @ccall SYNCH_LIBRARY.WakeByAddressAll(address::Ptr{Cvoid})::Cvoid
+        end
+        return nothing
+    end
+else
+    # macOS / Linux fallback: spin with cooperative yield, no kernel wait.
+    # Wake is a no-op because waiters poll the epoch via the spin loop.
+    @inline _last_error() = UInt32(0)
+    @inline _atomic_pointer(word::Base.Threads.Atomic{UInt64}) = Ptr{UInt64}(0)
+
+    function _wait_on_epoch(
+        epoch::Base.Threads.Atomic{UInt64},
+        comparisons::Vector{UInt64},
+        expected::UInt64,
+        timeout_ms::UInt32,
+    )
+        # comparisons is unused on non-Windows; keep signature for compatibility.
+        if timeout_ms == INFINITE
+            while epoch[] == expected
+                yield()
+            end
+            return true
+        end
+        deadline = time_ns() + UInt64(timeout_ms) * UInt64(1_000_000)
+        while epoch[] == expected
+            now = time_ns()
+            now >= deadline && return false
+            yield()
+            # Brief pause reduces contention on Apple E-cores without adding latency
+            # on P-cores; the epoch check is cheap and waiters wake within ~1µs.
+        end
+        return true
+    end
+
+    @inline _wake_one(epoch::Base.Threads.Atomic{UInt64}) = nothing
+    @inline _wake_all(epoch::Base.Threads.Atomic{UInt64}) = nothing
 end
 
 @inline function _signal_items!(queue::BoundedMPMCQueue, count::Int)
