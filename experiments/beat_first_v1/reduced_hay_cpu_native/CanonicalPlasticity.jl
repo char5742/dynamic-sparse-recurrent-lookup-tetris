@@ -939,17 +939,22 @@ that cell's `N_eff`; its EMA observation is `X_eff / N_eff`.  A cell with
 `N_eff == 0` is bitwise unchanged.  Task utility is already normalized by
 the scalar loss and is summed without another state/candidate divisor.  Only
 connection activity is averaged by state and candidate before its cost is
-subtracted.  All layout, payload, overflow, and resulting-state checks complete
-before the first persistent mutation.  Call `preflight_canonical_plasticity`
-before an optimizer transaction that must know this reducer can commit.  This
-is the production canonical reducer; `reduce_candidate_plasticity!` below is a
-legacy focused oracle.
+subtracted.  `utility_due=false` leaves persistent utility and its counter
+bitwise unchanged while still updating cell activity EMAs; it also rejects a
+nonzero task-utility publication.  This is the analog-clock-off and
+`utility_mode=:none` contract.  All layout, payload, overflow, and
+resulting-state checks complete before the first persistent mutation.  Call
+`preflight_canonical_plasticity` before an optimizer transaction that must know
+this reducer can commit.  This is the production canonical reducer;
+`reduce_candidate_plasticity!` below is a legacy focused oracle.
 """
 function preflight_canonical_plasticity(
     state::PlasticityState{T},
     batch::CanonicalPlasticityBatch,
     config::Local.PlasticityConfig,
     state_candidate_offsets::AbstractVector{<:Integer},
+    ;
+    utility_due::Bool=true,
 ) where {T<:AbstractFloat}
     states, candidates, raw_observations =
         _preflight_canonical_batch(
@@ -995,29 +1000,47 @@ function preflight_canonical_plasticity(
             throw(OverflowError("canonical cell EMA update overflow"))
     end
 
+    utility_nonzero = 0
     utility_decay = T(config.utility_decay)
     connection_cost = Float64(config.connection_cost)
-    utility_nonzero = 0
     @inbounds for contact in eachindex(state.utility)
         old_utility = state.utility[contact]
         isfinite(old_utility) || throw(DomainError(
             old_utility,
             "persistent structural utility is nonfinite",
         ))
-        contribution = _canonical_contact_contribution(
-            batch,
-            state_candidate_offsets,
-            states,
-            contact,
-            connection_cost,
-        )
-        stored_contribution = T(contribution)
-        isfinite(stored_contribution) || throw(OverflowError(
-            "canonical utility is outside persistent storage range",
-        ))
-        isfinite(muladd(utility_decay, old_utility, stored_contribution)) ||
-            throw(OverflowError("canonical utility update overflow"))
-        utility_nonzero += !iszero(contribution)
+        if utility_due
+            contribution = _canonical_contact_contribution(
+                batch,
+                state_candidate_offsets,
+                states,
+                contact,
+                connection_cost,
+            )
+            stored_contribution = T(contribution)
+            isfinite(stored_contribution) || throw(OverflowError(
+                "canonical utility is outside persistent storage range",
+            ))
+            isfinite(muladd(utility_decay, old_utility, stored_contribution)) ||
+                throw(OverflowError("canonical utility update overflow"))
+            utility_nonzero += !iszero(contribution)
+        else
+            for state_slot in 1:states
+                iszero(batch.common.utility_product_sum[contact, state_slot]) ||
+                    throw(ArgumentError(
+                        "task utility was published while its clock was not due",
+                    ))
+                left = Int(state_candidate_offsets[state_slot])
+                right = Int(state_candidate_offsets[state_slot + 1])
+                for candidate in (left + 1):right
+                    iszero(batch.candidate.utility_product_sum[
+                        contact, candidate,
+                    ]) || throw(ArgumentError(
+                        "task utility was published while its clock was not due",
+                    ))
+                end
+            end
+        end
     end
     UInt64(utility_nonzero) <= typemax(UInt64) - state.utility_updates || throw(
         OverflowError("utility_updates counter overflow"),
@@ -1030,12 +1053,16 @@ function reduce_canonical_plasticity!(
     batch::CanonicalPlasticityBatch,
     config::Local.PlasticityConfig,
     state_candidate_offsets::AbstractVector{<:Integer},
+    ;
+    utility_due::Bool=true,
 ) where {T<:AbstractFloat}
     stats = preflight_canonical_plasticity(
         state,
         batch,
         config,
         state_candidate_offsets,
+        ;
+        utility_due,
     )
     states = length(state_candidate_offsets) - 1
     decay = T(config.firing_ema_decay)
@@ -1071,22 +1098,24 @@ function reduce_canonical_plasticity!(
             complement * T(incoming * inverse_visits),
         )
     end
-    @inbounds for contact in eachindex(state.utility)
-        contribution = T(_canonical_contact_contribution(
-            batch,
-            state_candidate_offsets,
-            states,
-            contact,
-            connection_cost,
-        ))
-        state.utility[contact] = muladd(
-            utility_decay,
-            state.utility[contact],
-            contribution,
-        )
+    if utility_due
+        @inbounds for contact in eachindex(state.utility)
+            contribution = T(_canonical_contact_contribution(
+                batch,
+                state_candidate_offsets,
+                states,
+                contact,
+                connection_cost,
+            ))
+            state.utility[contact] = muladd(
+                utility_decay,
+                state.utility[contact],
+                contribution,
+            )
+        end
     end
     state.reduced_batches += UInt64(1)
-    state.utility_updates += UInt64(stats.utility_nonzero)
+    utility_due && (state.utility_updates += UInt64(stats.utility_nonzero))
     return stats
 end
 
@@ -1234,8 +1263,113 @@ struct OptimizerMomentReset{S,R}
     registry::R
 end
 
+@inline function _reset_named_moment!(
+    ::Tuple{},
+    ::Tuple{},
+    name::Symbol,
+    index,
+)
+    throw(KeyError(name))
+end
+
+@inline function _reset_named_moment!(
+    groups::Tuple,
+    moments::Tuple,
+    name::Symbol,
+    index,
+)
+    group = first(groups)
+    moment = first(moments)
+    if group.name == name
+        checkbounds(group.parameter, index)
+        @inbounds moment.first[index] = 0.0f0
+        @inbounds moment.second[index] = 0.0f0
+        return nothing
+    end
+    return _reset_named_moment!(
+        Base.tail(groups),
+        Base.tail(moments),
+        name,
+        index,
+    )
+end
+
 @inline function (reset::OptimizerMomentReset)(name::Symbol, index)
-    Optimizer.reset_moments!(reset.state, reset.registry, name, index)
+    # Keep the optimizer's complete registry/state contract check, then reset
+    # through tuple recursion.  The optimizer's generic lookup returns a union
+    # when canonical groups have different array ranks (matrix/vector/4-D),
+    # whereas this branch-local recursion remains allocation free.
+    Optimizer.assert_registry_match(reset.state, reset.registry)
+    _reset_named_moment!(
+        reset.registry.groups,
+        reset.state.moments,
+        name,
+        index,
+    )
+    return nothing
+end
+
+@inline function _assert_reset_group_identity(
+    group::Optimizer.ParameterGroup,
+    ::Tuple{},
+)
+    throw(KeyError(group.name))
+end
+
+@inline function _assert_reset_group_identity(
+    group::Optimizer.ParameterGroup,
+    registry_groups::Tuple,
+)
+    registered = first(registry_groups)
+    if registered.name == group.name
+        registered.parameter === group.parameter &&
+            registered.gradient === group.gradient &&
+            registered.transform_kind == group.transform_kind &&
+            registered.multiplier == group.multiplier &&
+            registered.lower_bound == group.lower_bound &&
+            registered.upper_bound == group.upper_bound || throw(
+                ArgumentError(
+                    "moment-reset group $(group.name) does not identify " *
+                    "the registered parameter storage",
+                ),
+            )
+        return nothing
+    end
+    return _assert_reset_group_identity(group, Base.tail(registry_groups))
+end
+
+@inline _assert_reset_group_identities(
+    ::Tuple{},
+    registry_groups::Tuple,
+) = nothing
+
+@inline function _assert_reset_group_identities(
+    groups::Tuple,
+    registry_groups::Tuple,
+)
+    group = first(groups)
+    group isa Optimizer.ParameterGroup || throw(ArgumentError(
+        "moment-reset targets must be ParameterGroups",
+    ))
+    _assert_reset_group_identity(group, registry_groups)
+    return _assert_reset_group_identities(
+        Base.tail(groups),
+        registry_groups,
+    )
+end
+
+@inline function _preflight_moment_reset(reset_moment!, groups::Tuple)
+    throw(ArgumentError(
+        "plasticity mutation requires an OptimizerMomentReset",
+    ))
+end
+
+@inline function _preflight_moment_reset(
+    reset::OptimizerMomentReset,
+    groups::Tuple,
+)
+    Optimizer.assert_registry_match(reset.state, reset.registry)
+    _assert_reset_group_identities(groups, reset.registry.groups)
     return nothing
 end
 
@@ -1251,6 +1385,218 @@ end
     return nothing
 end
 
+@inline function _assert_group_scalar_metadata(
+    group::Optimizer.ParameterGroup,
+)
+    isfinite(group.multiplier) && group.multiplier >= 0.0f0 || throw(
+        ArgumentError(
+            "parameter-group multiplier must be finite and nonnegative",
+        ),
+    )
+    !isnan(group.lower_bound) && !isnan(group.upper_bound) &&
+        group.lower_bound < group.upper_bound || throw(ArgumentError(
+            "parameter-group bounds must be ordered",
+        ))
+    !isnan(group.projected_lower_raw) &&
+        !isnan(group.projected_upper_raw) &&
+        group.projected_lower_raw < group.projected_upper_raw || throw(
+            ArgumentError("parameter-group projected bounds must be ordered"),
+        )
+    return nothing
+end
+
+@inline function _preflight_group_raw_parameters(
+    group::Optimizer.ParameterGroup,
+)
+    lower = group.projected_lower_raw
+    upper = group.projected_upper_raw
+    @inbounds for index in eachindex(group.parameter)
+        raw = group.parameter[index]
+        isfinite(raw) || throw(DomainError(
+            raw,
+            "non-finite raw parameter in group $(group.name)",
+        ))
+        lower <= raw <= upper || throw(DomainError(
+            raw,
+            "raw parameter in group $(group.name) is outside its bounds",
+        ))
+    end
+    return nothing
+end
+
+@inline function _preflight_firing_rate(state::PlasticityState)
+    @inbounds for cell in eachindex(state.firing_rate)
+        rate = state.firing_rate[cell]
+        isfinite(rate) && zero(rate) <= rate <= one(rate) || throw(DomainError(
+            rate,
+            "firing-rate EMA must be finite and lie in [0, 1]",
+        ))
+    end
+    return nothing
+end
+
+@inline _preflight_unique_groups(::Tuple{}) = nothing
+
+@inline _preflight_group_distinct_from(group, ::Tuple{}) = nothing
+
+@inline function _preflight_group_distinct_from(group, others::Tuple)
+    other = first(others)
+    other isa Optimizer.ParameterGroup || throw(ArgumentError(
+        "plasticity segments must be ParameterGroups",
+    ))
+    group.name != other.name && group.parameter !== other.parameter || throw(
+        ArgumentError(
+            "plasticity segments must identify distinct parameter groups",
+        ),
+    )
+    return _preflight_group_distinct_from(group, Base.tail(others))
+end
+
+@inline function _preflight_unique_groups(groups::Tuple)
+    group = first(groups)
+    group isa Optimizer.ParameterGroup || throw(ArgumentError(
+        "plasticity segments must be ParameterGroups",
+    ))
+    _preflight_group_distinct_from(group, Base.tail(groups))
+    return _preflight_unique_groups(Base.tail(groups))
+end
+
+@inline function _preflight_cell_segments(
+    ::Tuple{},
+    ::Tuple{},
+    expected_start::Int,
+    total_cells::Int,
+)
+    expected_start == total_cells + 1 || throw(DimensionMismatch(
+        "cell-group ranges must cover every logical cell in 1:$total_cells",
+    ))
+    return nothing
+end
+
+@inline function _preflight_cell_segments(
+    ::Tuple{},
+    ranges::Tuple,
+    expected_start::Int,
+    total_cells::Int,
+)
+    throw(DimensionMismatch("more logical cell ranges than cell groups"))
+end
+
+@inline function _preflight_cell_segments(
+    groups::Tuple,
+    ::Tuple{},
+    expected_start::Int,
+    total_cells::Int,
+)
+    throw(DimensionMismatch("fewer logical cell ranges than cell groups"))
+end
+
+@inline function _preflight_cell_segments(
+    groups::Tuple,
+    ranges::Tuple,
+    expected_start::Int,
+    total_cells::Int,
+)
+    group = first(groups)
+    group isa Optimizer.ParameterGroup || throw(ArgumentError(
+        "every intrinsic-homeostasis segment must be a ParameterGroup",
+    ))
+    logical_range = first(ranges)
+    logical_range isa AbstractUnitRange{<:Integer} || throw(ArgumentError(
+        "every intrinsic-homeostasis segment requires an integer unit range",
+    ))
+    isempty(logical_range) && throw(DimensionMismatch(
+        "logical cell ranges must be nonempty",
+    ))
+    Int(first(logical_range)) == expected_start || throw(DimensionMismatch(
+        "cell-group ranges must be contiguous, ordered, and start at 1",
+    ))
+    range_length = length(logical_range)
+    range_length <= total_cells - expected_start + 1 || throw(
+        DimensionMismatch("logical cell range exceeds firing-rate storage"),
+    )
+    Int(last(logical_range)) == expected_start + range_length - 1 || throw(
+        DimensionMismatch("logical cell ranges must have unit stride"),
+    )
+    _assert_group_scalar_metadata(group)
+    _assert_cell_group(group, range_length)
+    _preflight_group_raw_parameters(group)
+    return _preflight_cell_segments(
+        Base.tail(groups),
+        Base.tail(ranges),
+        expected_start + range_length,
+        total_cells,
+    )
+end
+
+@inline function _preflight_cell_offset_segments(
+    ::Tuple{},
+    ::Tuple{},
+    expected_offset::Int,
+    total_cells::Int,
+)
+    expected_offset == total_cells || throw(DimensionMismatch(
+        "cell-group offsets must cover every logical cell in 1:$total_cells",
+    ))
+    return nothing
+end
+
+@inline function _preflight_cell_offset_segments(
+    ::Tuple{},
+    offsets::Tuple,
+    expected_offset::Int,
+    total_cells::Int,
+)
+    throw(DimensionMismatch("more logical cell offsets than cell groups"))
+end
+
+@inline function _preflight_cell_offset_segments(
+    groups::Tuple,
+    ::Tuple{},
+    expected_offset::Int,
+    total_cells::Int,
+)
+    throw(DimensionMismatch("fewer logical cell offsets than cell groups"))
+end
+
+@inline function _preflight_cell_offset_segments(
+    groups::Tuple,
+    offsets::Tuple,
+    expected_offset::Int,
+    total_cells::Int,
+)
+    group = first(groups)
+    group isa Optimizer.ParameterGroup || throw(ArgumentError(
+        "every intrinsic-homeostasis segment must be a ParameterGroup",
+    ))
+    logical_offset = first(offsets)
+    logical_offset isa Integer || throw(ArgumentError(
+        "every intrinsic-homeostasis segment requires an integer offset",
+    ))
+    Int(logical_offset) == expected_offset || throw(DimensionMismatch(
+        "cell-group offsets must be contiguous, ordered, and start at zero",
+    ))
+    _assert_group_scalar_metadata(group)
+    ndims(group.parameter) == 2 || throw(DimensionMismatch(
+        "cell raw groups must be matrices",
+    ))
+    range_length = size(group.parameter, 2)
+    range_length > 0 || throw(DimensionMismatch(
+        "cell raw groups must have at least one cell",
+    ))
+    range_length <= total_cells - expected_offset || throw(
+        DimensionMismatch("logical cell offset exceeds firing-rate storage"),
+    )
+    _assert_cell_group(group, range_length)
+    _preflight_group_raw_parameters(group)
+    return _preflight_cell_offset_segments(
+        Base.tail(groups),
+        Base.tail(offsets),
+        expected_offset + range_length,
+        total_cells,
+    )
+end
+
 @inline function _set_cell_physical!(
     group::Optimizer.ParameterGroup,
     parameter::Int,
@@ -1264,48 +1610,144 @@ end
         "cell raw parameter must be finite",
     ))
     new_raw = _bounded_raw(physical, parameter)
+    new_raw = clamp(
+        new_raw,
+        group.projected_lower_raw,
+        group.projected_upper_raw,
+    )
     new_raw == old_raw && return false
     @inbounds group.parameter[parameter, cell] = new_raw
     reset_moment!(group.name, CartesianIndex(parameter, cell))
     return true
 end
 
-"""
-Apply intrinsic firing-rate homeostasis in physical parameter space.
-
-Only soma-threshold gap and adaptation gain are changed.  Dormant cells lower
-both; overspiking cells raise both.  A false `due` flag or zero group
-multiplier is a strict no-op, including optimizer moments and counters.
-"""
-function apply_intrinsic_homeostasis!(
+@inline function _count_cell_segment_changes(
     state::PlasticityState,
     config::Local.PlasticityConfig,
-    due::Bool,
-    cell_group::Optimizer.ParameterGroup,
+    group::Optimizer.ParameterGroup,
+    logical_start::Int,
+)
+    group.multiplier > 0.0f0 || return 0
+    multiplier = group.multiplier
+    changed_cells = 0
+    @inbounds for local_cell in axes(group.parameter, 2)
+        logical_cell = logical_start + local_cell - 1
+        rate = state.firing_rate[logical_cell]
+        direction = rate < config.target_rate_min ? -1.0f0 :
+                    rate > config.target_rate_max ? 1.0f0 : 0.0f0
+        iszero(direction) && continue
+        threshold_index = Cell.P_SOMA_THRESHOLD_GAP
+        adaptation_index = Cell.P_ADAPTATION_GAIN
+        old_threshold_raw = group.parameter[threshold_index, local_cell]
+        old_adaptation_raw = group.parameter[adaptation_index, local_cell]
+        old_threshold = cell_physical_parameter(
+            old_threshold_raw,
+            threshold_index,
+        )
+        old_adaptation = cell_physical_parameter(
+            old_adaptation_raw,
+            adaptation_index,
+        )
+        threshold = clamp(
+            old_threshold + direction *
+                config.threshold_homeostasis_step * multiplier,
+            Cell.PARAMETER_LOWER[threshold_index],
+            Cell.PARAMETER_UPPER[threshold_index],
+        )
+        adaptation = clamp(
+            old_adaptation + direction *
+                config.adaptation_homeostasis_step * multiplier,
+            Cell.PARAMETER_LOWER[adaptation_index],
+            Cell.PARAMETER_UPPER[adaptation_index],
+        )
+        threshold_raw = clamp(
+            _bounded_raw(threshold, threshold_index),
+            group.projected_lower_raw,
+            group.projected_upper_raw,
+        )
+        adaptation_raw = clamp(
+            _bounded_raw(adaptation, adaptation_index),
+            group.projected_lower_raw,
+            group.projected_upper_raw,
+        )
+        changed_cells += threshold_raw != old_threshold_raw ||
+            adaptation_raw != old_adaptation_raw
+    end
+    return changed_cells
+end
+
+@inline _count_cell_segment_changes(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    ::Tuple{},
+    ::Tuple{},
+) = 0
+
+@inline function _count_cell_segment_changes(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    groups::Tuple,
+    ranges::Tuple,
+)
+    changed = _count_cell_segment_changes(
+        state,
+        config,
+        first(groups),
+        Int(first(first(ranges))),
+    )
+    return changed + _count_cell_segment_changes(
+        state,
+        config,
+        Base.tail(groups),
+        Base.tail(ranges),
+    )
+end
+
+@inline function _count_cell_offset_segment_changes(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    groups::Tuple,
+    offsets::Tuple,
+)
+    isempty(groups) && return 0
+    changed = _count_cell_segment_changes(
+        state,
+        config,
+        first(groups),
+        Int(first(offsets)) + 1,
+    )
+    return changed + _count_cell_offset_segment_changes(
+        state,
+        config,
+        Base.tail(groups),
+        Base.tail(offsets),
+    )
+end
+
+@inline function _apply_cell_segment!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    group::Optimizer.ParameterGroup,
+    logical_start::Int,
     reset_moment!,
 )
-    cells = length(state.firing_rate)
-    _assert_cell_group(cell_group, cells)
-    due && cell_group.multiplier > 0.0f0 || return 0
-    multiplier = cell_group.multiplier
+    group.multiplier > 0.0f0 || return 0
+    multiplier = group.multiplier
     changed_cells = 0
-    @inbounds for cell in 1:cells
-        rate = state.firing_rate[cell]
-        isfinite(rate) || throw(DomainError(
-            rate,
-            "firing-rate EMA must be finite",
-        ))
+    @inbounds for local_cell in axes(group.parameter, 2)
+        logical_cell = logical_start + local_cell - 1
+        rate = state.firing_rate[logical_cell]
         direction = rate < config.target_rate_min ? -1.0f0 :
                     rate > config.target_rate_max ? 1.0f0 : 0.0f0
         iszero(direction) && continue
         threshold_index = Cell.P_SOMA_THRESHOLD_GAP
         adaptation_index = Cell.P_ADAPTATION_GAIN
         old_threshold = cell_physical_parameter(
-            cell_group.parameter[threshold_index, cell],
+            group.parameter[threshold_index, local_cell],
             threshold_index,
         )
         old_adaptation = cell_physical_parameter(
-            cell_group.parameter[adaptation_index, cell],
+            group.parameter[adaptation_index, local_cell],
             adaptation_index,
         )
         threshold = clamp(
@@ -1321,21 +1763,201 @@ function apply_intrinsic_homeostasis!(
             Cell.PARAMETER_UPPER[adaptation_index],
         )
         changed = _set_cell_physical!(
-            cell_group,
+            group,
             threshold_index,
-            cell,
+            local_cell,
             threshold,
             reset_moment!,
         )
         changed |= _set_cell_physical!(
-            cell_group,
+            group,
             adaptation_index,
-            cell,
+            local_cell,
             adaptation,
             reset_moment!,
         )
         changed_cells += changed
     end
+    return changed_cells
+end
+
+@inline _apply_cell_segments!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    ::Tuple{},
+    ::Tuple{},
+    reset_moment!,
+) = 0
+
+@inline function _apply_cell_segments!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    groups::Tuple,
+    ranges::Tuple,
+    reset_moment!,
+)
+    logical_start = Int(first(first(ranges)))
+    changed = _apply_cell_segment!(
+        state,
+        config,
+        first(groups),
+        logical_start,
+        reset_moment!,
+    )
+    return changed + _apply_cell_segments!(
+        state,
+        config,
+        Base.tail(groups),
+        Base.tail(ranges),
+        reset_moment!,
+    )
+end
+
+@inline _apply_cell_offset_segments!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    ::Tuple{},
+    ::Tuple{},
+    reset_moment!,
+) = 0
+
+@inline function _apply_cell_offset_segments!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    groups::Tuple,
+    offsets::Tuple,
+    reset_moment!,
+)
+    changed = _apply_cell_segment!(
+        state,
+        config,
+        first(groups),
+        Int(first(offsets)) + 1,
+        reset_moment!,
+    )
+    return changed + _apply_cell_offset_segments!(
+        state,
+        config,
+        Base.tail(groups),
+        Base.tail(offsets),
+        reset_moment!,
+    )
+end
+
+"""
+Apply intrinsic firing-rate homeostasis in physical parameter space.
+
+Only soma-threshold gap and adaptation gain are changed.  Dormant cells lower
+both; overspiking cells raise both.  A false `due` flag or zero group
+multiplier is a strict no-op, including optimizer moments and counters.
+Every mutating call requires an `OptimizerMomentReset`; arbitrary callbacks are
+rejected before the first parameter write.
+"""
+function apply_intrinsic_homeostasis!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    due::Bool,
+    cell_group::Optimizer.ParameterGroup,
+    reset_moment!,
+)
+    cells = length(state.firing_rate)
+    return apply_intrinsic_homeostasis!(
+        state,
+        config,
+        due,
+        (cell_group,),
+        (1:cells,),
+        reset_moment!,
+    )
+end
+
+"""
+Apply intrinsic homeostasis to segmented optimizer cell groups.
+
+`logical_ranges` maps each group's local columns onto the authoritative
+firing-rate EMA.  The ranges must be nonempty and cover `1:TOTAL` exactly,
+in order and without a gap or overlap.  Every group and every EMA is validated
+before any parameter, moment, or persistent counter is changed.  Aliased
+segments, counter overflow, and noncanonical moment resetters fail closed.
+"""
+function apply_intrinsic_homeostasis!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    due::Bool,
+    cell_groups::Tuple,
+    logical_ranges::Tuple{R,Vararg{Any}},
+    reset_moment!,
+) where {R<:AbstractUnitRange}
+    cells = length(state.firing_rate)
+    _preflight_firing_rate(state)
+    _preflight_unique_groups(cell_groups)
+    _preflight_cell_segments(cell_groups, logical_ranges, 1, cells)
+    due || return 0
+    _preflight_moment_reset(reset_moment!, cell_groups)
+    predicted_changes = _count_cell_segment_changes(
+        state,
+        config,
+        cell_groups,
+        logical_ranges,
+    )
+    UInt64(predicted_changes) <=
+        typemax(UInt64) - state.homeostasis_events || throw(
+        OverflowError("homeostasis_events counter overflow"),
+    )
+    changed_cells = _apply_cell_segments!(
+        state,
+        config,
+        cell_groups,
+        logical_ranges,
+        reset_moment!,
+    )
+    state.homeostasis_events += UInt64(changed_cells)
+    return changed_cells
+end
+
+"""
+Offset form of segmented intrinsic homeostasis.
+
+Offsets are zero based: `(0, 1436)` maps groups of 1436 and 22 columns onto
+the canonical 1458-cell EMA.  Offsets must therefore be the exact cumulative
+column counts of preceding groups.
+"""
+function apply_intrinsic_homeostasis!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    due::Bool,
+    cell_groups::Tuple,
+    logical_offsets::Tuple{I,Vararg{Any}},
+    reset_moment!,
+) where {I<:Integer}
+    cells = length(state.firing_rate)
+    _preflight_firing_rate(state)
+    _preflight_unique_groups(cell_groups)
+    _preflight_cell_offset_segments(
+        cell_groups,
+        logical_offsets,
+        0,
+        cells,
+    )
+    due || return 0
+    _preflight_moment_reset(reset_moment!, cell_groups)
+    predicted_changes = _count_cell_offset_segment_changes(
+        state,
+        config,
+        cell_groups,
+        logical_offsets,
+    )
+    UInt64(predicted_changes) <=
+        typemax(UInt64) - state.homeostasis_events || throw(
+        OverflowError("homeostasis_events counter overflow"),
+    )
+    changed_cells = _apply_cell_offset_segments!(
+        state,
+        config,
+        cell_groups,
+        logical_offsets,
+        reset_moment!,
+    )
     state.homeostasis_events += UInt64(changed_cells)
     return changed_cells
 end
@@ -1347,6 +1969,209 @@ end
         ),
     )
     return nothing
+end
+
+@inline function _preflight_conductance_segment(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    group,
+    destination,
+)
+    group isa Optimizer.ParameterGroup || throw(ArgumentError(
+        "every synaptic-scaling segment must be a ParameterGroup",
+    ))
+    destination isa AbstractVector{<:Integer} || throw(ArgumentError(
+        "every synaptic-scaling segment requires a destination vector",
+    ))
+    _assert_group_scalar_metadata(group)
+    _assert_conductance_group(group)
+    isfinite(group.lower_bound) && isfinite(group.upper_bound) &&
+        group.lower_bound > 0.0f0 || throw(ArgumentError(
+            "conductance groups require finite positive physical bounds",
+        ))
+    length(destination) == length(group.parameter) || throw(
+        DimensionMismatch(
+            "one destination id is required per conductance parameter",
+        ),
+    )
+    lower = max(config.conductance_floor, group.lower_bound)
+    upper = min(config.conductance_ceiling, group.upper_bound)
+    lower < upper || throw(ArgumentError(
+        "plasticity and optimizer conductance bounds do not overlap",
+    ))
+    _preflight_group_raw_parameters(group)
+    cells = length(state.firing_rate)
+    @inbounds for contact in 1:length(destination)
+        target = Int(destination[contact])
+        0 <= target <= cells || throw(BoundsError(state.firing_rate, target))
+    end
+    return nothing
+end
+
+@inline _preflight_conductance_segments(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    ::Tuple{},
+    ::Tuple{},
+) = nothing
+
+@inline function _preflight_conductance_segments(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    ::Tuple{},
+    destinations::Tuple,
+)
+    throw(DimensionMismatch(
+        "more destination vectors than conductance groups",
+    ))
+end
+
+@inline function _preflight_conductance_segments(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    groups::Tuple,
+    ::Tuple{},
+)
+    throw(DimensionMismatch(
+        "fewer destination vectors than conductance groups",
+    ))
+end
+
+@inline function _preflight_conductance_segments(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    groups::Tuple,
+    destinations::Tuple,
+)
+    _preflight_conductance_segment(
+        state,
+        config,
+        first(groups),
+        first(destinations),
+    )
+    return _preflight_conductance_segments(
+        state,
+        config,
+        Base.tail(groups),
+        Base.tail(destinations),
+    )
+end
+
+@inline function _apply_conductance_segment!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    group::Optimizer.ParameterGroup,
+    destination::AbstractVector{<:Integer},
+    reset_moment!,
+)
+    group.multiplier > 0.0f0 || return 0
+    lower = max(config.conductance_floor, group.lower_bound)
+    upper = min(config.conductance_ceiling, group.upper_bound)
+    changed = 0
+    @inbounds for contact in 1:length(destination)
+        target = Int(destination[contact])
+        target == 0 && continue
+        rate = state.firing_rate[target]
+        direction = rate < config.target_rate_min ? 1.0f0 :
+                    rate > config.target_rate_max ? -1.0f0 : 0.0f0
+        iszero(direction) && continue
+        raw = group.parameter[contact]
+        physical = Optimizer.physical_conductance(raw)
+        factor = exp(
+            direction * config.synaptic_scaling_rate * group.multiplier,
+        )
+        scaled = clamp(physical * factor, lower, upper)
+        scaled == physical && continue
+        group.parameter[contact] = Optimizer.inverse_softplus(scaled)
+        reset_moment!(group.name, contact)
+        changed += 1
+    end
+    return changed
+end
+
+@inline function _count_conductance_segment_changes(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    group::Optimizer.ParameterGroup,
+    destination::AbstractVector{<:Integer},
+)
+    group.multiplier > 0.0f0 || return 0
+    lower = max(config.conductance_floor, group.lower_bound)
+    upper = min(config.conductance_ceiling, group.upper_bound)
+    changed = 0
+    @inbounds for contact in 1:length(destination)
+        target = Int(destination[contact])
+        target == 0 && continue
+        rate = state.firing_rate[target]
+        direction = rate < config.target_rate_min ? 1.0f0 :
+                    rate > config.target_rate_max ? -1.0f0 : 0.0f0
+        iszero(direction) && continue
+        physical = Optimizer.physical_conductance(group.parameter[contact])
+        factor = exp(
+            direction * config.synaptic_scaling_rate * group.multiplier,
+        )
+        scaled = clamp(physical * factor, lower, upper)
+        changed += scaled != physical
+    end
+    return changed
+end
+
+@inline _count_conductance_segment_changes(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    ::Tuple{},
+    ::Tuple{},
+) = 0
+
+@inline function _count_conductance_segment_changes(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    groups::Tuple,
+    destinations::Tuple,
+)
+    changed = _count_conductance_segment_changes(
+        state,
+        config,
+        first(groups),
+        first(destinations),
+    )
+    return changed + _count_conductance_segment_changes(
+        state,
+        config,
+        Base.tail(groups),
+        Base.tail(destinations),
+    )
+end
+
+@inline _apply_conductance_segments!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    ::Tuple{},
+    ::Tuple{},
+    reset_moment!,
+) = 0
+
+@inline function _apply_conductance_segments!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    groups::Tuple,
+    destinations::Tuple,
+    reset_moment!,
+)
+    changed = _apply_conductance_segment!(
+        state,
+        config,
+        first(groups),
+        first(destinations),
+        reset_moment!,
+    )
+    return changed + _apply_conductance_segments!(
+        state,
+        config,
+        Base.tail(groups),
+        Base.tail(destinations),
+        reset_moment!,
+    )
 end
 
 """
@@ -1363,48 +2188,60 @@ function apply_synaptic_scaling!(
     destination::AbstractVector{<:Integer},
     reset_moment!,
 )
-    _assert_conductance_group(conductance_group)
-    length(destination) == length(conductance_group.parameter) || throw(
-        DimensionMismatch(
-            "one destination id is required per conductance parameter",
-        ),
+    return apply_synaptic_scaling!(
+        state,
+        config,
+        due,
+        (conductance_group,),
+        (destination,),
+        reset_moment!,
     )
-    due && conductance_group.multiplier > 0.0f0 || return 0
-    lower = max(config.conductance_floor, conductance_group.lower_bound)
-    upper = min(config.conductance_ceiling, conductance_group.upper_bound)
-    lower < upper || throw(ArgumentError(
-        "plasticity and optimizer conductance bounds do not overlap",
-    ))
-    changed = 0
-    @inbounds for contact in eachindex(destination)
-        target = Int(destination[contact])
-        target == 0 && continue
-        checkbounds(state.firing_rate, target)
-        rate = state.firing_rate[target]
-        isfinite(rate) || throw(DomainError(
-            rate,
-            "firing-rate EMA must be finite",
-        ))
-        direction = rate < config.target_rate_min ? 1.0f0 :
-                    rate > config.target_rate_max ? -1.0f0 : 0.0f0
-        iszero(direction) && continue
-        raw = conductance_group.parameter[contact]
-        isfinite(raw) || throw(DomainError(
-            raw,
-            "conductance raw parameter must be finite",
-        ))
-        physical = Optimizer.physical_conductance(raw)
-        factor = exp(
-            direction * config.synaptic_scaling_rate *
-                conductance_group.multiplier,
-        )
-        scaled = clamp(physical * factor, lower, upper)
-        scaled == physical && continue
-        conductance_group.parameter[contact] =
-            Optimizer.inverse_softplus(scaled)
-        reset_moment!(conductance_group.name, contact)
-        changed += 1
-    end
+end
+
+"""
+Apply synaptic scaling transactionally across segmented conductance groups.
+
+Each destination vector uses the local linear indexing of its group; zero
+marks a shared/non-anatomical gain.  All groups, raw parameters, bounds,
+destinations, and firing-rate EMAs are checked before the first mutation.
+Aliased segments, counter overflow, and noncanonical moment resetters fail
+closed.
+"""
+function apply_synaptic_scaling!(
+    state::PlasticityState,
+    config::Local.PlasticityConfig,
+    due::Bool,
+    conductance_groups::Tuple,
+    destinations::Tuple,
+    reset_moment!,
+)
+    _preflight_firing_rate(state)
+    _preflight_unique_groups(conductance_groups)
+    _preflight_conductance_segments(
+        state,
+        config,
+        conductance_groups,
+        destinations,
+    )
+    due || return 0
+    _preflight_moment_reset(reset_moment!, conductance_groups)
+    predicted_changes = _count_conductance_segment_changes(
+        state,
+        config,
+        conductance_groups,
+        destinations,
+    )
+    UInt64(predicted_changes) <=
+        typemax(UInt64) - state.synaptic_scaling_events || throw(
+        OverflowError("synaptic_scaling_events counter overflow"),
+    )
+    changed = _apply_conductance_segments!(
+        state,
+        config,
+        conductance_groups,
+        destinations,
+        reset_moment!,
+    )
     state.synaptic_scaling_events += UInt64(changed)
     return changed
 end

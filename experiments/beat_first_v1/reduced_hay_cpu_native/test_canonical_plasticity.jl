@@ -53,6 +53,83 @@ function parameter_fixture(
     return registry, optimizer
 end
 
+function segmented_cell_fixture(
+    core_cells::Int=1436,
+    output_cells::Int=22;
+    core_multiplier=1.0f0,
+    output_multiplier=1.0f0,
+)
+    default = Cell.default_raw_parameters()
+    core = repeat(default, 1, core_cells)
+    output = repeat(default, 1, output_cells)
+    registry = Optimizer.ParameterRegistry(
+        Optimizer.ParameterGroup(
+            :core_cell_raw,
+            core,
+            zeros(Float32, size(core)),
+            Optimizer.CELL_RAW;
+            multiplier=core_multiplier,
+        ),
+        Optimizer.ParameterGroup(
+            :output_cell_raw,
+            output,
+            zeros(Float32, size(output)),
+            Optimizer.CELL_RAW;
+            multiplier=output_multiplier,
+        ),
+    )
+    optimizer = Optimizer.AdamWState(registry)
+    for moments in optimizer.moments
+        fill!(moments.first, 1.0f0)
+        fill!(moments.second, 2.0f0)
+    end
+    return registry, optimizer
+end
+
+function segmented_conductance_fixture(;
+    semantic_multiplier=1.0f0,
+    event_multiplier=1.0f0,
+    output_multiplier=1.0f0,
+)
+    initial = Optimizer.inverse_softplus(0.5f0)
+    semantic = fill(initial, 2, 2)
+    event = fill(initial, 3)
+    output = fill(initial, 1, 2)
+    make_group(name, parameter, multiplier) = Optimizer.ParameterGroup(
+        name,
+        parameter,
+        zeros(Float32, size(parameter)),
+        Optimizer.INVERSE_SOFTPLUS_CONDUCTANCE;
+        multiplier=multiplier,
+        lower_bound=1.0f-4,
+        upper_bound=4.0f0,
+    )
+    registry = Optimizer.ParameterRegistry(
+        make_group(
+            :semantic_projection_raw,
+            semantic,
+            semantic_multiplier,
+        ),
+        make_group(:event_raw, event, event_multiplier),
+        make_group(
+            :output_projection_raw,
+            output,
+            output_multiplier,
+        ),
+    )
+    optimizer = Optimizer.AdamWState(registry)
+    for moments in optimizer.moments
+        fill!(moments.first, 1.0f0)
+        fill!(moments.second, 2.0f0)
+    end
+    destinations = (
+        UInt16[1, 0, 2, 3],
+        UInt16[2, 1, 0],
+        UInt16[3, 1],
+    )
+    return registry, optimizer, destinations
+end
+
 mutable struct ResetCounter
     count::Int
     last_linear::Int
@@ -338,6 +415,354 @@ end
         @test Cell.PARAMETER_LOWER[parameter] <= physical <=
             Cell.PARAMETER_UPPER[parameter]
     end
+end
+
+@testset "segmented canonical cell homeostasis covers all 1458 EMAs" begin
+    config = Local.PlasticityConfig(
+        target_rate_min=0.05,
+        target_rate_max=0.25,
+        threshold_homeostasis_step=0.2,
+        adaptation_homeostasis_step=0.1,
+    )
+    registry, optimizer = segmented_cell_fixture()
+    groups = registry.groups
+    ranges = (1:1436, 1437:1458)
+    state = Plasticity.PlasticityState(config, 1458, 0)
+    fill!(state.firing_rate, 0.1f0)
+    state.firing_rate[1] = 0.0f0
+    state.firing_rate[1437] = 1.0f0
+    reset = Plasticity.OptimizerMomentReset(optimizer, registry)
+    threshold = Cell.P_SOMA_THRESHOLD_GAP
+    adaptation = Cell.P_ADAPTATION_GAIN
+    core_before = Plasticity.cell_physical_parameter(
+        groups[1].parameter[threshold, 1],
+        threshold,
+    )
+    output_before = Plasticity.cell_physical_parameter(
+        groups[2].parameter[threshold, 1],
+        threshold,
+    )
+
+    @test Plasticity.apply_intrinsic_homeostasis!(
+        state, config, true, groups, ranges, reset,
+    ) == 2
+    @test Plasticity.cell_physical_parameter(
+        groups[1].parameter[threshold, 1], threshold,
+    ) < core_before
+    @test Plasticity.cell_physical_parameter(
+        groups[2].parameter[threshold, 1], threshold,
+    ) > output_before
+    @test optimizer.moments[1].first[threshold, 1] == 0.0f0
+    @test optimizer.moments[1].first[adaptation, 1] == 0.0f0
+    @test optimizer.moments[2].first[threshold, 1] == 0.0f0
+    @test optimizer.moments[2].first[adaptation, 1] == 0.0f0
+    @test optimizer.moments[2].first[threshold, 2] == 1.0f0
+    @test state.homeostasis_events == UInt64(2)
+
+    offset_registry, offset_optimizer = segmented_cell_fixture()
+    offset_state = Plasticity.PlasticityState(config, 1458, 0)
+    fill!(offset_state.firing_rate, 0.1f0)
+    offset_state.firing_rate[1438] = 0.0f0
+    @test Plasticity.apply_intrinsic_homeostasis!(
+        offset_state,
+        config,
+        true,
+        offset_registry.groups,
+        (0, 1436),
+        Plasticity.OptimizerMomentReset(offset_optimizer, offset_registry),
+    ) == 1
+    @test offset_optimizer.moments[2].first[threshold, 2] == 0.0f0
+    @test offset_optimizer.moments[2].first[threshold, 1] == 1.0f0
+end
+
+@testset "segmented cell freeze and malformed maps are atomic" begin
+    config = Local.PlasticityConfig(
+        target_rate_min=0.05,
+        target_rate_max=0.25,
+    )
+    registry, optimizer = segmented_cell_fixture(
+        2,
+        2;
+        output_multiplier=0.0f0,
+    )
+    groups = registry.groups
+    reset = Plasticity.OptimizerMomentReset(optimizer, registry)
+    state = Plasticity.PlasticityState(config, 4, 0)
+    state.firing_rate .= Float32[0.0, 0.1, 1.0, 0.1]
+    frozen_before = copy(groups[2].parameter)
+    frozen_moments = copy(optimizer.moments[2].first)
+    @test Plasticity.apply_intrinsic_homeostasis!(
+        state, config, true, groups, (1:2, 3:4), reset,
+    ) == 1
+    @test groups[2].parameter == frozen_before
+    @test optimizer.moments[2].first == frozen_moments
+
+    atomic_registry, atomic_optimizer = segmented_cell_fixture(2, 2)
+    atomic_groups = atomic_registry.groups
+    atomic_reset = Plasticity.OptimizerMomentReset(
+        atomic_optimizer,
+        atomic_registry,
+    )
+    atomic_state = Plasticity.PlasticityState(config, 4, 0)
+    atomic_state.firing_rate .= Float32[0.0, 0.1, 1.0, 0.1]
+    parameters_before = map(group -> copy(group.parameter), atomic_groups)
+    moments_before = map(
+        moments -> (copy(moments.first), copy(moments.second)),
+        atomic_optimizer.moments,
+    )
+    @test_throws DimensionMismatch Plasticity.apply_intrinsic_homeostasis!(
+        atomic_state, config, true, atomic_groups, (1:2, 4:5), atomic_reset,
+    )
+    @test_throws DimensionMismatch Plasticity.apply_intrinsic_homeostasis!(
+        atomic_state, config, true, atomic_groups, (1:2, 2:3), atomic_reset,
+    )
+    @test_throws DimensionMismatch Plasticity.apply_intrinsic_homeostasis!(
+        atomic_state, config, true, atomic_groups, (1:1, 2:4), atomic_reset,
+    )
+    @test all(
+        atomic_groups[index].parameter == parameters_before[index]
+        for index in eachindex(atomic_groups)
+    )
+    @test atomic_state.homeostasis_events == UInt64(0)
+
+    atomic_groups[2].parameter[1, 2] = NaN32
+    core_before = copy(atomic_groups[1].parameter)
+    @test_throws DomainError Plasticity.apply_intrinsic_homeostasis!(
+        atomic_state, config, true, atomic_groups, (1:2, 3:4), atomic_reset,
+    )
+    @test atomic_groups[1].parameter == core_before
+    @test all(
+        atomic_optimizer.moments[index].first == moments_before[index][1] &&
+            atomic_optimizer.moments[index].second == moments_before[index][2]
+        for index in eachindex(atomic_optimizer.moments)
+    )
+    @test atomic_state.homeostasis_events == UInt64(0)
+end
+
+@testset "segmented conductance scaling is transactional" begin
+    config = Local.PlasticityConfig(
+        target_rate_min=0.05,
+        target_rate_max=0.25,
+        synaptic_scaling_rate=0.2,
+    )
+    registry, optimizer, destinations = segmented_conductance_fixture()
+    groups = registry.groups
+    state = Plasticity.PlasticityState(config, 3, 0)
+    state.firing_rate .= Float32[0.0, 1.0, 0.1]
+    reset = Plasticity.OptimizerMomentReset(optimizer, registry)
+    physical_before = map(
+        group -> Optimizer.physical_conductance.(copy(group.parameter)),
+        groups,
+    )
+    @test Plasticity.apply_synaptic_scaling!(
+        state, config, true, groups, destinations, reset,
+    ) == 5
+    physical_after = map(
+        group -> Optimizer.physical_conductance.(group.parameter),
+        groups,
+    )
+    @test physical_after[1][1] > physical_before[1][1]
+    @test physical_after[1][2] == physical_before[1][2]
+    @test physical_after[1][3] < physical_before[1][3]
+    @test physical_after[1][4] == physical_before[1][4]
+    @test physical_after[2][1] < physical_before[2][1]
+    @test physical_after[2][2] > physical_before[2][2]
+    @test physical_after[2][3] == physical_before[2][3]
+    @test physical_after[3][1] == physical_before[3][1]
+    @test physical_after[3][2] > physical_before[3][2]
+    @test all(iszero, optimizer.moments[1].first[[1, 3]])
+    @test optimizer.moments[1].first[2] == 1.0f0
+    @test all(iszero, optimizer.moments[2].first[1:2])
+    @test optimizer.moments[2].first[3] == 1.0f0
+    @test optimizer.moments[3].first[1] == 1.0f0
+    @test optimizer.moments[3].first[2] == 0.0f0
+    @test state.synaptic_scaling_events == UInt64(5)
+
+    frozen_registry, frozen_optimizer, frozen_destinations =
+        segmented_conductance_fixture(event_multiplier=0.0f0)
+    frozen_state = Plasticity.PlasticityState(config, 3, 0)
+    frozen_state.firing_rate .= Float32[0.0, 1.0, 0.1]
+    frozen_group_before = copy(frozen_registry.groups[2].parameter)
+    frozen_moment_before = copy(frozen_optimizer.moments[2].first)
+    @test Plasticity.apply_synaptic_scaling!(
+        frozen_state,
+        config,
+        true,
+        frozen_registry.groups,
+        frozen_destinations,
+        Plasticity.OptimizerMomentReset(frozen_optimizer, frozen_registry),
+    ) == 3
+    @test frozen_registry.groups[2].parameter == frozen_group_before
+    @test frozen_optimizer.moments[2].first == frozen_moment_before
+end
+
+@testset "segmented conductance late failures precede all mutation" begin
+    config = Local.PlasticityConfig(
+        target_rate_min=0.05,
+        target_rate_max=0.25,
+    )
+    registry, optimizer, destinations = segmented_conductance_fixture()
+    groups = registry.groups
+    state = Plasticity.PlasticityState(config, 3, 0)
+    state.firing_rate .= Float32[0.0, 1.0, 0.1]
+    reset = Plasticity.OptimizerMomentReset(optimizer, registry)
+    parameter_before = map(group -> copy(group.parameter), groups)
+    moment_before = map(
+        moments -> (copy(moments.first), copy(moments.second)),
+        optimizer.moments,
+    )
+    bad_shape = (destinations[1], destinations[2][1:2], destinations[3])
+    @test_throws DimensionMismatch Plasticity.apply_synaptic_scaling!(
+        state, config, true, groups, bad_shape, reset,
+    )
+    bad_destination = (
+        destinations[1], destinations[2], UInt16[3, 4],
+    )
+    @test_throws BoundsError Plasticity.apply_synaptic_scaling!(
+        state, config, true, groups, bad_destination, reset,
+    )
+    @test all(
+        groups[index].parameter == parameter_before[index]
+        for index in eachindex(groups)
+    )
+
+    groups[3].parameter[2] = NaN32
+    first_before = copy(groups[1].parameter)
+    second_before = copy(groups[2].parameter)
+    @test_throws DomainError Plasticity.apply_synaptic_scaling!(
+        state, config, true, groups, destinations, reset,
+    )
+    @test groups[1].parameter == first_before
+    @test groups[2].parameter == second_before
+    @test all(
+        optimizer.moments[index].first == moment_before[index][1] &&
+            optimizer.moments[index].second == moment_before[index][2]
+        for index in eachindex(optimizer.moments)
+    )
+    @test state.synaptic_scaling_events == UInt64(0)
+end
+
+@testset "slow plasticity callbacks, counters, and segments fail atomically" begin
+    config = Local.PlasticityConfig(
+        target_rate_min=0.05,
+        target_rate_max=0.25,
+        threshold_homeostasis_step=0.2,
+        adaptation_homeostasis_step=0.1,
+        synaptic_scaling_rate=0.2,
+    )
+    registry, optimizer = segmented_cell_fixture(2, 2)
+    groups = registry.groups
+    reset = Plasticity.OptimizerMomentReset(optimizer, registry)
+    state = Plasticity.PlasticityState(config, 4, 0)
+    state.firing_rate .= Float32[0, 0.1, 1, 0.1]
+    parameters_before = map(group -> copy(group.parameter), groups)
+    moments_before = map(
+        moment -> (copy(moment.first), copy(moment.second)),
+        optimizer.moments,
+    )
+
+    arbitrary = ResetCounter(0, 0)
+    @test_throws ArgumentError Plasticity.apply_intrinsic_homeostasis!(
+        state, config, true, groups, (1:2, 3:4), arbitrary,
+    )
+    @test arbitrary.count == 0
+    @test all(
+        groups[index].parameter == parameters_before[index]
+        for index in eachindex(groups)
+    )
+
+    @test_throws ArgumentError Plasticity.apply_intrinsic_homeostasis!(
+        state, config, true, (groups[1], groups[1]), (1:2, 3:4), reset,
+    )
+    @test all(
+        groups[index].parameter == parameters_before[index]
+        for index in eachindex(groups)
+    )
+
+    state.homeostasis_events = typemax(UInt64)
+    @test_throws OverflowError Plasticity.apply_intrinsic_homeostasis!(
+        state, config, true, groups, (1:2, 3:4), reset,
+    )
+    @test all(
+        groups[index].parameter == parameters_before[index]
+        for index in eachindex(groups)
+    )
+    @test all(
+        optimizer.moments[index].first == moments_before[index][1] &&
+            optimizer.moments[index].second == moments_before[index][2]
+        for index in eachindex(optimizer.moments)
+    )
+    @test state.homeostasis_events == typemax(UInt64)
+
+    invalid_rate = Plasticity.PlasticityState(config, 4, 0)
+    invalid_rate.firing_rate[1] = -0.01f0
+    @test_throws DomainError Plasticity.apply_intrinsic_homeostasis!(
+        invalid_rate, config, false, groups, (1:2, 3:4), reset,
+    )
+    invalid_rate.firing_rate[1] = 1.01f0
+    @test_throws DomainError Plasticity.apply_intrinsic_homeostasis!(
+        invalid_rate, config, false, groups, (1:2, 3:4), reset,
+    )
+
+    conductance_registry, conductance_optimizer, destinations =
+        segmented_conductance_fixture()
+    conductance_groups = conductance_registry.groups
+    conductance_reset = Plasticity.OptimizerMomentReset(
+        conductance_optimizer,
+        conductance_registry,
+    )
+    conductance_state = Plasticity.PlasticityState(config, 3, 0)
+    conductance_state.firing_rate .= Float32[0, 1, 0.1]
+    conductance_before = map(
+        group -> copy(group.parameter), conductance_groups,
+    )
+    conductance_moments_before = map(
+        moment -> (copy(moment.first), copy(moment.second)),
+        conductance_optimizer.moments,
+    )
+    arbitrary = ResetCounter(0, 0)
+    @test_throws ArgumentError Plasticity.apply_synaptic_scaling!(
+        conductance_state,
+        config,
+        true,
+        conductance_groups,
+        destinations,
+        arbitrary,
+    )
+    @test arbitrary.count == 0
+    @test all(
+        conductance_groups[index].parameter == conductance_before[index]
+        for index in eachindex(conductance_groups)
+    )
+    @test_throws ArgumentError Plasticity.apply_synaptic_scaling!(
+        conductance_state,
+        config,
+        true,
+        (conductance_groups[1], conductance_groups[1]),
+        (destinations[1], destinations[1]),
+        conductance_reset,
+    )
+    conductance_state.synaptic_scaling_events = typemax(UInt64)
+    @test_throws OverflowError Plasticity.apply_synaptic_scaling!(
+        conductance_state,
+        config,
+        true,
+        conductance_groups,
+        destinations,
+        conductance_reset,
+    )
+    @test all(
+        conductance_groups[index].parameter == conductance_before[index]
+        for index in eachindex(conductance_groups)
+    )
+    @test all(
+        conductance_optimizer.moments[index].first ==
+            conductance_moments_before[index][1] &&
+            conductance_optimizer.moments[index].second ==
+            conductance_moments_before[index][2]
+        for index in eachindex(conductance_optimizer.moments)
+    )
+    @test conductance_state.synaptic_scaling_events == typemax(UInt64)
 end
 
 @testset "group multiplier zero is a strict plasticity freeze" begin
@@ -745,6 +1170,72 @@ function publish_candidate_one!(
     return batch
 end
 
+@testset "canonical utility follows only its explicit analog clock" begin
+    config = Local.PlasticityConfig(
+        firing_ema_decay=0.0,
+        utility_decay=0.5,
+        connection_cost=0.0,
+    )
+    offsets = Int[0, 1]
+    batch = canonical_single_state_batch()
+    publish_common_one!(batch)
+    publish_candidate_one!(batch)
+    state = Plasticity.PlasticityState(config, 1, 2)
+    state.firing_rate[1] = 0.75f0
+    state.utility .= Float32[0.25, 0.5]
+    utility_bits = copy(reinterpret(UInt32, state.utility))
+    utility_updates = state.utility_updates
+
+    stats = Plasticity.preflight_canonical_plasticity(
+        state, batch, config, offsets; utility_due=false,
+    )
+    @test stats.utility_nonzero == 0
+    @test reinterpret(UInt32, state.utility) == utility_bits
+    committed = Plasticity.reduce_canonical_plasticity!(
+        state, batch, config, offsets; utility_due=false,
+    )
+    @test committed == stats
+    @test reinterpret(UInt32, state.utility) == utility_bits
+    @test state.utility_updates == utility_updates
+    @test state.firing_rate[1] == 0.0f0
+    @test state.reduced_batches == 1
+
+    # `utility_due=false` is also the strict :none-mode contract on an analog
+    # tick: persistent utility remains frozen while cell EMAs still publish.
+    Plasticity.begin_plasticity_batch!(batch)
+    publish_common_one!(batch)
+    publish_candidate_one!(batch)
+    Plasticity.reduce_canonical_plasticity!(
+        state, batch, config, offsets; utility_due=false,
+    )
+    @test reinterpret(UInt32, state.utility) == utility_bits
+    @test state.utility_updates == utility_updates
+    @test state.reduced_batches == 2
+
+    due_batch = canonical_single_state_batch()
+    publish_common_one!(due_batch)
+    publish_candidate_one!(due_batch)
+    Plasticity.reduce_canonical_plasticity!(
+        state, due_batch, config, offsets; utility_due=true,
+    )
+    @test state.utility == Float32[0.125, 0.25]
+    @test state.utility_updates == utility_updates
+
+    # A nonzero task-utility publication on an inactive clock is rejected
+    # before any persistent EMA/counter mutation.
+    invalid = canonical_single_state_batch()
+    Plasticity.record_state_common_plasticity!(
+        invalid, 1, UInt32[0], UInt8[1], Float32[0], Float32[0],
+        Float32[1, 0], Float32[0, 0],
+    )
+    publish_candidate_one!(invalid)
+    before = plasticity_state_bits(state)
+    @test_throws ArgumentError Plasticity.reduce_canonical_plasticity!(
+        state, invalid, config, offsets; utility_due=false,
+    )
+    @test plasticity_state_bits(state) == before
+end
+
 @testset "canonical publication cardinality and slot failures are atomic" begin
     config = Local.PlasticityConfig(
         firing_ema_decay=0.0,
@@ -1017,17 +1508,37 @@ function canonical_allocation_probe()
     reduce_bytes = @allocated Plasticity.reduce_canonical_plasticity!(
         state, batch, config, offsets,
     )
+    fill!(batch.common.utility_product_sum, 0.0f0)
+    fill!(batch.candidate.utility_product_sum, 0.0f0)
+    Plasticity.preflight_canonical_plasticity(
+        state, batch, config, offsets; utility_due=false,
+    )
+    Plasticity.reduce_canonical_plasticity!(
+        state, batch, config, offsets; utility_due=false,
+    )
+    preflight_inactive_bytes = @allocated begin
+        Plasticity.preflight_canonical_plasticity(
+            state, batch, config, offsets; utility_due=false,
+        )
+    end
+    reduce_inactive_bytes = @allocated begin
+        Plasticity.reduce_canonical_plasticity!(
+            state, batch, config, offsets; utility_due=false,
+        )
+    end
     return (
         begin_bytes,
         common_bytes,
         candidate_bytes,
         preflight_bytes,
         reduce_bytes,
+        preflight_inactive_bytes,
+        reduce_inactive_bytes,
     )
 end
 
 @testset "canonical publication, preflight, and reduction allocate zero bytes" begin
-    @test canonical_allocation_probe() == (0, 0, 0, 0, 0)
+    @test canonical_allocation_probe() == (0, 0, 0, 0, 0, 0, 0)
 end
 
 function allocation_probe()
@@ -1047,8 +1558,8 @@ function allocation_probe()
     contact_activity = Float32[0.1, 0.1]
     state = Plasticity.PlasticityState(config, 2, 2)
     destination = Int[1, 2]
-    registry, _ = parameter_fixture(2, destination)
-    reset = ResetCounter(0, 0)
+    registry, optimizer = parameter_fixture(2, destination)
+    reset = Plasticity.OptimizerMomentReset(optimizer, registry)
 
     Plasticity.begin_plasticity_batch!(batch)
     Plasticity.record_candidate_plasticity!(
@@ -1090,4 +1601,96 @@ end
 @testset "hot plasticity primitives allocate zero bytes" begin
     bytes = allocation_probe()
     @test bytes == (0, 0, 0, 0, 0)
+end
+
+function segmented_allocation_probe()
+    config = Local.PlasticityConfig(
+        target_rate_min=0.05,
+        target_rate_max=0.25,
+        threshold_homeostasis_step=0.01,
+        adaptation_homeostasis_step=0.01,
+        synaptic_scaling_rate=0.01,
+    )
+    cell_registry, _ = segmented_cell_fixture()
+    conductance_registry, _, destinations =
+        segmented_conductance_fixture()
+    registry = Optimizer.ParameterRegistry(
+        cell_registry.groups[1],
+        conductance_registry.groups[1],
+        conductance_registry.groups[2],
+        cell_registry.groups[2],
+        conductance_registry.groups[3],
+    )
+    optimizer = Optimizer.AdamWState(registry)
+    for moments in optimizer.moments
+        fill!(moments.first, 1.0f0)
+        fill!(moments.second, 2.0f0)
+    end
+    state = Plasticity.PlasticityState(config, 1458, 0)
+    fill!(state.firing_rate, 0.1f0)
+    state.firing_rate[1] = 0.0f0
+    state.firing_rate[2] = 1.0f0
+    state.firing_rate[1437] = 1.0f0
+    reset = Plasticity.OptimizerMomentReset(optimizer, registry)
+    cell_groups = (registry.groups[1], registry.groups[4])
+    conductance_groups = (
+        registry.groups[2], registry.groups[3], registry.groups[5],
+    )
+    cell_ranges = (1:1436, 1437:1458)
+    cell_offsets = (0, 1436)
+
+    Plasticity.apply_intrinsic_homeostasis!(
+        state,
+        config,
+        true,
+        cell_groups,
+        cell_ranges,
+        reset,
+    )
+    Plasticity.apply_intrinsic_homeostasis!(
+        state,
+        config,
+        true,
+        cell_groups,
+        cell_offsets,
+        reset,
+    )
+    Plasticity.apply_synaptic_scaling!(
+        state,
+        config,
+        true,
+        conductance_groups,
+        destinations,
+        reset,
+    )
+
+    range_bytes = @allocated Plasticity.apply_intrinsic_homeostasis!(
+        state,
+        config,
+        true,
+        cell_groups,
+        cell_ranges,
+        reset,
+    )
+    offset_bytes = @allocated Plasticity.apply_intrinsic_homeostasis!(
+        state,
+        config,
+        true,
+        cell_groups,
+        cell_offsets,
+        reset,
+    )
+    conductance_bytes = @allocated Plasticity.apply_synaptic_scaling!(
+        state,
+        config,
+        true,
+        conductance_groups,
+        destinations,
+        reset,
+    )
+    return range_bytes, offset_bytes, conductance_bytes
+end
+
+@testset "segmented homeostasis and scaling allocate zero bytes" begin
+    @test segmented_allocation_probe() == (0, 0, 0)
 end
