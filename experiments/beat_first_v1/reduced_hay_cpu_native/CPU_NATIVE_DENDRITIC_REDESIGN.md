@@ -357,6 +357,22 @@ The 22 physical output cells are structured as:
 | four geometry opponent populations | 8 |
 | uncertainty opponent population | 2 |
 
+The two state-value cells are evaluated once per state, before candidate
+execution.  Their fixed sixteen-fibre input is the ten ordered **before-plane
+column roots** plus six role-bound state-context packets (`HOLD`, `NEXT1` ...
+`NEXT5`), split eight fibres per cell.  Every context packet carries its queue
+role, piece token, all four exact REN bytes, and the typed B2B flag on separate
+nonnegative lanes.  It contains no placement, after-board, line-clear, or
+T-spin field.  Hence `V(s)` observes the whole board and all state-common
+queue/meta while remaining invariant to candidate order.
+
+Candidate execution supplies zero candidate evidence to value cells 1--2 and
+uses only the cached state-common value.  In reverse, the sum of all candidate
+Q cotangents is applied to the state-value tape exactly once; candidate-local
+replay gives the value component zero credit.  This prevents both a hidden
+candidate-conditioned `V` and accidental multiplication of shared-value
+credit by the number of candidates.
+
 Candidate Q uses a dueling decomposition over all candidates of one state:
 
 ```math

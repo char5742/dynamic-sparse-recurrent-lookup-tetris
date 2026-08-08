@@ -1,6 +1,7 @@
 module CanonicalLocalLearning
 
 using LinearAlgebra
+using SHA
 using ..ActiveApicalCell
 using ..DendriticAxonPacket
 
@@ -14,6 +15,8 @@ export LOCAL_OBSERVATION_DIM,
        StructuralUtilityState,
        EligibilityScratch,
        FixedLocalSignalMap,
+       PlasticityConfig,
+       LocalLearningConfig,
        LearningSchedule,
        LearningClockState,
        DuePlasticityClocks,
@@ -33,6 +36,9 @@ export LOCAL_OBSERVATION_DIM,
        accumulate_hard_event_gradient!,
        update_structural_utility!,
        update_packet_structural_utility!,
+       update_configured_utility!,
+       config_summary,
+       config_fingerprint,
        continuous_observation!
 
 # Local learning observes every continuous compartment coordinate, the exact
@@ -258,6 +264,7 @@ function FixedLocalSignalMap(
     family::Integer=1,
     cell::Integer=1,
     scale::Real=1,
+    predictor_scale::Real=scale,
     T::Type{<:AbstractFloat}=Float32,
 )
     outputs = _require_positive("output_dim", output_dim)
@@ -271,7 +278,13 @@ function FixedLocalSignalMap(
         "feedback scale must be finite and nonnegative",
     ))
     global_scale = finite_scale / sqrt(T(outputs))
-    predictor_scale = predictors == 0 ? zero(T) : finite_scale / sqrt(T(predictors))
+    finite_predictor_scale = T(predictor_scale)
+    isfinite(finite_predictor_scale) && finite_predictor_scale >= zero(T) ||
+        throw(ArgumentError(
+            "predictor feedback scale must be finite and nonnegative",
+        ))
+    predictor_lane_scale = predictors == 0 ? zero(T) :
+        finite_predictor_scale / sqrt(T(predictors))
     global_matrix = Matrix{T}(undef, observations, outputs)
     predictor = Matrix{T}(undef, observations, predictors)
     seed_value = UInt64(seed)
@@ -285,7 +298,7 @@ function FixedLocalSignalMap(
     @inbounds for column in 1:predictors, row in 1:observations
         predictor[row, column] = _rademacher(
             T, xor(seed_value, 0xc6bc279692b5c323),
-            family_value, cell_value, row, column, predictor_scale,
+            family_value, cell_value, row, column, predictor_lane_scale,
         )
     end
     return FixedLocalSignalMap{T}(
@@ -352,6 +365,234 @@ function LearningSchedule(;
         _require_positive("homeostasis_interval", homeostasis_interval),
         _require_positive("structure_interval", structure_interval),
     )
+end
+
+"""
+One immutable owner of slow biological plasticity controls. The canonical
+information spine is not rewired; these settings apply only to optional event
+contacts and intrinsic cell homeostasis. `structure_enabled=false` is the
+initial canonical setting even though utility may be collected in shadow.
+"""
+struct PlasticityConfig
+    firing_ema_decay::Float32
+    target_rate_min::Float32
+    target_rate_max::Float32
+    threshold_homeostasis_step::Float32
+    adaptation_homeostasis_step::Float32
+    synaptic_scaling_rate::Float32
+    conductance_floor::Float32
+    conductance_ceiling::Float32
+    structure_enabled::Bool
+    utility_decay::Float32
+    connection_cost::Float32
+    max_swaps_per_node::Int
+end
+
+function PlasticityConfig(;
+    firing_ema_decay::Real=0.99,
+    target_rate_min::Real=0.002,
+    target_rate_max::Real=0.25,
+    threshold_homeostasis_step::Real=0.04,
+    adaptation_homeostasis_step::Real=0.02,
+    synaptic_scaling_rate::Real=0.05,
+    conductance_floor::Real=1.0e-4,
+    conductance_ceiling::Real=4.0,
+    structure_enabled::Bool=false,
+    utility_decay::Real=0.999,
+    connection_cost::Real=1.0e-6,
+    max_swaps_per_node::Integer=1,
+)
+    ema = Float32(firing_ema_decay)
+    minimum_rate = Float32(target_rate_min)
+    maximum_rate = Float32(target_rate_max)
+    threshold_step = Float32(threshold_homeostasis_step)
+    adaptation_step = Float32(adaptation_homeostasis_step)
+    scaling_rate = Float32(synaptic_scaling_rate)
+    floor = Float32(conductance_floor)
+    ceiling = Float32(conductance_ceiling)
+    decay = Float32(utility_decay)
+    cost = Float32(connection_cost)
+    isfinite(ema) && 0.0f0 <= ema < 1.0f0 || throw(ArgumentError(
+        "firing EMA decay must be finite and in [0, 1)",
+    ))
+    isfinite(minimum_rate) && isfinite(maximum_rate) &&
+        0.0f0 <= minimum_rate < maximum_rate <= 1.0f0 || throw(ArgumentError(
+            "target firing-rate range must satisfy 0 <= min < max <= 1",
+        ))
+    isfinite(threshold_step) && threshold_step >= 0.0f0 || throw(ArgumentError(
+        "threshold homeostasis step must be finite and nonnegative",
+    ))
+    isfinite(adaptation_step) && adaptation_step >= 0.0f0 || throw(ArgumentError(
+        "adaptation homeostasis step must be finite and nonnegative",
+    ))
+    isfinite(scaling_rate) && scaling_rate >= 0.0f0 || throw(ArgumentError(
+        "synaptic scaling rate must be finite and nonnegative",
+    ))
+    isfinite(floor) && isfinite(ceiling) && 0.0f0 < floor < ceiling ||
+        throw(ArgumentError(
+            "physical conductance bounds must satisfy 0 < floor < ceiling",
+        ))
+    isfinite(decay) && 0.0f0 <= decay < 1.0f0 || throw(ArgumentError(
+        "utility decay must be finite and in [0, 1)",
+    ))
+    isfinite(cost) && cost >= 0.0f0 || throw(ArgumentError(
+        "connection cost must be finite and nonnegative",
+    ))
+    0 <= max_swaps_per_node <= 1 || throw(ArgumentError(
+        "canonical structural plasticity permits at most one swap per node",
+    ))
+    return PlasticityConfig(
+        ema,
+        minimum_rate,
+        maximum_rate,
+        threshold_step,
+        adaptation_step,
+        scaling_rate,
+        floor,
+        ceiling,
+        structure_enabled,
+        decay,
+        cost,
+        Int(max_swaps_per_node),
+    )
+end
+
+"""
+The single checkpointed owner of canonical local-learning controls.
+
+`eligibility_decay` applies only to the optional hard-event synaptic tag. The
+continuous multi-compartment e-prop state already contains the physical Hay
+decays through its local Jacobian and is never silently decayed a second time.
+`utility_mode` selects `:packet`, `:continuous`, or `:none`; utility collection
+may run in shadow while `plasticity.structure_enabled` remains false.
+"""
+struct LocalLearningConfig
+    schedule::LearningSchedule
+    feedback_seed::UInt64
+    feedback_scale::Float32
+    predictor_scale::Float32
+    predictor_dim::Int
+    eligibility_decay::Float32
+    analog_multiplier::Float32
+    hard_event_multiplier::Float32
+    utility_mode::Symbol
+    plasticity::PlasticityConfig
+end
+
+
+function LocalLearningConfig(;
+    schedule::LearningSchedule=LearningSchedule(),
+    feedback_seed::Integer=0x4445434f4c4c4532,
+    feedback_scale::Real=1.0,
+    predictor_scale::Real=0.0,
+    predictor_dim::Integer=0,
+    eligibility_decay::Real=0.0,
+    analog_multiplier::Real=1.0,
+    hard_event_multiplier::Real=1.0,
+    utility_mode::Symbol=:packet,
+    plasticity::PlasticityConfig=PlasticityConfig(),
+)
+    feedback_seed >= 0 || throw(ArgumentError(
+        "feedback seed must be nonnegative",
+    ))
+    feedback = Float32(feedback_scale)
+    predictor = Float32(predictor_scale)
+    decay = Float32(eligibility_decay)
+    analog = Float32(analog_multiplier)
+    hard_event = Float32(hard_event_multiplier)
+    predictor_dim >= 0 || throw(ArgumentError(
+        "predictor dimension must be nonnegative",
+    ))
+    isfinite(feedback) && feedback >= 0.0f0 || throw(ArgumentError(
+        "feedback scale must be finite and nonnegative",
+    ))
+    isfinite(predictor) && predictor >= 0.0f0 || throw(ArgumentError(
+        "predictor scale must be finite and nonnegative",
+    ))
+    isfinite(decay) && 0.0f0 <= decay < 1.0f0 || throw(ArgumentError(
+        "eligibility decay must be finite and in [0, 1)",
+    ))
+    isfinite(analog) && analog >= 0.0f0 || throw(ArgumentError(
+        "analog multiplier must be finite and nonnegative",
+    ))
+    isfinite(hard_event) && hard_event >= 0.0f0 || throw(ArgumentError(
+        "hard-event multiplier must be finite and nonnegative",
+    ))
+    utility_mode in (:packet, :continuous, :none) || throw(ArgumentError(
+        "utility mode must be :packet, :continuous, or :none",
+    ))
+    return LocalLearningConfig(
+        schedule,
+        UInt64(feedback_seed),
+        feedback,
+        predictor,
+        Int(predictor_dim),
+        decay,
+        analog,
+        hard_event,
+        utility_mode,
+        plasticity,
+    )
+end
+
+function FixedLocalSignalMap(
+    output_dim::Integer,
+    config::LocalLearningConfig;
+    observation_dim::Integer=LOCAL_OBSERVATION_DIM,
+    family::Integer=1,
+    cell::Integer=1,
+    T::Type{<:AbstractFloat}=Float32,
+)
+    return FixedLocalSignalMap(
+        output_dim,
+        config.predictor_dim;
+        observation_dim=observation_dim,
+        seed=config.feedback_seed,
+        family=family,
+        cell=cell,
+        scale=config.feedback_scale,
+        predictor_scale=config.predictor_scale,
+        T=T,
+    )
+end
+
+function config_summary(config::LocalLearningConfig)
+    schedule = config.schedule
+    plasticity = config.plasticity
+    values = (
+        "analog_interval=$(schedule.analog_interval)",
+        "hard_event_interval=$(schedule.hard_event_interval)",
+        "homeostasis_interval=$(schedule.homeostasis_interval)",
+        "structure_interval=$(schedule.structure_interval)",
+        "feedback_seed=$(config.feedback_seed)",
+        "feedback_scale=$(config.feedback_scale)",
+        "predictor_scale=$(config.predictor_scale)",
+        "predictor_dim=$(config.predictor_dim)",
+        "eligibility_decay=$(config.eligibility_decay)",
+        "analog_multiplier=$(config.analog_multiplier)",
+        "hard_event_multiplier=$(config.hard_event_multiplier)",
+        "utility_mode=$(config.utility_mode)",
+        "firing_ema_decay=$(plasticity.firing_ema_decay)",
+        "target_rate_min=$(plasticity.target_rate_min)",
+        "target_rate_max=$(plasticity.target_rate_max)",
+        "threshold_homeostasis_step=$(plasticity.threshold_homeostasis_step)",
+        "adaptation_homeostasis_step=$(plasticity.adaptation_homeostasis_step)",
+        "synaptic_scaling_rate=$(plasticity.synaptic_scaling_rate)",
+        "conductance_floor=$(plasticity.conductance_floor)",
+        "conductance_ceiling=$(plasticity.conductance_ceiling)",
+        "structure_enabled=$(plasticity.structure_enabled)",
+        "utility_decay=$(plasticity.utility_decay)",
+        "connection_cost=$(plasticity.connection_cost)",
+        "max_swaps_per_node=$(plasticity.max_swaps_per_node)",
+    )
+    return join(values, ' ')
+end
+
+config_fingerprint(config::LocalLearningConfig) =
+    bytes2hex(sha256(config_summary(config)))
+
+function Base.show(io::IO, config::LocalLearningConfig)
+    print(io, "LocalLearningConfig(", config_summary(config), ')')
 end
 
 struct DuePlasticityClocks
@@ -784,6 +1025,32 @@ function accumulate_active_apical_transition!(
     return true
 end
 
+function accumulate_active_apical_transition!(
+    analog::AnalogEligibilityState{T},
+    event::HardEventEligibilityState{T},
+    scratch::EligibilityScratch{T},
+    basis::LocalParameterBasis{T},
+    previous_state::AbstractVector{T},
+    input::AbstractVector{T},
+    raw_parameters::AbstractVector{T},
+    next_state::AbstractVector{T},
+    config::LocalLearningConfig;
+    touched::Bool,
+) where {T<:AbstractFloat}
+    return accumulate_active_apical_transition!(
+        analog,
+        event,
+        scratch,
+        basis,
+        previous_state,
+        input,
+        raw_parameters,
+        next_state;
+        touched=touched,
+        event_decay=T(config.eligibility_decay),
+    )
+end
+
 function accumulate_packet_gradient!(
     gradient::AbstractVector{T},
     learning_signal::AbstractVector{T},
@@ -810,6 +1077,22 @@ function accumulate_packet_gradient!(
     return gradient
 end
 
+function accumulate_packet_gradient!(
+    gradient::AbstractVector{T},
+    learning_signal::AbstractVector{T},
+    analog::AnalogEligibilityState{T},
+    config::LocalLearningConfig;
+    due::Bool=true,
+) where {T<:AbstractFloat}
+    return accumulate_packet_gradient!(
+        gradient,
+        learning_signal,
+        analog;
+        scale=T(config.analog_multiplier),
+        due=due,
+    )
+end
+
 function accumulate_analog_gradient!(
     gradient::AbstractVector{T},
     learning_signal::AbstractVector{T},
@@ -828,6 +1111,22 @@ function accumulate_analog_gradient!(
         mul!(gradient, transpose(analog.eligibility), learning_signal, scale, one(T))
     end
     return gradient
+end
+
+function accumulate_analog_gradient!(
+    gradient::AbstractVector{T},
+    learning_signal::AbstractVector{T},
+    analog::AnalogEligibilityState{T},
+    config::LocalLearningConfig;
+    due::Bool=true,
+) where {T<:AbstractFloat}
+    return accumulate_analog_gradient!(
+        gradient,
+        learning_signal,
+        analog;
+        scale=T(config.analog_multiplier),
+        due=due,
+    )
 end
 
 function accumulate_hard_event_gradient!(
@@ -852,6 +1151,22 @@ function accumulate_hard_event_gradient!(
         end
     end
     return gradient
+end
+
+function accumulate_hard_event_gradient!(
+    gradient::AbstractVector{T},
+    control_signal::T,
+    event::HardEventEligibilityState{T},
+    config::LocalLearningConfig;
+    due::Bool=true,
+) where {T<:AbstractFloat}
+    return accumulate_hard_event_gradient!(
+        gradient,
+        control_signal,
+        event;
+        scale=T(config.hard_event_multiplier),
+        due=due,
+    )
 end
 
 function update_structural_utility!(
@@ -916,6 +1231,33 @@ function update_packet_structural_utility!(
     end
     state.update_count += 1
     return state
+end
+
+
+function update_configured_utility!(
+    state::StructuralUtilityState{T},
+    learning_signal::AbstractVector{T},
+    analog::AnalogEligibilityState{T},
+    config::LocalLearningConfig;
+    due::Bool=true,
+) where {T<:AbstractFloat}
+    config.utility_mode === :none && return state
+    if config.utility_mode === :packet
+        return update_packet_structural_utility!(
+            state,
+            learning_signal,
+            analog;
+            decay=T(config.plasticity.utility_decay),
+            due=due,
+        )
+    end
+    return update_structural_utility!(
+        state,
+        learning_signal,
+        analog;
+        decay=T(config.plasticity.utility_decay),
+        due=due,
+    )
 end
 
 end # module CanonicalLocalLearning

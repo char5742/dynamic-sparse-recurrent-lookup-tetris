@@ -274,6 +274,59 @@ end
     @test state.group_steps[1] == 0
 end
 
+@testset "due mask preserves inactive Adam groups exactly" begin
+    registry = optimizer_fixture(frozen_multiplier=1.0f0)
+    state = AdamWState(registry)
+    config = AdamWConfig(
+        learning_rate=0.01f0,
+        beta1=0.5f0,
+        beta2=0.75f0,
+        clip_norm=100.0f0,
+        weight_decay=0.1f0,
+    )
+    for group in registry.groups
+        fill!(group.gradient, 0.25f0)
+    end
+    apply_optimizer_boundary!(state, registry, config)
+
+    parameter_before = map(group -> copy(group.parameter), registry.groups)
+    first_before = map(moment -> copy(moment.first), state.moments)
+    second_before = map(moment -> copy(moment.second), state.moments)
+    steps_before = copy(state.group_steps)
+    due = (true, false, true, false, true, false)
+    stats = apply_optimizer_boundary!(
+        state, registry, config; due_mask=due,
+    )
+
+    @test stats.active_groups == 3
+    @test stats.total_step == 2
+    @test state.total_step == 2
+    @test state.group_steps == steps_before .+ UInt64[1, 0, 1, 0, 1, 0]
+    @test Float32(stats.gradient_norm) ≈ Float32(gradient_norm(
+        registry; due_mask=due,
+    )) atol=1.0f-6 rtol=0.0f0
+    for index in (2, 4, 6)
+        @test registry.groups[index].parameter == parameter_before[index]
+        @test state.moments[index].first == first_before[index]
+        @test state.moments[index].second == second_before[index]
+    end
+    for index in (1, 3, 5)
+        @test registry.groups[index].parameter != parameter_before[index]
+        @test state.moments[index].first != first_before[index]
+        @test state.moments[index].second != second_before[index]
+    end
+
+    @test_throws DimensionMismatch apply_optimizer_boundary!(
+        state, registry, config; due_mask=(true, false),
+    )
+    @test_throws ArgumentError apply_optimizer_boundary!(
+        state, registry, config; due_mask=(true, false, true, false, true, 1),
+    )
+    @test_throws ArgumentError apply_optimizer_boundary!(
+        state, registry, config; due_mask=trues(6),
+    )
+end
+
 @testset "steady-state optimizer boundary allocates zero bytes" begin
     registry = optimizer_fixture(frozen_multiplier=1.0f0)
     state = AdamWState(registry)
@@ -289,4 +342,11 @@ end
     apply_optimizer_boundary!(state, registry, config)
     allocated = @allocated apply_optimizer_boundary!(state, registry, config)
     @test allocated == 0
+
+    due = (true, false, true, true, false, true)
+    apply_optimizer_boundary!(state, registry, config; due_mask=due)
+    masked_allocated = @allocated apply_optimizer_boundary!(
+        state, registry, config; due_mask=due,
+    )
+    @test masked_allocated == 0
 end

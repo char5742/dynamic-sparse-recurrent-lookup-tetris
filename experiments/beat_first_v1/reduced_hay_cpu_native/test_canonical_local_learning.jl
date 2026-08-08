@@ -30,6 +30,45 @@ function nonspiking_transition()
 end
 
 @testset "canonical local learning configuration and fixed maps" begin
+    default_config = Local.LocalLearningConfig()
+    copied_config = Local.LocalLearningConfig()
+    @test default_config == copied_config
+    @test !default_config.plasticity.structure_enabled
+    @test default_config.utility_mode === :packet
+    @test default_config.plasticity.max_swaps_per_node == 1
+    summary = Local.config_summary(default_config)
+    @test occursin("feedback_seed=", summary)
+    @test occursin("conductance_floor=", summary)
+    @test occursin("structure_enabled=false", summary)
+    fingerprint = Local.config_fingerprint(default_config)
+    @test length(fingerprint) == 64
+    @test fingerprint == Local.config_fingerprint(copied_config)
+    @test fingerprint != Local.config_fingerprint(Local.LocalLearningConfig(
+        feedback_seed=default_config.feedback_seed + 1,
+    ))
+    @test fingerprint != Local.config_fingerprint(Local.LocalLearningConfig(
+        plasticity=Local.PlasticityConfig(target_rate_max=0.2),
+    ))
+    @test occursin("LocalLearningConfig(", sprint(show, default_config))
+
+    configured = Local.LocalLearningConfig(
+        feedback_scale=2.0,
+        predictor_scale=0.5,
+        predictor_dim=5,
+        eligibility_decay=0.8,
+        analog_multiplier=0.25,
+        hard_event_multiplier=0.1,
+        utility_mode=:continuous,
+    )
+    configured_map = Local.FixedLocalSignalMap(
+        22, configured; family=3, cell=17,
+    )
+    @test size(configured_map.global_feedback) ==
+        (Local.LOCAL_OBSERVATION_DIM, 22)
+    @test size(configured_map.predictor_feedback) ==
+        (Local.LOCAL_OBSERVATION_DIM, 5)
+    @test configured.eligibility_decay == 0.8f0
+
     map_a = Local.FixedLocalSignalMap(
         22, 5; seed=0x91, family=3, cell=17,
     )
@@ -71,6 +110,23 @@ end
     )
     @test_throws ArgumentError Local.FixedLocalSignalMap(0)
     @test_throws ArgumentError Local.FixedLocalSignalMap(22, -1)
+    @test_throws ArgumentError Local.PlasticityConfig(firing_ema_decay=1.0)
+    @test_throws ArgumentError Local.PlasticityConfig(
+        target_rate_min=0.3, target_rate_max=0.2,
+    )
+    @test_throws ArgumentError Local.PlasticityConfig(
+        conductance_floor=1.0, conductance_ceiling=1.0,
+    )
+    @test_throws ArgumentError Local.PlasticityConfig(utility_decay=1.0)
+    @test_throws ArgumentError Local.PlasticityConfig(max_swaps_per_node=2)
+    @test_throws ArgumentError Local.LocalLearningConfig(feedback_seed=-1)
+    @test_throws ArgumentError Local.LocalLearningConfig(predictor_dim=-1)
+    @test_throws ArgumentError Local.LocalLearningConfig(eligibility_decay=1.0)
+    @test_throws ArgumentError Local.LocalLearningConfig(analog_multiplier=-1)
+    @test_throws ArgumentError Local.LocalLearningConfig(
+        hard_event_multiplier=-1,
+    )
+    @test_throws ArgumentError Local.LocalLearningConfig(utility_mode=:invalid)
 
     schedule = Local.LearningSchedule(
         analog_interval=1,
@@ -219,6 +275,22 @@ end
         analog_gradient, learning_signal, analog,
     )
     @test norm(analog_gradient) > 0.0f0
+    scaled_config = Local.LocalLearningConfig(
+        analog_multiplier=0.25,
+        hard_event_multiplier=0.5,
+        utility_mode=:packet,
+        plasticity=Local.PlasticityConfig(utility_decay=0.9),
+    )
+    scaled_analog_gradient = zeros(Float32, parameter_count)
+    Local.accumulate_analog_gradient!(
+        scaled_analog_gradient, learning_signal, analog, scaled_config,
+    )
+    @test isapprox(
+        scaled_analog_gradient,
+        0.25f0 .* analog_gradient;
+        rtol=2eps(Float32),
+        atol=2eps(Float32),
+    )
     @test analog.eligibility == eligibility_before_modulation
     changed_map = Local.FixedLocalSignalMap(
         22; seed=0x1235, family=4, cell=9,
@@ -268,6 +340,19 @@ end
         event_gradient, 0.75f0, event_for_control,
     )
     @test norm(event_gradient) > 0.0f0
+    scaled_event_gradient = zeros(Float32, parameter_count)
+    Local.accumulate_hard_event_gradient!(
+        scaled_event_gradient,
+        0.75f0,
+        event_for_control,
+        scaled_config,
+    )
+    @test isapprox(
+        scaled_event_gradient,
+        0.5f0 .* event_gradient;
+        rtol=2eps(Float32),
+        atol=2eps(Float32),
+    )
     @test event_gradient != analog_gradient
     event_stopped = zeros(Float32, parameter_count)
     Local.accumulate_hard_event_gradient!(
@@ -297,6 +382,11 @@ end
         packet_utility, packet_signal, analog; decay=0.9f0,
     )
     @test any(>(0.0f0), packet_utility.utility)
+    configured_utility = Local.StructuralUtilityState(parameter_count)
+    Local.update_configured_utility!(
+        configured_utility, packet_signal, analog, scaled_config,
+    )
+    @test configured_utility.utility == packet_utility.utility
 
     # A fresh unvisited cell remains exactly unchanged; no synthetic task
     # update is created merely because another cell was active.

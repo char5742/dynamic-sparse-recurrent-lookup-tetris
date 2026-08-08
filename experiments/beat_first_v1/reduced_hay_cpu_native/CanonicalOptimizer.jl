@@ -385,21 +385,28 @@ end
     return nothing
 end
 
-@inline _preflight_group_clocks!(::Tuple{}, steps, index) = nothing
-
-@inline function _preflight_group_clocks!(groups::Tuple, steps, index)
+@inline function _preflight_group_clocks!(groups::Tuple, steps, due, index)
     group = first(groups)
-    if group.multiplier > 0.0f0 && steps[index] == typemax(UInt64)
+    if first(due) && group.multiplier > 0.0f0 &&
+       steps[index] == typemax(UInt64)
         throw(OverflowError(
             "optimizer group clock overflow for $(group.name)",
         ))
     end
-    _preflight_group_clocks!(Base.tail(groups), steps, index + 1)
+    _preflight_group_clocks!(
+        Base.tail(groups), steps, Base.tail(due), index + 1,
+    )
     return nothing
 end
 
-@inline function _group_gradient_norm_squared(group::ParameterGroup, scale64)
-    group.multiplier > 0.0f0 || return 0.0
+@inline _preflight_group_clocks!(::Tuple{}, steps, ::Tuple{}, index) = nothing
+
+@inline function _group_gradient_norm_squared(
+    group::ParameterGroup,
+    scale64,
+    due::Bool,
+)
+    due && group.multiplier > 0.0f0 || return 0.0
     total = 0.0
     @inbounds @simd for index in eachindex(group.gradient)
         value = Float64(group.gradient[index]) * scale64
@@ -408,17 +415,35 @@ end
     return total
 end
 
-@inline _gradient_norm_squared(::Tuple{}, scale64) = 0.0
+@inline _gradient_norm_squared(::Tuple{}, scale64, ::Tuple{}) = 0.0
 
-@inline function _gradient_norm_squared(groups::Tuple, scale64)
-    return _group_gradient_norm_squared(first(groups), scale64) +
-        _gradient_norm_squared(Base.tail(groups), scale64)
+@inline function _gradient_norm_squared(groups::Tuple, scale64, due::Tuple)
+    return _group_gradient_norm_squared(
+        first(groups), scale64, first(due),
+    ) + _gradient_norm_squared(Base.tail(groups), scale64, Base.tail(due))
+end
+
+@inline _all_groups_due(groups::Tuple) = ntuple(_ -> true, length(groups))
+
+function _validated_due_mask(registry::ParameterRegistry, due_mask)
+    due = due_mask === nothing ? _all_groups_due(registry.groups) : due_mask
+    due isa Tuple || throw(ArgumentError(
+        "optimizer due_mask must be a Tuple of Bool values",
+    ))
+    length(due) == registry_group_count(registry) || throw(DimensionMismatch(
+        "optimizer due_mask length differs from parameter registry",
+    ))
+    all(value -> value isa Bool, due) || throw(ArgumentError(
+        "optimizer due_mask entries must be Bool",
+    ))
+    return due
 end
 
 """L2 norm of all non-frozen gradients after caller-provided averaging."""
 function gradient_norm(
     registry::ParameterRegistry;
     gradient_scale::Real=1.0,
+    due_mask=nothing,
 )
     scale64 = Float64(gradient_scale)
     isfinite(scale64) && scale64 >= 0.0 || throw(ArgumentError(
@@ -428,7 +453,8 @@ function gradient_norm(
     isfinite(scale32) || throw(ArgumentError(
         "gradient_scale is outside the Float32 optimizer domain",
     ))
-    value = sqrt(_gradient_norm_squared(registry.groups, scale64))
+    due = _validated_due_mask(registry, due_mask)
+    value = sqrt(_gradient_norm_squared(registry.groups, scale64, due))
     isfinite(value) || throw(DomainError(value, "gradient norm is not finite"))
     return value
 end
@@ -479,7 +505,9 @@ end
     return nothing
 end
 
-@inline _update_groups!(::Tuple{}, ::Tuple{}, steps, config, scale, index) = 0
+@inline _update_groups!(
+    ::Tuple{}, ::Tuple{}, steps, config, scale, ::Tuple{}, index,
+) = 0
 
 @inline function _update_groups!(
     groups::Tuple,
@@ -487,11 +515,12 @@ end
     steps,
     config,
     scale,
+    due,
     index,
 )
     group = first(groups)
     active = 0
-    if group.multiplier > 0.0f0
+    if first(due) && group.multiplier > 0.0f0
         next_step = steps[index] + UInt64(1)
         _adamw_array!(group, first(moments), config, scale, next_step)
         steps[index] = next_step
@@ -503,12 +532,13 @@ end
         steps,
         config,
         scale,
+        Base.tail(due),
         index + 1,
     )
 end
 
-@inline function _project_group!(group::ParameterGroup)
-    group.multiplier > 0.0f0 || return 0
+@inline function _project_group!(group::ParameterGroup, due::Bool)
+    due && group.multiplier > 0.0f0 || return 0
     lower = group.projected_lower_raw
     upper = group.projected_upper_raw
     changed = 0
@@ -521,11 +551,11 @@ end
     return changed
 end
 
-@inline _project_groups!(::Tuple{}) = 0
+@inline _project_groups!(::Tuple{}, ::Tuple{}) = 0
 
-@inline function _project_groups!(groups::Tuple)
-    return _project_group!(first(groups)) +
-        _project_groups!(Base.tail(groups))
+@inline function _project_groups!(groups::Tuple, due::Tuple)
+    return _project_group!(first(groups), first(due)) +
+        _project_groups!(Base.tail(groups), Base.tail(due))
 end
 
 """
@@ -535,13 +565,16 @@ This is the only supported parameter-mutation boundary for serial and
 barrierless training. The full registry is validated before the first write.
 Weight decay is hard-coded by transform trait: only `SIGNED_WEIGHT` and
 `SIGNED_READOUT` decay. Inverse-softplus conductances and cell raw coordinates
-are projected after Adam without raw-space decay.
+are projected after Adam without raw-space decay. `due_mask` is a registry-
+ordered tuple. A false entry preserves that group's parameter, both moments,
+and group clock exactly while the global boundary clock still advances once.
 """
 function apply_optimizer_boundary!(
     state::AdamWState,
     registry::ParameterRegistry,
     config::AdamWConfig;
     gradient_scale::Real=1.0,
+    due_mask=nothing,
 )
     scale64 = Float64(gradient_scale)
     isfinite(scale64) && scale64 >= 0.0 || throw(ArgumentError(
@@ -552,12 +585,13 @@ function apply_optimizer_boundary!(
         "gradient_scale is outside the Float32 optimizer domain",
     ))
     assert_registry_match(state, registry)
+    due = _validated_due_mask(registry, due_mask)
     _preflight_groups!(registry.groups, state.moments)
-    _preflight_group_clocks!(registry.groups, state.group_steps, 1)
+    _preflight_group_clocks!(registry.groups, state.group_steps, due, 1)
     state.total_step == typemax(UInt64) && throw(OverflowError(
         "total optimizer clock overflow",
     ))
-    norm = sqrt(_gradient_norm_squared(registry.groups, scale64))
+    norm = sqrt(_gradient_norm_squared(registry.groups, scale64, due))
     isfinite(norm) || throw(DomainError(norm, "gradient norm is not finite"))
     clip_scale = Float32(min(
         1.0,
@@ -571,9 +605,10 @@ function apply_optimizer_boundary!(
         state.group_steps,
         config,
         effective_scale,
+        due,
         1,
     )
-    projected_values = _project_groups!(registry.groups)
+    projected_values = _project_groups!(registry.groups, due)
     state.total_step += UInt64(1)
     return OptimizerStepStats(
         norm,
