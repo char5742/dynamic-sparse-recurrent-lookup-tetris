@@ -1,159 +1,121 @@
 module ReducedHayCPU
 
 """
-The sole production root for the typed candidate-delta relation/motif graph.
+The sole production root for the route-free, ordered multiscale Reduced-Hay
+graph.
 
-Historical point-SNN, routed workspace, dendritic-forest, exact-oracle, and
-local-credit files may remain beside this root as research records.  None is
-included here, so it cannot enter the canonical forward or optimizer path by
-accident.
+Historical program-bank, relation/motif, dense-output, routed-workspace and
+exact-training files remain beside this root only as research records.  They
+are deliberately outside this include closure and cannot enter the canonical
+forward, local-learning, plasticity or optimizer path.
 """
 
-# Model-neutral Tetris ranking and candidate-delta input contracts.
-include(joinpath(@__DIR__, "TetrisRankingBatch.jl"))
-include(joinpath(@__DIR__, "CandidateDeltaInput.jl"))
-
-# High-dimensional Reduced-Hay cell and typed anatomical primitives.
+# Numerical cell, target-free input and immutable typed anatomy.
 include(joinpath(@__DIR__, "ActiveApicalCell.jl"))
-include(joinpath(@__DIR__, "DendriticProgramBank.jl"))
-include(joinpath(@__DIR__, "SpatialProgramPackets.jl"))
-include(joinpath(@__DIR__, "HighDimensionalCellPacket.jl"))
-include(joinpath(@__DIR__, "TypedDendriticAfferents.jl"))
-include(joinpath(@__DIR__, "DendriticRelationTopology.jl"))
-include(joinpath(@__DIR__, "DendriticMotifTopology.jl"))
-include(joinpath(@__DIR__, "TypedRelationCellBank.jl"))
-include(joinpath(@__DIR__, "TypedOutputCellBank.jl"))
-include(joinpath(@__DIR__, "TypedRelationContext.jl"))
-include(joinpath(@__DIR__, "StructuredMotifReadout.jl"))
+include(joinpath(@__DIR__, "CanonicalTetrisInput.jl"))
+include(joinpath(@__DIR__, "TetrisRankingBatch.jl"))
+include(joinpath(@__DIR__, "DendriticAxonPacket.jl"))
+include(joinpath(@__DIR__, "OrderedMultiscaleTopology.jl"))
+include(joinpath(@__DIR__, "CanonicalSpatialDrive.jl"))
+include(joinpath(@__DIR__, "CanonicalExperimentData.jl"))
+include(joinpath(@__DIR__, "DendriticOutputPopulation.jl"))
+include(joinpath(@__DIR__, "CanonicalListNet.jl"))
 
-# One canonical relation-to-motif model, optimizer, serial oracle, and
-# production executor.
-include(joinpath(@__DIR__, "CandidateDeltaRelationGraph.jl"))
-include(joinpath(@__DIR__, "RelationGraphOptimizer.jl"))
-include(joinpath(@__DIR__, "RelationGraphTraining.jl"))
+# Fixed-memory event execution and the sole optimizer/local-plasticity stack.
+include(joinpath(@__DIR__, "CanonicalEventArena.jl"))
 include(joinpath(@__DIR__, "BarrierlessScheduler.jl"))
-include(joinpath(@__DIR__, "RelationGraphBarrierless.jl"))
-include(joinpath(@__DIR__, "Sampler.jl"))
-include(joinpath(@__DIR__, "Checkpoint.jl"))
+include(joinpath(@__DIR__, "CanonicalOptimizer.jl"))
+include(joinpath(@__DIR__, "CanonicalLocalLearning.jl"))
+include(joinpath(@__DIR__, "CanonicalPlasticity.jl"))
 
-const CanonicalRanking = TetrisRankingBatch
-const CanonicalInput = CandidateDeltaInput
-const CanonicalCell = ActiveApicalCell
-const CanonicalProgramBank = DendriticProgramBank
-const CanonicalSpatialPackets = SpatialProgramPackets
-const CanonicalPacket = HighDimensionalCellPacket
-const CanonicalAfferents = TypedDendriticAfferents
-const CanonicalTopology = DendriticRelationTopology
-const CanonicalMotifTopology = DendriticMotifTopology
-const CanonicalRelationCells = TypedRelationCellBank
-const CanonicalOutputCells = TypedOutputCellBank
-const CanonicalContext = TypedRelationContext
-const CanonicalMotifReadout = StructuredMotifReadout
-const CanonicalModel = CandidateDeltaRelationGraph
-const CanonicalOptimizer = RelationGraphOptimizer
+# One concrete graph, one barrierless executor and one production trainer.
+include(joinpath(@__DIR__, "CanonicalDendriticGraph.jl"))
+include(joinpath(@__DIR__, "CanonicalBarrierless.jl"))
+include(joinpath(@__DIR__, "CanonicalValidation.jl"))
+include(joinpath(@__DIR__, "CanonicalCheckpoint.jl"))
+include(joinpath(@__DIR__, "CanonicalExactOracle.jl"))
+include(joinpath(@__DIR__, "CanonicalTraining.jl"))
 
-# The serial implementation is an explicit comparison oracle.  It is exposed
-# only as a module namespace; no serial trainer or serial train_update! is
-# lifted into the production root.
-const CanonicalTraining = RelationGraphTraining
-const CanonicalBarrierless = RelationGraphBarrierless
-const CanonicalSampler = ReducedHayCPUSampler
-const CanonicalCheckpoint = RelationGraphCheckpoint
-
-using .CandidateDeltaRelationGraph: ModelCache,
-    ModelForwardStats,
-    ModelGradient,
-    ModelParameters,
-    ModelState,
-    ModelWorker,
-    initialize_model,
-    stored_parameter_count
-using .RelationGraphOptimizer: AdamWState,
-    AdamWStepCounters,
-    AdamWStepStats,
-    OptimizerConfig,
-    apply_adamw!,
-    gradient_norm
-using .RelationGraphBarrierless: BarrierlessRelationGraphSession,
-    BarrierlessRelationGraphTrainer,
-    forward_batch!,
-    latest_gradient,
-    latest_loss,
-    run_trainer_team!,
-    scheduler_report,
-    train_update!
-
-export CanonicalRanking,
-    CanonicalInput,
-    CanonicalCell,
-    CanonicalProgramBank,
-    CanonicalSpatialPackets,
-    CanonicalPacket,
-    CanonicalAfferents,
-    CanonicalTopology,
-    CanonicalMotifTopology,
-    CanonicalRelationCells,
-    CanonicalOutputCells,
-    CanonicalContext,
-    CanonicalMotifReadout,
+# The root exposes canonical subsystem ownership explicitly.  Low-level graph
+# traversal, gradient, optimizer, barrierless and exact-oracle operations stay
+# namespace-scoped so that the only root-level learning operation is the
+# production CanonicalTraining.train_update!.
+using .CanonicalDendriticGraph: GraphConfig,
     CanonicalModel,
-    CanonicalOptimizer,
-    CanonicalTraining,
-    CanonicalBarrierless,
-    CanonicalSampler,
-    CanonicalCheckpoint,
-    ModelCache,
-    ModelForwardStats,
-    ModelGradient,
-    ModelParameters,
     ModelState,
     ModelWorker,
     initialize_model,
-    stored_parameter_count,
-    AdamWState,
-    AdamWStepCounters,
-    AdamWStepStats,
-    OptimizerConfig,
-    apply_adamw!,
-    gradient_norm,
-    BarrierlessRelationGraphSession,
-    BarrierlessRelationGraphTrainer,
-    forward_batch!,
-    latest_gradient,
-    latest_loss,
-    run_trainer_team!,
-    scheduler_report,
-    train_update!
+    initialize_state,
+    initialize_worker,
+    stored_parameter_count
+using .CanonicalTraining: CanonicalTrainingConfig,
+    CanonicalTrainer,
+    TrainingUpdateResult,
+    with_training_team,
+    train_update!,
+    mechanism_counts,
+    update_count
 
-"""Fail closed if the typed relation modules disagree on public dimensions."""
+export ActiveApicalCell,
+    CanonicalTetrisInput,
+    DendriticAxonPacket,
+    OrderedMultiscaleTopology,
+    CanonicalSpatialDrive,
+    CanonicalExperimentData,
+    DendriticOutputPopulation,
+    CanonicalListNet,
+    CanonicalEventArena,
+    CanonicalOptimizer,
+    CanonicalLocalLearning,
+    CanonicalPlasticity,
+    CanonicalDendriticGraph,
+    CanonicalBarrierless,
+    CanonicalValidation,
+    CanonicalCheckpoint,
+    CanonicalExactOracle,
+    CanonicalTraining,
+    GraphConfig,
+    CanonicalModel,
+    ModelState,
+    ModelWorker,
+    initialize_model,
+    initialize_state,
+    initialize_worker,
+    stored_parameter_count,
+    CanonicalTrainingConfig,
+    CanonicalTrainer,
+    TrainingUpdateResult,
+    with_training_team,
+    train_update!,
+    mechanism_counts,
+    update_count
+
+"""Fail closed if independently owned canonical dimensions drift apart."""
 function _assert_canonical_contract()
+    input = CanonicalTetrisInput
+    ranking = TetrisRankingBatch
+    axon = DendriticAxonPacket
+    topology = OrderedMultiscaleTopology
+    spatial = CanonicalSpatialDrive
+    data = CanonicalExperimentData
+    output = DendriticOutputPopulation
+    events = CanonicalEventArena
+    graph = CanonicalDendriticGraph
+
     checks = (
-        CanonicalRanking.INPUT_RAILS == CanonicalInput.INPUT_RAILS,
-        CanonicalRanking.BOARD_ROWS == CanonicalInput.BOARD_ROWS,
-        CanonicalRanking.BOARD_COLUMNS == CanonicalInput.BOARD_COLUMNS,
-        CanonicalRanking.OUTPUT_DIM == CanonicalOutputCells.OUTPUT_CELLS,
-        CanonicalInput.BOARD_CELLS == CanonicalSpatialPackets.POSITION_COUNT,
-        CanonicalSpatialPackets.PACKET_COUNT == CanonicalTopology.SOURCE_COUNT,
-        CanonicalModel.PROGRAM_PACKET_DIM ==
-            CanonicalSpatialPackets.PACKET_WIDTH,
-        CanonicalModel.CELL_PACKET_DIM == CanonicalPacket.PACKET_DIM,
-        CanonicalTopology.RELATION_COUNT ==
-            CanonicalRelationCells.RELATION_CELLS,
-        CanonicalMotifTopology.RELATION_SOURCE_COUNT ==
-            CanonicalRelationCells.RELATION_CELLS,
-        CanonicalMotifTopology.MOTIF_COUNT ==
-            CanonicalRelationCells.RELATION_CELLS,
-        CanonicalMotifReadout.SOURCE_COUNT ==
-            CanonicalMotifTopology.MOTIF_COUNT,
-        CanonicalTopology.BASAL_COMPARTMENT_COUNT == CanonicalCell.N_BASAL,
-        CanonicalModel.PROGRAM_SOURCES == CanonicalSpatialPackets.PACKET_COUNT,
-        CanonicalModel.RELATION_CELLS ==
-            CanonicalRelationCells.RELATION_CELLS,
-        CanonicalModel.OUTPUT_CELLS == CanonicalOutputCells.OUTPUT_CELLS,
-        CanonicalProgramBank.PAYLOAD_WIDTH ==
-            CanonicalModel.PROGRAM_PACKET_DIM,
+        input.BOARD_ROWS == ranking.BOARD_ROWS == topology.ROW_COUNT,
+        input.BOARD_COLUMNS == ranking.BOARD_COLUMNS == topology.COLUMN_COUNT,
+        input.BOARD_CELLS == topology.SPATIAL_COUNT_PER_PLANE,
+        axon.PACKET_DIM == topology.FULL_PACKET_WIDTH == output.EVIDENCE_DIM,
+        ActiveApicalCell.N_BASAL == spatial.NEIGHBOR_COUNT == output.MAX_EVIDENCE,
+        topology.NODE_COUNT == graph.TOTAL_NODE_COUNT,
+        graph.CORE_NODE_COUNT + output.OUTPUT_CELLS == topology.NODE_COUNT,
+        ranking.OUTPUT_DIM == output.OUTPUT_DIM == topology.OUTPUT_COUNT,
+        spatial.PHASE_COUNT == length(instances(graph.TransitionPhase)),
+        GraphConfig().max_event_waves == events.CANONICAL_MAX_WAVES,
+        data.CANDIDATE_WIDTH == 80,
     )
-    all(checks) || error("typed candidate-delta relation contract drifted")
+    all(checks) || error("canonical Reduced-Hay root contract drifted")
     return nothing
 end
 

@@ -661,3 +661,36 @@ end
         Dict(:nonzero => ones(2)), [0.0],
     )
 end
+
+@testset "real-Graph adapter surface is concrete and hard kinks fail closed" begin
+    @test isconcretetype(Oracle.CanonicalGraphRecordedAdapter)
+    @test Oracle.CanonicalGraphRecordedAdapter <:
+        Oracle.AbstractRecordedFloat64Adapter
+    @test !isempty(methods(Oracle.canonical_graph_recorded_fixture))
+    @test !isempty(methods(Oracle.recorded_jvp!, (
+        Oracle.CanonicalGraphRecordedAdapter,
+        Oracle.CanonicalGraphRecording,
+        Any,
+        Type{Float64},
+    )))
+    @test !isempty(methods(Oracle.recorded_layer_jvp!, (
+        Oracle.CanonicalGraphRecordedAdapter,
+        Oracle.CanonicalGraphRecording,
+        Symbol,
+        Any,
+        Type{Float64},
+    )))
+
+    # Recorded previous hard events and clamp-boundary plateau coordinates are
+    # constants of a conditional trajectory.  The cold dual must not smuggle
+    # their incoming tangent across the boundary, including under BigFloat.
+    D = Oracle._RecordedDual{BigFloat}
+    lower = D(BigFloat(0), BigFloat(0))
+    upper = D(BigFloat(1), BigFloat(0))
+    at_lower = D(BigFloat(0), BigFloat(7))
+    at_upper = D(BigFloat(1), BigFloat(-5))
+    @test clamp(at_lower, lower, upper).tangent == 0
+    @test clamp(at_upper, lower, upper).tangent == 0
+    @test D(0.25f0).value == BigFloat(0.25f0)
+    @test D(0.25f0).tangent == 0
+end

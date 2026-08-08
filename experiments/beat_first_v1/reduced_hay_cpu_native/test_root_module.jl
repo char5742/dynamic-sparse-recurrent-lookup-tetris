@@ -6,9 +6,158 @@ end
 
 const Root = RootModuleTestHarness.ReducedHayCPU
 
-@testset "typed relation graph is the only canonical root" begin
+@testset "canonical Reduced-Hay root ownership" begin
     exported = Set(names(Root))
-    required = (
+
+    canonical_modules = (
+        :ActiveApicalCell,
+        :CanonicalTetrisInput,
+        :DendriticAxonPacket,
+        :OrderedMultiscaleTopology,
+        :CanonicalSpatialDrive,
+        :CanonicalExperimentData,
+        :DendriticOutputPopulation,
+        :CanonicalListNet,
+        :CanonicalEventArena,
+        :CanonicalOptimizer,
+        :CanonicalLocalLearning,
+        :CanonicalPlasticity,
+        :CanonicalDendriticGraph,
+        :CanonicalBarrierless,
+        :CanonicalValidation,
+        :CanonicalCheckpoint,
+        :CanonicalExactOracle,
+        :CanonicalTraining,
+    )
+    @test all(name -> name in exported, canonical_modules)
+    @test all(name -> getfield(Root, name) isa Module, canonical_modules)
+
+    direct_graph = (
+        :GraphConfig,
+        :CanonicalModel,
+        :ModelState,
+        :ModelWorker,
+        :initialize_model,
+        :initialize_state,
+        :initialize_worker,
+        :stored_parameter_count,
+    )
+    direct_training = (
+        :CanonicalTrainingConfig,
+        :CanonicalTrainer,
+        :TrainingUpdateResult,
+        :with_training_team,
+        :train_update!,
+        :mechanism_counts,
+        :update_count,
+    )
+    @test all(name -> name in exported, direct_graph)
+    @test all(name -> name in exported, direct_training)
+
+    for name in direct_graph
+        @test getfield(Root, name) ===
+            getfield(Root.CanonicalDendriticGraph, name)
+    end
+    for name in direct_training
+        @test getfield(Root, name) === getfield(Root.CanonicalTraining, name)
+    end
+    @test Root.train_update! === Root.CanonicalTraining.train_update!
+
+    model = Root.initialize_model()
+    state = Root.initialize_state(model)
+    worker = Root.initialize_worker(model)
+    @test model isa Root.CanonicalModel
+    @test state isa Root.ModelState
+    @test worker isa Root.ModelWorker
+    @test Root.stored_parameter_count(model) > 0
+    @test Root.CanonicalDendriticGraph.TOTAL_NODE_COUNT == 1_458
+    @test Root.DendriticOutputPopulation.OUTPUT_DIM == 22
+    @test Root.DendriticAxonPacket.PACKET_DIM == 12
+end
+
+@testset "root include closure is canonical-only" begin
+    source = read(joinpath(@__DIR__, "ReducedHayCPU.jl"), String)
+    included = [match.captures[1] for match in eachmatch(
+        r"include\(joinpath\(@__DIR__, \"([^\"]+)\"\)\)",
+        source,
+    )]
+    @test included == [
+        "ActiveApicalCell.jl",
+        "CanonicalTetrisInput.jl",
+        "TetrisRankingBatch.jl",
+        "DendriticAxonPacket.jl",
+        "OrderedMultiscaleTopology.jl",
+        "CanonicalSpatialDrive.jl",
+        "CanonicalExperimentData.jl",
+        "DendriticOutputPopulation.jl",
+        "CanonicalListNet.jl",
+        "CanonicalEventArena.jl",
+        "BarrierlessScheduler.jl",
+        "CanonicalOptimizer.jl",
+        "CanonicalLocalLearning.jl",
+        "CanonicalPlasticity.jl",
+        "CanonicalDendriticGraph.jl",
+        "CanonicalBarrierless.jl",
+        "CanonicalValidation.jl",
+        "CanonicalCheckpoint.jl",
+        "CanonicalExactOracle.jl",
+        "CanonicalTraining.jl",
+    ]
+
+    # Neutral implementation dependencies are reachable by their real module
+    # names but are not promoted into the root's public API.
+    @test isdefined(Root, :TetrisRankingBatch)
+    @test isdefined(Root, :BarrierlessScheduler)
+    @test :TetrisRankingBatch ∉ names(Root)
+    @test :BarrierlessScheduler ∉ names(Root)
+end
+
+@testset "retired modules and compatibility aliases are absent" begin
+    exported = Set(names(Root))
+    retired = (
+        # Previous program/relation/motif production root.
+        :CandidateDeltaInput,
+        :DendriticProgramBank,
+        :SpatialProgramPackets,
+        :HighDimensionalCellPacket,
+        :TypedDendriticAfferents,
+        :DendriticRelationTopology,
+        :DendriticMotifTopology,
+        :TypedRelationCellBank,
+        :TypedOutputCellBank,
+        :TypedRelationContext,
+        :StructuredMotifReadout,
+        :ContinuousDendriticReadout,
+        :CandidateDeltaRelationGraph,
+        :RelationGraphOptimizer,
+        :RelationGraphTraining,
+        :RelationGraphBarrierless,
+        :ReducedHayCPUSampler,
+        :RelationGraphCheckpoint,
+
+        # Earlier forest/point/dense-output and routed-workspace roots.
+        :CompactDendriticNode,
+        :DendriticDeltaForestTopology,
+        :DendriticDeltaForest,
+        :DendriticForestOutput,
+        :CandidateDeltaDendriticGraph,
+        :CandidateDeltaDendriticTraining,
+        :CandidateDeltaDendriticBarrierless,
+        :CandidateDeltaDendriticOptimizer,
+        :ReducedHayCPUCheckpoint,
+        :Architecture,
+        :Float32NumericCore,
+        :ReducedHayCPUNativeModel,
+        :ControlPlane,
+        :RoutingScratch,
+        :RouteLoadSnapshot,
+        :ROUTE_DETERMINISTIC,
+        :ROUTE_STOCHASTIC,
+        :route_kind,
+        :route_temperature,
+        :route_exploration,
+
+        # Compatibility aliases are forbidden; use the actual module/type.
         :CanonicalRanking,
         :CanonicalInput,
         :CanonicalCell,
@@ -22,90 +171,54 @@ const Root = RootModuleTestHarness.ReducedHayCPU
         :CanonicalOutputCells,
         :CanonicalContext,
         :CanonicalMotifReadout,
-        :CanonicalModel,
-        :CanonicalOptimizer,
-        :CanonicalTraining,
-        :CanonicalBarrierless,
         :CanonicalSampler,
-        :CanonicalCheckpoint,
-        :initialize_model,
-        :stored_parameter_count,
-        :BarrierlessRelationGraphTrainer,
-        :BarrierlessRelationGraphSession,
-        :train_update!,
-        :OptimizerConfig,
-        :apply_adamw!,
+        :CanonicalLocalLearner,
+        :CanonicalNode,
+        :CanonicalForest,
+        :CanonicalOutput,
+        :TrainingConfig,
+        :Trainer,
+        :ExactOracle,
+        :ExactBatchTrainer,
+        :BarrierlessExactExecutor,
+        :BarrierlessExactSession,
     )
-    @test all(name -> name in exported, required)
+    for name in retired
+        @test !isdefined(Root, name)
+        @test name ∉ exported
+    end
+end
 
-    @test Root.CanonicalModel === Root.CandidateDeltaRelationGraph
-    @test Root.CanonicalTraining === Root.RelationGraphTraining
-    @test Root.CanonicalBarrierless === Root.RelationGraphBarrierless
-    @test Root.CanonicalOptimizer === Root.RelationGraphOptimizer
-    @test Root.CanonicalSampler === Root.ReducedHayCPUSampler
-    @test Root.CanonicalCheckpoint === Root.RelationGraphCheckpoint
-    @test Root.train_update! === Root.CanonicalBarrierless.train_update!
-    @test Root.train_update! !== Root.CanonicalTraining.train_update!
-    @test :RelationGraphTrainer ∉ exported
-    @test Root.CanonicalCheckpoint.CHECKPOINT_SCHEMA == UInt32(2)
-
-    # Sampler/checkpoint stay namespace-scoped: the production entrypoint must
-    # name their ownership instead of accidentally binding an obsolete API.
-    for scoped in (
-        :DeterministicEpochSampler,
-        :next_batch!,
+@testset "low-level operations stay namespace-scoped" begin
+    exported = Set(names(Root))
+    scoped = (
+        :ModelParameters,
+        :ModelCache,
+        :ModelGradient,
+        :ModelLocalLearner,
+        :initialize_gradient,
+        :forward_candidate!,
+        :conditional_reverse_candidate!,
+        :local_replay_candidate!,
+        :parameter_components,
+        :gradient_components,
+        :ParameterRegistry,
+        :apply_adamw!,
+        :CanonicalExecutor,
+        :CanonicalSession,
+        :serial_reference_update!,
+        :AbstractExactOracleAdapter,
+        :conditional_reverse!,
+        :DendriticTrainingAdapter,
+        :MechanismHooks,
+        :hooks,
+        :AuxiliaryLossConfig,
         :save_checkpoint,
         :load_checkpoint,
         :restore_checkpoint!,
     )
-        @test scoped ∉ exported
-    end
-
-    parameters = Root.initialize_model()
-    @test parameters isa Root.ModelParameters
-    @test Root.stored_parameter_count(parameters) == 3_362_748
-    @test Root.CanonicalRanking.INPUT_RAILS == 1_298
-    @test Root.CanonicalRanking.OUTPUT_DIM == 22
-    @test Root.CanonicalInput.BOARD_CELLS == 240
-    @test Root.CanonicalSpatialPackets.PACKET_COUNT == 480
-    @test Root.CanonicalModel.PROGRAM_PACKET_DIM == 16
-    @test Root.CanonicalPacket.PACKET_DIM == 47
-    @test Root.CanonicalModel.CELL_PACKET_DIM == 47
-    @test Root.CanonicalTopology.RELATION_COUNT == 48
-    @test Root.CanonicalMotifTopology.MOTIF_COUNT == 48
-    @test Root.CanonicalMotifReadout.SOURCE_COUNT == 48
-    @test Root.CanonicalRelationCells.RELATION_CELLS == 48
-    @test Root.CanonicalOutputCells.OUTPUT_CELLS == 22
-
-    for retired in (
-        :CompactDendriticNode,
-        :DendriticDeltaForestTopology,
-        :DendriticDeltaForest,
-        :DendriticForestOutput,
-        :CandidateDeltaDendriticGraph,
-        :CandidateDeltaDendriticTraining,
-        :CandidateDeltaDendriticBarrierless,
-        :CandidateDeltaDendriticOptimizer,
-        :CanonicalNode,
-        :CanonicalForest,
-        :CanonicalOutput,
-        :ExactBatchTrainer,
-        :BarrierlessExactExecutor,
-        :BarrierlessExactSession,
-        :ReducedHayCPUCheckpoint,
-        :Architecture,
-        :Float32NumericCore,
-        :ReducedHayCPUNativeModel,
-        :CanonicalLocalLearner,
-        :ControlPlane,
-        :RoutingScratch,
-        :RouteLoadSnapshot,
-        :ROUTE_DETERMINISTIC,
-        :ROUTE_STOCHASTIC,
-        :CanonicalTrainer,
-        :ExactOracle,
-    )
-        @test !isdefined(Root, retired)
-        @test retired ∉ exported
+    for name in scoped
+        @test !isdefined(Root, name)
+        @test name ∉ exported
     end
 end
