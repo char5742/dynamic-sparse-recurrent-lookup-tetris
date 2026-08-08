@@ -14,7 +14,7 @@ const Topology = OrderedMultiscaleTopology
     @test EVIDENCE_COUNT == 32
     @test OUTPUT_COUNT == 22
     @test NODE_COUNT == 1_458
-    @test EDGE_COUNT == 2_472
+    @test EDGE_COUNT == 2_216
     @test FULL_PACKET_WIDTH == 12
     @test SEMANTIC_OUTPUT_WIDTH == 3
 
@@ -93,10 +93,14 @@ end
     end
 end
 
-@testset "semantic graph is balanced, ordered and hub-free" begin
+@testset "static semantic graph is balanced, ordered and hub-free" begin
     topology = canonical_topology()
+    for family in 1:8, slot in 1:4
+        node = motif_node(family, slot)
+        @test child_count(topology, node) == 0
+        @test parent_count(topology, node) == 8
+    end
     for node in vcat(
-        [motif_node(family, slot) for family in 1:8 for slot in 1:4],
         [evidence_node(index) for index in 1:32],
         [output_node(index) for index in 1:22],
     )
@@ -110,19 +114,6 @@ end
             push!(sources, child_node(topology, node, index))
         end
         @test length(unique(sources)) == SEMANTIC_FANIN
-    end
-
-    # A motif compares matching before/after roots in four explicit roles.
-    for family in 1:8, slot in 1:4
-        node = motif_node(family, slot)
-        @test node_plane(topology, child_node(topology, node, 1)) == BEFORE_PLANE
-        @test node_plane(topology, child_node(topology, node, 2)) == AFTER_PLANE
-        @test node_plane(topology, child_node(topology, node, 3)) == BEFORE_PLANE
-        @test node_plane(topology, child_node(topology, node, 4)) == AFTER_PLANE
-        @test node_plane(topology, child_node(topology, node, 5)) == BEFORE_PLANE
-        @test node_plane(topology, child_node(topology, node, 6)) == AFTER_PLANE
-        @test node_plane(topology, child_node(topology, node, 7)) == BEFORE_PLANE
-        @test node_plane(topology, child_node(topology, node, 8)) == AFTER_PLANE
     end
 
     # Evidence signatures are all different and every motif fans out exactly 8.
@@ -145,18 +136,329 @@ end
     @test minimum(evidence_fanout) == 5
     @test maximum(evidence_fanout) == 6
 
-    row_root_fanout = Int[]
-    for plane in 1:2, row in 1:24
-        push!(row_root_fanout, parent_count(topology, row_root_node(plane, row)))
-    end
-    column_root_fanout = Int[]
-    for plane in 1:2, column in 1:10
-        push!(column_root_fanout,
-              parent_count(topology, column_root_node(plane, column)))
-    end
-    @test extrema(row_root_fanout) == (2, 3)
-    @test extrema(column_root_fanout) == (6, 7)
+    @test all(
+        parent_count(topology, row_root_node(plane, row)) == 0
+        for plane in 1:2 for row in 1:24
+    )
+    @test all(
+        parent_count(topology, column_root_node(plane, column)) == 0
+        for plane in 1:2 for column in 1:10
+    )
     @test maximum(child_count(topology, node) for node in 1:NODE_COUNT) == 8
+end
+
+function motif_fixture_context(;
+    positions=(UInt16(24), UInt16(48), UInt16(0), UInt16(0)),
+    count=2,
+    clear_last=false,
+    hold=UInt8(1),
+    next=(UInt8(2), UInt8(3), UInt8(4), UInt8(5), UInt8(6)),
+    ren=Int32(0x01020304),
+    b2b=UInt8(1),
+    tspin=UInt8(2),
+)
+    if clear_last
+        mu = ntuple(row -> row == 24 ? UInt8(0) : UInt8(row + 1), 24)
+        mask = UInt32(1) << 23
+        cleared = 1
+    else
+        mu = ntuple(row -> UInt8(row), 24)
+        mask = UInt32(0)
+        cleared = 0
+    end
+    return CandidateMotifContext(
+        positions,
+        count,
+        mu,
+        mask,
+        cleared,
+        hold,
+        next,
+        ren,
+        b2b,
+        tspin,
+    )
+end
+
+function motif_kinds(incidence, motif)
+    return [
+        motif_source(incidence, motif, rank).kind
+        for rank in 1:motif_source_count(incidence, motif)
+    ]
+end
+
+function motif_branches(incidence, motif)
+    return [
+        motif_source(incidence, motif, rank).branch_slot
+        for rank in 1:motif_source_count(incidence, motif)
+    ]
+end
+
+@testset "candidate semantic incidence realizes all eight motif families" begin
+    topology = canonical_topology()
+    incidence = CandidateMotifIncidence()
+    context = motif_fixture_context()
+    fill_candidate_motif_incidence!(incidence, topology, context)
+
+    @test all(1 <= motif_source_count(incidence, motif) <= 8 for motif in 1:32)
+    for motif in 1:32
+        branches = motif_branches(incidence, motif)
+        @test length(unique(branches)) == length(branches)
+        @test all(branch -> 1 <= branch <= 8, branches)
+    end
+
+    # Families 1--6 use the same canonical placement-slot identity but have
+    # distinct typed source contracts.
+    @test motif_kinds(incidence, 1) == UInt8[
+        MOTIF_SPATIAL_SOURCE,
+        MOTIF_SPATIAL_SOURCE,
+        MOTIF_RAW_PLACEMENT_SOURCE,
+        MOTIF_ROW_REMAP_SOURCE,
+    ]
+    @test motif_kinds(incidence, 5) == UInt8[
+        MOTIF_RAW_PLACEMENT_SOURCE,
+        MOTIF_OUTSIDE_SOURCE,
+        MOTIF_SPATIAL_SOURCE,
+        MOTIF_ROW_REMAP_SOURCE,
+    ]
+    @test motif_kinds(incidence, 9) == UInt8[
+        MOTIF_ROW_ROOT_SOURCE,
+        MOTIF_ROW_ROOT_SOURCE,
+        MOTIF_RAW_PLACEMENT_SOURCE,
+        MOTIF_ROW_REMAP_SOURCE,
+    ]
+    @test motif_kinds(incidence, 13) == UInt8[
+        MOTIF_COLUMN_ROOT_SOURCE,
+        MOTIF_COLUMN_ROOT_SOURCE,
+        MOTIF_RAW_PLACEMENT_SOURCE,
+        MOTIF_ROW_REMAP_SOURCE,
+    ]
+    @test motif_kinds(incidence, 17) == UInt8[
+        MOTIF_ROW_ROOT_SOURCE,
+        MOTIF_ROW_ROOT_SOURCE,
+        MOTIF_ROW_ROOT_SOURCE,
+        MOTIF_ROW_ROOT_SOURCE,
+        MOTIF_ROW_ROOT_SOURCE,
+        MOTIF_ROW_ROOT_SOURCE,
+        MOTIF_RAW_PLACEMENT_SOURCE,
+        MOTIF_ROW_REMAP_SOURCE,
+    ]
+    @test motif_kinds(incidence, 21) == UInt8[
+        MOTIF_COLUMN_ROOT_SOURCE,
+        MOTIF_COLUMN_ROOT_SOURCE,
+        MOTIF_COLUMN_ROOT_SOURCE,
+        MOTIF_COLUMN_ROOT_SOURCE,
+        MOTIF_COLUMN_ROOT_SOURCE,
+        MOTIF_COLUMN_ROOT_SOURCE,
+        MOTIF_RAW_PLACEMENT_SOURCE,
+        MOTIF_ROW_REMAP_SOURCE,
+    ]
+
+    # Unused canonical placement slots are observed ABSENT, not silence.
+    for family in 1:6
+        motif = (family - 1) * 4 + 3
+        @test motif_source_count(incidence, motif) == 1
+        source = motif_source(incidence, motif, 1)
+        @test source.kind == MOTIF_ABSENT_SOURCE
+        @test source.placement_slot == 3
+    end
+
+    # Family 7 carries the whole ordered raw footprint and the corresponding
+    # exact remap/clear identity on disjoint branches.
+    for motif in 25:28
+        @test motif_source_count(incidence, motif) == 8
+        @test motif_branches(incidence, motif) == UInt8[1, 2, 3, 4, 5, 6, 7, 8]
+        @test motif_kinds(incidence, motif) == UInt8[
+            MOTIF_RAW_PLACEMENT_SOURCE,
+            MOTIF_RAW_PLACEMENT_SOURCE,
+            MOTIF_ABSENT_SOURCE,
+            MOTIF_ABSENT_SOURCE,
+            MOTIF_ROW_REMAP_SOURCE,
+            MOTIF_ROW_REMAP_SOURCE,
+            MOTIF_ABSENT_SOURCE,
+            MOTIF_ABSENT_SOURCE,
+        ]
+        @test [
+            motif_source(incidence, motif, rank).placement_slot
+            for rank in 1:8
+        ] == UInt8[1, 2, 3, 4, 1, 2, 3, 4]
+    end
+
+    # Family 8 partitions nine independent semantic items across four cells;
+    # queue order, REN words and booleans never share one scalar token.
+    @test motif_source_count(incidence, 29) == 6
+    @test motif_kinds(incidence, 29) == fill(MOTIF_QUEUE_SOURCE, 6)
+    @test [motif_source(incidence, 29, rank).context_slot for rank in 1:6] ==
+          UInt8[1, 2, 3, 4, 5, 6]
+    @test motif_kinds(incidence, 30) == UInt8[
+        MOTIF_REN_WORD_SOURCE,
+        MOTIF_REN_WORD_SOURCE,
+        MOTIF_BOOLEAN_SOURCE,
+        MOTIF_BOOLEAN_SOURCE,
+    ]
+    @test [motif_source(incidence, 30, rank).context_slot for rank in 1:4] ==
+          UInt8[7, 8, 9, 10]
+    @test motif_kinds(incidence, 31) == UInt8[
+        MOTIF_QUEUE_SOURCE,
+        MOTIF_QUEUE_SOURCE,
+        MOTIF_QUEUE_SOURCE,
+        MOTIF_QUEUE_SOURCE,
+        MOTIF_QUEUE_SOURCE,
+        MOTIF_BOOLEAN_SOURCE,
+    ]
+    @test motif_kinds(incidence, 32) == UInt8[
+        MOTIF_QUEUE_SOURCE,
+        MOTIF_REN_WORD_SOURCE,
+        MOTIF_REN_WORD_SOURCE,
+        MOTIF_BOOLEAN_SOURCE,
+        MOTIF_BOOLEAN_SOURCE,
+    ]
+end
+
+@testset "raw placement clear-remap and context interventions are observable" begin
+    topology = canonical_topology()
+    no_clear = CandidateMotifIncidence()
+    clear = CandidateMotifIncidence()
+    fill_candidate_motif_incidence!(no_clear, topology, motif_fixture_context())
+    fill_candidate_motif_incidence!(
+        clear,
+        topology,
+        motif_fixture_context(clear_last=true),
+    )
+    for motif in 25:28
+        @test any(
+            motif_source(clear, motif, rank).kind == MOTIF_CLEARED_ROW_SOURCE
+            for rank in 1:8
+        )
+        @test any(
+            motif_source(no_clear, motif, rank) != motif_source(clear, motif, rank)
+            for rank in 1:8
+        )
+    end
+
+    # Exact Int32 REN remains distinguishable above the Float32 integer limit.
+    ren_a = CandidateMotifIncidence()
+    ren_b = CandidateMotifIncidence()
+    fill_candidate_motif_incidence!(
+        ren_a,
+        topology,
+        motif_fixture_context(ren=Int32(16_777_216)),
+    )
+    fill_candidate_motif_incidence!(
+        ren_b,
+        topology,
+        motif_fixture_context(ren=Int32(16_777_217)),
+    )
+    @test motif_source(ren_a, 30, 1) != motif_source(ren_b, 30, 1)
+    packet_a = zeros(Float32, 12)
+    packet_b = zeros(Float32, 12)
+    materialize_external_motif_packet!(packet_a, motif_source(ren_a, 30, 1))
+    materialize_external_motif_packet!(packet_b, motif_source(ren_b, 30, 1))
+    @test packet_a != packet_b
+    @test_throws ArgumentError materialize_external_motif_packet!(
+        packet_a,
+        motif_source(no_clear, 1, 1),
+    )
+
+    # NEXT role swap and each explicit boolean change their own descriptors.
+    queue_swap = CandidateMotifIncidence()
+    fill_candidate_motif_incidence!(queue_swap, topology, motif_fixture_context(
+        next=(UInt8(3), UInt8(2), UInt8(4), UInt8(5), UInt8(6)),
+    ))
+    @test motif_source(no_clear, 29, 2) != motif_source(queue_swap, 29, 2)
+    @test motif_source(no_clear, 29, 3) != motif_source(queue_swap, 29, 3)
+    hold_change = CandidateMotifIncidence()
+    fill_candidate_motif_incidence!(
+        hold_change,
+        topology,
+        motif_fixture_context(hold=UInt8(8)),
+    )
+    @test motif_source(no_clear, 29, 1) != motif_source(hold_change, 29, 1)
+    @test motif_source(no_clear, 32, 1) != motif_source(hold_change, 32, 1)
+
+    b2b_flip = CandidateMotifIncidence()
+    fill_candidate_motif_incidence!(
+        b2b_flip,
+        topology,
+        motif_fixture_context(b2b=UInt8(2)),
+    )
+    @test motif_source(no_clear, 30, 3) != motif_source(b2b_flip, 30, 3)
+    @test motif_source(no_clear, 32, 4) != motif_source(b2b_flip, 32, 4)
+    b2b_closure = AffectedClosure()
+    fill_changed_motif_closure!(
+        b2b_closure,
+        topology,
+        no_clear,
+        b2b_flip,
+    )
+    @test UInt16[
+        node for node in b2b_closure if node_class(topology, node) == MOTIF_CLASS
+    ] == UInt16[motif_node(8, 2), motif_node(8, 4)]
+
+    tspin_flip = CandidateMotifIncidence()
+    fill_candidate_motif_incidence!(
+        tspin_flip,
+        topology,
+        motif_fixture_context(tspin=UInt8(1)),
+    )
+    closure = AffectedClosure()
+    fill_changed_motif_closure!(closure, topology, no_clear, tspin_flip)
+    changed_motifs = UInt16[
+        node for node in closure if node_class(topology, node) == MOTIF_CLASS
+    ]
+    @test changed_motifs == UInt16[
+        motif_node(8, 2),
+        motif_node(8, 3),
+        motif_node(8, 4),
+    ]
+    @test any(node_class(topology, node) == EVIDENCE_CLASS for node in closure)
+    @test any(node_class(topology, node) == OUTPUT_CLASS for node in closure)
+
+    # Moving one canonical raw slot changes its six local families plus all
+    # four footprint/remap views, but never changes family 8.
+    moved = CandidateMotifIncidence()
+    fill_candidate_motif_incidence!(moved, topology, motif_fixture_context(
+        positions=(UInt16(10 + 2 * 24), UInt16(0), UInt16(0), UInt16(0)),
+        count=1,
+    ))
+    base_one = CandidateMotifIncidence()
+    fill_candidate_motif_incidence!(base_one, topology, motif_fixture_context(
+        positions=(UInt16(11 + 2 * 24), UInt16(0), UInt16(0), UInt16(0)),
+        count=1,
+    ))
+    fill_changed_motif_closure!(closure, topology, base_one, moved)
+    changed_motifs = UInt16[
+        node for node in closure if node_class(topology, node) == MOTIF_CLASS
+    ]
+    @test Set(changed_motifs) == Set(UInt16[
+        motif_node(1, 1), motif_node(2, 1), motif_node(3, 1),
+        motif_node(4, 1), motif_node(5, 1), motif_node(6, 1),
+        motif_node(7, 1), motif_node(7, 2), motif_node(7, 3),
+        motif_node(7, 4),
+    ])
+    @test all(motif_family(topology, node) != 8 for node in changed_motifs)
+
+    # Live spine changes reach only motifs that explicitly name the affected
+    # spatial packet or one of its ordered row/column ancestors.
+    seed = UInt16[spatial_node(AFTER_PLANE, 24, 1)]
+    fill_incidence_affected_closure!(
+        closure,
+        topology,
+        no_clear,
+        seed,
+    )
+    @test motif_node(1, 1) in closure
+    @test row_root_node(AFTER_PLANE, 24) in closure
+    @test column_root_node(AFTER_PLANE, 1) in closure
+    @test any(node_class(topology, node) == OUTPUT_CLASS for node in closure)
+    fill_incidence_affected_closure!(closure, topology, no_clear, seed)
+    @test @allocated(
+        fill_incidence_affected_closure!(closure, topology, no_clear, seed)
+    ) == 0
+    fill_changed_motif_closure!(closure, topology, no_clear, tspin_flip)
+    @test @allocated(
+        fill_changed_motif_closure!(closure, topology, no_clear, tspin_flip)
+    ) == 0
 end
 
 @testset "bidirectional adjacency and exact topological order" begin
@@ -243,6 +545,7 @@ end
 @testset "ordered topology bounds fail closed" begin
     topology = canonical_topology()
     closure = AffectedClosure()
+    incidence = CandidateMotifIncidence()
     @test_throws BoundsError spatial_node(0, 1)
     @test_throws BoundsError spatial_node(3, 1)
     @test_throws BoundsError spatial_node(1, 0)
@@ -274,5 +577,43 @@ end
         AFTER_PLANE,
         UInt16[241],
         1,
+    )
+    @test_throws BoundsError motif_source_count(incidence, 33)
+    @test_throws BoundsError motif_source(incidence, 1, 1)
+    @test_throws DimensionMismatch materialize_external_motif_packet!(
+        zeros(Float32, 11),
+        CandidateMotifSource(
+            MOTIF_ABSENT_SOURCE,
+            UInt8(0),
+            UInt16(0),
+            UInt8(0),
+            UInt8(0),
+            UInt8(1),
+            UInt8(1),
+            UInt8(1),
+            Int32(1),
+        ),
+    )
+    @test_throws ArgumentError motif_fixture_context(
+        positions=(UInt16(48), UInt16(24), UInt16(0), UInt16(0)),
+    )
+    @test_throws ArgumentError CandidateMotifContext(
+        (UInt16(24), UInt16(48), UInt16(0), UInt16(0)),
+        2,
+        ntuple(row -> UInt8(row), 24),
+        UInt32(1) << 23,
+        1,
+        UInt8(1),
+        (UInt8(2), UInt8(3), UInt8(4), UInt8(5), UInt8(6)),
+        0,
+        UInt8(1),
+        UInt8(1),
+    )
+    @test_throws BoundsError fill_incidence_affected_closure!(
+        closure,
+        topology,
+        incidence,
+        UInt16[1],
+        2,
     )
 end

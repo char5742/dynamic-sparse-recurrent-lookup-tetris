@@ -260,6 +260,66 @@ The 32 first-tier motif cells are eight families with four canonical slots:
 The four raw placement slots are sorted by a deterministic canonical rule and
 retain absolute coordinates. `ABSENT` is explicit.
 
+The motif-input incidence is candidate-derived and is **not** stored as a
+fixed row/column-to-motif edge table.  The immutable topology contains the two
+spatial planes, their ordered row/column trees, motif-to-evidence edges, and
+evidence-to-output edges.  A caller-owned fixed `8 x 32` incidence names the
+live spine packet or typed external token used by each motif branch.  This
+separation is mandatory: candidate placement, clear/remap, queue, REN, B2B,
+and T-spin must not be disguised as generic static geometry anchors.
+
+For families 1--6, canonical motif slot `k` means raw-placement slot `k` in
+strict column-major order.  An unused slot has one explicit typed `ABSENT`
+source rather than zero fan-in or a silent packet.  The exact source contract
+for a present slot `(r,c)` is:
+
+| family | ordered branch sources |
+|---|---|
+| 1. placement-centred patch | before spatial packet `(r,c)`; after spatial packet `(mu(r),c)` or typed cleared-row token; raw placement; row remap |
+| 2. landing/support | raw placement; before support site `(r+1,c)` or typed `OUTSIDE`; after spatial packet or cleared-row token; row remap |
+| 3. touched row | before row root `r`; after row root `mu(r)` or cleared-row token; raw placement; row remap |
+| 4. touched column | before column root `c`; after column root `c`; raw placement; row remap |
+| 5. row band | before/after row-root pairs at the first, third, and sixth rows of the containing six-row band; raw placement; row remap |
+| 6. column shard | before/after column-root pairs for shard `1:3`, `4:6`, `7:9`, or `10`; raw placement; row remap |
+
+A spatial packet is the output of the spatial Reduced-Hay cell that already
+receives its ordered centre and eight neighbours; family 1 therefore does not
+attempt to squeeze nine independent leaf packets into eight semantic inputs.
+Every listed source owns a unique basal branch identity and every motif fan-in
+is at most eight.
+
+All four family-7 cells are independent learned views of the same complete
+footprint/remap incidence:
+
+```text
+branches 1..4: raw placement slot 1..4 or typed ABSENT
+branches 5..8: corresponding row remap / cleared-row token or typed ABSENT
+```
+
+Family 8 has nine independent semantic items and must not pack them into one
+eight-branch cell.  Its four learned views are fixed as:
+
+| context motif slot | ordered sources |
+|---:|---|
+| 1 | HOLD, NEXT1, NEXT2, NEXT3, NEXT4, NEXT5 |
+| 2 | REN low UInt16, REN high UInt16, B2B, T-spin |
+| 3 | NEXT1, NEXT2, NEXT3, NEXT4, NEXT5, T-spin |
+| 4 | HOLD, REN low UInt16, REN high UInt16, B2B, T-spin |
+
+Queue roles, REN words, B2B, and T-spin are separate typed sources.  REN is
+never cast to one Float32: the two UInt16 words preserve every nonnegative
+Int32 value, including distinctions above `2^24`.  A typed external source is
+materialized into a bounded 12D packet with source kind, coordinate/role, and
+the exact payload bytes on separate lanes.  A live spine descriptor cannot be
+materialized this way; it must read the current packet of its referenced node.
+
+Candidate closure is likewise two-stage.  Changed spatial nodes first advance
+through the immutable ordered spine; motifs explicitly referencing any marked
+live packet are then seeded, followed by immutable evidence/output closure.
+Changes in external descriptors seed exactly the motifs whose incidence
+changed.  Thus T-spin or queue changes reach family 8 without pretending to be
+geometry edges, while placement/clear changes reach families 1--7.
+
 The following 32 evidence cells apply a fixed balanced mixing schedule over
 the eight motif families. Every evidence cell receives at most eight sources,
 and no single geometry hub is allowed.
