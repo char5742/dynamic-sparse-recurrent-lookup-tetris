@@ -633,6 +633,23 @@ end
 @inline tspin_value(input::CandidateInputRef) =
     @inbounds input.storage.tspin[input.flat]
 
+# Bind the zero-copy backend to CanonicalTetrisInput's public target-free
+# protocol.  The graph therefore specializes on the ref type without knowing
+# CanonicalInputBatch's storage fields and without materializing an owned input.
+@inline Input.hold_piece(input::StateInputRef) = hold_piece(input)
+@inline Input.hold_piece(input::CandidateInputRef) = hold_piece(input)
+@inline Input.next_piece(input::StateInputRef, role::Integer) =
+    next_piece(input, role)
+@inline Input.next_piece(input::CandidateInputRef, role::Integer) =
+    next_piece(input, role)
+@inline Input.ren_value(input::StateInputRef) = ren_value(input)
+@inline Input.ren_value(input::CandidateInputRef) = ren_value(input)
+@inline Input.back_to_back_value(input::StateInputRef) =
+    back_to_back_value(input)
+@inline Input.back_to_back_value(input::CandidateInputRef) =
+    back_to_back_value(input)
+@inline Input.tspin_value(input::CandidateInputRef) = tspin_value(input)
+
 @inline placement_count(input::CandidateInputRef) =
     Int(@inbounds input.storage.placement_counts[input.flat])
 

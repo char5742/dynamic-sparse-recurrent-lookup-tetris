@@ -58,6 +58,11 @@ export BOARD_ROWS,
        full_row,
        source_to_after,
        after_to_source,
+       hold_piece,
+       next_piece,
+       ren_value,
+       back_to_back_value,
+       tspin_value,
        placement_count,
        placement_position,
        no_clear_dirty_count,
@@ -411,6 +416,23 @@ end
     1 <= row <= BOARD_ROWS || throw(BoundsError(1:BOARD_ROWS, row))
     return @inbounds Int(geometry.pi[row])
 end
+
+# These target-free metadata accessors are the canonical input protocol.  Data
+# backends extend the same functions for zero-copy state/candidate references;
+# graph code must never reach through a concrete storage layout.
+@inline hold_piece(input::TeacherSufficientInput) = input.state.meta.hold
+
+@inline function next_piece(input::TeacherSufficientInput, role::Integer)
+    1 <= role <= NEXT_COUNT || throw(BoundsError(1:NEXT_COUNT, role))
+    return @inbounds input.state.meta.next[Int(role)]
+end
+
+@inline ren_value(input::TeacherSufficientInput) = input.state.meta.ren
+
+@inline back_to_back_value(input::TeacherSufficientInput) =
+    input.state.meta.back_to_back
+
+@inline tspin_value(input::TeacherSufficientInput) = input.candidate.meta.tspin
 
 @inline placement_count(input::TeacherSufficientInput) =
     Int(input.candidate.count)

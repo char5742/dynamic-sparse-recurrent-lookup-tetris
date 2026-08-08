@@ -171,6 +171,17 @@ end
         @test Data.ren_value(state1) == Int32(2)
         @test Data.back_to_back_value(state1) == Canonical.FALSE_VALUE
         @test Data.tspin_value(candidate1) == Canonical.FALSE_VALUE
+        @test Canonical.hold_piece(state1) == Data.hold_piece(state1)
+        @test Canonical.hold_piece(candidate1) == Data.hold_piece(candidate1)
+        @test Canonical.next_piece(state1, 1) == Data.next_piece(state1, 1)
+        @test Canonical.next_piece(candidate1, 5) == Data.next_piece(candidate1, 5)
+        @test Canonical.ren_value(state1) == Data.ren_value(state1)
+        @test Canonical.ren_value(candidate1) == Data.ren_value(candidate1)
+        @test Canonical.back_to_back_value(state1) ==
+            Data.back_to_back_value(state1)
+        @test Canonical.back_to_back_value(candidate1) ==
+            Data.back_to_back_value(candidate1)
+        @test Canonical.tspin_value(candidate1) == Data.tspin_value(candidate1)
         @test Data.placement_count(candidate1) == 4
         @test [Data.placement_position(candidate1, index) for index in 1:4] ==
             UInt16[68, 69, 70, 71]

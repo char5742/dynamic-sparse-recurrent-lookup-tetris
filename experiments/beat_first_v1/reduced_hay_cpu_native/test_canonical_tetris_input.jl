@@ -103,6 +103,14 @@ end
         ] == UInt16[95, 118, 119, 219]
         @test [Canonical.placement_position(input, index) for index in 1:4] ==
             UInt16[95, 118, 119, 219]
+        @test Canonical.hold_piece(input) == Canonical.NONE
+        @test Canonical.next_piece(input, 1) == Canonical.PIECE_I
+        @test Canonical.next_piece(input, 5) == Canonical.PIECE_Z
+        @test Canonical.ren_value(input) == Int32(37)
+        @test Canonical.back_to_back_value(input) == Canonical.FALSE_VALUE
+        @test Canonical.tspin_value(input) == Canonical.FALSE_VALUE
+        @test_throws BoundsError Canonical.next_piece(input, 0)
+        @test_throws BoundsError Canonical.next_piece(input, 6)
 
         @test Canonical.before_cell(input, 23, 4) == Canonical.EMPTY
         @test Canonical.placement_cell(input, 23, 4) == Canonical.PRESENT
