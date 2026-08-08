@@ -79,6 +79,103 @@ function optimizer_fixture(; frozen_multiplier=0.0f0)
     return registry
 end
 
+function dual_optimizer_fixture()
+    core_parameter = fill(0.25f0, 2, 2)
+    semantic_parameter = fill(inverse_softplus(0.4f0), 2, 1, 1, 2)
+    event_parameter = fill(inverse_softplus(0.3f0), 3)
+    output_cell_parameter = fill(-0.2f0, 2, 1)
+    output_projection_parameter = fill(
+        inverse_softplus(0.5f0), 2, 2,
+    )
+    return ParameterRegistry(
+        ParameterGroup(
+            :core_cell_raw,
+            core_parameter,
+            zeros(Float32, size(core_parameter)),
+            CELL_RAW;
+            lower_bound=-4.0f0,
+            upper_bound=4.0f0,
+        ),
+        ParameterGroup(
+            :semantic_projection_raw,
+            semantic_parameter,
+            zeros(Float32, size(semantic_parameter)),
+            INVERSE_SOFTPLUS_CONDUCTANCE;
+            lower_bound=0.05f0,
+            upper_bound=2.0f0,
+        ),
+        ParameterGroup(
+            :event_raw,
+            event_parameter,
+            zeros(Float32, size(event_parameter)),
+            INVERSE_SOFTPLUS_CONDUCTANCE;
+            lower_bound=0.05f0,
+            upper_bound=2.0f0,
+        ),
+        ParameterGroup(
+            :output_cell_raw,
+            output_cell_parameter,
+            zeros(Float32, size(output_cell_parameter)),
+            CELL_RAW;
+            lower_bound=-4.0f0,
+            upper_bound=4.0f0,
+        ),
+        ParameterGroup(
+            :output_projection_raw,
+            output_projection_parameter,
+            zeros(Float32, size(output_projection_parameter)),
+            INVERSE_SOFTPLUS_CONDUCTANCE;
+            lower_bound=0.05f0,
+            upper_bound=2.0f0,
+        ),
+    )
+end
+
+function dual_gradient_lanes(registry::ParameterRegistry)
+    analog_buffers = map(group -> group.gradient, registry.groups)
+    hard_buffers = (
+        zeros(Float32, size(registry.groups[1].parameter)),
+        zeros(Float32, size(registry.groups[2].parameter)),
+        zeros(Float32, size(registry.groups[3].parameter)),
+        nothing,
+        nothing,
+    )
+    return (
+        GradientBufferSet(registry, analog_buffers),
+        GradientBufferSet(registry, hard_buffers),
+    )
+end
+
+function optimizer_snapshot(registry, state, analog, hard)
+    return (
+        parameter=map(group -> copy(group.parameter), registry.groups),
+        first=map(moment -> copy(moment.first), state.moments),
+        second=map(moment -> copy(moment.second), state.moments),
+        group_steps=copy(state.group_steps),
+        total_step=state.total_step,
+        analog=map(
+            buffer -> buffer === nothing ? nothing : copy(buffer),
+            analog.buffers,
+        ),
+        hard=map(
+            buffer -> buffer === nothing ? nothing : copy(buffer),
+            hard.buffers,
+        ),
+    )
+end
+
+function test_optimizer_snapshot(snapshot, registry, state, analog, hard)
+    @test map(group -> group.parameter, registry.groups) ==
+        snapshot.parameter
+    @test map(moment -> moment.first, state.moments) == snapshot.first
+    @test map(moment -> moment.second, state.moments) == snapshot.second
+    @test state.group_steps == snapshot.group_steps
+    @test state.total_step == snapshot.total_step
+    @test isequal(analog.buffers, snapshot.analog)
+    @test isequal(hard.buffers, snapshot.hard)
+    return nothing
+end
+
 @testset "canonical optimizer registry and decay policy" begin
     registry = optimizer_fixture()
     @test parameter_group_names(registry) == (
@@ -349,4 +446,329 @@ end
         state, registry, config; due_mask=due,
     )
     @test masked_allocated == 0
+end
+
+
+@testset "dual lanes clip independently and enter Adam exactly once" begin
+    registry = dual_optimizer_fixture()
+    state = AdamWState(registry)
+    analog, hard = dual_gradient_lanes(registry)
+    fill!(analog.buffers[1], 0.0f0)
+    fill!(hard.buffers[1], 0.0f0)
+    analog.buffers[1][1] = 3.0f0
+    analog.buffers[1][2] = 4.0f0
+    hard.buffers[1][2] = 10.0f0
+    analog_before = map(copy, analog.buffers)
+    hard_before = map(
+        buffer -> buffer === nothing ? nothing : copy(buffer), hard.buffers,
+    )
+    config = AdamWConfig(
+        learning_rate=0.01f0,
+        beta1=0.0f0,
+        beta2=0.0f0,
+        epsilon=1.0f-8,
+        clip_norm=2.5f0,
+        weight_decay=0.0f0,
+    )
+    due = (true, false, false, false, false)
+    stats = apply_dual_optimizer_boundary!(
+        state,
+        registry,
+        analog,
+        hard,
+        config;
+        due_mask=due,
+    )
+
+    @test approximately_equal(
+        Float32(stats.analog_gradient_norm), 5.0f0,
+    )
+    @test approximately_equal(stats.analog_clip_scale, 0.5f0)
+    @test approximately_equal(
+        Float32(stats.hard_event_gradient_norm), 10.0f0,
+    )
+    @test approximately_equal(stats.hard_event_clip_scale, 0.25f0)
+    @test approximately_equal(
+        Float32(stats.combined_gradient_norm), sqrt(22.5f0),
+    )
+    @test stats.combined_gradient_norm > Float64(config.clip_norm)
+    @test state.moments[1].first[1] == 1.5f0
+    @test state.moments[1].first[2] == 4.5f0
+    @test state.moments[1].second[1] == 2.25f0
+    @test state.moments[1].second[2] == 20.25f0
+    @test state.group_steps == UInt64[1, 0, 0, 0, 0]
+    @test state.total_step == 1
+    @test stats.active_groups == 1
+    @test analog.buffers == analog_before
+    @test hard.buffers == hard_before
+end
+
+@testset "dual lane sum rounds each clipped lane before addition" begin
+    registry = dual_optimizer_fixture()
+    state = AdamWState(registry)
+    analog, hard = dual_gradient_lanes(registry)
+    analog_value = 0.66898423f0
+    analog_scale = 0.24527991f0
+    hard_value = 0.8008963f0
+    hard_scale = 0.6619079f0
+    analog.buffers[1][1] = analog_value
+    hard.buffers[1][1] = hard_value
+    separately_rounded =
+        (analog_value * analog_scale) + (hard_value * hard_scale)
+    fused = muladd(analog_value, analog_scale, hard_value * hard_scale)
+    @test separately_rounded != fused
+
+    stats = apply_dual_optimizer_boundary!(
+        state,
+        registry,
+        analog,
+        hard,
+        AdamWConfig(
+            learning_rate=0.01f0,
+            beta1=0.0f0,
+            beta2=0.0f0,
+            clip_norm=100.0f0,
+            weight_decay=0.0f0,
+        );
+        analog_gradient_scale=analog_scale,
+        hard_event_gradient_scale=hard_scale,
+        due_mask=(true, false, false, false, false),
+    )
+    @test stats.analog_clip_scale == 1.0f0
+    @test stats.hard_event_clip_scale == 1.0f0
+    @test state.moments[1].first[1] == separately_rounded
+    @test state.moments[1].first[1] != fused
+end
+
+@testset "dual lanes support either zero lane and explicit structural zeros" begin
+    config = AdamWConfig(
+        learning_rate=0.01f0,
+        beta1=0.5f0,
+        beta2=0.75f0,
+        clip_norm=100.0f0,
+        weight_decay=0.0f0,
+    )
+
+    hard_only_registry = dual_optimizer_fixture()
+    hard_only_state = AdamWState(hard_only_registry)
+    analog_zero, hard_only = dual_gradient_lanes(hard_only_registry)
+    fill!(hard_only.buffers[1], 0.25f0)
+    hard_stats = apply_dual_optimizer_boundary!(
+        hard_only_state,
+        hard_only_registry,
+        analog_zero,
+        hard_only,
+        config,
+    )
+    @test hard_stats.analog_gradient_norm == 0.0
+    @test hard_stats.analog_clip_scale == 1.0f0
+    @test hard_stats.hard_event_gradient_norm > 0.0
+    @test all(==(0.125f0), hard_only_state.moments[1].first)
+    @test all(iszero, hard_only_state.moments[4].first)
+    @test hard_only_state.group_steps == fill(UInt64(1), 5)
+    @test hard_only_state.total_step == 1
+
+    analog_only_registry = dual_optimizer_fixture()
+    analog_only_state = AdamWState(analog_only_registry)
+    analog_only, _ = dual_gradient_lanes(analog_only_registry)
+    fill!(analog_only.buffers[4], -0.5f0)
+    structural_zero = GradientBufferSet(
+        analog_only_registry,
+        (nothing, nothing, nothing, nothing, nothing),
+    )
+    analog_stats = apply_dual_optimizer_boundary!(
+        analog_only_state,
+        analog_only_registry,
+        analog_only,
+        structural_zero,
+        config,
+    )
+    @test analog_stats.analog_gradient_norm > 0.0
+    @test analog_stats.hard_event_gradient_norm == 0.0
+    @test analog_stats.hard_event_clip_scale == 1.0f0
+    @test all(==(-0.25f0), analog_only_state.moments[4].first)
+    @test analog_only_state.group_steps == fill(UInt64(1), 5)
+
+    both_zero_registry = dual_optimizer_fixture()
+    both_zero_state = AdamWState(both_zero_registry)
+    both_zero_analog, _ = dual_gradient_lanes(both_zero_registry)
+    both_zero_hard = GradientBufferSet(
+        both_zero_registry,
+        (nothing, nothing, nothing, nothing, nothing),
+    )
+    parameters_before = map(
+        group -> copy(group.parameter), both_zero_registry.groups,
+    )
+    zero_stats = apply_dual_optimizer_boundary!(
+        both_zero_state,
+        both_zero_registry,
+        both_zero_analog,
+        both_zero_hard,
+        config,
+    )
+    @test zero_stats.analog_gradient_norm == 0.0
+    @test zero_stats.hard_event_gradient_norm == 0.0
+    @test zero_stats.combined_gradient_norm == 0.0
+    @test zero_stats.active_groups == 5
+    @test map(group -> group.parameter, both_zero_registry.groups) ==
+        parameters_before
+    @test both_zero_state.group_steps == fill(UInt64(1), 5)
+    @test both_zero_state.total_step == 1
+end
+
+@testset "dual five-group due mask preserves inactive groups" begin
+    registry = dual_optimizer_fixture()
+    state = AdamWState(registry)
+    analog, hard = dual_gradient_lanes(registry)
+    for buffer in analog.buffers
+        fill!(buffer, 0.2f0)
+    end
+    for buffer in hard.buffers
+        buffer === nothing || fill!(buffer, -0.04f0)
+    end
+    parameters_before = map(group -> copy(group.parameter), registry.groups)
+    first_before = map(moment -> copy(moment.first), state.moments)
+    second_before = map(moment -> copy(moment.second), state.moments)
+    due = (true, false, true, true, false)
+    stats = apply_dual_optimizer_boundary!(
+        state,
+        registry,
+        analog,
+        hard,
+        AdamWConfig(clip_norm=100.0f0, weight_decay=0.0f0);
+        analog_gradient_scale=0.5f0,
+        hard_event_gradient_scale=2.0f0,
+        due_mask=due,
+    )
+    @test stats.active_groups == 3
+    @test state.group_steps == UInt64[1, 0, 1, 1, 0]
+    @test state.total_step == 1
+    for index in (2, 5)
+        @test registry.groups[index].parameter == parameters_before[index]
+        @test state.moments[index].first == first_before[index]
+        @test state.moments[index].second == second_before[index]
+    end
+    for index in (1, 3, 4)
+        @test registry.groups[index].parameter != parameters_before[index]
+        @test state.moments[index].first != first_before[index]
+        @test state.moments[index].second != second_before[index]
+    end
+    @test_throws DimensionMismatch apply_dual_optimizer_boundary!(
+        state,
+        registry,
+        analog,
+        hard,
+        AdamWConfig();
+        due_mask=(true, false),
+    )
+end
+
+@testset "dual preflight is lane-specific and transactional" begin
+    registry = dual_optimizer_fixture()
+    state = AdamWState(registry)
+    analog, hard = dual_gradient_lanes(registry)
+    config = AdamWConfig(clip_norm=10.0f0, weight_decay=0.0f0)
+
+    bad_names = GradientBufferSet(
+        (
+            :core_cell_raw,
+            :event_raw,
+            :semantic_projection_raw,
+            :output_cell_raw,
+            :output_projection_raw,
+        ),
+        analog.buffers,
+    )
+    snapshot = optimizer_snapshot(registry, state, analog, hard)
+    @test_throws ArgumentError apply_dual_optimizer_boundary!(
+        state, registry, bad_names, hard, config,
+    )
+    test_optimizer_snapshot(snapshot, registry, state, analog, hard)
+
+    wrong_shape_buffers = (
+        zeros(Float32, 1),
+        analog.buffers[2],
+        analog.buffers[3],
+        analog.buffers[4],
+        analog.buffers[5],
+    )
+    wrong_shape = GradientBufferSet(registry, wrong_shape_buffers)
+    snapshot = optimizer_snapshot(registry, state, analog, hard)
+    @test_throws DimensionMismatch apply_dual_optimizer_boundary!(
+        state, registry, wrong_shape, hard, config,
+    )
+    test_optimizer_snapshot(snapshot, registry, state, analog, hard)
+
+    analog.buffers[1][1] = NaN32
+    snapshot = optimizer_snapshot(registry, state, analog, hard)
+    @test_throws DomainError apply_dual_optimizer_boundary!(
+        state, registry, analog, hard, config,
+    )
+    test_optimizer_snapshot(snapshot, registry, state, analog, hard)
+    analog.buffers[1][1] = 0.0f0
+
+    hard.buffers[2][1] = Inf32
+    snapshot = optimizer_snapshot(registry, state, analog, hard)
+    @test_throws DomainError apply_dual_optimizer_boundary!(
+        state, registry, analog, hard, config,
+    )
+    test_optimizer_snapshot(snapshot, registry, state, analog, hard)
+    hard.buffers[2][1] = 0.0f0
+
+    analog.buffers[1][1] = floatmax(Float32)
+    hard.buffers[1][1] = floatmax(Float32)
+    overflow_config = AdamWConfig(
+        clip_norm=floatmax(Float32), weight_decay=0.0f0,
+    )
+    snapshot = optimizer_snapshot(registry, state, analog, hard)
+    @test_throws OverflowError apply_dual_optimizer_boundary!(
+        state,
+        registry,
+        analog,
+        hard,
+        overflow_config;
+        due_mask=(true, false, false, false, false),
+    )
+    test_optimizer_snapshot(snapshot, registry, state, analog, hard)
+
+    analog.buffers[1][1] = 0.0f0
+    hard.buffers[1][1] = 0.0f0
+    snapshot = optimizer_snapshot(registry, state, analog, hard)
+    @test_throws ArgumentError apply_dual_optimizer_boundary!(
+        state,
+        registry,
+        analog,
+        hard,
+        config;
+        hard_event_gradient_scale=1.0e300,
+    )
+    test_optimizer_snapshot(snapshot, registry, state, analog, hard)
+end
+
+@testset "steady-state dual optimizer boundary allocates zero bytes" begin
+    registry = dual_optimizer_fixture()
+    state = AdamWState(registry)
+    analog, hard = dual_gradient_lanes(registry)
+    for buffer in analog.buffers
+        fill!(buffer, 1.0f-3)
+    end
+    for buffer in hard.buffers
+        buffer === nothing || fill!(buffer, -2.0f-4)
+    end
+    config = AdamWConfig(
+        learning_rate=1.0f-4,
+        clip_norm=10.0f0,
+        weight_decay=1.0f-4,
+    )
+    due = (true, false, true, true, false)
+    apply_dual_optimizer_boundary!(
+        state, registry, analog, hard, config; due_mask=due,
+    )
+    apply_dual_optimizer_boundary!(
+        state, registry, analog, hard, config; due_mask=due,
+    )
+    allocated = @allocated apply_dual_optimizer_boundary!(
+        state, registry, analog, hard, config; due_mask=due,
+    )
+    @test allocated == 0
 end

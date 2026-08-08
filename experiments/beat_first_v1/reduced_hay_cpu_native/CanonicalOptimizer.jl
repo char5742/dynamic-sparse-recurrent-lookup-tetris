@@ -16,10 +16,12 @@ export ParameterTransformKind,
     NO_DECAY_RAW,
     ParameterGroup,
     ParameterRegistry,
+    GradientBufferSet,
     GroupMoments,
     AdamWState,
     AdamWConfig,
     OptimizerStepStats,
+    DualOptimizerStepStats,
     parameter_group_names,
     registry_group_count,
     uses_weight_decay,
@@ -29,6 +31,7 @@ export ParameterTransformKind,
     gradient_norm,
     assert_registry_match,
     apply_optimizer_boundary!,
+    apply_dual_optimizer_boundary!,
     reset_moments!
 
 """Storage semantics, projection semantics, and decay policy of one group."""
@@ -196,6 +199,59 @@ end
 
 ParameterRegistry(groups::ParameterGroup...) = ParameterRegistry(groups)
 
+"""
+One registry-ordered, read-only gradient lane.
+
+Every entry is either a `Float32` array or `nothing`.  `nothing` is an
+explicit structural zero: it owns no storage and contributes exactly zero to
+that group.  Names, order, shapes, finiteness and storage independence are
+validated again at the optimizer boundary so a stale lane fails before any
+persistent state is mutated.
+"""
+struct GradientBufferSet{N<:Tuple,B<:Tuple}
+    names::N
+    buffers::B
+end
+
+function GradientBufferSet(names::N, buffers::B) where {
+    N<:Tuple,
+    B<:Tuple,
+}
+    length(names) == length(buffers) || throw(DimensionMismatch(
+        "gradient-buffer names and buffers differ in length",
+    ))
+    @inbounds for left in eachindex(names)
+        name = names[left]
+        name isa Symbol || throw(ArgumentError(
+            "gradient-buffer group name at index $left is not a Symbol",
+        ))
+        name === Symbol("") && throw(ArgumentError(
+            "gradient-buffer group name at index $left is empty",
+        ))
+        buffer = buffers[left]
+        buffer === nothing || buffer isa AbstractArray{Float32} ||
+            throw(ArgumentError(
+                "gradient buffer for group $name must be a Float32 array or nothing",
+            ))
+        for right in (left + 1):length(names)
+            name != names[right] || throw(ArgumentError(
+                "duplicate gradient-buffer group name $name",
+            ))
+            other = buffers[right]
+            if buffer !== nothing && other !== nothing &&
+               Base.mightalias(buffer, other)
+                throw(ArgumentError(
+                    "gradient storage aliases across buffer groups",
+                ))
+            end
+        end
+    end
+    return GradientBufferSet{N,B}(names, buffers)
+end
+
+GradientBufferSet(registry::ParameterRegistry, buffers::Tuple) =
+    GradientBufferSet(parameter_group_names(registry), buffers)
+
 @inline registry_group_count(registry::ParameterRegistry) =
     length(registry.groups)
 
@@ -301,6 +357,18 @@ struct OptimizerStepStats
     total_step::UInt64
 end
 
+"""Diagnostics for two independently clipped lanes and their exact sum."""
+struct DualOptimizerStepStats
+    analog_gradient_norm::Float64
+    analog_clip_scale::Float32
+    hard_event_gradient_norm::Float64
+    hard_event_clip_scale::Float32
+    combined_gradient_norm::Float64
+    active_groups::Int
+    projected_values::Int
+    total_step::UInt64
+end
+
 @inline function _assert_array_finite(array, label::Symbol)
     @inbounds @simd for index in eachindex(array)
         value = array[index]
@@ -385,6 +453,203 @@ end
     return nothing
 end
 
+@inline _preflight_optimizer_state!(::Tuple{}, ::Tuple{}) = nothing
+
+@inline function _preflight_optimizer_state!(groups::Tuple, moments::Tuple)
+    group = first(groups)
+    moment = first(moments)
+    _assert_array_finite(group.parameter, group.name)
+    _assert_array_finite(moment.first, group.name)
+    _assert_array_finite(moment.second, group.name)
+    group.multiplier == 0.0f0 && _assert_frozen_bounds(group)
+    _preflight_optimizer_state!(Base.tail(groups), Base.tail(moments))
+    return nothing
+end
+
+@inline function _assert_lane_array_finite(
+    buffer::AbstractArray{Float32},
+    lane::Symbol,
+    group::Symbol,
+)
+    @inbounds @simd for index in eachindex(buffer)
+        value = buffer[index]
+        isfinite(value) || throw(DomainError(
+            value,
+            "non-finite value in $lane gradient buffer $group",
+        ))
+    end
+    return nothing
+end
+
+@inline _assert_lane_array_finite(
+    ::Nothing, lane::Symbol, group::Symbol,
+) = nothing
+
+@inline _preflight_gradient_buffers!(
+    ::Tuple{}, ::Tuple{}, ::Tuple{}, lane::Symbol,
+) = nothing
+
+@inline function _preflight_gradient_buffers!(
+    names::Tuple,
+    buffers::Tuple,
+    groups::Tuple,
+    lane::Symbol,
+)
+    name = first(names)
+    group = first(groups)
+    name == group.name || throw(ArgumentError(
+        "$lane gradient-buffer group order does not match registry",
+    ))
+    buffer = first(buffers)
+    if buffer !== nothing
+        axes(buffer) == axes(group.parameter) || throw(DimensionMismatch(
+            "$lane gradient shape does not match group $(group.name)",
+        ))
+        _assert_lane_array_finite(buffer, lane, group.name)
+    end
+    _preflight_gradient_buffers!(
+        Base.tail(names),
+        Base.tail(buffers),
+        Base.tail(groups),
+        lane,
+    )
+    return nothing
+end
+
+@inline function _preflight_gradient_set!(
+    set::GradientBufferSet,
+    registry::ParameterRegistry,
+    lane::Symbol,
+)
+    length(set.names) == registry_group_count(registry) ||
+        throw(DimensionMismatch(
+            "$lane gradient-buffer group count differs from registry",
+        ))
+    _preflight_gradient_buffers!(
+        set.names, set.buffers, registry.groups, lane,
+    )
+    return nothing
+end
+
+@inline _assert_buffer_disjoint_from_state!(
+    ::Nothing, ::Tuple{}, ::Tuple{}, lane::Symbol, name::Symbol,
+) = nothing
+
+@inline _assert_buffer_disjoint_from_state!(
+    ::Nothing, groups::Tuple, moments::Tuple, lane::Symbol, name::Symbol,
+) = nothing
+
+@inline _assert_buffer_disjoint_from_state!(
+    buffer::AbstractArray{Float32},
+    ::Tuple{},
+    ::Tuple{},
+    lane::Symbol,
+    name::Symbol,
+) = nothing
+
+@inline function _assert_buffer_disjoint_from_state!(
+    buffer::AbstractArray{Float32},
+    groups::Tuple,
+    moments::Tuple,
+    lane::Symbol,
+    name::Symbol,
+)
+    group = first(groups)
+    moment = first(moments)
+    Base.mightalias(buffer, group.parameter) && throw(ArgumentError(
+        "$lane gradient buffer $name aliases parameter storage",
+    ))
+    Base.mightalias(buffer, moment.first) && throw(ArgumentError(
+        "$lane gradient buffer $name aliases first-moment storage",
+    ))
+    Base.mightalias(buffer, moment.second) && throw(ArgumentError(
+        "$lane gradient buffer $name aliases second-moment storage",
+    ))
+    _assert_buffer_disjoint_from_state!(
+        buffer,
+        Base.tail(groups),
+        Base.tail(moments),
+        lane,
+        name,
+    )
+    return nothing
+end
+
+@inline _assert_set_disjoint_from_state!(
+    ::Tuple{}, ::Tuple{}, groups::Tuple, moments::Tuple, lane::Symbol,
+) = nothing
+
+@inline function _assert_set_disjoint_from_state!(
+    names::Tuple,
+    buffers::Tuple,
+    groups::Tuple,
+    moments::Tuple,
+    lane::Symbol,
+)
+    _assert_buffer_disjoint_from_state!(
+        first(buffers), groups, moments, lane, first(names),
+    )
+    _assert_set_disjoint_from_state!(
+        Base.tail(names),
+        Base.tail(buffers),
+        groups,
+        moments,
+        lane,
+    )
+    return nothing
+end
+
+@inline _assert_buffer_disjoint_from_set!(
+    ::Nothing, ::Tuple{}, lane::Symbol, name::Symbol,
+) = nothing
+
+@inline _assert_buffer_disjoint_from_set!(
+    ::Nothing, buffers::Tuple, lane::Symbol, name::Symbol,
+) = nothing
+
+@inline _assert_buffer_disjoint_from_set!(
+    buffer::AbstractArray{Float32},
+    ::Tuple{},
+    lane::Symbol,
+    name::Symbol,
+) = nothing
+
+@inline function _assert_buffer_disjoint_from_set!(
+    buffer::AbstractArray{Float32},
+    buffers::Tuple,
+    lane::Symbol,
+    name::Symbol,
+)
+    other = first(buffers)
+    if other !== nothing && Base.mightalias(buffer, other)
+        throw(ArgumentError(
+            "$lane gradient buffer $name aliases the other gradient lane",
+        ))
+    end
+    _assert_buffer_disjoint_from_set!(
+        buffer, Base.tail(buffers), lane, name,
+    )
+    return nothing
+end
+
+@inline _assert_lanes_disjoint!(
+    ::Tuple{}, ::Tuple{}, hard_buffers::Tuple,
+) = nothing
+
+@inline function _assert_lanes_disjoint!(
+    names::Tuple,
+    analog_buffers::Tuple,
+    hard_buffers::Tuple,
+)
+    _assert_buffer_disjoint_from_set!(
+        first(analog_buffers), hard_buffers, :analog, first(names),
+    )
+    _assert_lanes_disjoint!(
+        Base.tail(names), Base.tail(analog_buffers), hard_buffers,
+    )
+    return nothing
+end
+
 @inline function _preflight_group_clocks!(groups::Tuple, steps, due, index)
     group = first(groups)
     if first(due) && group.multiplier > 0.0f0 &&
@@ -413,6 +678,47 @@ end
         total = muladd(value, value, total)
     end
     return total
+end
+
+@inline function _buffer_gradient_norm_squared(
+    group::ParameterGroup,
+    ::Nothing,
+    scale64,
+    due::Bool,
+)
+    return 0.0
+end
+
+@inline function _buffer_gradient_norm_squared(
+    group::ParameterGroup,
+    buffer::AbstractArray{Float32},
+    scale64,
+    due::Bool,
+)
+    due && group.multiplier > 0.0f0 || return 0.0
+    total = 0.0
+    @inbounds @simd for index in eachindex(buffer)
+        value = Float64(buffer[index]) * scale64
+        total = muladd(value, value, total)
+    end
+    return total
+end
+
+@inline _buffer_norm_squared(
+    ::Tuple{}, ::Tuple{}, scale64, ::Tuple{},
+) = 0.0
+
+@inline function _buffer_norm_squared(
+    groups::Tuple,
+    buffers::Tuple,
+    scale64,
+    due::Tuple,
+)
+    return _buffer_gradient_norm_squared(
+        first(groups), first(buffers), scale64, first(due),
+    ) + _buffer_norm_squared(
+        Base.tail(groups), Base.tail(buffers), scale64, Base.tail(due),
+    )
 end
 
 @inline _gradient_norm_squared(::Tuple{}, scale64, ::Tuple{}) = 0.0
@@ -503,6 +809,261 @@ end
         )
     end
     return nothing
+end
+
+@inline _lane_value(::Nothing, index) = 0.0f0
+@inline _lane_value(buffer::AbstractArray{Float32}, index) =
+    @inbounds buffer[index]
+
+@inline function _combined_gradient_value(
+    analog_buffer,
+    hard_buffer,
+    index,
+    analog_scale::Float32,
+    hard_scale::Float32,
+)
+    analog = _lane_value(analog_buffer, index)
+    hard = _lane_value(hard_buffer, index)
+    analog_clipped = analog * analog_scale
+    hard_clipped = hard * hard_scale
+    return analog_clipped + hard_clipped
+end
+
+@inline function _preflight_dual_adamw_array!(
+    group::ParameterGroup,
+    moments::GroupMoments,
+    analog_buffer,
+    hard_buffer,
+    config::AdamWConfig,
+    analog_scale::Float32,
+    hard_scale::Float32,
+    step::UInt64,
+)
+    beta1 = config.beta1
+    beta2 = config.beta2
+    one_minus_beta1 = 1.0f0 - beta1
+    one_minus_beta2 = 1.0f0 - beta2
+    correction1 = inv(1.0f0 - beta1^step)
+    correction2 = inv(1.0f0 - beta2^step)
+    rate = config.learning_rate * group.multiplier
+    decay = uses_weight_decay(group.transform_kind) ?
+        config.weight_decay : 0.0f0
+    isfinite(correction1) && isfinite(correction2) && isfinite(rate) ||
+        throw(OverflowError(
+            "non-finite Adam coefficient for group $(group.name)",
+        ))
+    combined_norm_squared = 0.0
+    @inbounds for index in eachindex(group.parameter)
+        value = _combined_gradient_value(
+            analog_buffer,
+            hard_buffer,
+            index,
+            analog_scale,
+            hard_scale,
+        )
+        isfinite(value) || throw(OverflowError(
+            "combined gradient overflow for group $(group.name)",
+        ))
+        value64 = Float64(value)
+        combined_norm_squared = muladd(
+            value64, value64, combined_norm_squared,
+        )
+        isfinite(combined_norm_squared) || throw(OverflowError(
+            "combined gradient norm overflow for group $(group.name)",
+        ))
+        momentum = muladd(
+            beta1,
+            moments.first[index],
+            one_minus_beta1 * value,
+        )
+        variance = muladd(
+            beta2,
+            moments.second[index],
+            one_minus_beta2 * value * value,
+        )
+        isfinite(momentum) && isfinite(variance) && variance >= 0.0f0 ||
+            throw(OverflowError(
+                "non-finite Adam moment for group $(group.name)",
+            ))
+        normalized = momentum * correction1 /
+            (sqrt(variance * correction2) + config.epsilon)
+        updated = group.parameter[index] - rate * (
+            normalized + decay * group.parameter[index]
+        )
+        isfinite(normalized) && isfinite(updated) || throw(OverflowError(
+            "non-finite Adam update for group $(group.name)",
+        ))
+        projected = clamp(
+            updated,
+            group.projected_lower_raw,
+            group.projected_upper_raw,
+        )
+        isfinite(projected) || throw(OverflowError(
+            "non-finite projected parameter for group $(group.name)",
+        ))
+    end
+    return combined_norm_squared
+end
+
+@inline function _adamw_dual_array!(
+    group::ParameterGroup,
+    moments::GroupMoments,
+    analog_buffer,
+    hard_buffer,
+    config::AdamWConfig,
+    analog_scale::Float32,
+    hard_scale::Float32,
+    step::UInt64,
+)
+    beta1 = config.beta1
+    beta2 = config.beta2
+    one_minus_beta1 = 1.0f0 - beta1
+    one_minus_beta2 = 1.0f0 - beta2
+    correction1 = inv(1.0f0 - beta1^step)
+    correction2 = inv(1.0f0 - beta2^step)
+    rate = config.learning_rate * group.multiplier
+    decay = uses_weight_decay(group.transform_kind) ?
+        config.weight_decay : 0.0f0
+    @inbounds for index in eachindex(group.parameter)
+        value = _combined_gradient_value(
+            analog_buffer,
+            hard_buffer,
+            index,
+            analog_scale,
+            hard_scale,
+        )
+        momentum = muladd(
+            beta1,
+            moments.first[index],
+            one_minus_beta1 * value,
+        )
+        variance = muladd(
+            beta2,
+            moments.second[index],
+            one_minus_beta2 * value * value,
+        )
+        moments.first[index] = momentum
+        moments.second[index] = variance
+        normalized = momentum * correction1 /
+            (sqrt(variance * correction2) + config.epsilon)
+        group.parameter[index] -= rate * (
+            normalized + decay * group.parameter[index]
+        )
+    end
+    return nothing
+end
+
+@inline _preflight_dual_groups!(
+    ::Tuple{},
+    ::Tuple{},
+    ::Tuple{},
+    ::Tuple{},
+    steps,
+    config,
+    analog_scale,
+    hard_scale,
+    ::Tuple{},
+    index,
+) = 0.0
+
+@inline function _preflight_dual_groups!(
+    groups::Tuple,
+    moments::Tuple,
+    analog_buffers::Tuple,
+    hard_buffers::Tuple,
+    steps,
+    config,
+    analog_scale,
+    hard_scale,
+    due::Tuple,
+    index,
+)
+    group = first(groups)
+    local_norm_squared = 0.0
+    if first(due) && group.multiplier > 0.0f0
+        local_norm_squared = _preflight_dual_adamw_array!(
+            group,
+            first(moments),
+            first(analog_buffers),
+            first(hard_buffers),
+            config,
+            analog_scale,
+            hard_scale,
+            steps[index] + UInt64(1),
+        )
+    end
+    total = local_norm_squared + _preflight_dual_groups!(
+        Base.tail(groups),
+        Base.tail(moments),
+        Base.tail(analog_buffers),
+        Base.tail(hard_buffers),
+        steps,
+        config,
+        analog_scale,
+        hard_scale,
+        Base.tail(due),
+        index + 1,
+    )
+    isfinite(total) || throw(OverflowError(
+        "combined gradient norm is not finite",
+    ))
+    return total
+end
+
+@inline _update_dual_groups!(
+    ::Tuple{},
+    ::Tuple{},
+    ::Tuple{},
+    ::Tuple{},
+    steps,
+    config,
+    analog_scale,
+    hard_scale,
+    ::Tuple{},
+    index,
+) = 0
+
+@inline function _update_dual_groups!(
+    groups::Tuple,
+    moments::Tuple,
+    analog_buffers::Tuple,
+    hard_buffers::Tuple,
+    steps,
+    config,
+    analog_scale,
+    hard_scale,
+    due::Tuple,
+    index,
+)
+    group = first(groups)
+    active = 0
+    if first(due) && group.multiplier > 0.0f0
+        next_step = steps[index] + UInt64(1)
+        _adamw_dual_array!(
+            group,
+            first(moments),
+            first(analog_buffers),
+            first(hard_buffers),
+            config,
+            analog_scale,
+            hard_scale,
+            next_step,
+        )
+        steps[index] = next_step
+        active = 1
+    end
+    return active + _update_dual_groups!(
+        Base.tail(groups),
+        Base.tail(moments),
+        Base.tail(analog_buffers),
+        Base.tail(hard_buffers),
+        steps,
+        config,
+        analog_scale,
+        hard_scale,
+        Base.tail(due),
+        index + 1,
+    )
 end
 
 @inline _update_groups!(
@@ -613,6 +1174,145 @@ function apply_optimizer_boundary!(
     return OptimizerStepStats(
         norm,
         clip_scale,
+        active_groups,
+        projected_values,
+        state.total_step,
+    )
+end
+
+"""
+Apply one AdamW boundary from independently clipped analog and hard-event lanes.
+
+Both `GradientBufferSet`s are registry-ordered and read-only.  Each lane is
+validated and norm-clipped independently.  In fixed registry and array-index
+order, the optimizer consumes exactly
+
+`g_total = g_analog_clipped + g_hard_event_clipped`.
+
+There is deliberately no second/shared clip of that sum and no intermediate
+combined gradient buffer.  All lane, state, clock, combined-gradient, Adam and
+projection arithmetic is preflighted before the first persistent write.  A
+due group advances its moments and group clock once even when either lane is a
+structural zero; the global boundary clock also advances exactly once.
+"""
+function apply_dual_optimizer_boundary!(
+    state::AdamWState,
+    registry::ParameterRegistry,
+    analog::GradientBufferSet,
+    hard_event::GradientBufferSet,
+    config::AdamWConfig;
+    analog_gradient_scale::Real=1.0,
+    hard_event_gradient_scale::Real=1.0,
+    due_mask=nothing,
+)
+    analog_scale64 = Float64(analog_gradient_scale)
+    isfinite(analog_scale64) && analog_scale64 >= 0.0 ||
+        throw(ArgumentError(
+            "analog_gradient_scale must be finite and non-negative",
+        ))
+    analog_scale32 = Float32(analog_scale64)
+    isfinite(analog_scale32) || throw(ArgumentError(
+        "analog_gradient_scale is outside the Float32 optimizer domain",
+    ))
+    hard_scale64 = Float64(hard_event_gradient_scale)
+    isfinite(hard_scale64) && hard_scale64 >= 0.0 ||
+        throw(ArgumentError(
+            "hard_event_gradient_scale must be finite and non-negative",
+        ))
+    hard_scale32 = Float32(hard_scale64)
+    isfinite(hard_scale32) || throw(ArgumentError(
+        "hard_event_gradient_scale is outside the Float32 optimizer domain",
+    ))
+
+    assert_registry_match(state, registry)
+    due = _validated_due_mask(registry, due_mask)
+    _preflight_optimizer_state!(registry.groups, state.moments)
+    _preflight_gradient_set!(analog, registry, :analog)
+    _preflight_gradient_set!(hard_event, registry, :hard_event)
+    _assert_set_disjoint_from_state!(
+        analog.names,
+        analog.buffers,
+        registry.groups,
+        state.moments,
+        :analog,
+    )
+    _assert_set_disjoint_from_state!(
+        hard_event.names,
+        hard_event.buffers,
+        registry.groups,
+        state.moments,
+        :hard_event,
+    )
+    _assert_lanes_disjoint!(
+        analog.names, analog.buffers, hard_event.buffers,
+    )
+    _preflight_group_clocks!(
+        registry.groups, state.group_steps, due, 1,
+    )
+    state.total_step == typemax(UInt64) && throw(OverflowError(
+        "total optimizer clock overflow",
+    ))
+
+    analog_norm = sqrt(_buffer_norm_squared(
+        registry.groups, analog.buffers, analog_scale64, due,
+    ))
+    isfinite(analog_norm) || throw(DomainError(
+        analog_norm, "analog gradient norm is not finite",
+    ))
+    hard_norm = sqrt(_buffer_norm_squared(
+        registry.groups, hard_event.buffers, hard_scale64, due,
+    ))
+    isfinite(hard_norm) || throw(DomainError(
+        hard_norm, "hard-event gradient norm is not finite",
+    ))
+    analog_clip_scale = Float32(min(
+        1.0,
+        Float64(config.clip_norm) / max(analog_norm, eps(Float64)),
+    ))
+    hard_clip_scale = Float32(min(
+        1.0,
+        Float64(config.clip_norm) / max(hard_norm, eps(Float64)),
+    ))
+    effective_analog_scale = analog_scale32 * analog_clip_scale
+    effective_hard_scale = hard_scale32 * hard_clip_scale
+
+    combined_norm_squared = _preflight_dual_groups!(
+        registry.groups,
+        state.moments,
+        analog.buffers,
+        hard_event.buffers,
+        state.group_steps,
+        config,
+        effective_analog_scale,
+        effective_hard_scale,
+        due,
+        1,
+    )
+    combined_norm = sqrt(combined_norm_squared)
+    isfinite(combined_norm) || throw(DomainError(
+        combined_norm, "combined clipped gradient norm is not finite",
+    ))
+
+    active_groups = _update_dual_groups!(
+        registry.groups,
+        state.moments,
+        analog.buffers,
+        hard_event.buffers,
+        state.group_steps,
+        config,
+        effective_analog_scale,
+        effective_hard_scale,
+        due,
+        1,
+    )
+    projected_values = _project_groups!(registry.groups, due)
+    state.total_step += UInt64(1)
+    return DualOptimizerStepStats(
+        analog_norm,
+        analog_clip_scale,
+        hard_norm,
+        hard_clip_scale,
+        combined_norm,
         active_groups,
         projected_values,
         state.total_step,
