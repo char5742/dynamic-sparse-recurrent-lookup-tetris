@@ -150,6 +150,108 @@ end
     @test_throws ArgumentError Local.LearningSchedule(analog_interval=0)
 end
 
+clock_snapshot(clock) = (
+    clock.update,
+    clock.analog_ticks,
+    clock.hard_event_ticks,
+    clock.homeostasis_ticks,
+    clock.structure_ticks,
+)
+
+@testset "transaction-safe learning clocks" begin
+    schedule = Local.LearningSchedule(
+        analog_interval=2,
+        hard_event_interval=3,
+        homeostasis_interval=4,
+        structure_interval=6,
+    )
+    clock = Local.LearningClockState()
+    before_preview = clock_snapshot(clock)
+    due = Local.preview_clocks(clock, schedule)
+    @test clock_snapshot(clock) == before_preview
+    @test due.expected_update == 1
+    @test due.expected_ticks == (0, 0, 0, 0)
+    @test due.schedule_intervals == (2, 3, 4, 6)
+    @test due == Local.preview_clocks(clock, schedule)
+
+    committed = Local.commit_clocks!(clock, schedule, due)
+    @test committed == due
+    @test clock_snapshot(clock) == (1, 0, 0, 0, 0)
+    after_commit = clock_snapshot(clock)
+    @test_throws ArgumentError Local.commit_clocks!(clock, schedule, due)
+    @test clock_snapshot(clock) == after_commit
+
+    next_due = Local.preview_clocks(clock, schedule)
+    wrong_due = Local.DuePlasticityClocks(
+        !next_due.analog,
+        next_due.hard_event,
+        next_due.homeostasis,
+        next_due.structure,
+        next_due.expected_update,
+        next_due.expected_ticks,
+        next_due.schedule_intervals,
+    )
+    before_mismatch = clock_snapshot(clock)
+    @test_throws ArgumentError Local.commit_clocks!(clock, schedule, wrong_due)
+    @test clock_snapshot(clock) == before_mismatch
+    @test_throws ArgumentError Local.commit_clocks!(
+        clock,
+        Local.LearningSchedule(
+            analog_interval=2,
+            hard_event_interval=3,
+            homeostasis_interval=5,
+            structure_interval=6,
+        ),
+        next_due,
+    )
+    @test clock_snapshot(clock) == before_mismatch
+    @test_throws ArgumentError Local.commit_clocks!(
+        clock,
+        schedule,
+        Local.DuePlasticityClocks(false, false, false, false),
+    )
+    @test clock_snapshot(clock) == before_mismatch
+
+    overflow_update = Local.LearningClockState(typemax(Int), 3, 4, 5, 6)
+    overflow_update_before = clock_snapshot(overflow_update)
+    @test_throws OverflowError Local.preview_clocks(overflow_update, schedule)
+    @test clock_snapshot(overflow_update) == overflow_update_before
+
+    overflow_tick = Local.LearningClockState(0, typemax(Int), 4, 5, 6)
+    every_update = Local.LearningSchedule(
+        analog_interval=1,
+        hard_event_interval=2,
+        homeostasis_interval=3,
+        structure_interval=4,
+    )
+    overflow_tick_before = clock_snapshot(overflow_tick)
+    @test_throws OverflowError Local.preview_clocks(overflow_tick, every_update)
+    @test clock_snapshot(overflow_tick) == overflow_tick_before
+    stale_overflow_due = Local.DuePlasticityClocks(
+        true,
+        false,
+        false,
+        false,
+        1,
+        (typemax(Int), 4, 5, 6),
+        (1, 2, 3, 4),
+    )
+    @test_throws OverflowError Local.commit_clocks!(
+        overflow_tick, every_update, stale_overflow_due,
+    )
+    @test clock_snapshot(overflow_tick) == overflow_tick_before
+
+    hot_clock = Local.LearningClockState()
+    Local.preview_clocks(hot_clock, schedule)
+    preview_allocated = @allocated Local.preview_clocks(hot_clock, schedule)
+    @test preview_allocated == 0
+    hot_due = Local.preview_clocks(hot_clock, schedule)
+    commit_allocated = @allocated Local.commit_clocks!(
+        hot_clock, schedule, hot_due,
+    )
+    @test commit_allocated == 0
+end
+
 @testset "two-pass ListNet replay boundary" begin
     replay = Local.TwoPassListNetReplay(22, 3)
     Local.record_teacher_free_forward!(replay, 1, 0x101)
@@ -505,7 +607,7 @@ end
     )
 end
 
-@testset "linearity and common/candidate alternative worlds" begin
+@testset "linearity and generic seeded-adjoint duality" begin
     raw, states, inputs, continuous_a, packet_a = make_local_trajectory(2)
     continuous_b = [0.37 .* signal for signal in continuous_a]
     packet_b = [-0.21 .* signal for signal in packet_a]
@@ -526,9 +628,9 @@ end
     )
     @test isapprox(root_sum, root_a + root_b; rtol=3eps(Float64), atol=3eps(Float64))
 
-    # Candidate worlds return independent roots. Summing those roots before a
-    # single common replay equals duplicating the common replay, while a common
-    # local signal can still be added exactly once by the graph owner.
+    # Generic/oracle seed duality only. Canonical Graph candidate worlds stop
+    # at initial_core and never use this root-to-common propagation; canonical
+    # common instead receives aggregate raw-22D fixed feedback once per state.
     common_raw, common_states, common_inputs, _, _ = make_local_trajectory(1)
     zero_continuous = [zeros(Float64, Local.LOCAL_OBSERVATION_DIM)]
     zero_packet = [zeros(Float64, Axon.PACKET_DIM)]

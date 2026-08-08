@@ -28,6 +28,8 @@ export LOCAL_OBSERVATION_DIM,
        add_terminal_seed!,
        finish_local_adjoint!,
        reset_adjoint_arena!,
+       preview_clocks,
+       commit_clocks!,
        advance_clocks!,
        record_teacher_free_forward!,
        seal_listnet_deltas!,
@@ -114,8 +116,9 @@ Reverse local-adjoint state for one cell in one alternative world.
 
 Only the 48-dimensional cell-state cotangent is retained. There is no
 parameter-width dimension: the state is therefore independent of the number
-of shared semantic/event contacts. Candidate worlds use independent instances;
-their root cotangents may be summed into a common-world instance explicitly.
+of shared semantic/event contacts. The generic primitive supports an explicit
+terminal seed, but the canonical Graph stops candidate alternative worlds at
+`initial_core`; it does not propagate their 48D root cotangents into common.
 """
 mutable struct ContractedLocalAdjoint{T<:AbstractFloat}
     state_bar::Vector{T}
@@ -644,7 +647,27 @@ struct DuePlasticityClocks
     hard_event::Bool
     homeostasis::Bool
     structure::Bool
+    expected_update::Int
+    expected_ticks::NTuple{4,Int}
+    schedule_intervals::NTuple{4,Int}
 end
+
+# Zero-token sentinel for initialization/display only. A transactional commit
+# accepts only a value returned by `preview_clocks` for the current clock.
+DuePlasticityClocks(
+    analog::Bool,
+    hard_event::Bool,
+    homeostasis::Bool,
+    structure::Bool,
+) = DuePlasticityClocks(
+    analog,
+    hard_event,
+    homeostasis,
+    structure,
+    0,
+    (0, 0, 0, 0),
+    (0, 0, 0, 0),
+)
 
 mutable struct LearningClockState
     update::Int
@@ -656,18 +679,78 @@ end
 
 LearningClockState() = LearningClockState(0, 0, 0, 0, 0)
 
-function advance_clocks!(clock::LearningClockState, schedule::LearningSchedule)
+@inline function _checked_tick(current::Int, due::Bool, name::AbstractString)
+    if due && current == typemax(Int)
+        throw(OverflowError("$name learning tick overflow"))
+    end
+    return current + Int(due)
+end
+
+"""
+    preview_clocks(clock, schedule) -> DuePlasticityClocks
+
+Purely compute the due mask and transaction token for the next successful
+update. The clock and all tick counters remain bit-identical. Every overflow
+that a matching commit could encounter is checked here before mutation.
+"""
+function preview_clocks(clock::LearningClockState, schedule::LearningSchedule)
     clock.update == typemax(Int) && throw(OverflowError("learning clock overflow"))
-    clock.update += 1
-    analog = mod(clock.update, schedule.analog_interval) == 0
-    hard_event = mod(clock.update, schedule.hard_event_interval) == 0
-    homeostasis = mod(clock.update, schedule.homeostasis_interval) == 0
-    structure = mod(clock.update, schedule.structure_interval) == 0
-    clock.analog_ticks += analog
-    clock.hard_event_ticks += hard_event
-    clock.homeostasis_ticks += homeostasis
-    clock.structure_ticks += structure
-    return DuePlasticityClocks(analog, hard_event, homeostasis, structure)
+    next_update = clock.update + 1
+    analog = mod(next_update, schedule.analog_interval) == 0
+    hard_event = mod(next_update, schedule.hard_event_interval) == 0
+    homeostasis = mod(next_update, schedule.homeostasis_interval) == 0
+    structure = mod(next_update, schedule.structure_interval) == 0
+    expected_ticks = (
+        _checked_tick(clock.analog_ticks, analog, "analog"),
+        _checked_tick(clock.hard_event_ticks, hard_event, "hard-event"),
+        _checked_tick(clock.homeostasis_ticks, homeostasis, "homeostasis"),
+        _checked_tick(clock.structure_ticks, structure, "structure"),
+    )
+    schedule_intervals = (
+        schedule.analog_interval,
+        schedule.hard_event_interval,
+        schedule.homeostasis_interval,
+        schedule.structure_interval,
+    )
+    return DuePlasticityClocks(
+        analog,
+        hard_event,
+        homeostasis,
+        structure,
+        next_update,
+        expected_ticks,
+        schedule_intervals,
+    )
+end
+
+"""
+    commit_clocks!(clock, schedule, expected_due)
+
+Atomically advance an already-previewed learning clock. The expected token and
+all four due bits must match a fresh pure preview. Mismatch, duplicate commit,
+or overflow fails before any field is changed.
+"""
+function commit_clocks!(
+    clock::LearningClockState,
+    schedule::LearningSchedule,
+    expected_due::DuePlasticityClocks,
+)
+    actual = preview_clocks(clock, schedule)
+    actual == expected_due || throw(ArgumentError(
+        "learning clock preview is stale or does not match the schedule",
+    ))
+    clock.update = actual.expected_update
+    clock.analog_ticks = actual.expected_ticks[1]
+    clock.hard_event_ticks = actual.expected_ticks[2]
+    clock.homeostasis_ticks = actual.expected_ticks[3]
+    clock.structure_ticks = actual.expected_ticks[4]
+    return actual
+end
+
+"""Oracle convenience: preview and immediately commit one update."""
+function advance_clocks!(clock::LearningClockState, schedule::LearningSchedule)
+    due = preview_clocks(clock, schedule)
+    return commit_clocks!(clock, schedule, due)
 end
 
 @enum ReplayPhase::UInt8 begin
@@ -816,9 +899,10 @@ end
     begin_local_adjoint!(state, terminal_record; terminal_seed=nothing)
 
 Begin reverse replay of one cell chain. `terminal_record` is the newest exact
-state version in this alternative world. Candidate worlds are replayed first;
-their resulting root `state_bar`s can then be summed into a common-world state
-with `add_terminal_seed!` before the common chain is replayed once.
+state version in this world. `terminal_seed` is a generic/oracle facility.
+Canonical candidate replay stops at `initial_core`; common replay instead uses
+the fixed-feedback projection of the aggregate raw 22D ListNet derivative and
+runs once per state, without a candidate-root state seed.
 """
 function begin_local_adjoint!(
     state::ContractedLocalAdjoint{T},
@@ -881,7 +965,7 @@ function begin_local_adjoint!(
     return selected
 end
 
-"""Add a candidate-root cotangent to an active common-world terminal seed."""
+"""Add a generic/oracle terminal cotangent to an active adjoint seed."""
 function add_terminal_seed!(
     state::ContractedLocalAdjoint{T},
     seed::AbstractVector{T},
@@ -923,7 +1007,13 @@ function add_terminal_seed!(
     return selected
 end
 
-"""Allocation-free candidate-column to common-column seed reduction."""
+"""
+Allocation-free generic/oracle column-to-column seed reduction.
+
+This is not part of the canonical Graph call chain: candidate alternative
+worlds are stop-gradient at `initial_core` and common receives aggregate raw
+22D fixed-feedback, not their 48D state cotangents.
+"""
 function add_terminal_seed!(
     destination::ContractedAdjointArena{T},
     destination_node::Integer,
