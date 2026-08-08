@@ -9,11 +9,12 @@ const Cell = ActiveApicalCell
 const Axon = DendriticAxonPacket
 
 export LOCAL_OBSERVATION_DIM,
-       LocalParameterBasis,
-       AnalogEligibilityState,
-       HardEventEligibilityState,
+       ChronologicalTransitionLink,
+       ContractedLocalAdjoint,
+       ContractedAdjointArena,
+       ContractedAdjointScratch,
+       CausalEventControl,
        StructuralUtilityState,
-       EligibilityScratch,
        FixedLocalSignalMap,
        PlasticityConfig,
        LocalLearningConfig,
@@ -23,20 +24,20 @@ export LOCAL_OBSERVATION_DIM,
        ReplayPhase,
        TwoPassListNetReplay,
        reset_replay!,
-       reset_eligibility!,
+       begin_local_adjoint!,
+       add_terminal_seed!,
+       finish_local_adjoint!,
+       reset_adjoint_arena!,
        advance_clocks!,
        record_teacher_free_forward!,
        seal_listnet_deltas!,
        copy_replay_delta!,
        finish_replay!,
        project_learning_signal!,
-       accumulate_active_apical_transition!,
-       accumulate_analog_gradient!,
-       accumulate_packet_gradient!,
-       accumulate_hard_event_gradient!,
+       contract_replayed_transition!,
+       raw_parameter_cotangent,
+       input_cotangent,
        update_structural_utility!,
-       update_packet_structural_utility!,
-       update_configured_utility!,
        config_summary,
        config_fingerprint,
        continuous_observation!
@@ -65,87 +66,187 @@ end
 end
 
 """
-    LocalParameterBasis(parameter_count; T=Float32, include_cell_parameters=true)
+    ChronologicalTransitionLink(record, predecessor, packet_version)
 
-Teacher-free local parameterization for one cell transition. `raw_basis`
-maps local parameters to the 46 raw Reduced-Hay parameters. `input_basis`
-maps them to the 27 typed receptor inputs. Graph/contact code refreshes the
-input columns from the presynaptic packet before each replay transition.
-
-This is the explicit adapter boundary for the canonical 12D axon packet. The
-learning kernel does not depend on packet lane layout; the packet/graph owner
-must express each contact derivative in `input_basis`.
+Immutable identity of one replayed cell transition. `record` is the exact
+post-transition state version and `predecessor` is the version consumed by the
+forward cell kernel (`0` denotes the anatomical/common root). `packet_version`
+identifies the packet produced by this exact transition; graph/contact replay
+must never substitute a cell's final packet.
 """
-struct LocalParameterBasis{T<:AbstractFloat}
-    raw_basis::Matrix{T}
-    input_basis::Matrix{T}
-end
-
-function LocalParameterBasis(
-    parameter_count::Integer;
-    T::Type{<:AbstractFloat}=Float32,
-    include_cell_parameters::Bool=true,
-)
-    count = _require_positive("parameter_count", parameter_count)
-    raw = zeros(T, Cell.PARAM_DIM, count)
-    input = zeros(T, Cell.INPUT_DIM, count)
-    if include_cell_parameters
-        count >= Cell.PARAM_DIM || throw(ArgumentError(
-            "including cell parameters requires at least $(Cell.PARAM_DIM) columns",
+struct ChronologicalTransitionLink
+    record::Int
+    predecessor::Int
+    packet_version::Int
+    function ChronologicalTransitionLink(
+        record::Int,
+        predecessor::Int,
+        packet_version::Int,
+    )
+        record > 0 || throw(ArgumentError(
+            "transition record must be positive",
         ))
-        @inbounds for parameter in 1:Cell.PARAM_DIM
-            raw[parameter, parameter] = one(T)
-        end
+        predecessor >= 0 || throw(ArgumentError(
+            "transition predecessor must be nonnegative",
+        ))
+        predecessor != record || throw(ArgumentError(
+            "a transition cannot be its own predecessor",
+        ))
+        packet_version > 0 || throw(ArgumentError(
+            "packet version must be positive",
+        ))
+        return new(record, predecessor, packet_version)
     end
-    return LocalParameterBasis{T}(raw, input)
 end
 
-function _check_basis(basis::LocalParameterBasis, parameter_count::Int)
-    size(basis.raw_basis) == (Cell.PARAM_DIM, parameter_count) || throw(
-        DimensionMismatch("raw parameter basis has the wrong shape"),
+function ChronologicalTransitionLink(
+    record::Integer,
+    predecessor::Integer,
+    packet_version::Integer=record,
+)
+    return ChronologicalTransitionLink(
+        Int(record), Int(predecessor), Int(packet_version),
     )
-    size(basis.input_basis) == (Cell.INPUT_DIM, parameter_count) || throw(
-        DimensionMismatch("input parameter basis has the wrong shape"),
-    )
-    return nothing
 end
 
-"""Forward sensitivities and current continuous e-prop eligibility."""
-mutable struct AnalogEligibilityState{T<:AbstractFloat}
-    state_sensitivity::Matrix{T}
-    eligibility::Matrix{T}
-    packet_eligibility::Matrix{T}
+"""
+Reverse local-adjoint state for one cell in one alternative world.
+
+Only the 48-dimensional cell-state cotangent is retained. There is no
+parameter-width dimension: the state is therefore independent of the number
+of shared semantic/event contacts. Candidate worlds use independent instances;
+their root cotangents may be summed into a common-world instance explicitly.
+"""
+mutable struct ContractedLocalAdjoint{T<:AbstractFloat}
+    state_bar::Vector{T}
+    expected_record::Int
+    active::Bool
     touched::Bool
-    transition_count::Int
+    visited_transition_count::Int
+    conditional_pullback_count::Int
 end
 
-function AnalogEligibilityState(
-    parameter_count::Integer;
+function ContractedLocalAdjoint(; T::Type{<:AbstractFloat}=Float32)
+    return ContractedLocalAdjoint{T}(
+        zeros(T, Cell.STATE_DIM), 0, false, false, 0, 0,
+    )
+end
+
+"""
+Generation-stamped production arena for every core cell owned by one worker.
+
+The `48 × node_count` cotangent slab is contiguous and parameter-width
+independent. Metadata are parallel primitive arrays, so replay addresses a
+cell by integer column and creates neither a per-cell object nor a SubArray
+view. `reset_adjoint_arena!` advances a generation instead of clearing the
+whole slab.
+"""
+mutable struct ContractedAdjointArena{T<:AbstractFloat}
+    state_bar::Matrix{T}
+    expected_record::Vector{Int}
+    active::Vector{Bool}
+    touched::Vector{Bool}
+    visited_transition_count::Vector{Int}
+    conditional_pullback_count::Vector{Int}
+    generation::Vector{UInt32}
+    current_generation::UInt32
+end
+
+function ContractedAdjointArena(
+    node_count::Integer;
     T::Type{<:AbstractFloat}=Float32,
 )
-    count = _require_positive("parameter_count", parameter_count)
-    return AnalogEligibilityState{T}(
+    count = _require_positive("adjoint arena node_count", node_count)
+    return ContractedAdjointArena{T}(
         zeros(T, Cell.STATE_DIM, count),
-        zeros(T, LOCAL_OBSERVATION_DIM, count),
-        zeros(T, Axon.PACKET_DIM, count),
-        false,
-        0,
+        zeros(Int, count),
+        fill(false, count),
+        fill(false, count),
+        zeros(Int, count),
+        zeros(Int, count),
+        zeros(UInt32, count),
+        UInt32(1),
     )
 end
 
-"""Eligibility for the hard spike/event decision, separate from analog credit."""
-mutable struct HardEventEligibilityState{T<:AbstractFloat}
-    trace::Vector{T}
-    touched::Bool
-    transition_count::Int
+function reset_adjoint_arena!(arena::ContractedAdjointArena)
+    if arena.current_generation == typemax(UInt32)
+        fill!(arena.generation, UInt32(0))
+        arena.current_generation = UInt32(1)
+    else
+        arena.current_generation += UInt32(1)
+    end
+    return arena
 end
 
-function HardEventEligibilityState(
-    parameter_count::Integer;
-    T::Type{<:AbstractFloat}=Float32,
+@inline function _check_arena_node(arena::ContractedAdjointArena, node::Integer)
+    selected = Int(node)
+    checkbounds(arena.expected_record, selected)
+    return selected
+end
+
+@inline function _arena_is_current(
+    arena::ContractedAdjointArena,
+    node::Int,
 )
-    count = _require_positive("parameter_count", parameter_count)
-    return HardEventEligibilityState{T}(zeros(T, count), false, 0)
+    return arena.generation[node] == arena.current_generation
+end
+
+"""
+Fixed-width scratch for one contracted transition.
+
+The dimensions are properties of the Reduced-Hay cell/packet only. In
+particular, no array scales with the number of learnable parameters.
+`draw` and `dinput` are the transition's direct contributions; the graph owner
+must reduce `draw` into shared cell parameters and scatter `dinput` through
+the exact chronological deposit records without propagating cotangents into
+the source cell.
+"""
+struct ContractedAdjointScratch{T<:AbstractFloat}
+    dstate::Vector{T}
+    dinput::Vector{T}
+    draw::Vector{T}
+    dnext::Vector{T}
+    packet_bar::Vector{T}
+    packet_dnext::Vector{T}
+end
+
+function ContractedAdjointScratch(; T::Type{<:AbstractFloat}=Float32)
+    return ContractedAdjointScratch{T}(
+        zeros(T, Cell.STATE_DIM),
+        zeros(T, Cell.INPUT_DIM),
+        zeros(T, Cell.PARAM_DIM),
+        zeros(T, Cell.STATE_DIM),
+        zeros(T, Axon.PACKET_DIM),
+        zeros(T, Cell.STATE_DIM),
+    )
+end
+
+"""
+Explicit hard-event control boundary.
+
+The initial canonical model has no causal continuation/energy estimator, so
+only `CausalEventControl()` is accepted by the contracted kernel. A nonzero or
+connected control fails closed instead of silently reusing the analog ListNet
+signal. Once a fused two-lane cell VJP exists, a connected estimator can be
+implemented without merging the analog and hard-event clocks.
+"""
+struct CausalEventControl{T<:AbstractFloat}
+    advantage::T
+    connected::Bool
+end
+
+CausalEventControl(; T::Type{<:AbstractFloat}=Float32) =
+    CausalEventControl{T}(zero(T), false)
+
+function CausalEventControl(
+    advantage::T;
+    connected::Bool,
+) where {T<:AbstractFloat}
+    isfinite(advantage) || throw(ArgumentError(
+        "hard-event advantage must be finite",
+    ))
+    return CausalEventControl{T}(advantage, connected)
 end
 
 """Slow utility state. It never aliases analog or hard-event gradients."""
@@ -160,65 +261,6 @@ function StructuralUtilityState(
 )
     count = _require_positive("parameter_count", parameter_count)
     return StructuralUtilityState{T}(zeros(T, count), 0)
-end
-
-"""Fixed storage for conditional local Jacobians and forward sensitivities."""
-struct EligibilityScratch{T<:AbstractFloat}
-    state_jacobian::Matrix{T}
-    input_jacobian::Matrix{T}
-    raw_jacobian::Matrix{T}
-    next_sensitivity::Matrix{T}
-    direct_sensitivity::Matrix{T}
-    dstate::Vector{T}
-    dinput::Vector{T}
-    draw::Vector{T}
-    dnext::Vector{T}
-    margin_sensitivity::Vector{T}
-    packet_bar::Vector{T}
-    packet_dnext::Vector{T}
-end
-
-function EligibilityScratch(
-    parameter_count::Integer;
-    T::Type{<:AbstractFloat}=Float32,
-)
-    count = _require_positive("parameter_count", parameter_count)
-    return EligibilityScratch{T}(
-        zeros(T, Cell.STATE_DIM, Cell.STATE_DIM),
-        zeros(T, Cell.STATE_DIM, Cell.INPUT_DIM),
-        zeros(T, Cell.STATE_DIM, Cell.PARAM_DIM),
-        zeros(T, Cell.STATE_DIM, count),
-        zeros(T, Cell.STATE_DIM, count),
-        zeros(T, Cell.STATE_DIM),
-        zeros(T, Cell.INPUT_DIM),
-        zeros(T, Cell.PARAM_DIM),
-        zeros(T, Cell.STATE_DIM),
-        zeros(T, count),
-        zeros(T, Axon.PACKET_DIM),
-        zeros(T, Cell.STATE_DIM),
-    )
-end
-
-function _check_learning_shapes(
-    analog::AnalogEligibilityState{T},
-    event::HardEventEligibilityState{T},
-    basis::LocalParameterBasis{T},
-    scratch::EligibilityScratch{T},
-) where {T<:AbstractFloat}
-    parameter_count = size(analog.state_sensitivity, 2)
-    size(analog.state_sensitivity) == (Cell.STATE_DIM, parameter_count) ||
-        throw(DimensionMismatch("analog state sensitivity has the wrong shape"))
-    size(analog.eligibility) == (LOCAL_OBSERVATION_DIM, parameter_count) ||
-        throw(DimensionMismatch("analog eligibility has the wrong shape"))
-    size(analog.packet_eligibility) == (Axon.PACKET_DIM, parameter_count) ||
-        throw(DimensionMismatch("axon packet eligibility has the wrong shape"))
-    length(event.trace) == parameter_count || throw(DimensionMismatch(
-        "hard-event eligibility has the wrong length",
-    ))
-    _check_basis(basis, parameter_count)
-    size(scratch.next_sensitivity) == (Cell.STATE_DIM, parameter_count) ||
-        throw(DimensionMismatch("eligibility scratch has the wrong parameter width"))
-    return parameter_count
 end
 
 """
@@ -488,7 +530,9 @@ function LocalLearningConfig(;
     predictor_dim::Integer=0,
     eligibility_decay::Real=0.0,
     analog_multiplier::Real=1.0,
-    hard_event_multiplier::Real=1.0,
+    # Fail closed until a causal continuation/energy estimator and fused
+    # analog/event cell VJP are connected.
+    hard_event_multiplier::Real=0.0,
     utility_mode::Symbol=:packet,
     plasticity::PlasticityConfig=PlasticityConfig(),
 )
@@ -768,19 +812,175 @@ function finish_replay!(replay::TwoPassListNetReplay)
     return replay
 end
 
-function reset_eligibility!(
-    analog::AnalogEligibilityState,
-    event::HardEventEligibilityState,
+"""
+    begin_local_adjoint!(state, terminal_record; terminal_seed=nothing)
+
+Begin reverse replay of one cell chain. `terminal_record` is the newest exact
+state version in this alternative world. Candidate worlds are replayed first;
+their resulting root `state_bar`s can then be summed into a common-world state
+with `add_terminal_seed!` before the common chain is replayed once.
+"""
+function begin_local_adjoint!(
+    state::ContractedLocalAdjoint{T},
+    terminal_record::Integer;
+    terminal_seed::Union{Nothing,AbstractVector{T}}=nothing,
+) where {T<:AbstractFloat}
+    terminal = Int(terminal_record)
+    terminal >= 0 || throw(ArgumentError(
+        "terminal record must be nonnegative",
+    ))
+    fill!(state.state_bar, zero(T))
+    if terminal_seed !== nothing
+        length(terminal_seed) == Cell.STATE_DIM || throw(DimensionMismatch(
+            "terminal seed has the wrong length",
+        ))
+        all(isfinite, terminal_seed) || throw(ArgumentError(
+            "terminal seed must be finite",
+        ))
+        copyto!(state.state_bar, terminal_seed)
+    end
+    state.expected_record = terminal
+    state.active = true
+    state.touched = false
+    state.visited_transition_count = 0
+    state.conditional_pullback_count = 0
+    return state
+end
+
+function begin_local_adjoint!(
+    arena::ContractedAdjointArena{T},
+    node::Integer,
+    terminal_record::Integer;
+    terminal_seed::Union{Nothing,AbstractVector{T}}=nothing,
+) where {T<:AbstractFloat}
+    selected = _check_arena_node(arena, node)
+    terminal = Int(terminal_record)
+    terminal >= 0 || throw(ArgumentError(
+        "terminal record must be nonnegative",
+    ))
+    @inbounds for index in 1:Cell.STATE_DIM
+        arena.state_bar[index, selected] = zero(T)
+    end
+    if terminal_seed !== nothing
+        length(terminal_seed) == Cell.STATE_DIM || throw(DimensionMismatch(
+            "terminal seed has the wrong length",
+        ))
+        all(isfinite, terminal_seed) || throw(ArgumentError(
+            "terminal seed must be finite",
+        ))
+        @inbounds for index in 1:Cell.STATE_DIM
+            arena.state_bar[index, selected] = terminal_seed[index]
+        end
+    end
+    arena.expected_record[selected] = terminal
+    arena.active[selected] = true
+    arena.touched[selected] = false
+    arena.visited_transition_count[selected] = 0
+    arena.conditional_pullback_count[selected] = 0
+    arena.generation[selected] = arena.current_generation
+    return selected
+end
+
+"""Add a candidate-root cotangent to an active common-world terminal seed."""
+function add_terminal_seed!(
+    state::ContractedLocalAdjoint{T},
+    seed::AbstractVector{T},
+) where {T<:AbstractFloat}
+    state.active || throw(ArgumentError(
+        "local adjoint must be active before adding a terminal seed",
+    ))
+    length(seed) == Cell.STATE_DIM || throw(DimensionMismatch(
+        "terminal seed has the wrong length",
+    ))
+    all(isfinite, seed) || throw(ArgumentError(
+        "terminal seed must be finite",
+    ))
+    @inbounds for index in eachindex(state.state_bar, seed)
+        state.state_bar[index] += seed[index]
+    end
+    return state
+end
+
+function add_terminal_seed!(
+    arena::ContractedAdjointArena{T},
+    node::Integer,
+    seed::AbstractVector{T},
+) where {T<:AbstractFloat}
+    selected = _check_arena_node(arena, node)
+    _arena_is_current(arena, selected) && arena.active[selected] ||
+        throw(ArgumentError(
+            "local adjoint column must be active before adding a terminal seed",
+        ))
+    length(seed) == Cell.STATE_DIM || throw(DimensionMismatch(
+        "terminal seed has the wrong length",
+    ))
+    all(isfinite, seed) || throw(ArgumentError(
+        "terminal seed must be finite",
+    ))
+    @inbounds for index in 1:Cell.STATE_DIM
+        arena.state_bar[index, selected] += seed[index]
+    end
+    return selected
+end
+
+"""Allocation-free candidate-column to common-column seed reduction."""
+function add_terminal_seed!(
+    destination::ContractedAdjointArena{T},
+    destination_node::Integer,
+    source::ContractedAdjointArena{T},
+    source_node::Integer,
+) where {T<:AbstractFloat}
+    target = _check_arena_node(destination, destination_node)
+    origin = _check_arena_node(source, source_node)
+    _arena_is_current(destination, target) && destination.active[target] ||
+        throw(ArgumentError(
+            "destination local-adjoint column must be active",
+        ))
+    _arena_is_current(source, origin) || throw(ArgumentError(
+        "source local-adjoint column is stale",
+    ))
+    @inbounds for index in 1:Cell.STATE_DIM
+        destination.state_bar[index, target] += source.state_bar[index, origin]
+    end
+    return target
+end
+
+"""Verify that reverse replay reached the declared chronological root."""
+function finish_local_adjoint!(
+    state::ContractedLocalAdjoint,
+    root_record::Integer=0,
 )
-    fill!(analog.state_sensitivity, 0)
-    fill!(analog.eligibility, 0)
-    fill!(analog.packet_eligibility, 0)
-    analog.touched = false
-    analog.transition_count = 0
-    fill!(event.trace, 0)
-    event.touched = false
-    event.transition_count = 0
-    return nothing
+    state.active || throw(ArgumentError("local adjoint is not active"))
+    root = Int(root_record)
+    root >= 0 || throw(ArgumentError("root record must be nonnegative"))
+    state.expected_record == root || throw(ArgumentError(
+        "local replay stopped at record $(state.expected_record), expected $root",
+    ))
+    state.conditional_pullback_count == state.visited_transition_count ||
+        error("each visited transition must execute exactly one cell pullback")
+    state.active = false
+    return state.state_bar
+end
+
+function finish_local_adjoint!(
+    arena::ContractedAdjointArena,
+    node::Integer,
+    root_record::Integer=0,
+)
+    selected = _check_arena_node(arena, node)
+    _arena_is_current(arena, selected) && arena.active[selected] ||
+        throw(ArgumentError("local adjoint column is not active"))
+    root = Int(root_record)
+    root >= 0 || throw(ArgumentError("root record must be nonnegative"))
+    arena.expected_record[selected] == root || throw(ArgumentError(
+        "local replay stopped at record $(arena.expected_record[selected]), " *
+        "expected $root",
+    ))
+    arena.conditional_pullback_count[selected] ==
+        arena.visited_transition_count[selected] ||
+        error("each visited transition must execute exactly one cell pullback")
+    arena.active[selected] = false
+    return selected
 end
 
 """Write the local 47D continuous observation; teacher state is not an input."""
@@ -809,54 +1009,86 @@ function continuous_observation!(
     return destination
 end
 
-function _conditional_jacobians!(
-    scratch::EligibilityScratch{T},
+@inline function _check_transition_shapes(
+    scratch::ContractedAdjointScratch{T},
     previous_state::AbstractVector{T},
     input::AbstractVector{T},
-    cache::Cell.CellParameterCache{T},
-    derivative_cache::Cell.CellParameterDerivativeCache{T},
     next_state::AbstractVector{T},
+    continuous_signal::AbstractVector{T},
+    packet_signal::AbstractVector{T},
 ) where {T<:AbstractFloat}
-    fill!(scratch.state_jacobian, zero(T))
-    fill!(scratch.input_jacobian, zero(T))
-    fill!(scratch.raw_jacobian, zero(T))
-    @inbounds for output in 1:(Cell.STATE_DIM - 1)
-        fill!(scratch.dnext, zero(T))
-        scratch.dnext[output] = one(T)
-        Cell.cell_step_conditional_pullback!(
-            scratch.dstate,
-            scratch.dinput,
-            scratch.draw,
-            previous_state,
-            input,
-            cache,
-            derivative_cache,
-            next_state,
-            scratch.dnext,
-        )
-        copyto!(@view(scratch.state_jacobian[output, :]), scratch.dstate)
-        copyto!(@view(scratch.input_jacobian[output, :]), scratch.dinput)
-        copyto!(@view(scratch.raw_jacobian[output, :]), scratch.draw)
-    end
-    # Hard spikes are fixed observations in the conditional analog model.
-    fill!(@view(scratch.state_jacobian[Cell.SPIKE_INDEX, :]), zero(T))
-    fill!(@view(scratch.input_jacobian[Cell.SPIKE_INDEX, :]), zero(T))
-    fill!(@view(scratch.raw_jacobian[Cell.SPIKE_INDEX, :]), zero(T))
-    return scratch
+    length(scratch.dstate) == Cell.STATE_DIM || throw(DimensionMismatch(
+        "local-adjoint scratch has the wrong cell-state length",
+    ))
+    length(previous_state) == Cell.STATE_DIM || throw(DimensionMismatch(
+        "previous state has the wrong length",
+    ))
+    length(input) == Cell.INPUT_DIM || throw(DimensionMismatch(
+        "cell input has the wrong length",
+    ))
+    length(next_state) == Cell.STATE_DIM || throw(DimensionMismatch(
+        "next state has the wrong length",
+    ))
+    length(continuous_signal) == LOCAL_OBSERVATION_DIM || throw(
+        DimensionMismatch("continuous learning signal has the wrong length"),
+    )
+    length(packet_signal) == Axon.PACKET_DIM || throw(
+        DimensionMismatch("packet learning signal has the wrong length"),
+    )
+    return nothing
 end
 
-function _margin_sensitivity!(
-    destination::AbstractVector{T},
-    scratch::EligibilityScratch{T},
-    previous_sensitivity::AbstractMatrix{T},
-    basis::LocalParameterBasis{T},
+@inline function _check_event_control(control::CausalEventControl)
+    if control.connected || !iszero(control.advantage)
+        throw(ArgumentError(
+            "hard-event control is disconnected: a causal continuation/energy " *
+            "estimator and fused two-lane cell VJP are required",
+        ))
+    end
+    return nothing
+end
+
+@inline function _contract_seeded_transition!(
+    scratch::ContractedAdjointScratch{T},
     previous_state::AbstractVector{T},
     input::AbstractVector{T},
     cache::Cell.CellParameterCache{T},
     derivative_cache::Cell.CellParameterDerivativeCache{T},
     next_state::AbstractVector{T},
+    continuous_signal::AbstractVector{T},
+    packet_signal::AbstractVector{T},
+    eligibility_scale::T,
 ) where {T<:AbstractFloat}
-    fill!(scratch.dnext, zero(T))
+    continuous_count = Cell.N_COMPARTMENTS * Cell.COMPARTMENT_STATE_DIM
+    @inbounds for index in 1:continuous_count
+        scratch.dnext[index] = muladd(
+            eligibility_scale,
+            continuous_signal[index],
+            scratch.dnext[index],
+        )
+    end
+    scratch.dnext[Cell.ADAPTATION_INDEX] = muladd(
+        eligibility_scale,
+        continuous_signal[ADAPTATION_OBSERVATION],
+        scratch.dnext[Cell.ADAPTATION_INDEX],
+    )
+    direct_margin_cotangent =
+        eligibility_scale * continuous_signal[MARGIN_OBSERVATION]
+
+    @inbounds for lane in 1:Axon.PACKET_DIM
+        scratch.packet_bar[lane] = eligibility_scale * packet_signal[lane]
+    end
+    direct_margin_cotangent += Axon.axon_packet_pullback!(
+        scratch.packet_dnext,
+        scratch.packet_bar,
+        previous_state,
+        next_state,
+        cache,
+    )
+    @inbounds for index in 1:(Cell.STATE_DIM - 1)
+        scratch.dnext[index] += scratch.packet_dnext[index]
+    end
+
     Cell.cell_step_conditional_pullback!(
         scratch.dstate,
         scratch.dinput,
@@ -869,395 +1101,262 @@ function _margin_sensitivity!(
         scratch.dnext,
         zero(T),
         zero(T),
-        one(T),
+        direct_margin_cotangent,
     )
-    mul!(destination, transpose(previous_sensitivity), scratch.dstate)
-    mul!(destination, transpose(basis.raw_basis), scratch.draw, one(T), one(T))
-    mul!(destination, transpose(basis.input_basis), scratch.dinput, one(T), one(T))
-    return destination
-end
-
-function _packet_eligibility!(
-    destination::AbstractMatrix{T},
-    scratch::EligibilityScratch{T},
-    next_sensitivity::AbstractMatrix{T},
-    previous_state::AbstractVector{T},
-    next_state::AbstractVector{T},
-    cache::Cell.CellParameterCache{T},
-) where {T<:AbstractFloat}
-    size(destination) == (Axon.PACKET_DIM, size(next_sensitivity, 2)) ||
-        throw(DimensionMismatch("axon packet eligibility has the wrong shape"))
-    @inbounds for lane in 1:Axon.PACKET_DIM
-        fill!(scratch.packet_bar, zero(T))
-        scratch.packet_bar[lane] = one(T)
-        margin_cotangent = Axon.axon_packet_pullback!(
-            scratch.packet_dnext,
-            scratch.packet_bar,
-            previous_state,
-            next_state,
-            cache,
-        )
-        for parameter in axes(next_sensitivity, 2)
-            value = margin_cotangent * scratch.margin_sensitivity[parameter]
-            for state in 1:(Cell.STATE_DIM - 1)
-                value = muladd(
-                    scratch.packet_dnext[state],
-                    next_sensitivity[state, parameter],
-                    value,
-                )
-            end
-            destination[lane, parameter] = value
-        end
-    end
-    return destination
+    return nothing
 end
 
 """
-    accumulate_active_apical_transition!(...; touched, event_decay)
+    contract_replayed_transition!(...; touched, eligibility_scale,
+                                  event_control)
 
-Generate teacher-free multi-compartment eligibility for one recorded hard
-trajectory transition. The conditional analog trace never differentiates the
-hard threshold. Hard-event eligibility is generated separately from the exact
-pre-reset margin and a bounded triangular surrogate. `event_decay=0` implements
-the canonical instantaneous `T = H'(margin) * dmargin/dp`; a nonzero value is
-an explicit slower synaptic tag rather than an implicit part of analog credit.
+Contract one recorded transition during pass-2 replay. The forward trajectory
+and its local observables are teacher-free; the post-hoc `continuous_signal`
+and `packet_signal` only select the already-defined local derivatives.
 
-If `touched=false`, no state or trace is changed. This makes an unvisited cell
-strictly different from a mandatory-sweep cell whose recorded hard spike is 0.
+This is the reverse form of `sum_t m_t' * E_t`: all future local recurrence is
+carried by one 48D `state_bar`, and exactly one conditional cell pullback is
+executed for every visited transition. Continuous cotangents stop at the
+destination input. The graph owner is responsible for using `dinput` only to
+differentiate the local deposit/contact parameters and must not propagate it
+through the source packet into another cell.
 """
-function accumulate_active_apical_transition!(
-    analog::AnalogEligibilityState{T},
-    event::HardEventEligibilityState{T},
-    scratch::EligibilityScratch{T},
-    basis::LocalParameterBasis{T},
+function contract_replayed_transition!(
+    state::ContractedLocalAdjoint{T},
+    scratch::ContractedAdjointScratch{T},
+    link::ChronologicalTransitionLink,
     previous_state::AbstractVector{T},
     input::AbstractVector{T},
-    raw_parameters::AbstractVector{T},
-    next_state::AbstractVector{T};
+    cache::Cell.CellParameterCache{T},
+    derivative_cache::Cell.CellParameterDerivativeCache{T},
+    next_state::AbstractVector{T},
+    continuous_signal::AbstractVector{T},
+    packet_signal::AbstractVector{T};
     touched::Bool,
-    event_decay::T=zero(T),
+    eligibility_scale::T=one(T),
+    event_control::CausalEventControl{T}=CausalEventControl(; T=T),
 ) where {T<:AbstractFloat}
-    parameter_count = _check_learning_shapes(analog, event, basis, scratch)
-    length(previous_state) == Cell.STATE_DIM || throw(DimensionMismatch(
-        "previous state has the wrong length",
-    ))
-    length(input) == Cell.INPUT_DIM || throw(DimensionMismatch(
-        "cell input has the wrong length",
-    ))
-    length(raw_parameters) == Cell.PARAM_DIM || throw(DimensionMismatch(
-        "raw cell parameters have the wrong length",
-    ))
-    length(next_state) == Cell.STATE_DIM || throw(DimensionMismatch(
-        "next state has the wrong length",
-    ))
-    _require_unit_interval("event_decay", event_decay)
-    touched || return false
-    all(isfinite, previous_state) && all(isfinite, input) &&
-        all(isfinite, raw_parameters) && all(isfinite, next_state) ||
-        throw(ArgumentError("cell transition must be finite"))
-
-    cache, derivative_cache = Cell.parameter_caches(raw_parameters)
-    _conditional_jacobians!(
-        scratch, previous_state, input, cache, derivative_cache, next_state,
-    )
-    previous_sensitivity = analog.state_sensitivity
-    _margin_sensitivity!(
-        scratch.margin_sensitivity,
+    _check_transition_shapes(
         scratch,
-        previous_sensitivity,
-        basis,
+        previous_state,
+        input,
+        next_state,
+        continuous_signal,
+        packet_signal,
+    )
+    isfinite(eligibility_scale) || throw(ArgumentError(
+        "eligibility scale must be finite",
+    ))
+    _check_event_control(event_control)
+    touched || return false
+    state.active || throw(ArgumentError(
+        "begin_local_adjoint! must be called before replay contraction",
+    ))
+    state.expected_record == link.record || throw(ArgumentError(
+        "out-of-order local replay: expected record $(state.expected_record), " *
+        "received $(link.record)",
+    ))
+    all(isfinite, previous_state) && all(isfinite, input) &&
+        all(isfinite, next_state) &&
+        all(isfinite, continuous_signal) && all(isfinite, packet_signal) ||
+        throw(ArgumentError("local replay inputs must be finite"))
+
+    copyto!(scratch.dnext, state.state_bar)
+    _contract_seeded_transition!(
+        scratch,
         previous_state,
         input,
         cache,
         derivative_cache,
         next_state,
+        continuous_signal,
+        packet_signal,
+        eligibility_scale,
     )
-
-    mul!(
-        scratch.next_sensitivity,
-        scratch.state_jacobian,
-        previous_sensitivity,
-    )
-    mul!(scratch.direct_sensitivity, scratch.raw_jacobian, basis.raw_basis)
-    scratch.next_sensitivity .+= scratch.direct_sensitivity
-    mul!(scratch.direct_sensitivity, scratch.input_jacobian, basis.input_basis)
-    scratch.next_sensitivity .+= scratch.direct_sensitivity
-    fill!(@view(scratch.next_sensitivity[Cell.SPIKE_INDEX, :]), zero(T))
-
-    @inbounds begin
-        continuous_count = Cell.N_COMPARTMENTS * Cell.COMPARTMENT_STATE_DIM
-        for parameter in 1:parameter_count
-            for state in 1:continuous_count
-                analog.eligibility[state, parameter] =
-                    scratch.next_sensitivity[state, parameter]
-            end
-            analog.eligibility[MARGIN_OBSERVATION, parameter] =
-                scratch.margin_sensitivity[parameter]
-            analog.eligibility[ADAPTATION_OBSERVATION, parameter] =
-                scratch.next_sensitivity[Cell.ADAPTATION_INDEX, parameter]
-        end
-    end
-    _packet_eligibility!(
-        analog.packet_eligibility,
-        scratch,
-        scratch.next_sensitivity,
-        previous_state,
-        next_state,
-        cache,
-    )
-    copyto!(analog.state_sensitivity, scratch.next_sensitivity)
-
-    margin = Cell.spike_margin_from_transition(
-        previous_state, next_state, cache,
-    )
-    surrogate = Cell.spike_surrogate_derivative(margin)
-    @inbounds for parameter in 1:parameter_count
-        event.trace[parameter] = muladd(
-            event_decay,
-            event.trace[parameter],
-            surrogate * scratch.margin_sensitivity[parameter],
-        )
-    end
-    analog.touched = true
-    analog.transition_count += 1
-    event.touched = true
-    event.transition_count += 1
+    copyto!(state.state_bar, scratch.dstate)
+    state.expected_record = link.predecessor
+    state.touched = true
+    state.visited_transition_count += 1
+    state.conditional_pullback_count += 1
     return true
 end
 
-function accumulate_active_apical_transition!(
-    analog::AnalogEligibilityState{T},
-    event::HardEventEligibilityState{T},
-    scratch::EligibilityScratch{T},
-    basis::LocalParameterBasis{T},
+"""
+Production arena overload. It addresses the cotangent slab by integer column,
+uses precomputed parameter caches, and creates no per-transition view/object.
+"""
+function contract_replayed_transition!(
+    arena::ContractedAdjointArena{T},
+    node::Integer,
+    scratch::ContractedAdjointScratch{T},
+    link::ChronologicalTransitionLink,
+    previous_state::AbstractVector{T},
+    input::AbstractVector{T},
+    cache::Cell.CellParameterCache{T},
+    derivative_cache::Cell.CellParameterDerivativeCache{T},
+    next_state::AbstractVector{T},
+    continuous_signal::AbstractVector{T},
+    packet_signal::AbstractVector{T};
+    touched::Bool,
+    eligibility_scale::T=one(T),
+    event_control::CausalEventControl{T}=CausalEventControl(; T=T),
+) where {T<:AbstractFloat}
+    _check_transition_shapes(
+        scratch,
+        previous_state,
+        input,
+        next_state,
+        continuous_signal,
+        packet_signal,
+    )
+    isfinite(eligibility_scale) || throw(ArgumentError(
+        "eligibility scale must be finite",
+    ))
+    _check_event_control(event_control)
+    touched || return false
+    selected = _check_arena_node(arena, node)
+    _arena_is_current(arena, selected) && arena.active[selected] ||
+        throw(ArgumentError(
+            "begin_local_adjoint! must activate the arena column before replay",
+        ))
+    arena.expected_record[selected] == link.record || throw(ArgumentError(
+        "out-of-order local replay: expected record " *
+        "$(arena.expected_record[selected]), received $(link.record)",
+    ))
+    all(isfinite, previous_state) && all(isfinite, input) &&
+        all(isfinite, next_state) &&
+        all(isfinite, continuous_signal) && all(isfinite, packet_signal) ||
+        throw(ArgumentError("local replay inputs must be finite"))
+
+    @inbounds for index in 1:Cell.STATE_DIM
+        scratch.dnext[index] = arena.state_bar[index, selected]
+    end
+    _contract_seeded_transition!(
+        scratch,
+        previous_state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        continuous_signal,
+        packet_signal,
+        eligibility_scale,
+    )
+    @inbounds for index in 1:Cell.STATE_DIM
+        arena.state_bar[index, selected] = scratch.dstate[index]
+    end
+    arena.expected_record[selected] = link.predecessor
+    arena.touched[selected] = true
+    arena.visited_transition_count[selected] += 1
+    arena.conditional_pullback_count[selected] += 1
+    return true
+end
+
+# Focused-test/oracle convenience overloads. Production must pass the caches
+# already owned by the model rather than rebuilding them per transition.
+function contract_replayed_transition!(
+    state::ContractedLocalAdjoint{T},
+    scratch::ContractedAdjointScratch{T},
+    link::ChronologicalTransitionLink,
     previous_state::AbstractVector{T},
     input::AbstractVector{T},
     raw_parameters::AbstractVector{T},
     next_state::AbstractVector{T},
-    config::LocalLearningConfig;
-    touched::Bool,
+    continuous_signal::AbstractVector{T},
+    packet_signal::AbstractVector{T};
+    kwargs...,
 ) where {T<:AbstractFloat}
-    return accumulate_active_apical_transition!(
-        analog,
-        event,
+    length(raw_parameters) == Cell.PARAM_DIM || throw(DimensionMismatch(
+        "raw cell parameters have the wrong length",
+    ))
+    all(isfinite, raw_parameters) || throw(ArgumentError(
+        "raw cell parameters must be finite",
+    ))
+    cache, derivative_cache = Cell.parameter_caches(raw_parameters)
+    return contract_replayed_transition!(
+        state,
         scratch,
-        basis,
+        link,
         previous_state,
         input,
-        raw_parameters,
-        next_state;
-        touched=touched,
-        event_decay=T(config.eligibility_decay),
+        cache,
+        derivative_cache,
+        next_state,
+        continuous_signal,
+        packet_signal;
+        kwargs...,
     )
 end
 
-function accumulate_packet_gradient!(
-    gradient::AbstractVector{T},
-    learning_signal::AbstractVector{T},
-    analog::AnalogEligibilityState{T};
-    scale::T=one(T),
-    due::Bool=true,
+function contract_replayed_transition!(
+    arena::ContractedAdjointArena{T},
+    node::Integer,
+    scratch::ContractedAdjointScratch{T},
+    link::ChronologicalTransitionLink,
+    previous_state::AbstractVector{T},
+    input::AbstractVector{T},
+    raw_parameters::AbstractVector{T},
+    next_state::AbstractVector{T},
+    continuous_signal::AbstractVector{T},
+    packet_signal::AbstractVector{T};
+    kwargs...,
 ) where {T<:AbstractFloat}
-    length(gradient) == size(analog.packet_eligibility, 2) || throw(
-        DimensionMismatch("packet gradient has the wrong length"),
-    )
-    length(learning_signal) == size(analog.packet_eligibility, 1) || throw(
-        DimensionMismatch("packet learning signal has the wrong length"),
-    )
-    isfinite(scale) || throw(ArgumentError("packet gradient scale must be finite"))
-    if due && analog.touched && !iszero(scale)
-        mul!(
-            gradient,
-            transpose(analog.packet_eligibility),
-            learning_signal,
-            scale,
-            one(T),
-        )
-    end
-    return gradient
-end
-
-function accumulate_packet_gradient!(
-    gradient::AbstractVector{T},
-    learning_signal::AbstractVector{T},
-    analog::AnalogEligibilityState{T},
-    config::LocalLearningConfig;
-    due::Bool=true,
-) where {T<:AbstractFloat}
-    return accumulate_packet_gradient!(
-        gradient,
-        learning_signal,
-        analog;
-        scale=T(config.analog_multiplier),
-        due=due,
-    )
-end
-
-function accumulate_analog_gradient!(
-    gradient::AbstractVector{T},
-    learning_signal::AbstractVector{T},
-    analog::AnalogEligibilityState{T};
-    scale::T=one(T),
-    due::Bool=true,
-) where {T<:AbstractFloat}
-    length(gradient) == size(analog.eligibility, 2) || throw(
-        DimensionMismatch("analog gradient has the wrong length"),
-    )
-    length(learning_signal) == size(analog.eligibility, 1) || throw(
-        DimensionMismatch("analog learning signal has the wrong length"),
-    )
-    isfinite(scale) || throw(ArgumentError("analog gradient scale must be finite"))
-    if due && analog.touched && !iszero(scale)
-        mul!(gradient, transpose(analog.eligibility), learning_signal, scale, one(T))
-    end
-    return gradient
-end
-
-function accumulate_analog_gradient!(
-    gradient::AbstractVector{T},
-    learning_signal::AbstractVector{T},
-    analog::AnalogEligibilityState{T},
-    config::LocalLearningConfig;
-    due::Bool=true,
-) where {T<:AbstractFloat}
-    return accumulate_analog_gradient!(
-        gradient,
-        learning_signal,
-        analog;
-        scale=T(config.analog_multiplier),
-        due=due,
-    )
-end
-
-function accumulate_hard_event_gradient!(
-    gradient::AbstractVector{T},
-    control_signal::T,
-    event::HardEventEligibilityState{T};
-    scale::T=one(T),
-    due::Bool=true,
-) where {T<:AbstractFloat}
-    length(gradient) == length(event.trace) || throw(DimensionMismatch(
-        "hard-event gradient has the wrong length",
+    length(raw_parameters) == Cell.PARAM_DIM || throw(DimensionMismatch(
+        "raw cell parameters have the wrong length",
     ))
-    isfinite(control_signal) && isfinite(scale) || throw(ArgumentError(
-        "hard-event control signal and scale must be finite",
+    all(isfinite, raw_parameters) || throw(ArgumentError(
+        "raw cell parameters must be finite",
     ))
-    if due && event.touched && !iszero(control_signal) && !iszero(scale)
-        coefficient = control_signal * scale
-        @inbounds for parameter in eachindex(gradient, event.trace)
-            gradient[parameter] = muladd(
-                coefficient, event.trace[parameter], gradient[parameter],
-            )
-        end
-    end
-    return gradient
-end
-
-function accumulate_hard_event_gradient!(
-    gradient::AbstractVector{T},
-    control_signal::T,
-    event::HardEventEligibilityState{T},
-    config::LocalLearningConfig;
-    due::Bool=true,
-) where {T<:AbstractFloat}
-    return accumulate_hard_event_gradient!(
-        gradient,
-        control_signal,
-        event;
-        scale=T(config.hard_event_multiplier),
-        due=due,
+    cache, derivative_cache = Cell.parameter_caches(raw_parameters)
+    return contract_replayed_transition!(
+        arena,
+        node,
+        scratch,
+        link,
+        previous_state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        continuous_signal,
+        packet_signal;
+        kwargs...,
     )
 end
 
+@inline raw_parameter_cotangent(scratch::ContractedAdjointScratch) = scratch.draw
+@inline input_cotangent(scratch::ContractedAdjointScratch) = scratch.dinput
+
+"""
+Update slow structural utility from an already-contracted parameter
+contribution. Since each contribution is `m * eligibility`, zero third factor
+or zero eligibility independently produces zero utility. Shared parameters are
+updated once after the graph owner has deterministically reduced all uses.
+"""
 function update_structural_utility!(
     state::StructuralUtilityState{T},
-    learning_signal::AbstractVector{T},
-    analog::AnalogEligibilityState{T};
+    contracted_contribution::AbstractVector{T};
     decay::T=T(0.999),
+    normalization::T=one(T),
     due::Bool=true,
 ) where {T<:AbstractFloat}
-    length(state.utility) == size(analog.eligibility, 2) || throw(
-        DimensionMismatch("structural utility has the wrong length"),
-    )
-    length(learning_signal) == size(analog.eligibility, 1) || throw(
-        DimensionMismatch("structural learning signal has the wrong length"),
+    length(state.utility) == length(contracted_contribution) || throw(
+        DimensionMismatch("structural utility contribution has the wrong length"),
     )
     _require_unit_interval("utility decay", decay)
+    isfinite(normalization) && normalization >= zero(T) || throw(ArgumentError(
+        "utility normalization must be finite and nonnegative",
+    ))
     due || return state
-    analog.touched || return state
-    signal_norm = norm(learning_signal)
-    @inbounds for parameter in eachindex(state.utility)
-        eligibility = @view analog.eligibility[:, parameter]
-        eligibility_norm = norm(eligibility)
-        denominator = signal_norm * eligibility_norm
-        contribution = iszero(denominator) ? zero(T) :
-            abs(dot(learning_signal, eligibility)) /
-            (denominator + eps(T))
+    denominator = normalization + eps(T)
+    @inbounds for parameter in eachindex(state.utility, contracted_contribution)
+        contribution = abs(contracted_contribution[parameter]) / denominator
         state.utility[parameter] = muladd(
             decay, state.utility[parameter], contribution,
         )
     end
     state.update_count += 1
     return state
-end
-
-function update_packet_structural_utility!(
-    state::StructuralUtilityState{T},
-    learning_signal::AbstractVector{T},
-    analog::AnalogEligibilityState{T};
-    decay::T=T(0.999),
-    due::Bool=true,
-) where {T<:AbstractFloat}
-    length(state.utility) == size(analog.packet_eligibility, 2) || throw(
-        DimensionMismatch("structural utility has the wrong length"),
-    )
-    length(learning_signal) == size(analog.packet_eligibility, 1) || throw(
-        DimensionMismatch("packet structural learning signal has the wrong length"),
-    )
-    _require_unit_interval("utility decay", decay)
-    due || return state
-    analog.touched || return state
-    signal_norm = norm(learning_signal)
-    @inbounds for parameter in eachindex(state.utility)
-        eligibility = @view analog.packet_eligibility[:, parameter]
-        eligibility_norm = norm(eligibility)
-        denominator = signal_norm * eligibility_norm
-        contribution = iszero(denominator) ? zero(T) :
-            abs(dot(learning_signal, eligibility)) /
-            (denominator + eps(T))
-        state.utility[parameter] = muladd(
-            decay, state.utility[parameter], contribution,
-        )
-    end
-    state.update_count += 1
-    return state
-end
-
-
-function update_configured_utility!(
-    state::StructuralUtilityState{T},
-    learning_signal::AbstractVector{T},
-    analog::AnalogEligibilityState{T},
-    config::LocalLearningConfig;
-    due::Bool=true,
-) where {T<:AbstractFloat}
-    config.utility_mode === :none && return state
-    if config.utility_mode === :packet
-        return update_packet_structural_utility!(
-            state,
-            learning_signal,
-            analog;
-            decay=T(config.plasticity.utility_decay),
-            due=due,
-        )
-    end
-    return update_structural_utility!(
-        state,
-        learning_signal,
-        analog;
-        decay=T(config.plasticity.utility_decay),
-        due=due,
-    )
 end
 
 end # module CanonicalLocalLearning

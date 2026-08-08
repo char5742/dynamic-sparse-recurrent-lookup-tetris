@@ -191,242 +191,395 @@ end
     @test_throws ArgumentError Local.TwoPassListNetReplay(22, 0)
 end
 
-@testset "teacher-free multi-compartment causal eligibility" begin
-    raw, state, input, next_state = nonspiking_transition()
-    parameter_count = Cell.PARAM_DIM + 3
-    basis = Local.LocalParameterBasis(parameter_count)
-    # Three graph/contact parameters drive typed AMPA, NMDA and GABA inputs.
-    basis.input_basis[Cell.input_index(1, Cell.INPUT_AMPA), Cell.PARAM_DIM + 1] = 0.7f0
-    basis.input_basis[Cell.input_index(2, Cell.INPUT_NMDA), Cell.PARAM_DIM + 2] = 0.6f0
-    basis.input_basis[Cell.input_index(3, Cell.INPUT_GABA), Cell.PARAM_DIM + 3] = 0.5f0
-
-    analog = Local.AnalogEligibilityState(parameter_count)
-    event = Local.HardEventEligibilityState(parameter_count)
-    scratch = Local.EligibilityScratch(parameter_count)
-    @test Local.accumulate_active_apical_transition!(
-        analog,
-        event,
-        scratch,
-        basis,
-        state,
-        input,
-        raw,
-        next_state;
-        touched=true,
-    )
-    @test analog.touched
-    @test event.touched
-    @test analog.transition_count == 1
-    @test event.transition_count == 1
-    @test next_state[Cell.SPIKE_INDEX] == 0.0f0
-
-    for field in (
-        Cell.FIELD_VOLTAGE,
-        Cell.FIELD_AMPA,
-        Cell.FIELD_NMDA,
-        Cell.FIELD_GABA,
-        Cell.FIELD_PLATEAU,
-    )
-        rows = [Cell.state_index(compartment, field) for
-            compartment in 1:Cell.N_COMPARTMENTS]
-        @test norm(@view(analog.eligibility[rows, :])) > 0.0f0
-    end
-    @test norm(@view(analog.eligibility[
-        (Local.LOCAL_OBSERVATION_DIM - 1):Local.LOCAL_OBSERVATION_DIM,
-        :,
-    ])) > 0.0f0
-    @test all(column -> norm(@view(analog.eligibility[:, column])) > 0.0f0,
-        (Cell.PARAM_DIM + 1):parameter_count)
-    @test norm(event.trace) > 0.0f0
-    @test size(analog.packet_eligibility) == (Axon.PACKET_DIM, parameter_count)
-    @test all(column ->
-        norm(@view(analog.packet_eligibility[:, column])) > 0.0f0,
-        (Cell.PARAM_DIM + 1):parameter_count,
-    )
-    first_event_trace = copy(event.trace)
-
-    # Eligibility carries through local temporal dynamics without reading a
-    # teacher. A second replayed transition changes the recurrent sensitivity.
-    first_eligibility = copy(analog.eligibility)
+function make_local_trajectory(step_count::Int; T=Float64)
+    raw32, initial32, input32, _ = nonspiking_transition()
+    raw = T.(raw32)
+    initial = T.(initial32)
+    input = T.(input32)
+    input .*= T(0.45)
     cache = Cell.transform_parameters(raw)
-    next_next_state = Cell.cell_step_cached_functional(next_state, input, cache)
-    Local.accumulate_active_apical_transition!(
-        analog,
-        event,
-        scratch,
-        basis,
-        next_state,
-        input,
-        raw,
-        next_next_state;
-        touched=true,
-    )
-    @test analog.transition_count == 2
-    @test analog.eligibility != first_eligibility
-
-    map = Local.FixedLocalSignalMap(22; seed=0x1234, family=4, cell=9)
-    raw_delta = collect(range(-0.25f0, 0.35f0; length=22))
-    learning_signal = zeros(Float32, Local.LOCAL_OBSERVATION_DIM)
-    Local.project_learning_signal!(learning_signal, map, raw_delta)
-    eligibility_before_modulation = copy(analog.eligibility)
-
-    analog_gradient = zeros(Float32, parameter_count)
-    Local.accumulate_analog_gradient!(
-        analog_gradient, learning_signal, analog,
-    )
-    @test norm(analog_gradient) > 0.0f0
-    scaled_config = Local.LocalLearningConfig(
-        analog_multiplier=0.25,
-        hard_event_multiplier=0.5,
-        utility_mode=:packet,
-        plasticity=Local.PlasticityConfig(utility_decay=0.9),
-    )
-    scaled_analog_gradient = zeros(Float32, parameter_count)
-    Local.accumulate_analog_gradient!(
-        scaled_analog_gradient, learning_signal, analog, scaled_config,
-    )
-    @test isapprox(
-        scaled_analog_gradient,
-        0.25f0 .* analog_gradient;
-        rtol=2eps(Float32),
-        atol=2eps(Float32),
-    )
-    @test analog.eligibility == eligibility_before_modulation
-    changed_map = Local.FixedLocalSignalMap(
-        22; seed=0x1235, family=4, cell=9,
-    )
-    changed_signal = similar(learning_signal)
-    Local.project_learning_signal!(changed_signal, changed_map, raw_delta)
-    changed_gradient = zeros(Float32, parameter_count)
-    Local.accumulate_analog_gradient!(
-        changed_gradient, changed_signal, analog,
-    )
-    @test changed_gradient != analog_gradient
-    packet_map = Local.FixedLocalSignalMap(
-        22; observation_dim=Axon.PACKET_DIM, seed=0x512, family=4, cell=9,
-    )
-    packet_signal = zeros(Float32, Axon.PACKET_DIM)
-    Local.project_learning_signal!(packet_signal, packet_map, raw_delta)
-    packet_gradient = zeros(Float32, parameter_count)
-    Local.accumulate_packet_gradient!(
-        packet_gradient, packet_signal, analog,
-    )
-    @test norm(packet_gradient) > 0.0f0
-
-    # M=0 and eligibility=0 are independent causal stops.
-    zero_modulation_gradient = zeros(Float32, parameter_count)
-    Local.accumulate_analog_gradient!(
-        zero_modulation_gradient,
-        zeros(Float32, Local.LOCAL_OBSERVATION_DIM),
-        analog,
-    )
-    @test all(iszero, zero_modulation_gradient)
-
-    zero_eligibility = Local.AnalogEligibilityState(parameter_count)
-    zero_eligibility.touched = true
-    @test all(iszero, zero_eligibility.packet_eligibility)
-    zero_trace_gradient = zeros(Float32, parameter_count)
-    Local.accumulate_analog_gradient!(
-        zero_trace_gradient, learning_signal, zero_eligibility,
-    )
-    @test all(iszero, zero_trace_gradient)
-
-    # Hard-event control is a disjoint estimator and clock.
-    event_for_control = Local.HardEventEligibilityState{Float32}(
-        first_event_trace, true, 1,
-    )
-    event_gradient = zeros(Float32, parameter_count)
-    Local.accumulate_hard_event_gradient!(
-        event_gradient, 0.75f0, event_for_control,
-    )
-    @test norm(event_gradient) > 0.0f0
-    scaled_event_gradient = zeros(Float32, parameter_count)
-    Local.accumulate_hard_event_gradient!(
-        scaled_event_gradient,
-        0.75f0,
-        event_for_control,
-        scaled_config,
-    )
-    @test isapprox(
-        scaled_event_gradient,
-        0.5f0 .* event_gradient;
-        rtol=2eps(Float32),
-        atol=2eps(Float32),
-    )
-    @test event_gradient != analog_gradient
-    event_stopped = zeros(Float32, parameter_count)
-    Local.accumulate_hard_event_gradient!(
-        event_stopped, 0.0f0, event_for_control,
-    )
-    @test all(iszero, event_stopped)
-
-    # Structural utility depends on both the third factor and eligibility.
-    utility = Local.StructuralUtilityState(parameter_count)
-    Local.update_structural_utility!(utility, learning_signal, analog; decay=0.9f0)
-    @test any(>(0.0f0), utility.utility)
-    utility_zero_m = Local.StructuralUtilityState(parameter_count)
-    Local.update_structural_utility!(
-        utility_zero_m,
-        zeros(Float32, Local.LOCAL_OBSERVATION_DIM),
-        analog;
-        decay=0.9f0,
-    )
-    @test all(iszero, utility_zero_m.utility)
-    utility_zero_e = Local.StructuralUtilityState(parameter_count)
-    Local.update_structural_utility!(
-        utility_zero_e, learning_signal, zero_eligibility; decay=0.9f0,
-    )
-    @test all(iszero, utility_zero_e.utility)
-    packet_utility = Local.StructuralUtilityState(parameter_count)
-    Local.update_packet_structural_utility!(
-        packet_utility, packet_signal, analog; decay=0.9f0,
-    )
-    @test any(>(0.0f0), packet_utility.utility)
-    configured_utility = Local.StructuralUtilityState(parameter_count)
-    Local.update_configured_utility!(
-        configured_utility, packet_signal, analog, scaled_config,
-    )
-    @test configured_utility.utility == packet_utility.utility
-
-    # A fresh unvisited cell remains exactly unchanged; no synthetic task
-    # update is created merely because another cell was active.
-    unvisited_analog = Local.AnalogEligibilityState(parameter_count)
-    unvisited_event = Local.HardEventEligibilityState(parameter_count)
-    unvisited_scratch = Local.EligibilityScratch(parameter_count)
-    @test !Local.accumulate_active_apical_transition!(
-        unvisited_analog,
-        unvisited_event,
-        unvisited_scratch,
-        basis,
-        state,
-        input,
-        raw,
-        next_state;
-        touched=false,
-    )
-    @test !unvisited_analog.touched
-    @test !unvisited_event.touched
-    @test all(iszero, unvisited_analog.eligibility)
-    @test all(iszero, unvisited_analog.packet_eligibility)
-    @test all(iszero, unvisited_event.trace)
-    unvisited_gradient = zeros(Float32, parameter_count)
-    Local.accumulate_analog_gradient!(
-        unvisited_gradient, learning_signal, unvisited_analog,
-    )
-    @test all(iszero, unvisited_gradient)
-
-    Local.reset_eligibility!(analog, event)
-    @test !analog.touched
-    @test !event.touched
-    @test analog.transition_count == 0
-    @test event.transition_count == 0
-    @test all(iszero, analog.state_sensitivity)
-    @test all(iszero, analog.eligibility)
-    @test all(iszero, analog.packet_eligibility)
-    @test all(iszero, event.trace)
+    states = Vector{Vector{T}}(undef, step_count + 1)
+    inputs = Vector{Vector{T}}(undef, step_count)
+    states[1] = initial
+    for step in 1:step_count
+        inputs[step] = copy(input)
+        states[step + 1] = Cell.cell_step_cached_functional(
+            states[step], inputs[step], cache,
+        )
+    end
+    continuous = [
+        T[sin(T(0.07) * T(step + lane)) for
+            lane in 1:Local.LOCAL_OBSERVATION_DIM]
+        for step in 1:step_count
+    ]
+    packet = [
+        T[cos(T(0.11) * T(2step + lane)) for lane in 1:Axon.PACKET_DIM]
+        for step in 1:step_count
+    ]
+    return raw, states, inputs, continuous, packet
 end
 
-@testset "continuous observation and bounds" begin
+# Test-only forward full-eligibility oracle. Production never constructs these
+# matrices; this intentionally expensive reference proves the contraction
+# identity against the former RTRL-style implementation.
+function full_eligibility_contraction(
+    raw,
+    states,
+    inputs,
+    continuous_signals,
+    packet_signals,
+    raw_parameter,
+    input_channel,
+    input_scale,
+)
+    T = eltype(raw)
+    parameter_count = 2
+    state_sensitivity = zeros(T, Cell.STATE_DIM, parameter_count)
+    gradient = zeros(T, parameter_count)
+    cache, derivative_cache = Cell.parameter_caches(raw)
+    dstate = zeros(T, Cell.STATE_DIM)
+    dinput = zeros(T, Cell.INPUT_DIM)
+    draw = zeros(T, Cell.PARAM_DIM)
+    dnext = zeros(T, Cell.STATE_DIM)
+    state_jacobian = zeros(T, Cell.STATE_DIM, Cell.STATE_DIM)
+    input_jacobian = zeros(T, Cell.STATE_DIM, Cell.INPUT_DIM)
+    raw_jacobian = zeros(T, Cell.STATE_DIM, Cell.PARAM_DIM)
+    next_sensitivity = similar(state_sensitivity)
+    margin_sensitivity = zeros(T, parameter_count)
+    continuous_eligibility = zeros(T, Local.LOCAL_OBSERVATION_DIM, parameter_count)
+    packet_eligibility = zeros(T, Axon.PACKET_DIM, parameter_count)
+    packet_bar = zeros(T, Axon.PACKET_DIM)
+    packet_dnext = zeros(T, Cell.STATE_DIM)
+
+    for step in eachindex(inputs)
+        previous_state = states[step]
+        next_state = states[step + 1]
+        input = inputs[step]
+        fill!(state_jacobian, zero(T))
+        fill!(input_jacobian, zero(T))
+        fill!(raw_jacobian, zero(T))
+        for output in 1:(Cell.STATE_DIM - 1)
+            fill!(dnext, zero(T))
+            dnext[output] = one(T)
+            Cell.cell_step_conditional_pullback!(
+                dstate, dinput, draw, previous_state, input, cache,
+                derivative_cache, next_state, dnext,
+            )
+            state_jacobian[output, :] .= dstate
+            input_jacobian[output, :] .= dinput
+            raw_jacobian[output, :] .= draw
+        end
+        mul!(next_sensitivity, state_jacobian, state_sensitivity)
+        next_sensitivity[:, 1] .+= @view(raw_jacobian[:, raw_parameter])
+        next_sensitivity[:, 2] .+=
+            input_scale .* @view(input_jacobian[:, input_channel])
+
+        fill!(dnext, zero(T))
+        Cell.cell_step_conditional_pullback!(
+            dstate, dinput, draw, previous_state, input, cache,
+            derivative_cache, next_state, dnext, zero(T), zero(T), one(T),
+        )
+        margin_sensitivity[1] =
+            dot(dstate, @view(state_sensitivity[:, 1])) + draw[raw_parameter]
+        margin_sensitivity[2] =
+            dot(dstate, @view(state_sensitivity[:, 2])) +
+            input_scale * dinput[input_channel]
+
+        continuous_count = Cell.N_COMPARTMENTS * Cell.COMPARTMENT_STATE_DIM
+        continuous_eligibility[1:continuous_count, :] .=
+            @view(next_sensitivity[1:continuous_count, :])
+        continuous_eligibility[end - 1, :] .= margin_sensitivity
+        continuous_eligibility[end, :] .=
+            @view(next_sensitivity[Cell.ADAPTATION_INDEX, :])
+
+        for lane in 1:Axon.PACKET_DIM
+            fill!(packet_bar, zero(T))
+            packet_bar[lane] = one(T)
+            margin_bar = Axon.axon_packet_pullback!(
+                packet_dnext, packet_bar, previous_state, next_state, cache,
+            )
+            for parameter in 1:parameter_count
+                packet_eligibility[lane, parameter] =
+                    dot(packet_dnext, @view(next_sensitivity[:, parameter])) +
+                    margin_bar * margin_sensitivity[parameter]
+            end
+        end
+        mul!(
+            gradient,
+            transpose(continuous_eligibility),
+            continuous_signals[step],
+            one(T),
+            one(T),
+        )
+        mul!(
+            gradient,
+            transpose(packet_eligibility),
+            packet_signals[step],
+            one(T),
+            one(T),
+        )
+        copyto!(state_sensitivity, next_sensitivity)
+    end
+    return gradient
+end
+
+function contracted_gradient(
+    raw,
+    states,
+    inputs,
+    continuous_signals,
+    packet_signals;
+    eligibility_scale=one(eltype(raw)),
+    touched=true,
+    terminal_seed=nothing,
+)
+    T = eltype(raw)
+    step_count = length(inputs)
+    adjoint = Local.ContractedLocalAdjoint(; T=T)
+    scratch = Local.ContractedAdjointScratch(; T=T)
+    Local.begin_local_adjoint!(
+        adjoint,
+        step_count;
+        terminal_seed=terminal_seed,
+    )
+    raw_gradient = zeros(T, Cell.PARAM_DIM)
+    input_gradient = zeros(T, Cell.INPUT_DIM)
+    for step in step_count:-1:1
+        changed = Local.contract_replayed_transition!(
+            adjoint,
+            scratch,
+            Local.ChronologicalTransitionLink(step, step - 1, 100 + step),
+            states[step],
+            inputs[step],
+            raw,
+            states[step + 1],
+            continuous_signals[step],
+            packet_signals[step];
+            touched=touched,
+            eligibility_scale=T(eligibility_scale),
+        )
+        if changed
+            raw_gradient .+= Local.raw_parameter_cotangent(scratch)
+            input_gradient .+= Local.input_cotangent(scratch)
+        end
+    end
+    if touched
+        root_bar = copy(Local.finish_local_adjoint!(adjoint, 0))
+    else
+        root_bar = copy(adjoint.state_bar)
+    end
+    return raw_gradient, input_gradient, root_bar, adjoint
+end
+
+@testset "factorized local-adjoint equals full eligibility contraction" begin
+    raw_parameter = findfirst(==(:basal_to_soma), Cell.PARAMETER_NAMES)
+    input_channel = Cell.input_index(1, Cell.INPUT_AMPA)
+    input_scale = 0.7
+    for step_count in (1, 2, 4)
+        raw, states, inputs, continuous, packet =
+            make_local_trajectory(step_count)
+        oracle = full_eligibility_contraction(
+            raw,
+            states,
+            inputs,
+            continuous,
+            packet,
+            raw_parameter,
+            input_channel,
+            input_scale,
+        )
+        raw_gradient, input_gradient, _, adjoint = contracted_gradient(
+            raw, states, inputs, continuous, packet,
+        )
+        contracted = [
+            raw_gradient[raw_parameter],
+            input_scale * input_gradient[input_channel],
+        ]
+        @test isapprox(contracted, oracle; rtol=2.0e-11, atol=2.0e-12)
+        @test adjoint.visited_transition_count == step_count
+        @test adjoint.conditional_pullback_count == step_count
+        @test !adjoint.active
+    end
+end
+
+@testset "teacher-free causal gates, nonspiking credit, and chronology" begin
+    raw32, state32, input32, next32 = nonspiking_transition()
+    raw = Float64.(raw32)
+    state = Float64.(state32)
+    input = Float64.(input32)
+    next_state = Float64.(next32)
+    continuous = [collect(range(-0.2, 0.3; length=Local.LOCAL_OBSERVATION_DIM))]
+    packet = [collect(range(0.15, -0.1; length=Axon.PACKET_DIM))]
+    states = [state, next_state]
+    inputs = [input]
+    @test next_state[Cell.SPIKE_INDEX] == 0.0
+
+    raw_gradient, input_gradient, root_bar, adjoint = contracted_gradient(
+        raw, states, inputs, continuous, packet,
+    )
+    @test norm(raw_gradient) > 0
+    @test norm(input_gradient) > 0
+    @test norm(root_bar) > 0
+    @test adjoint.touched
+
+    zeros_continuous = [zeros(Float64, Local.LOCAL_OBSERVATION_DIM)]
+    zeros_packet = [zeros(Float64, Axon.PACKET_DIM)]
+    zero_m_raw, zero_m_input, zero_m_root, _ = contracted_gradient(
+        raw, states, inputs, zeros_continuous, zeros_packet,
+    )
+    @test all(iszero, zero_m_raw)
+    @test all(iszero, zero_m_input)
+    @test all(iszero, zero_m_root)
+
+    zero_e_raw, zero_e_input, zero_e_root, _ = contracted_gradient(
+        raw,
+        states,
+        inputs,
+        continuous,
+        packet;
+        eligibility_scale=0.0,
+    )
+    @test all(iszero, zero_e_raw)
+    @test all(iszero, zero_e_input)
+    @test all(iszero, zero_e_root)
+
+    unvisited_raw, unvisited_input, unvisited_root, unvisited =
+        contracted_gradient(
+            raw, states, inputs, continuous, packet; touched=false,
+        )
+    @test all(iszero, unvisited_raw)
+    @test all(iszero, unvisited_input)
+    @test all(iszero, unvisited_root)
+    @test !unvisited.touched
+    @test unvisited.visited_transition_count == 0
+    @test unvisited.conditional_pullback_count == 0
+
+    adjoint_order = Local.ContractedLocalAdjoint(; T=Float64)
+    scratch = Local.ContractedAdjointScratch(; T=Float64)
+    Local.begin_local_adjoint!(adjoint_order, 1)
+    @test_throws ArgumentError Local.contract_replayed_transition!(
+        adjoint_order,
+        scratch,
+        Local.ChronologicalTransitionLink(2, 1, 202),
+        state,
+        input,
+        raw,
+        next_state,
+        continuous[1],
+        packet[1];
+        touched=true,
+    )
+    @test_throws ArgumentError Local.finish_local_adjoint!(adjoint_order, 0)
+    @test Local.ChronologicalTransitionLink(5, 3, 91).packet_version == 91
+    @test_throws ArgumentError Local.ChronologicalTransitionLink(0, 0)
+    @test_throws ArgumentError Local.ChronologicalTransitionLink(2, 2)
+
+    Local.begin_local_adjoint!(adjoint_order, 1)
+    connected = Local.CausalEventControl(0.2; connected=true)
+    @test_throws ArgumentError Local.contract_replayed_transition!(
+        adjoint_order,
+        scratch,
+        Local.ChronologicalTransitionLink(1, 0),
+        state,
+        input,
+        raw,
+        next_state,
+        continuous[1],
+        packet[1];
+        touched=true,
+        event_control=connected,
+    )
+    disconnected_nonzero = Local.CausalEventControl(0.2; connected=false)
+    @test_throws ArgumentError Local.contract_replayed_transition!(
+        adjoint_order,
+        scratch,
+        Local.ChronologicalTransitionLink(1, 0),
+        state,
+        input,
+        raw,
+        next_state,
+        continuous[1],
+        packet[1];
+        touched=true,
+        event_control=disconnected_nonzero,
+    )
+end
+
+@testset "linearity and common/candidate alternative worlds" begin
+    raw, states, inputs, continuous_a, packet_a = make_local_trajectory(2)
+    continuous_b = [0.37 .* signal for signal in continuous_a]
+    packet_b = [-0.21 .* signal for signal in packet_a]
+    continuous_sum = [continuous_a[i] .+ continuous_b[i] for i in 1:2]
+    packet_sum = [packet_a[i] .+ packet_b[i] for i in 1:2]
+    raw_a, input_a, root_a, _ = contracted_gradient(
+        raw, states, inputs, continuous_a, packet_a,
+    )
+    raw_b, input_b, root_b, _ = contracted_gradient(
+        raw, states, inputs, continuous_b, packet_b,
+    )
+    raw_sum, input_sum, root_sum, _ = contracted_gradient(
+        raw, states, inputs, continuous_sum, packet_sum,
+    )
+    @test isapprox(raw_sum, raw_a + raw_b; rtol=3eps(Float64), atol=3eps(Float64))
+    @test isapprox(
+        input_sum, input_a + input_b; rtol=3eps(Float64), atol=3eps(Float64),
+    )
+    @test isapprox(root_sum, root_a + root_b; rtol=3eps(Float64), atol=3eps(Float64))
+
+    # Candidate worlds return independent roots. Summing those roots before a
+    # single common replay equals duplicating the common replay, while a common
+    # local signal can still be added exactly once by the graph owner.
+    common_raw, common_states, common_inputs, _, _ = make_local_trajectory(1)
+    zero_continuous = [zeros(Float64, Local.LOCAL_OBSERVATION_DIM)]
+    zero_packet = [zeros(Float64, Axon.PACKET_DIM)]
+    seed_a = root_a
+    seed_b = root_b
+    raw_common_a, input_common_a, _, _ = contracted_gradient(
+        common_raw,
+        common_states,
+        common_inputs,
+        zero_continuous,
+        zero_packet;
+        terminal_seed=seed_a,
+    )
+    raw_common_b, input_common_b, _, _ = contracted_gradient(
+        common_raw,
+        common_states,
+        common_inputs,
+        zero_continuous,
+        zero_packet;
+        terminal_seed=seed_b,
+    )
+    combined = seed_a + seed_b
+    raw_common_once, input_common_once, _, _ = contracted_gradient(
+        common_raw,
+        common_states,
+        common_inputs,
+        zero_continuous,
+        zero_packet;
+        terminal_seed=combined,
+    )
+    @test isapprox(
+        raw_common_once,
+        raw_common_a + raw_common_b;
+        rtol=3eps(Float64),
+        atol=3eps(Float64),
+    )
+    @test isapprox(
+        input_common_once,
+        input_common_a + input_common_b;
+        rtol=3eps(Float64),
+        atol=3eps(Float64),
+    )
+
+    common_seed_state = Local.ContractedLocalAdjoint(; T=Float64)
+    Local.begin_local_adjoint!(common_seed_state, 1)
+    Local.add_terminal_seed!(common_seed_state, seed_a)
+    Local.add_terminal_seed!(common_seed_state, seed_b)
+    @test common_seed_state.state_bar == combined
+end
+
+@testset "continuous observation, utility, bounds, and allocation" begin
     raw, state, input, next_state = nonspiking_transition()
     cache = Cell.transform_parameters(raw)
     observation = zeros(Float32, Local.LOCAL_OBSERVATION_DIM)
@@ -439,196 +592,131 @@ end
         observation[1:end-1], state, next_state, cache,
     )
 
-    @test_throws ArgumentError Local.LocalParameterBasis(0)
-    @test_throws ArgumentError Local.LocalParameterBasis(
-        Cell.PARAM_DIM - 1,
-    )
-    @test_throws ArgumentError Local.AnalogEligibilityState(0)
-    @test_throws ArgumentError Local.HardEventEligibilityState(0)
     @test_throws ArgumentError Local.StructuralUtilityState(0)
-    @test_throws ArgumentError Local.EligibilityScratch(0)
-
-    basis = Local.LocalParameterBasis(Cell.PARAM_DIM)
-    analog = Local.AnalogEligibilityState(Cell.PARAM_DIM)
-    event = Local.HardEventEligibilityState(Cell.PARAM_DIM)
-    scratch = Local.EligibilityScratch(Cell.PARAM_DIM)
-    @test_throws ArgumentError Local.accumulate_active_apical_transition!(
-        analog,
-        event,
-        scratch,
-        basis,
-        state,
-        input,
-        raw,
-        next_state;
-        touched=true,
-        event_decay=1.1f0,
+    utility = Local.StructuralUtilityState(3)
+    Local.update_structural_utility!(
+        utility, Float32[0.2, 0.0, -0.4]; decay=0.9f0, normalization=2.0f0,
     )
-    @test_throws DimensionMismatch Local.accumulate_active_apical_transition!(
-        analog,
-        event,
-        scratch,
-        basis,
-        state[1:end-1],
-        input,
-        raw,
-        next_state;
-        touched=true,
+    @test utility.utility[1] > 0
+    @test utility.utility[2] == 0
+    @test utility.utility[3] > utility.utility[1]
+    zero_utility = Local.StructuralUtilityState(3)
+    Local.update_structural_utility!(
+        zero_utility, zeros(Float32, 3); decay=0.9f0,
+    )
+    @test all(iszero, zero_utility.utility)
+    @test_throws DimensionMismatch Local.update_structural_utility!(
+        utility, zeros(Float32, 2),
     )
 
-    # The local Jacobian reference is expensive but fixed-memory. This is the
-    # correctness kernel against which the later packet-specialized SIMD
-    # implementation is compared.
-    Local.accumulate_active_apical_transition!(
-        analog,
-        event,
+    # Scratch contains fixed cell/packet vectors only, never a P-wide matrix.
+    scratch = Local.ContractedAdjointScratch()
+    @test all(field -> !(field isa AbstractMatrix),
+        (getfield(scratch, name) for name in fieldnames(typeof(scratch))))
+    @test length(scratch.draw) == Cell.PARAM_DIM
+    @test length(scratch.dinput) == Cell.INPUT_DIM
+
+    continuous = collect(range(-0.2f0, 0.3f0; length=Local.LOCAL_OBSERVATION_DIM))
+    packet = collect(range(0.15f0, -0.1f0; length=Axon.PACKET_DIM))
+    adjoint = Local.ContractedLocalAdjoint()
+    event_control = Local.CausalEventControl()
+    link = Local.ChronologicalTransitionLink(1, 0, 71)
+    Local.begin_local_adjoint!(adjoint, 1)
+    Local.contract_replayed_transition!(
+        adjoint,
         scratch,
-        basis,
+        link,
         state,
         input,
         raw,
-        next_state;
+        next_state,
+        continuous,
+        packet;
         touched=true,
+        event_control=event_control,
     )
-    Local.reset_eligibility!(analog, event)
-    allocated = @allocated Local.accumulate_active_apical_transition!(
-        analog,
-        event,
+    Local.begin_local_adjoint!(adjoint, 1)
+    allocated = @allocated Local.contract_replayed_transition!(
+        adjoint,
         scratch,
-        basis,
+        link,
         state,
         input,
         raw,
-        next_state;
+        next_state,
+        continuous,
+        packet;
         touched=true,
+        event_control=event_control,
     )
     @test allocated == 0
-end
+    @test adjoint.conditional_pullback_count == 1
 
-@testset "two-step continuous eligibility finite difference" begin
-    raw32, state32, input32, _ = nonspiking_transition()
-    raw = Float64.(raw32)
-    state = Float64.(state32)
-    input = Float64.(input32)
-    input .*= 0.5
-    raw_parameter = findfirst(==(:basal_to_soma), Cell.PARAMETER_NAMES)
-    input_channel = Cell.input_index(1, Cell.INPUT_AMPA)
-
-    basis = Local.LocalParameterBasis(
-        2; T=Float64, include_cell_parameters=false,
-    )
-    basis.raw_basis[raw_parameter, 1] = 1.0
-    basis.input_basis[input_channel, 2] = 0.7
-    analog = Local.AnalogEligibilityState(2; T=Float64)
-    event = Local.HardEventEligibilityState(2; T=Float64)
-    scratch = Local.EligibilityScratch(2; T=Float64)
-    cache = Cell.transform_parameters(raw)
-    next_state = Cell.cell_step_cached_functional(state, input, cache)
-    next_next_state = Cell.cell_step_cached_functional(next_state, input, cache)
-    Local.accumulate_active_apical_transition!(
-        analog,
-        event,
+    # Production path: generation-stamped 48×N slab, integer column address,
+    # precomputed caches, no per-cell view/object and no cache reconstruction.
+    arena = Local.ContractedAdjointArena(1436)
+    selected = 713
+    cache, derivative_cache = Cell.parameter_caches(raw)
+    Local.begin_local_adjoint!(arena, selected, 1)
+    Local.contract_replayed_transition!(
+        arena,
+        selected,
         scratch,
-        basis,
+        link,
         state,
         input,
-        raw,
-        next_state;
-        touched=true,
-    )
-    Local.accumulate_active_apical_transition!(
-        analog,
-        event,
-        scratch,
-        basis,
+        cache,
+        derivative_cache,
         next_state,
-        input,
-        raw,
-        next_next_state;
+        continuous,
+        packet;
         touched=true,
+        event_control=event_control,
     )
+    Local.finish_local_adjoint!(arena, selected, 0)
+    Local.begin_local_adjoint!(arena, selected, 1)
+    arena_allocated = @allocated Local.contract_replayed_transition!(
+        arena,
+        selected,
+        scratch,
+        link,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        continuous,
+        packet;
+        touched=true,
+        event_control=event_control,
+    )
+    @test arena_allocated == 0
+    @test arena.visited_transition_count[selected] == 1
+    @test arena.conditional_pullback_count[selected] == 1
+    @test size(arena.state_bar) == (Cell.STATE_DIM, 1436)
+    Local.finish_local_adjoint!(arena, selected, 0)
+    Local.reset_adjoint_arena!(arena)
+    @test_throws ArgumentError Local.finish_local_adjoint!(arena, selected, 0)
 
-    function two_step_observation(raw_offset, input_offset)
-        candidate_raw = copy(raw)
-        candidate_raw[raw_parameter] += raw_offset
-        candidate_input = copy(input)
-        candidate_input[input_channel] += 0.7 * input_offset
-        candidate_cache = Cell.transform_parameters(candidate_raw)
-        first = Cell.cell_step_cached_functional(
-            state, candidate_input, candidate_cache,
-        )
-        second = Cell.cell_step_cached_functional(
-            first, candidate_input, candidate_cache,
-        )
-        @assert first[Cell.SPIKE_INDEX] == next_state[Cell.SPIKE_INDEX]
-        @assert second[Cell.SPIKE_INDEX] == next_next_state[Cell.SPIKE_INDEX]
-        observation = zeros(Float64, Local.LOCAL_OBSERVATION_DIM)
-        Local.continuous_observation!(
-            observation, first, second, candidate_cache,
-        )
-        return observation
-    end
+    candidate_arena = Local.ContractedAdjointArena(2)
+    common_arena = Local.ContractedAdjointArena(2)
+    candidate_seed = collect(range(-0.1f0, 0.2f0; length=Cell.STATE_DIM))
+    Local.begin_local_adjoint!(
+        candidate_arena, 1, 0; terminal_seed=candidate_seed,
+    )
+    Local.begin_local_adjoint!(common_arena, 1, 0)
+    Local.add_terminal_seed!(common_arena, 1, candidate_arena, 1)
+    @test common_arena.state_bar[:, 1] == candidate_seed
+    fill!(@view(common_arena.state_bar[:, 1]), 0.0f0)
+    seed_reduce_allocated = @allocated Local.add_terminal_seed!(
+        common_arena, 1, candidate_arena, 1,
+    )
+    @test seed_reduce_allocated == 0
 
-    function two_step_packet(raw_offset, input_offset)
-        candidate_raw = copy(raw)
-        candidate_raw[raw_parameter] += raw_offset
-        candidate_input = copy(input)
-        candidate_input[input_channel] += 0.7 * input_offset
-        candidate_cache = Cell.transform_parameters(candidate_raw)
-        first = Cell.cell_step_cached_functional(
-            state, candidate_input, candidate_cache,
-        )
-        second = Cell.cell_step_cached_functional(
-            first, candidate_input, candidate_cache,
-        )
-        @assert first[Cell.SPIKE_INDEX] == next_state[Cell.SPIKE_INDEX]
-        @assert second[Cell.SPIKE_INDEX] == next_next_state[Cell.SPIKE_INDEX]
-        packet = zeros(Float64, Axon.PACKET_DIM)
-        Axon.axon_packet!(packet, first, second, candidate_cache)
-        return packet
-    end
-
-    epsilon = 1.0e-5
-    raw_numerical = (
-        two_step_observation(epsilon, 0.0) -
-        two_step_observation(-epsilon, 0.0)
-    ) / (2epsilon)
-    input_numerical = (
-        two_step_observation(0.0, epsilon) -
-        two_step_observation(0.0, -epsilon)
-    ) / (2epsilon)
-    packet_raw_numerical = (
-        two_step_packet(epsilon, 0.0) -
-        two_step_packet(-epsilon, 0.0)
-    ) / (2epsilon)
-    packet_input_numerical = (
-        two_step_packet(0.0, epsilon) -
-        two_step_packet(0.0, -epsilon)
-    ) / (2epsilon)
-    @test isapprox(
-        @view(analog.eligibility[:, 1]),
-        raw_numerical;
-        rtol=8.0e-4,
-        atol=3.0e-7,
-    )
-    @test isapprox(
-        @view(analog.eligibility[:, 2]),
-        input_numerical;
-        rtol=8.0e-4,
-        atol=3.0e-7,
-    )
-    @test isapprox(
-        @view(analog.packet_eligibility[:, 1]),
-        packet_raw_numerical;
-        rtol=1.5e-3,
-        atol=3.0e-7,
-    )
-    @test isapprox(
-        @view(analog.packet_eligibility[:, 2]),
-        packet_input_numerical;
-        rtol=1.5e-3,
-        atol=3.0e-7,
-    )
-    @test next_state[Cell.SPIKE_INDEX] == 0.0
-    @test next_next_state[Cell.SPIKE_INDEX] == 1.0
+    @test !isdefined(Local, :AnalogEligibilityState)
+    @test !isdefined(Local, :HardEventEligibilityState)
+    @test !isdefined(Local, :LocalParameterBasis)
+    @test !isdefined(Local, :EligibilityScratch)
+    @test Local.LocalLearningConfig().predictor_dim == 0
+    @test Local.LocalLearningConfig().hard_event_multiplier == 0.0f0
 end

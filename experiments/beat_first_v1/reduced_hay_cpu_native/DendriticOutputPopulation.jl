@@ -37,7 +37,11 @@ export OUTPUT_DIM,
        initialize_parameters,
        refresh_cache!,
        output_initial_state!,
+       value_output_initial_state!,
+       candidate_output_initial_state!,
        output_initial_state_pullback!,
+       value_output_initial_state_pullback!,
+       candidate_output_initial_state_pullback!,
        clear_gradient!,
        clear_component_gradient!,
        accumulate_gradient!,
@@ -51,7 +55,11 @@ export OUTPUT_DIM,
        hard_event_count,
        hard_event_denominator,
        output_population_forward!,
-       output_population_pullback!
+       output_population_pullback!,
+       value_output_population_forward!,
+       value_output_population_pullback!,
+       candidate_output_population_forward!,
+       candidate_output_population_pullback!
 
 """External ranking ABI: Q, death, sixteen quantiles and four geometry values."""
 const OUTPUT_DIM = 22
@@ -340,6 +348,44 @@ function output_initial_state!(
     return state
 end
 
+"""Initialize shared state-value cells 1:2 without touching cells 3:22."""
+function value_output_initial_state!(
+    state::AbstractMatrix{T},
+    cache::OutputPopulationCache{T},
+) where {T<:AbstractFloat}
+    size(state) == (Cell.STATE_DIM, OUTPUT_CELLS) || throw(
+        DimensionMismatch(
+            "initial output state must have shape " *
+            "($(Cell.STATE_DIM), $OUTPUT_CELLS)",
+        ),
+    )
+    @inbounds for output_cell in VALUE_CELLS
+        Cell.initial_state!(@view(state[:, output_cell]), cache.cell[output_cell])
+    end
+    return state
+end
+
+"""
+Initialize candidate-local output cells 3:22 without touching shared value
+cells 1:2.  The shared value population is initialized and advanced by the
+state-common owner exactly once.
+"""
+function candidate_output_initial_state!(
+    state::AbstractMatrix{T},
+    cache::OutputPopulationCache{T},
+) where {T<:AbstractFloat}
+    size(state) == (Cell.STATE_DIM, OUTPUT_CELLS) || throw(
+        DimensionMismatch(
+            "initial output state must have shape " *
+            "($(Cell.STATE_DIM), $OUTPUT_CELLS)",
+        ),
+    )
+    @inbounds for output_cell in first(ADVANTAGE_CELLS):OUTPUT_CELLS
+        Cell.initial_state!(@view(state[:, output_cell]), cache.cell[output_cell])
+    end
+    return state
+end
+
 """Fixed-size forward trajectory; no candidate-local object is created."""
 struct OutputPopulationTape{T<:AbstractFloat}
     base_state::Matrix{T}
@@ -453,6 +499,65 @@ function output_initial_state_pullback!(
     return gradient
 end
 
+"""Shared value resting-state reverse for cells 1:2 only."""
+function value_output_initial_state_pullback!(
+    gradient::OutputPopulationGradient{T},
+    scratch::OutputPopulationScratch{T},
+    dstate::AbstractMatrix{T},
+    cache::OutputPopulationCache{T},
+) where {T<:AbstractFloat}
+    size(dstate) == (Cell.STATE_DIM, OUTPUT_CELLS) || throw(
+        DimensionMismatch(
+            "initial-state cotangent must have shape " *
+            "($(Cell.STATE_DIM), $OUTPUT_CELLS)",
+        ),
+    )
+    @inbounds for output_cell in VALUE_CELLS
+        fill!(scratch.draw_step, zero(T))
+        Cell.initial_state_pullback!(
+            scratch.draw_step,
+            @view(dstate[:, output_cell]),
+            cache.derivative[output_cell],
+        )
+        for parameter in 1:Cell.PARAM_DIM
+            gradient.cell_raw[parameter, output_cell] +=
+                scratch.draw_step[parameter]
+        end
+    end
+    return gradient
+end
+
+"""
+Candidate-local resting-state reverse for cells 3:22.  Gradient storage for
+shared value cells 1:2 is left byte-for-byte unchanged.
+"""
+function candidate_output_initial_state_pullback!(
+    gradient::OutputPopulationGradient{T},
+    scratch::OutputPopulationScratch{T},
+    dstate::AbstractMatrix{T},
+    cache::OutputPopulationCache{T},
+) where {T<:AbstractFloat}
+    size(dstate) == (Cell.STATE_DIM, OUTPUT_CELLS) || throw(
+        DimensionMismatch(
+            "initial-state cotangent must have shape " *
+            "($(Cell.STATE_DIM), $OUTPUT_CELLS)",
+        ),
+    )
+    @inbounds for output_cell in first(ADVANTAGE_CELLS):OUTPUT_CELLS
+        fill!(scratch.draw_step, zero(T))
+        Cell.initial_state_pullback!(
+            scratch.draw_step,
+            @view(dstate[:, output_cell]),
+            cache.derivative[output_cell],
+        )
+        for parameter in 1:Cell.PARAM_DIM
+            gradient.cell_raw[parameter, output_cell] +=
+                scratch.draw_step[parameter]
+        end
+    end
+    return gradient
+end
+
 @inline function _cell_step!(
     destination::AbstractVector{Float32},
     state::AbstractVector{Float32},
@@ -500,13 +605,13 @@ end
     return nothing
 end
 
-@inline function _populate_components!(
+@inline function _populate_candidate_components!(
     components::OutputComponents{T},
     margin::AbstractVector{T},
 ) where {T<:AbstractFloat}
     inverse_sqrt_two = inv(sqrt(T(2)))
     inverse_sqrt_eight = inv(sqrt(T(8)))
-    components.value = (margin[1] - margin[2]) * inverse_sqrt_two
+    components.value = zero(T)
 
     advantage = zero(T)
     @inbounds for offset in 1:length(ADVANTAGE_CELLS)
@@ -525,6 +630,28 @@ end
             (margin[first_cell] - margin[first_cell + 1]) * inverse_sqrt_two
     end
     components.uncertainty_raw = (margin[21] - margin[22]) * inverse_sqrt_two
+    return components
+end
+
+@inline function _populate_value_components!(
+    components::OutputComponents{T},
+    margin::AbstractVector{T},
+) where {T<:AbstractFloat}
+    components.value = (margin[1] - margin[2]) / sqrt(T(2))
+    components.advantage = zero(T)
+    components.death = zero(T)
+    fill!(components.geometry, zero(T))
+    components.uncertainty_raw = zero(T)
+    return components
+end
+
+
+@inline function _populate_components!(
+    components::OutputComponents{T},
+    margin::AbstractVector{T},
+) where {T<:AbstractFloat}
+    _populate_candidate_components!(components, margin)
+    components.value = (margin[1] - margin[2]) / sqrt(T(2))
     return components
 end
 
@@ -606,6 +733,168 @@ function output_population_forward!(
         hard_event[output_cell] = event
     end
     return _populate_components!(components, tape.margin), hard_event
+end
+
+"""
+State-common mandatory analog transition for value cells 1:2 only.  Every
+candidate-local slot 3:22 in tape, state, evidence and hard events is left
+untouched.  Non-value components are reset to zero.
+"""
+function value_output_population_forward!(
+    components::OutputComponents{T},
+    hard_event::AbstractVector{T},
+    tape::OutputPopulationTape{T},
+    base_state::AbstractMatrix{T},
+    evidence::AbstractArray{T,3},
+    evidence_count::AbstractVector{UInt8},
+    parameters::OutputPopulationParameters{T},
+    cache::OutputPopulationCache{T},
+) where {T<:AbstractFloat}
+    _check_forward_shapes(hard_event, tape, base_state, evidence, evidence_count)
+
+    @inbounds for output_cell in VALUE_CELLS
+        tape.evidence_count[output_cell] = evidence_count[output_cell]
+        for state in 1:Cell.STATE_DIM
+            tape.base_state[state, output_cell] = base_state[state, output_cell]
+        end
+        for source in 1:MAX_EVIDENCE, lane in 1:EVIDENCE_DIM
+            tape.evidence[lane, source, output_cell] =
+                evidence[lane, source, output_cell]
+        end
+        for input in 1:Cell.INPUT_DIM
+            tape.inbox[input, output_cell] = zero(T)
+        end
+
+        source_count = Int(evidence_count[output_cell])
+        source_count <= MAX_EVIDENCE || throw(ArgumentError(
+            "output cell $output_cell has $source_count evidence sources; " *
+            "maximum is $MAX_EVIDENCE",
+        ))
+        for source in 1:source_count
+            for receptor in 1:Cell.INPUT_CHANNELS
+                typed_input = zero(T)
+                for group in 1:Axon.GROUP_COUNT
+                    lane = evidence_lane(group, receptor)
+                    packet_value = evidence[lane, source, output_cell]
+                    isfinite(packet_value) || throw(ArgumentError(
+                        "output evidence must be finite",
+                    ))
+                    packet_value >= zero(T) || throw(ArgumentError(
+                        "12D axon evidence must be nonnegative",
+                    ))
+                    typed_input = muladd(
+                        cache.projection[group, receptor, ROLE_VALUE],
+                        packet_value,
+                        typed_input,
+                    )
+                end
+                tape.inbox[
+                    Cell.input_index(source, receptor),
+                    output_cell,
+                ] = typed_input
+            end
+        end
+
+        _cell_step!(
+            @view(tape.next_state[:, output_cell]),
+            @view(tape.base_state[:, output_cell]),
+            @view(tape.inbox[:, output_cell]),
+            cache.cell[output_cell],
+        )
+        margin = Cell.spike_margin_from_transition(
+            @view(tape.base_state[:, output_cell]),
+            @view(tape.next_state[:, output_cell]),
+            cache.cell[output_cell],
+        )
+        event = tape.next_state[Cell.SPIKE_INDEX, output_cell]
+        tape.margin[output_cell] = margin
+        tape.event[output_cell] = event
+        hard_event[output_cell] = event
+    end
+    return _populate_value_components!(components, tape.margin), hard_event
+end
+
+"""
+    candidate_output_population_forward!(...)
+
+Candidate-local mandatory analog transition for cells 3:22.  Columns 1:2 of
+the tape, inbox, evidence, state and hard-event vector are deliberately not
+read or written.  The returned `components.value` is exactly zero; the caller
+combines these candidate components with the separately cached state value.
+"""
+function candidate_output_population_forward!(
+    components::OutputComponents{T},
+    hard_event::AbstractVector{T},
+    tape::OutputPopulationTape{T},
+    base_state::AbstractMatrix{T},
+    evidence::AbstractArray{T,3},
+    evidence_count::AbstractVector{UInt8},
+    parameters::OutputPopulationParameters{T},
+    cache::OutputPopulationCache{T},
+) where {T<:AbstractFloat}
+    _check_forward_shapes(hard_event, tape, base_state, evidence, evidence_count)
+
+    @inbounds for output_cell in first(ADVANTAGE_CELLS):OUTPUT_CELLS
+        tape.evidence_count[output_cell] = evidence_count[output_cell]
+        for state in 1:Cell.STATE_DIM
+            tape.base_state[state, output_cell] = base_state[state, output_cell]
+        end
+        for source in 1:MAX_EVIDENCE, lane in 1:EVIDENCE_DIM
+            tape.evidence[lane, source, output_cell] =
+                evidence[lane, source, output_cell]
+        end
+        for input in 1:Cell.INPUT_DIM
+            tape.inbox[input, output_cell] = zero(T)
+        end
+
+        source_count = Int(evidence_count[output_cell])
+        source_count <= MAX_EVIDENCE || throw(ArgumentError(
+            "output cell $output_cell has $source_count evidence sources; " *
+            "maximum is $MAX_EVIDENCE",
+        ))
+        role = cell_role(output_cell)
+        for source in 1:source_count
+            for receptor in 1:Cell.INPUT_CHANNELS
+                typed_input = zero(T)
+                for group in 1:Axon.GROUP_COUNT
+                    lane = evidence_lane(group, receptor)
+                    packet_value = evidence[lane, source, output_cell]
+                    isfinite(packet_value) || throw(ArgumentError(
+                        "output evidence must be finite",
+                    ))
+                    packet_value >= zero(T) || throw(ArgumentError(
+                        "12D axon evidence must be nonnegative",
+                    ))
+                    typed_input = muladd(
+                        cache.projection[group, receptor, role],
+                        packet_value,
+                        typed_input,
+                    )
+                end
+                tape.inbox[
+                    Cell.input_index(source, receptor),
+                    output_cell,
+                ] = typed_input
+            end
+        end
+
+        _cell_step!(
+            @view(tape.next_state[:, output_cell]),
+            @view(tape.base_state[:, output_cell]),
+            @view(tape.inbox[:, output_cell]),
+            cache.cell[output_cell],
+        )
+        margin = Cell.spike_margin_from_transition(
+            @view(tape.base_state[:, output_cell]),
+            @view(tape.next_state[:, output_cell]),
+            cache.cell[output_cell],
+        )
+        event = tape.next_state[Cell.SPIKE_INDEX, output_cell]
+        tape.margin[output_cell] = margin
+        tape.event[output_cell] = event
+        hard_event[output_cell] = event
+    end
+    return _populate_candidate_components!(components, tape.margin), hard_event
 end
 
 @inline function uncertainty_scale(components::OutputComponents{T}) where {T}
@@ -794,6 +1083,191 @@ function output_population_pullback!(
         end
         # The previous hard spike is a control coordinate.  Exact continuous
         # task credit must not create a surrogate hard-event path.
+        scratch.dstate[Cell.SPIKE_INDEX] = zero(T)
+        for state in 1:Cell.STATE_DIM
+            dbase_state[state, output_cell] = scratch.dstate[state]
+        end
+
+        role = cell_role(output_cell)
+        source_count = Int(tape.evidence_count[output_cell])
+        for source in 1:source_count
+            for receptor in 1:Cell.INPUT_CHANNELS
+                input_bar = scratch.dinput[
+                    Cell.input_index(source, receptor),
+                ]
+                for group in 1:Axon.GROUP_COUNT
+                    lane = evidence_lane(group, receptor)
+                    packet_value = tape.evidence[lane, source, output_cell]
+                    devidence[lane, source, output_cell] +=
+                        input_bar * cache.projection[group, receptor, role]
+                    gradient.projection_raw[group, receptor, role] +=
+                        input_bar * packet_value *
+                        cache.projection_derivative[group, receptor, role]
+                end
+            end
+        end
+    end
+    return dbase_state, devidence, gradient
+end
+
+"""
+State-common exact conditional reverse for value cells 1:2 only.  Candidate
+columns and candidate-role parameter gradients are left unchanged.
+"""
+function value_output_population_pullback!(
+    dbase_state::AbstractMatrix{T},
+    devidence::AbstractArray{T,3},
+    gradient::OutputPopulationGradient{T},
+    scratch::OutputPopulationScratch{T},
+    tape::OutputPopulationTape{T},
+    parameters::OutputPopulationParameters{T},
+    cache::OutputPopulationCache{T},
+    components_bar::OutputComponentGradient{T},
+) where {T<:AbstractFloat}
+    size(dbase_state) == (Cell.STATE_DIM, OUTPUT_CELLS) || throw(
+        DimensionMismatch(
+            "base-state cotangent must have shape " *
+            "($(Cell.STATE_DIM), $OUTPUT_CELLS)",
+        ),
+    )
+    size(devidence) == (EVIDENCE_DIM, MAX_EVIDENCE, OUTPUT_CELLS) || throw(
+        DimensionMismatch(
+            "evidence cotangent must have shape " *
+            "($EVIDENCE_DIM, $MAX_EVIDENCE, $OUTPUT_CELLS)",
+        ),
+    )
+    size(parameters.projection_raw) ==
+        (Axon.GROUP_COUNT, Cell.INPUT_CHANNELS, ROLE_COUNT) || throw(
+        DimensionMismatch("projection parameter shape changed"),
+    )
+    @inbounds for output_cell in VALUE_CELLS
+        for state in 1:Cell.STATE_DIM
+            dbase_state[state, output_cell] = zero(T)
+        end
+        for source in 1:MAX_EVIDENCE, lane in 1:EVIDENCE_DIM
+            devidence[lane, source, output_cell] = zero(T)
+        end
+    end
+    _components_to_margin_bar!(scratch.margin_bar, components_bar)
+
+    @inbounds for output_cell in VALUE_CELLS
+        fill!(scratch.dnext, zero(T))
+        Cell.cell_step_conditional_pullback!(
+            scratch.dstate,
+            scratch.dinput,
+            scratch.draw_step,
+            @view(tape.base_state[:, output_cell]),
+            @view(tape.inbox[:, output_cell]),
+            cache.cell[output_cell],
+            cache.derivative[output_cell],
+            @view(tape.next_state[:, output_cell]),
+            scratch.dnext,
+            zero(T),
+            zero(T),
+            scratch.margin_bar[output_cell],
+        )
+        for parameter in 1:Cell.PARAM_DIM
+            gradient.cell_raw[parameter, output_cell] +=
+                scratch.draw_step[parameter]
+        end
+        scratch.dstate[Cell.SPIKE_INDEX] = zero(T)
+        for state in 1:Cell.STATE_DIM
+            dbase_state[state, output_cell] = scratch.dstate[state]
+        end
+
+        source_count = Int(tape.evidence_count[output_cell])
+        for source in 1:source_count
+            for receptor in 1:Cell.INPUT_CHANNELS
+                input_bar = scratch.dinput[
+                    Cell.input_index(source, receptor),
+                ]
+                for group in 1:Axon.GROUP_COUNT
+                    lane = evidence_lane(group, receptor)
+                    packet_value = tape.evidence[lane, source, output_cell]
+                    devidence[lane, source, output_cell] +=
+                        input_bar *
+                        cache.projection[group, receptor, ROLE_VALUE]
+                    gradient.projection_raw[
+                        group,
+                        receptor,
+                        ROLE_VALUE,
+                    ] += input_bar * packet_value *
+                         cache.projection_derivative[
+                        group,
+                        receptor,
+                        ROLE_VALUE,
+                    ]
+                end
+            end
+        end
+    end
+    return dbase_state, devidence, gradient
+end
+
+"""
+Candidate-local exact conditional reverse for cells 3:22.
+
+Columns 1:2 of `dbase_state` and `devidence`, value-cell parameter gradients,
+and the value-role projection gradient are not cleared or modified.  This is a
+strict ownership boundary, not a zero-gradient convention: the state-common
+owner may already have accumulated value credit there.
+"""
+function candidate_output_population_pullback!(
+    dbase_state::AbstractMatrix{T},
+    devidence::AbstractArray{T,3},
+    gradient::OutputPopulationGradient{T},
+    scratch::OutputPopulationScratch{T},
+    tape::OutputPopulationTape{T},
+    parameters::OutputPopulationParameters{T},
+    cache::OutputPopulationCache{T},
+    components_bar::OutputComponentGradient{T},
+) where {T<:AbstractFloat}
+    size(dbase_state) == (Cell.STATE_DIM, OUTPUT_CELLS) || throw(
+        DimensionMismatch(
+            "base-state cotangent must have shape " *
+            "($(Cell.STATE_DIM), $OUTPUT_CELLS)",
+        ),
+    )
+    size(devidence) == (EVIDENCE_DIM, MAX_EVIDENCE, OUTPUT_CELLS) || throw(
+        DimensionMismatch(
+            "evidence cotangent must have shape " *
+            "($EVIDENCE_DIM, $MAX_EVIDENCE, $OUTPUT_CELLS)",
+        ),
+    )
+    size(parameters.projection_raw) ==
+        (Axon.GROUP_COUNT, Cell.INPUT_CHANNELS, ROLE_COUNT) || throw(
+        DimensionMismatch("projection parameter shape changed"),
+    )
+    @inbounds for output_cell in first(ADVANTAGE_CELLS):OUTPUT_CELLS
+        for state in 1:Cell.STATE_DIM
+            dbase_state[state, output_cell] = zero(T)
+        end
+        for source in 1:MAX_EVIDENCE, lane in 1:EVIDENCE_DIM
+            devidence[lane, source, output_cell] = zero(T)
+        end
+    end
+    _components_to_margin_bar!(scratch.margin_bar, components_bar)
+
+    @inbounds for output_cell in first(ADVANTAGE_CELLS):OUTPUT_CELLS
+        fill!(scratch.dnext, zero(T))
+        Cell.cell_step_conditional_pullback!(
+            scratch.dstate,
+            scratch.dinput,
+            scratch.draw_step,
+            @view(tape.base_state[:, output_cell]),
+            @view(tape.inbox[:, output_cell]),
+            cache.cell[output_cell],
+            cache.derivative[output_cell],
+            @view(tape.next_state[:, output_cell]),
+            scratch.dnext,
+            zero(T),
+            zero(T),
+            scratch.margin_bar[output_cell],
+        )
+        for parameter in 1:Cell.PARAM_DIM
+            gradient.cell_raw[parameter, output_cell] +=
+                scratch.draw_step[parameter]
+        end
         scratch.dstate[Cell.SPIKE_INDEX] = zero(T)
         for state in 1:Cell.STATE_DIM
             dbase_state[state, output_cell] = scratch.dstate[state]
