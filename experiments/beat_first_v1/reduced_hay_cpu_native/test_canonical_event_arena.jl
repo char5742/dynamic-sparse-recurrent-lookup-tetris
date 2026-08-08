@@ -2,7 +2,7 @@ using Test
 
 include(joinpath(@__DIR__, "CanonicalEventArena.jl"))
 using .CanonicalEventArena
-import .CanonicalEventArena: advance_event_cell!
+import .CanonicalEventArena: advance_event_cell!, deliver_event_edge!
 
 struct ThresholdAdapter{T<:AbstractFloat}
     threshold::T
@@ -30,6 +30,71 @@ struct NeverEmitAdapter end
 ) where {T<:AbstractFloat}
     arena.state[slot, 1] += arena.inbox[slot, 1]
     arena.state[slot, 2] += one(T)
+    return NO_EVENT
+end
+
+struct TypedDeliveryAdapter{T<:AbstractFloat,R}
+    raw_weight::R
+end
+
+@inline function deliver_event_edge!(
+    ::TypedDeliveryAdapter{T},
+    arena::EventArena{T},
+    fixed::SourceMajorAdjacency{T},
+    source::Int,
+    source_mask::UInt8,
+    edge::Int,
+    destination::Int,
+    slot::Int,
+    wave::Int,
+) where {T<:AbstractFloat}
+    # Diagnostic stand-in for a refreshed 12D source packet.
+    source_amplitude = candidate_state(arena, source, 1)
+    input = Int(fixed.channel[edge])
+    arena.inbox[slot, input] += fixed.weight[edge] * source_amplitude
+    return nothing
+end
+
+@inline function deliver_event_edge!(
+    adapter::TypedDeliveryAdapter{T},
+    arena::EventArena{T},
+    overlay::DynamicSourceMajorOverlay,
+    source::Int,
+    source_mask::UInt8,
+    edge::Int,
+    destination::Int,
+    slot::Int,
+    wave::Int,
+) where {T<:AbstractFloat}
+    branch = Int(overlay.channel[edge])
+    base = 3 * (branch - 1)
+    trigger = overlay.trigger_bit[edge]
+    raw = Int(overlay.raw_index[edge])
+    value = adapter.raw_weight[raw]
+    if trigger == 0x01
+        # Soma event -> AMPA, modulated by the refreshed source packet stand-in.
+        arena.inbox[slot, base + 1] += value * candidate_state(arena, source, 1)
+    else
+        # Plateau bits are XOR transitions. Current source state decides
+        # whether this transition is an onset (NMDA) or offset (GABA).
+        plateau_is_on = candidate_state(arena, source, 3) > T(0.5)
+        receptor = plateau_is_on ? base + 2 : base + 3
+        arena.inbox[slot, receptor] += value
+    end
+    return nothing
+end
+
+
+@inline function advance_event_cell!(
+    ::TypedDeliveryAdapter{T},
+    arena::EventArena{T},
+    node::Int,
+    slot::Int,
+    wave::Int,
+) where {T<:AbstractFloat}
+    arena.state[slot, 1] += arena.inbox[slot, 1]
+    arena.state[slot, 2] += arena.inbox[slot, 2]
+    arena.state[slot, 3] += arena.inbox[slot, 3]
     return NO_EVENT
 end
 
@@ -117,6 +182,123 @@ end
         UInt32[1, 2, 2],
         UInt16[2], UInt8[1], UInt8[0], Float32[1],
     )
+end
+
+@testset "fixed-capacity dynamic source-major overlay" begin
+    overlay = DynamicSourceMajorOverlay(4, 3, 4)
+    begin_dynamic_overlay!(overlay)
+    # Deliberately unordered construction.
+    @test push_dynamic_edge!(overlay, 3, 4, 1, 0x02, 3) == 1
+    @test push_dynamic_edge!(overlay, 1, 3, 1, 0x01, 1) == 2
+    @test push_dynamic_edge!(overlay, 2, 3, 1, 0x02, 2) == 3
+    seal_dynamic_overlay!(overlay)
+    @test overlay.sealed
+    @test edge_count(overlay) == 3
+    @test overlay.source[1:3] == UInt16[1, 2, 3]
+    @test overlay.destination[1:3] == UInt16[3, 3, 4]
+    @test overlay.offsets == UInt32[1, 2, 3, 4, 4]
+    @test_throws ArgumentError push_dynamic_edge!(overlay, 1, 2, 1, 0x01, 1)
+
+    begin_dynamic_overlay!(overlay)
+    @test edge_count(overlay) == 0
+    seal_dynamic_overlay!(overlay)
+    @test overlay.offsets == fill(UInt32(1), 5)
+
+    begin_dynamic_overlay!(overlay)
+    @test_throws BoundsError push_dynamic_edge!(overlay, 0, 2, 1, 0x01, 1)
+    @test_throws BoundsError push_dynamic_edge!(overlay, 1, 5, 1, 0x01, 1)
+    @test_throws BoundsError push_dynamic_edge!(overlay, 1, 2, 4, 0x01, 1)
+    @test_throws ArgumentError push_dynamic_edge!(overlay, 1, 2, 1, 0x03, 1)
+    @test_throws ArgumentError push_dynamic_edge!(overlay, 1, 2, 1, 0x100, 1)
+    @test_throws ArgumentError push_dynamic_edge!(overlay, 1, 2, 1, 0x01, 0)
+
+    tiny = DynamicSourceMajorOverlay(2, 1, 1)
+    begin_dynamic_overlay!(tiny)
+    push_dynamic_edge!(tiny, 1, 2, 1, 0x01, 1)
+    overflow = try
+        push_dynamic_edge!(tiny, 1, 2, 1, 0x02, 2)
+        nothing
+    catch error
+        error
+    end
+    @test overflow isa ArenaOverflowError
+    @test overflow.kind == OVERFLOW_DYNAMIC_CAPACITY
+
+    duplicate = DynamicSourceMajorOverlay(2, 1, 2)
+    begin_dynamic_overlay!(duplicate)
+    push_dynamic_edge!(duplicate, 1, 2, 1, 0x01, 1)
+    push_dynamic_edge!(duplicate, 1, 2, 1, 0x01, 2)
+    @test_throws ArgumentError seal_dynamic_overlay!(duplicate)
+end
+
+function prepare_typed_overlay!(overlay)
+    begin_dynamic_overlay!(overlay)
+    push_dynamic_edge!(overlay, 3, 4, 1, 0x02, 3)
+    push_dynamic_edge!(overlay, 1, 3, 1, 0x01, 1)
+    push_dynamic_edge!(overlay, 2, 3, 1, 0x02, 2)
+    seal_dynamic_overlay!(overlay)
+    return overlay
+end
+
+function run_typed_overlay!(arena, fixed, overlay, adapter)
+    prepare_typed_overlay!(overlay)
+    begin_candidate!(arena)
+    seed_event!(arena, 3, 0x02) # plateau is off -> GABA
+    seed_event!(arena, 1, 0x01) # soma -> AMPA
+    seed_event!(arena, 2, 0x02) # plateau is on -> NMDA
+    return run_event_waves!(
+        arena,
+        fixed,
+        overlay,
+        adapter;
+        max_waves=1,
+    )
+end
+
+@testset "typed static+dynamic delivery shares one Jacobi wave" begin
+    fixed = graph(
+        4,
+        UInt32[1, 2, 2, 2, 2],
+        UInt16[3];
+        channel=UInt8[1],
+        trigger=UInt8[0x01],
+        weight=Float32[0.5],
+        inbox_dim=3,
+    )
+    overlay = DynamicSourceMajorOverlay(4, 3, 4)
+    arena = EventArena(4, 3, 3, Float32)
+    # Current source state/packet stand-ins.
+    arena.base_state[1, 1] = 2.0f0
+    arena.base_state[2, 3] = 1.0f0
+    arena.base_state[3, 3] = 0.0f0
+    adapter = TypedDeliveryAdapter{Float32,NTuple{3,Float32}}((3.0f0, 4.0f0, 5.0f0))
+
+    @test_throws ArgumentError run_event_waves!(
+        begin_candidate!(arena),
+        fixed,
+        overlay,
+        adapter;
+        max_waves=1,
+    )
+
+    report = run_typed_overlay!(arena, fixed, overlay, adapter)
+    # Node 3: static typed AMPA 0.5*2 + dynamic soma AMPA 3*2,
+    # and plateau-on dynamic NMDA 4. Node 4 receives plateau-off GABA 5.
+    @test candidate_state(arena, 3, 1) == 7.0f0
+    @test candidate_state(arena, 3, 2) == 4.0f0
+    @test candidate_state(arena, 3, 3) == 0.0f0
+    @test candidate_state(arena, 4, 1) == 0.0f0
+    @test candidate_state(arena, 4, 2) == 0.0f0
+    @test candidate_state(arena, 4, 3) == 5.0f0
+    @test report.waves_executed == 1
+    @test report.scanned_edges == 4
+    @test report.delivered_edges == 4
+    @test report.destination_updates == 2
+    @test report.terminated_empty
+
+    # The complete builder + mixed delivery hot path is allocation-free.
+    run_typed_overlay!(arena, fixed, overlay, adapter)
+    @test @allocated(run_typed_overlay!(arena, fixed, overlay, adapter)) == 0
 end
 
 @testset "generation-stamped COW state" begin

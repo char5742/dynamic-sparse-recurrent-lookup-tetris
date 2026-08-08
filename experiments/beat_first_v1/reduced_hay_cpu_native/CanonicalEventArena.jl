@@ -17,17 +17,23 @@ export CANONICAL_MAX_WAVES,
        OVERFLOW_NONE,
        OVERFLOW_ACTIVE_CAPACITY,
        OVERFLOW_FRONTIER_CAPACITY,
+       OVERFLOW_DYNAMIC_CAPACITY,
        SourceMajorAdjacency,
+       DynamicSourceMajorOverlay,
        EventArena,
        EventWaveReport,
        ArenaOverflowError,
        edge_count,
+       begin_dynamic_overlay!,
+       push_dynamic_edge!,
+       seal_dynamic_overlay!,
        active_count,
        state_slot,
        candidate_state,
        begin_candidate!,
        touch_node!,
        seed_event!,
+       deliver_event_edge!,
        advance_event_cell!,
        run_event_waves!
 
@@ -40,6 +46,7 @@ const OVERFLOW_FALLBACK = UInt8(2)
 const OVERFLOW_NONE = UInt8(0)
 const OVERFLOW_ACTIVE_CAPACITY = UInt8(1)
 const OVERFLOW_FRONTIER_CAPACITY = UInt8(2)
+const OVERFLOW_DYNAMIC_CAPACITY = UInt8(3)
 
 """Immutable source-major hot adjacency copied out of construction buffers."""
 struct SourceMajorAdjacency{T<:AbstractFloat}
@@ -53,6 +60,122 @@ struct SourceMajorAdjacency{T<:AbstractFloat}
 end
 
 @inline edge_count(graph::SourceMajorAdjacency) = length(graph.destination)
+
+"""
+Fixed-capacity candidate-owned source-major overlay.
+
+Construction is allocation-free after the cold constructor. Edges may be
+pushed in any order. `seal_dynamic_overlay!` sorts the live prefix by
+`(source, destination, channel, trigger_bit, raw_index)` and builds one-based
+source offsets in place. A trigger is exactly one hard-event bit; interpreting
+that bit (including plateau onset versus offset) belongs to the delivery
+adapter, which can inspect the current source state.
+"""
+mutable struct DynamicSourceMajorOverlay
+    node_count::Int
+    inbox_dim::Int
+    capacity::Int
+    count::Int
+    sealed::Bool
+    offsets::Vector{UInt32}
+    source::Vector{UInt16}
+    destination::Vector{UInt16}
+    channel::Vector{UInt8}
+    trigger_bit::Vector{UInt8}
+    raw_index::Vector{UInt32}
+end
+
+function DynamicSourceMajorOverlay(
+    node_count::Integer,
+    inbox_dim::Integer,
+    capacity::Integer,
+)
+    nodes = _checked_positive(node_count, "node_count")
+    inputs = _checked_positive(inbox_dim, "inbox_dim")
+    edges = _checked_positive(capacity, "dynamic edge capacity")
+    nodes <= typemax(UInt16) || throw(ArgumentError(
+        "node_count exceeds UInt16 overlay identity capacity",
+    ))
+    return DynamicSourceMajorOverlay(
+        nodes,
+        inputs,
+        edges,
+        0,
+        false,
+        zeros(UInt32, nodes + 1),
+        zeros(UInt16, edges),
+        zeros(UInt16, edges),
+        zeros(UInt8, edges),
+        zeros(UInt8, edges),
+        zeros(UInt32, edges),
+    )
+end
+
+@inline edge_count(overlay::DynamicSourceMajorOverlay) = overlay.count
+
+"""Discard the prior live prefix without clearing fixed storage."""
+function begin_dynamic_overlay!(overlay::DynamicSourceMajorOverlay)
+    overlay.count = 0
+    overlay.sealed = false
+    return overlay
+end
+
+@inline function _single_event_bit(value::UInt8)
+    return !iszero(value) && iszero(value & (value - UInt8(1)))
+end
+
+"""Append one candidate contact to fixed staging storage."""
+function push_dynamic_edge!(
+    overlay::DynamicSourceMajorOverlay,
+    source::Integer,
+    destination::Integer,
+    channel::Integer,
+    trigger_bit::Integer,
+    raw_index::Integer,
+)
+    overlay.sealed && throw(ArgumentError(
+        "begin_dynamic_overlay! must be called before pushing a sealed overlay",
+    ))
+    physical_source = Int(source)
+    physical_destination = Int(destination)
+    physical_channel = Int(channel)
+    trigger_value = Int(trigger_bit)
+    physical_raw = Int(raw_index)
+    1 <= physical_source <= overlay.node_count || throw(BoundsError(
+        1:overlay.node_count, physical_source,
+    ))
+    1 <= physical_destination <= overlay.node_count || throw(BoundsError(
+        1:overlay.node_count, physical_destination,
+    ))
+    1 <= physical_channel <= overlay.inbox_dim || throw(BoundsError(
+        1:overlay.inbox_dim, physical_channel,
+    ))
+    1 <= trigger_value <= typemax(UInt8) || throw(ArgumentError(
+        "dynamic trigger must fit UInt8",
+    ))
+    physical_trigger = UInt8(trigger_value)
+    _single_event_bit(physical_trigger) || throw(ArgumentError(
+        "dynamic trigger must contain exactly one hard-event bit",
+    ))
+    1 <= physical_raw <= typemax(UInt32) || throw(ArgumentError(
+        "dynamic raw parameter index must be positive and fit UInt32",
+    ))
+    requested = overlay.count + 1
+    requested <= overlay.capacity || throw(ArenaOverflowError(
+        OVERFLOW_DYNAMIC_CAPACITY,
+        overlay.capacity,
+        requested,
+    ))
+    @inbounds begin
+        overlay.source[requested] = UInt16(physical_source)
+        overlay.destination[requested] = UInt16(physical_destination)
+        overlay.channel[requested] = UInt8(physical_channel)
+        overlay.trigger_bit[requested] = physical_trigger
+        overlay.raw_index[requested] = UInt32(physical_raw)
+    end
+    overlay.count = requested
+    return requested
+end
 
 @inline function _checked_positive(value::Integer, label::AbstractString)
     physical = Int(value)
@@ -167,6 +290,7 @@ end
 function Base.showerror(io::IO, error::ArenaOverflowError)
     label = error.kind == OVERFLOW_ACTIVE_CAPACITY ? "active COW" :
             error.kind == OVERFLOW_FRONTIER_CAPACITY ? "frontier" :
+            error.kind == OVERFLOW_DYNAMIC_CAPACITY ? "dynamic overlay" :
             "unknown"
     print(
         io,
@@ -443,6 +567,105 @@ end
     return nothing
 end
 
+@inline function _dynamic_key_less(
+    overlay::DynamicSourceMajorOverlay,
+    left::Int,
+    right::Int,
+)
+    @inbounds begin
+        left_source = overlay.source[left]
+        right_source = overlay.source[right]
+        left_source != right_source && return left_source < right_source
+        left_destination = overlay.destination[left]
+        right_destination = overlay.destination[right]
+        left_destination != right_destination &&
+            return left_destination < right_destination
+        left_channel = overlay.channel[left]
+        right_channel = overlay.channel[right]
+        left_channel != right_channel && return left_channel < right_channel
+        left_trigger = overlay.trigger_bit[left]
+        right_trigger = overlay.trigger_bit[right]
+        left_trigger != right_trigger && return left_trigger < right_trigger
+        return overlay.raw_index[left] < overlay.raw_index[right]
+    end
+end
+
+@inline function _swap_dynamic!(
+    overlay::DynamicSourceMajorOverlay,
+    left::Int,
+    right::Int,
+)
+    _swap!(overlay.source, left, right)
+    _swap!(overlay.destination, left, right)
+    _swap!(overlay.channel, left, right)
+    _swap!(overlay.trigger_bit, left, right)
+    _swap!(overlay.raw_index, left, right)
+    return nothing
+end
+
+@inline function _sift_dynamic_down!(
+    overlay::DynamicSourceMajorOverlay,
+    root::Int,
+    count::Int,
+)
+    current = root
+    while 2 * current <= count
+        child = 2 * current
+        if child < count && _dynamic_key_less(overlay, child, child + 1)
+            child += 1
+        end
+        !_dynamic_key_less(overlay, current, child) && break
+        _swap_dynamic!(overlay, current, child)
+        current = child
+    end
+    return nothing
+end
+
+function _sort_dynamic_prefix!(overlay::DynamicSourceMajorOverlay)
+    count = overlay.count
+    @inbounds for root in div(count, 2):-1:1
+        _sift_dynamic_down!(overlay, root, count)
+    end
+    @inbounds for limit in count:-1:2
+        _swap_dynamic!(overlay, 1, limit)
+        _sift_dynamic_down!(overlay, 1, limit - 1)
+    end
+    return overlay
+end
+
+@inline function _same_dynamic_edge(
+    overlay::DynamicSourceMajorOverlay,
+    left::Int,
+    right::Int,
+)
+    @inbounds return overlay.source[left] == overlay.source[right] &&
+        overlay.destination[left] == overlay.destination[right] &&
+        overlay.channel[left] == overlay.channel[right] &&
+        overlay.trigger_bit[left] == overlay.trigger_bit[right]
+end
+
+"""Sort and seal the live overlay prefix without allocating."""
+function seal_dynamic_overlay!(overlay::DynamicSourceMajorOverlay)
+    overlay.sealed && return overlay
+    _sort_dynamic_prefix!(overlay)
+    @inbounds for edge in 2:overlay.count
+        _same_dynamic_edge(overlay, edge - 1, edge) && throw(ArgumentError(
+            "duplicate dynamic event contact",
+        ))
+    end
+    edge = 1
+    @inbounds for source in 1:overlay.node_count
+        overlay.offsets[source] = UInt32(edge)
+        while edge <= overlay.count && Int(overlay.source[edge]) == source
+            edge += 1
+        end
+    end
+    overlay.offsets[overlay.node_count + 1] = UInt32(overlay.count + 1)
+    edge == overlay.count + 1 || error("dynamic source-major seal lost an edge")
+    overlay.sealed = true
+    return overlay
+end
+
 @inline function _sift_down!(nodes, masks, root::Int, count::Int)
     current = root
     while 2 * current <= count
@@ -472,6 +695,36 @@ function _sort_prefix!(nodes, masks, count::Int)
 end
 
 """
+Per-edge delivery adapter protocol.
+
+The static method below preserves the diagnostic scalar graph contract. A
+canonical Reduced-Hay adapter specializes this function for both static and
+dynamic graph types, reads the refreshed source packet/current compartment
+state, and deposits a typed AMPA/NMDA/GABA payload. In particular, a plateau
+XOR bit is not itself an onset: the adapter must inspect the source's current
+plateau group to distinguish onset from offset.
+"""
+@inline function deliver_event_edge!(
+    adapter,
+    arena::EventArena{T},
+    graph::SourceMajorAdjacency{T},
+    source::Int,
+    source_mask::UInt8,
+    edge::Int,
+    destination::Int,
+    slot::Int,
+    wave::Int,
+) where {T<:AbstractFloat}
+    input = Int(@inbounds graph.channel[edge])
+    @inbounds arena.inbox[slot, input] += graph.weight[edge]
+    return nothing
+end
+
+# No generic DynamicSourceMajorOverlay method is provided deliberately. The
+# dynamic raw index has no scalar meaning inside the scheduler; a model-owned
+# typed adapter must define its delivery.
+
+"""
 Cell adapter protocol. The adapter must update `arena.state[slot, :]` from the
 fully accumulated `arena.inbox[slot, :]` and return a `UInt8` hard-event mask.
 Returning a `Bool` is accepted as the single-bit event convenience form.
@@ -498,6 +751,59 @@ end
     )
 end
 
+@inline function _dynamic_precedes_static(
+    overlay::DynamicSourceMajorOverlay,
+    dynamic_edge::Int,
+    graph::SourceMajorAdjacency,
+    static_edge::Int,
+)
+    @inbounds begin
+        dynamic_destination = overlay.destination[dynamic_edge]
+        static_destination = graph.destination[static_edge]
+        dynamic_destination != static_destination &&
+            return dynamic_destination < static_destination
+        dynamic_channel = overlay.channel[dynamic_edge]
+        static_channel = graph.channel[static_edge]
+        dynamic_channel != static_channel && return dynamic_channel < static_channel
+        dynamic_trigger = overlay.trigger_bit[dynamic_edge]
+        static_trigger = graph.trigger_mask[static_edge]
+        dynamic_trigger != static_trigger && return dynamic_trigger < static_trigger
+        # Static precedes dynamic on an equal logical delivery key. This makes
+        # the merged order independent of construction order.
+        return false
+    end
+end
+
+@inline function _touch_wave_destination!(
+    arena::EventArena{T},
+    destination::Int,
+) where {T<:AbstractFloat}
+    if @inbounds(arena.inbox_stamp[destination]) != arena.inbox_epoch
+        requested = arena.destination_count + 1
+        if requested > arena.frontier_capacity
+            _overflow!(
+                arena,
+                OVERFLOW_FRONTIER_CAPACITY,
+                arena.frontier_capacity,
+                requested,
+            )
+            return 0
+        end
+        slot = touch_node!(arena, destination)
+        iszero(slot) && return 0
+        @inbounds for input in 1:arena.inbox_dim
+            arena.inbox[slot, input] = zero(T)
+        end
+        @inbounds begin
+            arena.inbox_stamp[destination] = arena.inbox_epoch
+            arena.destination_nodes[requested] = UInt16(destination)
+        end
+        arena.destination_count = requested
+        return slot
+    end
+    return Int(@inbounds arena.node_slot[destination])
+end
+
 """
     run_event_waves!(arena, graph, adapter; max_waves=4)
 
@@ -516,6 +822,47 @@ function run_event_waves!(
     adapter;
     max_waves::Integer=CANONICAL_MAX_WAVES,
 ) where {T<:AbstractFloat}
+    return _run_event_waves!(
+        arena,
+        graph,
+        nothing,
+        adapter;
+        max_waves=max_waves,
+    )
+end
+
+function run_event_waves!(
+    arena::EventArena{T},
+    graph::SourceMajorAdjacency{T},
+    overlay::DynamicSourceMajorOverlay,
+    adapter;
+    max_waves::Integer=CANONICAL_MAX_WAVES,
+) where {T<:AbstractFloat}
+    overlay.sealed || throw(ArgumentError(
+        "seal_dynamic_overlay! must run before event execution",
+    ))
+    overlay.node_count == arena.node_count || throw(DimensionMismatch(
+        "arena and dynamic overlay node counts differ",
+    ))
+    overlay.inbox_dim == arena.inbox_dim || throw(DimensionMismatch(
+        "arena and dynamic overlay inbox dimensions differ",
+    ))
+    return _run_event_waves!(
+        arena,
+        graph,
+        overlay,
+        adapter;
+        max_waves=max_waves,
+    )
+end
+
+function _run_event_waves!(
+    arena::EventArena{T},
+    graph::SourceMajorAdjacency{T},
+    overlay::O,
+    adapter;
+    max_waves::Integer=CANONICAL_MAX_WAVES,
+) where {T<:AbstractFloat,O<:Union{Nothing,DynamicSourceMajorOverlay}}
     graph.node_count == arena.node_count || throw(DimensionMismatch(
         "arena and graph node counts differ",
     ))
@@ -550,60 +897,73 @@ function run_event_waves!(
             source = Int(arena.current_nodes[source_index])
             source_mask = arena.current_masks[source_index]
             visited_sources += 1
-            first_edge = Int(graph.offsets[source])
-            limit = Int(graph.offsets[source + 1]) - 1
-            for edge in first_edge:limit
+            static_edge = Int(graph.offsets[source])
+            static_limit = Int(graph.offsets[source + 1]) - 1
+            dynamic_edge = overlay === nothing ? 1 : Int(overlay.offsets[source])
+            dynamic_limit = overlay === nothing ? 0 :
+                Int(overlay.offsets[source + 1]) - 1
+            while static_edge <= static_limit || dynamic_edge <= dynamic_limit
+                use_dynamic = static_edge > static_limit ||
+                    (dynamic_edge <= dynamic_limit && _dynamic_precedes_static(
+                        overlay,
+                        dynamic_edge,
+                        graph,
+                        static_edge,
+                    ))
                 scanned_edges += 1
-                iszero(source_mask & graph.trigger_mask[edge]) && continue
-                delivered_edges += 1
-                destination = Int(graph.destination[edge])
-                if arena.inbox_stamp[destination] != arena.inbox_epoch
-                    requested = arena.destination_count + 1
-                    if requested > arena.frontier_capacity
-                        _overflow!(
-                            arena,
-                            OVERFLOW_FRONTIER_CAPACITY,
-                            arena.frontier_capacity,
-                            requested,
-                        )
-                        return EventWaveReport(
-                            waves_executed,
-                            visited_sources,
-                            scanned_edges,
-                            delivered_edges,
-                            destination_updates,
-                            emitted_events,
-                            false,
-                            false,
-                            true,
-                            arena.overflow_kind,
-                        )
-                    end
-                    slot = touch_node!(arena, destination)
-                    if slot == 0
-                        return EventWaveReport(
-                            waves_executed,
-                            visited_sources,
-                            scanned_edges,
-                            delivered_edges,
-                            destination_updates,
-                            emitted_events,
-                            false,
-                            false,
-                            true,
-                            arena.overflow_kind,
-                        )
-                    end
-                    for input in 1:arena.inbox_dim
-                        arena.inbox[slot, input] = zero(T)
-                    end
-                    arena.inbox_stamp[destination] = arena.inbox_epoch
-                    arena.destination_nodes[requested] = UInt16(destination)
-                    arena.destination_count = requested
+                trigger = use_dynamic ?
+                    @inbounds(overlay.trigger_bit[dynamic_edge]) :
+                    @inbounds(graph.trigger_mask[static_edge])
+                if iszero(source_mask & trigger)
+                    use_dynamic ? (dynamic_edge += 1) : (static_edge += 1)
+                    continue
                 end
-                slot = Int(arena.node_slot[destination])
-                input = Int(graph.channel[edge])
-                arena.inbox[slot, input] += graph.weight[edge]
+                delivered_edges += 1
+                destination = Int(use_dynamic ?
+                    @inbounds(overlay.destination[dynamic_edge]) :
+                    @inbounds(graph.destination[static_edge]))
+                slot = _touch_wave_destination!(arena, destination)
+                if iszero(slot)
+                    return EventWaveReport(
+                        waves_executed,
+                        visited_sources,
+                        scanned_edges,
+                        delivered_edges,
+                        destination_updates,
+                        emitted_events,
+                        false,
+                        false,
+                        true,
+                        arena.overflow_kind,
+                    )
+                end
+                if use_dynamic
+                    deliver_event_edge!(
+                        adapter,
+                        arena,
+                        overlay,
+                        source,
+                        source_mask,
+                        dynamic_edge,
+                        destination,
+                        slot,
+                        wave,
+                    )
+                    dynamic_edge += 1
+                else
+                    deliver_event_edge!(
+                        adapter,
+                        arena,
+                        graph,
+                        source,
+                        source_mask,
+                        static_edge,
+                        destination,
+                        slot,
+                        wave,
+                    )
+                    static_edge += 1
+                end
             end
         end
 
