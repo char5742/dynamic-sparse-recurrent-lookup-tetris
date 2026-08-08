@@ -779,20 +779,20 @@ function cell_step!(
 end
 
 function _cell_step_pullback!(
-    dstate::AbstractVector{T},
-    dinput::AbstractVector{T},
-    draw::AbstractVector{T},
+    dstate::AbstractVector{S},
+    dinput::AbstractVector{S},
+    draw::AbstractVector{S},
     state::AbstractVector{T},
     input::AbstractVector{T},
     cache::CellParameterCache{T},
     derivative_cache::CellParameterDerivativeCache{T},
     next_state::AbstractVector{T},
-    dnext::AbstractVector{T},
-    event_cotangent::T,
+    dnext::AbstractVector{S},
+    event_cotangent::S,
     spike_smoothing::T,
-    direct_margin_cotangent::T,
+    direct_margin_cotangent::S,
     propagate_downstream_event_surrogate::Bool,
-) where {T<:AbstractFloat}
+) where {T<:AbstractFloat,S<:Number}
     length(dstate) == STATE_DIM || throw(DimensionMismatch("expected $STATE_DIM state cotangents"))
     length(dinput) == INPUT_DIM || throw(DimensionMismatch("expected $INPUT_DIM input cotangents"))
     length(draw) == PARAM_DIM || throw(DimensionMismatch("expected $PARAM_DIM parameter cotangents"))
@@ -804,9 +804,9 @@ function _cell_step_pullback!(
         "spike smoothing must be in [0, 1]",
     ))
 
-    fill!(dstate, zero(T))
-    fill!(dinput, zero(T))
-    fill!(draw, zero(T))
+    fill!(dstate, zero(S))
+    fill!(dinput, zero(S))
+    fill!(draw, zero(S))
 
     @inbounds begin
         basal_signal = zero(T)
@@ -1115,7 +1115,7 @@ function _cell_step_pullback!(
 
         for raw_role in 1:N_BASAL
             jacobian_base = (raw_role - 1) * N_BASAL
-            value = zero(T)
+            value = zero(S)
             for output_role in 1:N_BASAL
                 value = muladd(
                     role_gradient[output_role],
@@ -1194,6 +1194,51 @@ function cell_step_conditional_pullback!(
     spike_smoothing::T=zero(T),
     direct_margin_cotangent::T=zero(T),
 ) where {T<:AbstractFloat}
+    return _cell_step_pullback!(
+        dstate,
+        dinput,
+        draw,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        dnext,
+        event_cotangent,
+        spike_smoothing,
+        direct_margin_cotangent,
+        false,
+    )
+end
+
+"""
+    cell_step_conditional_pullback_mixed!(...)
+
+Conditional one-step reverse with primal coordinates of type `T` and an
+independent numeric cotangent type `S`.  The canonical hard-control replay
+uses `Complex{T}` cotangents: the real lane carries the ordinary local third
+factor and the imaginary lane carries only source-event control credit.  Both
+lanes therefore share one traversal of the primal cell equations while their
+returned state, input, and raw-parameter cotangents remain exactly separable.
+
+This is an internal production primitive.  It does not make hard thresholds
+exact; `event_cotangent` still receives the same bounded soma-margin
+surrogate as `cell_step_conditional_pullback!`.
+"""
+function cell_step_conditional_pullback_mixed!(
+    dstate::AbstractVector{S},
+    dinput::AbstractVector{S},
+    draw::AbstractVector{S},
+    state::AbstractVector{T},
+    input::AbstractVector{T},
+    cache::CellParameterCache{T},
+    derivative_cache::CellParameterDerivativeCache{T},
+    next_state::AbstractVector{T},
+    dnext::AbstractVector{S},
+    event_cotangent::S=zero(S),
+    spike_smoothing::T=zero(T),
+    direct_margin_cotangent::S=zero(S),
+) where {T<:AbstractFloat,S<:Number}
     return _cell_step_pullback!(
         dstate,
         dinput,

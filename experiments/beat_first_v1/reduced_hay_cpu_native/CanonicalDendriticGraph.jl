@@ -22,11 +22,15 @@ const Local = CanonicalLocalLearning
 
 export CORE_NODE_COUNT,
        TOTAL_NODE_COUNT,
+       MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE,
        GraphConfig,
        ModelParameters,
        ModelCache,
        ModelState,
        ModelGradient,
+       ModelHardEventGradient,
+       ModelHardEventSeedRecord,
+       ModelHardEventDelta,
        ModelWorker,
        ModelForwardStats,
        TrajectorySignature,
@@ -58,6 +62,22 @@ export CORE_NODE_COUNT,
        initialize_local_signal_maps,
        initialize_local_learner,
        begin_local_microbatch!,
+       hard_event_gradient,
+       hard_event_delivery_gradient,
+       clear_hard_event_gradient!,
+       hard_gradient_components,
+       initialize_hard_event_delta,
+       clear_hard_event_delta!,
+       publish_hard_event_delta!,
+       hard_event_seed_count,
+       hard_event_seed_record,
+       hard_event_delta_sealed,
+       hard_event_delta_candidate_range,
+       accumulate_common_hard_event_seeds!,
+       load_common_hard_event_seeds!,
+       common_hard_event_seed_loaded,
+       common_hard_event_seed_consumed,
+       common_hard_event_seed_poisoned,
        local_plasticity_observation,
        local_replay_candidate!,
        local_replay_state_common!,
@@ -131,6 +151,8 @@ const DYNAMIC_MOTIF_EVENT_COUNT =
 const DYNAMIC_MOTIF_EVENT_EDGE_CAPACITY =
     DYNAMIC_MOTIF_EVENT_COUNT * Axon.EVENT_DIM
 const EVENT_KIND_PARAMETER_COUNT = Axon.EVENT_DIM
+const MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE =
+    DYNAMIC_MOTIF_EVENT_EDGE_CAPACITY # 80 dynamic contacts × five typed lanes
 
 """Checkpoint-stable anatomical identity of one live dynamic event contact."""
 struct DynamicEventContactDescriptor
@@ -248,6 +270,100 @@ struct ModelGradient
     output::Output.OutputPopulationGradient{Float32}
 end
 
+"""
+Gradient lane owned exclusively by hard-event source control.
+
+The ordinary analog clock owns its receiver contact/kind derivatives in
+`ModelGradient.event_raw`. Independently, the hard clock owns both the direct
+continuation derivative of every evaluated delivery and the returned scalar
+source-control advantage. The source cell-local surrogate may differentiate
+that transition's own sealed semantic/event input parameters, but never
+propagates a state or packet cotangent into another cell. The three recurrent
+parameter groups remain separate from the analog gradient while sharing no
+dense eligibility matrix.
+"""
+struct ModelHardEventGradient
+    core_cell_raw::Matrix{Float32}
+    semantic_projection_raw::Array{Float32,4}
+    event_raw::Vector{Float32}
+end
+
+function clear_hard_event_gradient!(gradient::ModelHardEventGradient)
+    fill!(gradient.core_cell_raw, 0.0f0)
+    fill!(gradient.semantic_projection_raw, 0.0f0)
+    fill!(gradient.event_raw, 0.0f0)
+    return gradient
+end
+
+hard_gradient_components(gradient::ModelHardEventGradient) = (
+    core_cell_raw=gradient.core_cell_raw,
+    semantic_projection_raw=gradient.semantic_projection_raw,
+    event_raw=gradient.event_raw,
+)
+
+"""One actual candidate delivery whose source is finalized state-common."""
+struct ModelHardEventSeedRecord
+    state_id::UInt16
+    candidate_ordinal::Int32
+    delivery_ordinal::UInt32
+    source_node::UInt16
+    lane::UInt8
+    advantage::Float32
+end
+
+"""
+Fixed-capacity publication slot for one deterministic candidate replay range.
+
+The recurrent hard gradient is reduced independently from the ordinary analog
+gradient. `seed_*` contains one record for every actual candidate delivery
+whose source record is `COMMON_SOURCE_RECORD`, including a zero advantage.
+Records are published in logical-candidate then physical-delivery order.
+`sealed` is written last, after the gradient, ledger, model digest, payload
+digests, and logical range are complete. Both compact advantages and all three
+hard-gradient groups are covered by the sealed payload digests.
+"""
+mutable struct ModelHardEventDelta
+    gradient::ModelHardEventGradient
+    seed_state_id::Vector{UInt16}
+    seed_candidate_ordinal::Vector{Int32}
+    seed_delivery_ordinal::Vector{UInt32}
+    seed_source_node::Vector{UInt16}
+    seed_lane::Vector{UInt8}
+    seed_advantage::Vector{Float32}
+    seed_count::Int
+    parameter_digest::UInt64
+    logical_first::Int32
+    logical_last::Int32
+    seed_identity_digest::UInt64
+    hard_gradient_digest::UInt64
+    sealed::Bool
+    reduced::Bool
+end
+
+@inline hard_event_seed_count(delta::ModelHardEventDelta) = delta.seed_count
+@inline hard_event_delta_sealed(delta::ModelHardEventDelta) = delta.sealed
+@inline hard_event_delta_candidate_range(delta::ModelHardEventDelta) = (
+    Int(delta.logical_first),
+    Int(delta.logical_last),
+)
+hard_event_gradient(delta::ModelHardEventDelta) = delta.gradient
+
+@inline function hard_event_seed_record(
+    delta::ModelHardEventDelta,
+    index::Integer,
+)
+    slot = Int(index)
+    1 <= slot <= delta.seed_count || throw(BoundsError(delta, slot))
+    return @inbounds ModelHardEventSeedRecord(
+        delta.seed_state_id[slot],
+        delta.seed_candidate_ordinal[slot],
+        delta.seed_delivery_ordinal[slot],
+        delta.seed_source_node[slot],
+        delta.seed_lane[slot],
+        delta.seed_advantage[slot],
+    )
+end
+
 gradient_components(gradient::ModelGradient) = (
     core_cell_raw=gradient.core_cell_raw,
     semantic_projection_raw=gradient.semantic_projection_raw,
@@ -318,9 +434,18 @@ mutable struct LocalReplayCounters
     event_receiver_updates::Int
     utility_updates::Int
     output_replays::Int
+    event_control_deliveries::Int
+    event_control_source_transitions::Int
+    event_control_soma_sources::Int
+    event_control_plateau_sources::Int
+    event_control_common_seeds::Int
+    event_control_semantic_updates::Int
+    event_control_event_parameter_updates::Int
 end
 
-LocalReplayCounters() = LocalReplayCounters(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+LocalReplayCounters() = LocalReplayCounters(
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+)
 
 """
 Fixed publication payload for the most recently replayed logical world.
@@ -349,6 +474,13 @@ struct LocalReplayReport
     event_receiver_updates::Int
     utility_updates::Int
     output_replays::Int
+    event_control_deliveries::Int
+    event_control_source_transitions::Int
+    event_control_soma_sources::Int
+    event_control_plateau_sources::Int
+    event_control_common_seeds::Int
+    event_control_semantic_updates::Int
+    event_control_event_parameter_updates::Int
 end
 
 mutable struct ModelLocalLearner
@@ -357,6 +489,37 @@ mutable struct ModelLocalLearner
     scratch::Local.ContractedAdjointScratch{Float32}
     continuous_signal::Vector{Float32}
     packet_signal::Vector{Float32}
+    fused_arena::Local.FusedContractedAdjointArena{Float32}
+    fused_scratch::Local.FusedContractedAdjointScratch{Float32}
+    continuous_signal_by_node::Matrix{Float32}
+    packet_signal_by_node::Matrix{Float32}
+    receiver_input_cotangent::Matrix{Float32}
+    logical_record::Vector{Bool}
+    source_event_advantage::Matrix{Float32}
+    event_delivery_advantage::Vector{Float32}
+    source_delivery_next::Vector{Int32}
+    source_delivery_head_by_record::Vector{Int32}
+    source_delivery_tail_by_record::Vector{Int32}
+    event_delivery_ready::Vector{Bool}
+    common_source_event_advantage::Matrix{Float32}
+    common_source_seed_loaded::Bool
+    common_source_seed_consumed::Bool
+    common_source_seed_in_progress::Bool
+    common_source_seed_state_id::UInt16
+    hard_seed_state_id::Vector{UInt16}
+    hard_seed_candidate_ordinal::Vector{Int32}
+    hard_seed_delivery_ordinal::Vector{UInt32}
+    hard_seed_source_node::Vector{UInt16}
+    hard_seed_lane::Vector{UInt8}
+    hard_seed_advantage::Vector{Float32}
+    hard_seed_count::Int
+    hard_expected_seed_count::Int
+    hard_seed_identity_digest::UInt64
+    first_hard_candidate_ordinal::Int32
+    last_hard_candidate_ordinal::Int32
+    hard_parameter_digest::UInt64
+    hard_gradient::ModelHardEventGradient
+    delivery_event_gradient::Vector{Float32}
     plasticity::LocalPlasticityObservation
     counters::LocalReplayCounters
 end
@@ -829,6 +992,15 @@ function _core_event_edge_count(topology::Topology.OrderedTopology)
     return count
 end
 
+@inline function _event_delivery_capacity(model::CanonicalModel)
+    return max(
+        1,
+        (_core_event_edge_count(model.topology) * Axon.EVENT_DIM +
+         DYNAMIC_MOTIF_EVENT_EDGE_CAPACITY) *
+        max(1, model.config.max_event_waves),
+    )
+end
+
 function _build_event_graph(
     topology::Topology.OrderedTopology,
     event_weight::AbstractVector{Float32},
@@ -1056,6 +1228,60 @@ end
 
 initialize_gradient(::CanonicalModel) = _gradient()
 
+function _hard_event_gradient(model::CanonicalModel)
+    return ModelHardEventGradient(
+        zeros(Float32, Cell.PARAM_DIM, CORE_NODE_COUNT),
+        zeros(Float32, size(model.parameters.semantic_projection_raw)),
+        zeros(Float32, length(model.parameters.event_raw)),
+    )
+end
+
+"""
+Allocate one fixed hard-event publication slot.
+
+The default compact capacity covers exactly one candidate. A replay chunk must
+pass `candidate_chunk_size * MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE`.
+"""
+function initialize_hard_event_delta(
+    model::CanonicalModel,
+    seed_capacity::Integer=MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE,
+)
+    capacity = Int(seed_capacity)
+    capacity >= 1 || throw(ArgumentError(
+        "hard-event delta seed capacity must be positive",
+    ))
+    return ModelHardEventDelta(
+        _hard_event_gradient(model),
+        zeros(UInt16, capacity),
+        zeros(Int32, capacity),
+        zeros(UInt32, capacity),
+        zeros(UInt16, capacity),
+        zeros(UInt8, capacity),
+        zeros(Float32, capacity),
+        0,
+        UInt64(0),
+        Int32(0),
+        Int32(0),
+        UInt64(0xcbf29ce484222325),
+        UInt64(0xcbf29ce484222325),
+        false,
+        false,
+    )
+end
+
+function clear_hard_event_delta!(delta::ModelHardEventDelta)
+    clear_hard_event_gradient!(delta.gradient)
+    delta.seed_count = 0
+    delta.parameter_digest = UInt64(0)
+    delta.logical_first = Int32(0)
+    delta.logical_last = Int32(0)
+    delta.seed_identity_digest = UInt64(0xcbf29ce484222325)
+    delta.hard_gradient_digest = UInt64(0xcbf29ce484222325)
+    delta.sealed = false
+    delta.reduced = false
+    return delta
+end
+
 function initialize_worker(model::CanonicalModel)
     config = model.config
     arena = Events.EventArena(
@@ -1107,12 +1333,7 @@ function initialize_worker(model::CanonicalModel)
         ReplayProvenance(
             config.tape_capacity,
             CORE_NODE_COUNT * Cell.N_BASAL,
-            max(
-                1,
-                (_core_event_edge_count(model.topology) * Axon.EVENT_DIM +
-                 DYNAMIC_MOTIF_EVENT_EDGE_CAPACITY) *
-                max(1, config.max_event_waves),
-            ),
+            _event_delivery_capacity(model),
             Output.OUTPUT_CELLS * Output.MAX_EVIDENCE,
         ),
         _gradient(),
@@ -1164,9 +1385,6 @@ function initialize_local_signal_maps(
     config.predictor_dim == 0 || throw(ArgumentError(
         "canonical local replay requires predictor_dim == 0",
     ))
-    iszero(config.hard_event_multiplier) || throw(ArgumentError(
-        "hard-event control is disconnected; hard_event_multiplier must be zero",
-    ))
     config.utility_mode in (:combined, :none) || throw(ArgumentError(
         "factorized two-block replay supports utility_mode=:combined or :none",
     ))
@@ -1206,9 +1424,17 @@ function initialize_local_signal_maps(
     return ModelLocalSignalMaps(config, continuous, packet)
 end
 
+"""
+Allocate the graph-local learner and its fixed hard-event sidecar.
+
+`hard_event_seed_capacity` defaults to one candidate. Multi-candidate chunks
+must reserve `chunk_size * MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE`.
+"""
 function initialize_local_learner(
     model::CanonicalModel,
     signals::ModelLocalSignalMaps,
+    ; hard_event_seed_capacity::Integer=
+        MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE,
 )
     length(signals.continuous) == CORE_NODE_COUNT || throw(DimensionMismatch(
         "continuous local-map population does not match the graph",
@@ -1216,12 +1442,48 @@ function initialize_local_learner(
     length(signals.packet) == CORE_NODE_COUNT || throw(DimensionMismatch(
         "packet local-map population does not match the graph",
     ))
+    seed_capacity = Int(hard_event_seed_capacity)
+    seed_capacity >= 1 || throw(ArgumentError(
+        "hard-event learner seed capacity must be positive",
+    ))
+    delivery_capacity = _event_delivery_capacity(model)
     return ModelLocalLearner(
         signals,
         Local.ContractedAdjointArena(CORE_NODE_COUNT; T=Float32),
         Local.ContractedAdjointScratch(; T=Float32),
         zeros(Float32, Local.LOCAL_OBSERVATION_DIM),
         zeros(Float32, Axon.PACKET_DIM),
+        Local.FusedContractedAdjointArena(CORE_NODE_COUNT; T=Float32),
+        Local.FusedContractedAdjointScratch(; T=Float32),
+        zeros(Float32, Local.LOCAL_OBSERVATION_DIM, CORE_NODE_COUNT),
+        zeros(Float32, Axon.PACKET_DIM, CORE_NODE_COUNT),
+        zeros(Float32, Cell.INPUT_DIM, model.config.tape_capacity),
+        fill(false, model.config.tape_capacity),
+        zeros(Float32, Axon.EVENT_DIM, model.config.tape_capacity),
+        zeros(Float32, delivery_capacity),
+        zeros(Int32, delivery_capacity),
+        zeros(Int32, model.config.tape_capacity),
+        zeros(Int32, model.config.tape_capacity),
+        fill(false, delivery_capacity),
+        zeros(Float32, Axon.EVENT_DIM, CORE_NODE_COUNT),
+        false,
+        false,
+        false,
+        UInt16(0),
+        zeros(UInt16, seed_capacity),
+        zeros(Int32, seed_capacity),
+        zeros(UInt32, seed_capacity),
+        zeros(UInt16, seed_capacity),
+        zeros(UInt8, seed_capacity),
+        zeros(Float32, seed_capacity),
+        0,
+        0,
+        UInt64(0xcbf29ce484222325),
+        Int32(0),
+        Int32(0),
+        UInt64(0),
+        _hard_event_gradient(model),
+        zeros(Float32, length(model.parameters.event_raw)),
         LocalPlasticityObservation(
             zeros(UInt8, TOTAL_NODE_COUNT),
             zeros(UInt8, TOTAL_NODE_COUNT),
@@ -1241,6 +1503,9 @@ function initialize_local_learner(
 end
 
 local_plasticity_observation(learner::ModelLocalLearner) = learner.plasticity
+hard_event_gradient(learner::ModelLocalLearner) = learner.hard_gradient
+hard_event_delivery_gradient(learner::ModelLocalLearner) =
+    learner.delivery_event_gradient
 
 function _reset_local_plasticity!(learner::ModelLocalLearner)
     observation = learner.plasticity
@@ -1265,8 +1530,423 @@ function begin_local_microbatch!(learner::ModelLocalLearner)
     counters.event_receiver_updates = 0
     counters.utility_updates = 0
     counters.output_replays = 0
+    counters.event_control_deliveries = 0
+    counters.event_control_source_transitions = 0
+    counters.event_control_soma_sources = 0
+    counters.event_control_plateau_sources = 0
+    counters.event_control_common_seeds = 0
+    counters.event_control_semantic_updates = 0
+    counters.event_control_event_parameter_updates = 0
     Local.reset_adjoint_arena!(learner.arena)
+    Local.reset_adjoint_arena!(learner.fused_arena)
+    fill!(learner.source_event_advantage, 0.0f0)
+    fill!(learner.common_source_event_advantage, 0.0f0)
+    learner.common_source_seed_loaded = false
+    learner.common_source_seed_consumed = false
+    learner.common_source_seed_in_progress = false
+    learner.common_source_seed_state_id = UInt16(0)
+    learner.hard_seed_count = 0
+    learner.hard_expected_seed_count = 0
+    learner.hard_seed_identity_digest = UInt64(0xcbf29ce484222325)
+    learner.first_hard_candidate_ordinal = Int32(0)
+    learner.last_hard_candidate_ordinal = Int32(0)
+    learner.hard_parameter_digest = UInt64(0)
+    clear_hard_event_gradient!(learner.hard_gradient)
+    fill!(learner.delivery_event_gradient, 0.0f0)
     _reset_local_plasticity!(learner)
+    return learner
+end
+
+@inline common_hard_event_seed_loaded(learner::ModelLocalLearner) =
+    learner.common_source_seed_loaded
+@inline common_hard_event_seed_consumed(learner::ModelLocalLearner) =
+    learner.common_source_seed_consumed
+@inline common_hard_event_seed_poisoned(learner::ModelLocalLearner) =
+    learner.common_source_seed_in_progress
+
+@inline function _bind_hard_parameter_digest!(
+    learner::ModelLocalLearner,
+    digest::UInt64,
+)
+    if iszero(learner.hard_parameter_digest)
+        learner.hard_parameter_digest = digest
+    else
+        learner.hard_parameter_digest == digest || throw(ArgumentError(
+            "hard-event microbatch crosses parameter snapshots",
+        ))
+    end
+    return nothing
+end
+
+@inline function _copy_hard_event_gradient!(
+    destination::ModelHardEventGradient,
+    source::ModelHardEventGradient,
+)
+    size(destination.core_cell_raw) == size(source.core_cell_raw) || throw(
+        DimensionMismatch("hard-event core gradient shape changed"),
+    )
+    size(destination.semantic_projection_raw) ==
+        size(source.semantic_projection_raw) || throw(DimensionMismatch(
+            "hard-event semantic gradient shape changed",
+        ))
+    length(destination.event_raw) == length(source.event_raw) || throw(
+        DimensionMismatch("hard-event parameter gradient shape changed"),
+    )
+    copyto!(destination.core_cell_raw, source.core_cell_raw)
+    copyto!(destination.semantic_projection_raw, source.semantic_projection_raw)
+    copyto!(destination.event_raw, source.event_raw)
+    return destination
+end
+
+@inline function _hard_seed_identity_digest(
+    hash::UInt64,
+    state_id::Int,
+    candidate::Int,
+    delivery::Int,
+    source::Int,
+    lane::Int,
+    advantage::Float32,
+)
+    hash = _mix_hash(hash, UInt64(state_id))
+    hash = _mix_hash(hash, UInt64(candidate))
+    hash = _mix_hash(hash, UInt64(delivery))
+    hash = _mix_hash(hash, UInt64(source))
+    hash = _mix_hash(hash, UInt64(lane))
+    return _mix_hash(hash, UInt64(reinterpret(UInt32, advantage)))
+end
+
+function _hard_gradient_payload_digest(gradient::ModelHardEventGradient)
+    hash = UInt64(0xcbf29ce484222325)
+    @inbounds for value in gradient.core_cell_raw
+        hash = _mix_hash(hash, UInt64(reinterpret(UInt32, value)))
+    end
+    @inbounds for value in gradient.semantic_projection_raw
+        hash = _mix_hash(hash, UInt64(reinterpret(UInt32, value)))
+    end
+    @inbounds for value in gradient.event_raw
+        hash = _mix_hash(hash, UInt64(reinterpret(UInt32, value)))
+    end
+    return hash
+end
+
+function _validate_learner_hard_seed_ledger!(
+    learner::ModelLocalLearner,
+    logical_first::Int,
+    logical_last::Int,
+)
+    count = learner.hard_seed_count
+    0 <= count <= length(learner.hard_seed_state_id) || error(
+        "hard-event learner seed count exceeds its fixed capacity",
+    )
+    count == learner.hard_expected_seed_count || error(
+        "hard-event learner seed count differs from evaluated sentinel coverage",
+    )
+    identity_digest = UInt64(0xcbf29ce484222325)
+    previous_candidate = 0
+    previous_state = 0
+    previous_delivery = 0
+    @inbounds for slot in 1:count
+        state_id = Int(learner.hard_seed_state_id[slot])
+        candidate = Int(learner.hard_seed_candidate_ordinal[slot])
+        delivery = Int(learner.hard_seed_delivery_ordinal[slot])
+        source = Int(learner.hard_seed_source_node[slot])
+        lane = Int(learner.hard_seed_lane[slot])
+        advantage = learner.hard_seed_advantage[slot]
+        state_id >= 1 || error("hard-event seed has no state identity")
+        logical_first <= candidate <= logical_last || error(
+            "hard-event seed candidate is outside its published logical range",
+        )
+        delivery >= 1 || error("hard-event seed has no physical delivery ordinal")
+        1 <= source <= CORE_NODE_COUNT || error(
+            "hard-event seed source is outside the core graph",
+        )
+        1 <= lane <= Axon.EVENT_DIM || error(
+            "hard-event seed lane is outside the typed event ABI",
+        )
+        isfinite(advantage) || error("hard-event seed advantage is not finite")
+        if candidate == previous_candidate
+            state_id == previous_state || error(
+                "one candidate hard-event ledger crosses state identities",
+            )
+            delivery > previous_delivery || error(
+                "hard-event records are not in physical delivery order",
+            )
+        else
+            candidate > previous_candidate || error(
+                "hard-event seed candidates are not strictly ordered",
+            )
+            previous_candidate = candidate
+            previous_state = state_id
+        end
+        previous_delivery = delivery
+        identity_digest = _hard_seed_identity_digest(
+            identity_digest,
+            state_id,
+            candidate,
+            delivery,
+            source,
+            lane,
+            advantage,
+        )
+    end
+    identity_digest == learner.hard_seed_identity_digest || error(
+        "hard-event learner seed identity digest changed",
+    )
+    return nothing
+end
+
+function publish_hard_event_delta!(
+    delta::ModelHardEventDelta,
+    learner::ModelLocalLearner,
+    model::CanonicalModel,
+    logical_first_candidate::Integer,
+    logical_last_candidate::Integer,
+)
+    delta.sealed && error("hard-event delta slot is already sealed")
+    learner.common_source_seed_loaded && error(
+        "loaded common hard-event seeds must be consumed before publication",
+    )
+    learner.common_source_seed_in_progress && error(
+        "failed common hard-event replay must be reset before publication",
+    )
+    first_candidate = Int(logical_first_candidate)
+    last_candidate = Int(logical_last_candidate)
+    typemin(Int32) <= first_candidate <= typemax(Int32) || throw(ArgumentError(
+        "hard-event logical first candidate does not fit Int32",
+    ))
+    typemin(Int32) <= last_candidate <= typemax(Int32) || throw(ArgumentError(
+        "hard-event logical last candidate does not fit Int32",
+    ))
+    if learner.first_hard_candidate_ordinal == 0
+        first_candidate == 0 && last_candidate == 0 || throw(ArgumentError(
+            "hard-event publication range is nonzero without candidate replay",
+        ))
+    else
+        first_candidate == Int(learner.first_hard_candidate_ordinal) &&
+            last_candidate == Int(learner.last_hard_candidate_ordinal) || throw(
+                ArgumentError(
+                    "hard-event publication range differs from replayed candidates",
+                ),
+            )
+    end
+    count = learner.hard_seed_count
+    delta_capacity = length(delta.seed_state_id)
+    length(delta.seed_candidate_ordinal) == delta_capacity &&
+        length(delta.seed_delivery_ordinal) == delta_capacity &&
+        length(delta.seed_source_node) == delta_capacity &&
+        length(delta.seed_lane) == delta_capacity &&
+        length(delta.seed_advantage) == delta_capacity || throw(DimensionMismatch(
+            "hard-event delta compact seed arrays have unequal capacities",
+        ))
+    count <= delta_capacity || throw(OverflowError(
+        "hard-event delta compact seed capacity exceeded",
+    ))
+    (iszero(learner.hard_parameter_digest) ||
+     learner.hard_parameter_digest == model.cache.parameter_digest) || throw(
+        ArgumentError("hard-event learner parameter digest changed"),
+    )
+    _validate_learner_hard_seed_ledger!(
+        learner,
+        first_candidate,
+        last_candidate,
+    )
+    all(isfinite, learner.hard_gradient.core_cell_raw) || error(
+        "hard-event core gradient is not finite",
+    )
+    all(isfinite, learner.hard_gradient.semantic_projection_raw) || error(
+        "hard-event semantic gradient is not finite",
+    )
+    all(isfinite, learner.hard_gradient.event_raw) || error(
+        "hard-event parameter gradient is not finite",
+    )
+
+    _copy_hard_event_gradient!(delta.gradient, learner.hard_gradient)
+    count == 0 || begin
+        copyto!(delta.seed_state_id, 1, learner.hard_seed_state_id, 1, count)
+        copyto!(
+            delta.seed_candidate_ordinal,
+            1,
+            learner.hard_seed_candidate_ordinal,
+            1,
+            count,
+        )
+        copyto!(
+            delta.seed_delivery_ordinal,
+            1,
+            learner.hard_seed_delivery_ordinal,
+            1,
+            count,
+        )
+        copyto!(delta.seed_source_node, 1, learner.hard_seed_source_node, 1, count)
+        copyto!(delta.seed_lane, 1, learner.hard_seed_lane, 1, count)
+        copyto!(delta.seed_advantage, 1, learner.hard_seed_advantage, 1, count)
+    end
+    delta.seed_count = count
+    delta.parameter_digest = model.cache.parameter_digest
+    delta.logical_first = Int32(first_candidate)
+    delta.logical_last = Int32(last_candidate)
+    delta.seed_identity_digest = learner.hard_seed_identity_digest
+    delta.hard_gradient_digest = _hard_gradient_payload_digest(
+        learner.hard_gradient,
+    )
+    delta.reduced = false
+    delta.sealed = true # publication fence: always written last
+    return delta
+end
+
+function accumulate_common_hard_event_seeds!(
+    destination::AbstractArray{Float32,3},
+    delta::ModelHardEventDelta,
+    model::CanonicalModel;
+    expected_first_candidate::Integer=delta.logical_first,
+    expected_last_candidate::Integer=delta.logical_last,
+)
+    size(destination, 1) == Axon.EVENT_DIM || throw(DimensionMismatch(
+        "common hard-event seed destination must have five event lanes",
+    ))
+    size(destination, 2) == CORE_NODE_COUNT || throw(DimensionMismatch(
+        "common hard-event seed destination node axis differs from the graph",
+    ))
+    delta.sealed || error("hard-event delta must be sealed before reduction")
+    delta.reduced && error("hard-event delta was already reduced")
+    delta.parameter_digest == model.cache.parameter_digest || throw(
+        ArgumentError("hard-event delta parameter digest changed"),
+    )
+    delta_capacity = length(delta.seed_state_id)
+    length(delta.seed_candidate_ordinal) == delta_capacity &&
+        length(delta.seed_delivery_ordinal) == delta_capacity &&
+        length(delta.seed_source_node) == delta_capacity &&
+        length(delta.seed_lane) == delta_capacity &&
+        length(delta.seed_advantage) == delta_capacity &&
+        0 <= delta.seed_count <= delta_capacity || throw(DimensionMismatch(
+            "hard-event delta compact seed arrays/count are inconsistent",
+        ))
+    Int(delta.logical_first) == Int(expected_first_candidate) &&
+        Int(delta.logical_last) == Int(expected_last_candidate) || throw(
+            ArgumentError("hard-event delta logical range changed"),
+        )
+    all(isfinite, destination) || throw(ArgumentError(
+        "common hard-event reduction destination must be finite",
+    ))
+    previous_candidate = 0
+    previous_state = 0
+    previous_delivery = 0
+    absolute_seed_sum = 0.0
+    identity_digest = UInt64(0xcbf29ce484222325)
+    @inbounds for slot in 1:delta.seed_count
+        state_id = Int(delta.seed_state_id[slot])
+        candidate = Int(delta.seed_candidate_ordinal[slot])
+        delivery = Int(delta.seed_delivery_ordinal[slot])
+        source = Int(delta.seed_source_node[slot])
+        lane = Int(delta.seed_lane[slot])
+        advantage = delta.seed_advantage[slot]
+        1 <= state_id <= size(destination, 3) || throw(ArgumentError(
+            "hard-event delta state identity is outside the reduction batch",
+        ))
+        Int(expected_first_candidate) <= candidate <=
+            Int(expected_last_candidate) || throw(ArgumentError(
+                "hard-event seed candidate is outside its logical range",
+            ))
+        delivery >= 1 || error(
+            "hard-event delta has no physical delivery ordinal",
+        )
+        1 <= source <= CORE_NODE_COUNT || error(
+            "hard-event delta source is outside the core graph",
+        )
+        1 <= lane <= Axon.EVENT_DIM || error(
+            "hard-event delta lane is outside the typed event ABI",
+        )
+        isfinite(advantage) || error(
+            "hard-event delta contains a nonfinite seed value",
+        )
+        absolute_seed_sum += abs(Float64(advantage))
+        absolute_seed_sum <= Float64(floatmax(Float32)) || throw(OverflowError(
+            "hard-event delta absolute seed sum exceeds Float32",
+        ))
+        if candidate == previous_candidate
+            state_id == previous_state || error(
+                "one reduced candidate crosses state identities",
+            )
+            delivery > previous_delivery || error(
+                "hard-event delta records are not in physical delivery order",
+            )
+        else
+            candidate > previous_candidate || error(
+                "hard-event delta candidates are not strictly ordered",
+            )
+            previous_candidate = candidate
+            previous_state = state_id
+        end
+        previous_delivery = delivery
+        identity_digest = _hard_seed_identity_digest(
+            identity_digest,
+            state_id,
+            candidate,
+            delivery,
+            source,
+            lane,
+            advantage,
+        )
+    end
+    identity_digest == delta.seed_identity_digest || error(
+        "hard-event delta seed identity digest changed",
+    )
+    _hard_gradient_payload_digest(delta.gradient) ==
+        delta.hard_gradient_digest || error(
+            "hard-event delta gradient payload digest changed",
+        )
+    @inbounds for slot in 1:delta.seed_count
+        state_id = Int(delta.seed_state_id[slot])
+        source = Int(delta.seed_source_node[slot])
+        lane = Int(delta.seed_lane[slot])
+        absolute_seed_sum <= Float64(floatmax(Float32)) -
+            abs(Float64(destination[lane, source, state_id])) || throw(OverflowError(
+                "common hard-event reduction would overflow Float32",
+            ))
+    end
+    @inbounds for slot in 1:delta.seed_count
+        state_id = Int(delta.seed_state_id[slot])
+        source = Int(delta.seed_source_node[slot])
+        lane = Int(delta.seed_lane[slot])
+        destination[lane, source, state_id] += delta.seed_advantage[slot]
+    end
+    delta.reduced = true
+    return destination
+end
+
+function load_common_hard_event_seeds!(
+    learner::ModelLocalLearner,
+    source::AbstractMatrix{Float32},
+    state_id::Integer,
+)
+    size(source) == size(learner.common_source_event_advantage) || throw(
+        DimensionMismatch("common hard-event seed slab differs from the graph"),
+    )
+    1 <= Int(state_id) <= typemax(UInt16) || throw(ArgumentError(
+        "common hard-event seed state identity must fit positive UInt16",
+    ))
+    learner.common_source_seed_loaded && error(
+        "common hard-event seed slab is already loaded",
+    )
+    learner.common_source_seed_consumed && error(
+        "begin_local_microbatch! is required before reloading common hard-event seeds",
+    )
+    learner.common_source_seed_in_progress && error(
+        "failed common hard-event replay must be reset before reloading seeds",
+    )
+    learner.first_hard_candidate_ordinal == 0 &&
+        learner.last_hard_candidate_ordinal == 0 &&
+        learner.hard_seed_count == 0 || error(
+            "common hard-event seeds require a fresh common replay learner",
+        )
+    all(isfinite, source) || throw(ArgumentError(
+        "common hard-event seed slab must be finite",
+    ))
+    copyto!(learner.common_source_event_advantage, source)
+    learner.common_source_seed_state_id = UInt16(state_id)
+    learner.common_source_seed_consumed = false
+    learner.common_source_seed_in_progress = false
+    learner.common_source_seed_loaded = true
     return learner
 end
 
@@ -3796,7 +4476,7 @@ function _collect_local_plasticity!(
     return observation
 end
 
-function _contract_local_records!(
+function _contract_analog_local_records!(
     model::CanonicalModel,
     worker::ModelWorker,
     learner::ModelLocalLearner,
@@ -3877,10 +4557,642 @@ function _contract_local_records!(
     return nothing
 end
 
+function _mark_logical_local_records!(
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+)
+    count = worker.tape.count
+    fill!(@view(learner.logical_record[1:count]), false)
+    @inbounds for node in 1:CORE_NODE_COUNT
+        record = Int(worker.tape.latest_record[node])
+        while record != 0
+            learner.logical_record[record] = true
+            record = Int(worker.tape.previous_record[record])
+        end
+    end
+    return nothing
+end
+
+function _preflight_candidate_hard_seed_capacity!(
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+)
+    _mark_logical_local_records!(worker, learner)
+    sentinel_delivery_count = 0
+    provenance = worker.provenance
+    @inbounds for delivery in 1:provenance.event_count
+        destination_record = Int(provenance.event_destination_record[delivery])
+        1 <= destination_record <= worker.tape.count || error(
+            "hard-event delivery destination is outside the replay tape",
+        )
+        learner.logical_record[destination_record] || continue
+        source_node = Int(provenance.event_source_node[delivery])
+        source_record = Int(provenance.event_source_record[delivery])
+        is_common_source_record(source_node, source_record) || continue
+        sentinel_delivery_count += 1
+    end
+    sentinel_delivery_count <= MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE || error(
+        "candidate common-source deliveries exceed the anatomical upper bound",
+    )
+    learner.hard_seed_count + sentinel_delivery_count <=
+        length(learner.hard_seed_state_id) || throw(OverflowError(
+            "hard-event learner compact seed capacity exceeded before replay",
+        ))
+    return nothing
+end
+
+function _prepare_hard_event_source_fanout!(
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    allow_common_source::Bool,
+)
+    provenance = worker.provenance
+    count = provenance.event_count
+    count <= length(learner.event_delivery_advantage) || error(
+        "hard-event delivery scratch is smaller than sealed provenance",
+    )
+    fill!(@view(learner.event_delivery_advantage[1:count]), 0.0f0)
+    fill!(@view(learner.event_delivery_ready[1:count]), false)
+    fill!(@view(learner.source_delivery_next[1:count]), Int32(0))
+    fill!(
+        @view(learner.source_delivery_head_by_record[1:worker.tape.count]),
+        Int32(0),
+    )
+    fill!(
+        @view(learner.source_delivery_tail_by_record[1:worker.tape.count]),
+        Int32(0),
+    )
+    allow_common_source && fill!(learner.common_source_event_advantage, 0.0f0)
+
+    @inbounds for delivery in 1:count
+        Int(provenance.event_ordinal[delivery]) == delivery || error(
+            "hard-event physical delivery ordinal changed before replay",
+        )
+        destination_record = Int(provenance.event_destination_record[delivery])
+        1 <= destination_record <= worker.tape.count || error(
+            "hard-event delivery destination is outside the replay tape",
+        )
+        learner.logical_record[destination_record] || continue
+        TransitionPhase(worker.tape.phase[destination_record]) == EVENT_WAVE || error(
+            "hard-event delivery destination is not an event-wave transition",
+        )
+        Int(provenance.event_wave[delivery]) ==
+            Int(worker.tape.wave[destination_record]) || error(
+                "hard-event delivery wave differs from its destination transition",
+            )
+        source_node = Int(provenance.event_source_node[delivery])
+        source_record = Int(provenance.event_source_record[delivery])
+        lane = Int(provenance.event_lane[delivery])
+        1 <= lane <= Axon.EVENT_DIM || error(
+            "hard-event delivery lane is outside the typed event ABI",
+        )
+        if is_common_source_record(source_node, source_record)
+            allow_common_source || error(
+                "state-common replay contains a candidate common-source sentinel",
+            )
+            Int(provenance.event_wave[delivery]) == 1 || error(
+                "common-source sentinel is valid only in candidate wave one",
+            )
+            continue
+        end
+        1 <= source_record < destination_record || error(
+            "hard-event source is not chronologically earlier than its destination",
+        )
+        learner.logical_record[source_record] || error(
+            "hard-event source transition is outside the logical replay world",
+        )
+        Int(worker.tape.node[source_record]) == source_node || error(
+            "hard-event source record/node identity changed before replay",
+        )
+        provenance.event_source_mask[delivery] ==
+            worker.tape.event_mask[source_record] || error(
+                "hard-event source mask changed before replay",
+            )
+        delivery_wave = Int(provenance.event_wave[delivery])
+        source_wave = Int(worker.tape.wave[source_record])
+        if delivery_wave == 1
+            source_wave == 0 || error(
+                "wave-one hard-event source is not a mandatory transition",
+            )
+        else
+            TransitionPhase(worker.tape.phase[source_record]) == EVENT_WAVE &&
+                source_wave == delivery_wave - 1 || error(
+                    "hard-event source transition is not from the preceding wave",
+                )
+        end
+        previous = Int(learner.source_delivery_tail_by_record[source_record])
+        if previous == 0
+            learner.source_delivery_head_by_record[source_record] = Int32(delivery)
+        else
+            learner.source_delivery_next[previous] = Int32(delivery)
+        end
+        learner.source_delivery_tail_by_record[source_record] = Int32(delivery)
+    end
+    return nothing
+end
+
+@inline function _gather_hard_event_source_advantages!(
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    source_record::Int,
+)
+    provenance = worker.provenance
+    delivery = Int(@inbounds learner.source_delivery_head_by_record[source_record])
+    while delivery != 0
+        @inbounds learner.event_delivery_ready[delivery] || error(
+            "hard-event destination advantage was not ready before source replay",
+        )
+        lane = Int(@inbounds provenance.event_lane[delivery])
+        @inbounds learner.source_event_advantage[lane, source_record] +=
+            learner.event_delivery_advantage[delivery]
+        delivery = Int(@inbounds learner.source_delivery_next[delivery])
+    end
+    return nothing
+end
+
+function _publish_candidate_common_source_deliveries!(
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    state_id::Int,
+    candidate_ordinal::Int,
+)
+    provenance = worker.provenance
+    appended = 0
+    @inbounds for delivery in 1:provenance.event_count
+        destination_record = Int(provenance.event_destination_record[delivery])
+        learner.logical_record[destination_record] || continue
+        source_node = Int(provenance.event_source_node[delivery])
+        source_record = Int(provenance.event_source_record[delivery])
+        is_common_source_record(source_node, source_record) || continue
+        learner.event_delivery_ready[delivery] || error(
+            "common-source delivery advantage was not evaluated",
+        )
+        lane = Int(provenance.event_lane[delivery])
+        slot = learner.hard_seed_count + 1
+        slot <= length(learner.hard_seed_state_id) || error(
+            "hard-event learner seed preflight was inconsistent",
+        )
+        learner.hard_seed_state_id[slot] = UInt16(state_id)
+        learner.hard_seed_candidate_ordinal[slot] = Int32(candidate_ordinal)
+        learner.hard_seed_delivery_ordinal[slot] =
+            provenance.event_ordinal[delivery]
+        learner.hard_seed_source_node[slot] = UInt16(source_node)
+        learner.hard_seed_lane[slot] = UInt8(lane)
+        learner.hard_seed_advantage[slot] =
+            learner.event_delivery_advantage[delivery]
+        learner.hard_seed_count = slot
+        learner.hard_seed_identity_digest = _hard_seed_identity_digest(
+            learner.hard_seed_identity_digest,
+            state_id,
+            candidate_ordinal,
+            delivery,
+            source_node,
+            lane,
+            learner.event_delivery_advantage[delivery],
+        )
+        appended += 1
+    end
+    appended <= MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE || error(
+        "candidate sentinel coverage exceeds its anatomical bound",
+    )
+    learner.hard_expected_seed_count += appended
+    learner.hard_expected_seed_count == learner.hard_seed_count || error(
+        "hard-event candidate sentinel coverage was not published exactly once",
+    )
+    return nothing
+end
+
+@inline function _event_control_advantages(
+    learner::ModelLocalLearner,
+    record::Int,
+)
+    return ntuple(
+        lane -> @inbounds(learner.source_event_advantage[lane, record]),
+        Val(Axon.EVENT_DIM),
+    )
+end
+
+function _return_event_source_advantages!(
+    model::CanonicalModel,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    destination_record::Int,
+    allow_common_source::Bool,
+)
+    provenance = worker.provenance
+    delivery = record_event_delivery_head(provenance, destination_record)
+    while delivery != 0
+        @inbounds begin
+            source_node = Int(provenance.event_source_node[delivery])
+            source_record = Int(provenance.event_source_record[delivery])
+            source_mask = provenance.event_source_mask[delivery]
+            lane = Int(provenance.event_lane[delivery])
+            channel = Int(provenance.event_resolved_channel[delivery])
+            raw_index = Int(provenance.event_contact_parameter[delivery])
+            kind_index = Int(provenance.event_kind_parameter[delivery])
+            scale = provenance.event_scale[delivery]
+        end
+        bit = UInt8(1) << (lane - 1)
+        !iszero(source_mask & bit) || error(
+            "delivered event lane is absent from its source mask",
+        )
+        amplitude = scale * model.cache.event_weight[raw_index] *
+            model.cache.event_weight[kind_index]
+        input_bar = @inbounds learner.receiver_input_cotangent[
+            channel,
+            destination_record,
+        ]
+        advantage = muladd(
+            input_bar,
+            amplitude,
+            learner.signals.config.hard_event_energy_cost,
+        )
+        if is_common_source_record(source_node, source_record)
+            allow_common_source || error(
+                "state-common replay cannot contain a common-source sentinel",
+            )
+            learner.counters.event_control_common_seeds += 1
+        end
+        @inbounds learner.event_delivery_ready[delivery] && error(
+            "hard-event delivery advantage was evaluated twice",
+        )
+        @inbounds learner.event_delivery_advantage[delivery] = advantage
+        @inbounds learner.event_delivery_ready[delivery] = true
+
+        # The continuation component also differentiates the evaluated
+        # outgoing delivery's own contact and shared kind gain. The source
+        # presence cost belongs only to the source transition surrogate.
+        direct_bar = input_bar * scale *
+            learner.signals.config.hard_event_multiplier
+        if !iszero(direct_bar)
+            contact_weight = @inbounds model.cache.event_weight[raw_index]
+            kind_weight = @inbounds model.cache.event_weight[kind_index]
+            contact_contribution = direct_bar * kind_weight *
+                _softplus_derivative(model.parameters.event_raw[raw_index])
+            kind_contribution = direct_bar * contact_weight *
+                _softplus_derivative(model.parameters.event_raw[kind_index])
+            @inbounds learner.hard_gradient.event_raw[raw_index] +=
+                contact_contribution
+            @inbounds learner.hard_gradient.event_raw[kind_index] +=
+                kind_contribution
+            @inbounds learner.delivery_event_gradient[raw_index] +=
+                contact_contribution
+            @inbounds learner.delivery_event_gradient[kind_index] +=
+                kind_contribution
+            learner.counters.event_control_event_parameter_updates += 1
+        end
+        learner.counters.event_control_deliveries += 1
+        delivery = next_event_delivery_record(provenance, delivery)
+    end
+    return nothing
+end
+
+function _seed_common_source_advantages!(
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+)
+    learner.common_source_seed_loaded || error(
+        "state-common hard replay requires an explicitly loaded seed slab",
+    )
+    learner.common_source_seed_consumed && error(
+        "state-common hard-event seed slab was already consumed",
+    )
+    learner.common_source_seed_in_progress || error(
+        "state-common hard-event seed slab is not in its consuming phase",
+    )
+    @inbounds for node in 1:CORE_NODE_COUNT
+        record = Int(worker.tape.latest_record[node])
+        for lane in 1:Axon.EVENT_DIM
+            advantage = learner.common_source_event_advantage[lane, node]
+            iszero(advantage) && continue
+            record > 0 || error(
+                "common hard-event source has no replay transition",
+            )
+            !iszero(worker.tape.event_mask[record] &
+                (UInt8(1) << (lane - 1))) || error(
+                "aggregated common hard-event lane changed during replay",
+            )
+            learner.source_event_advantage[lane, record] += advantage
+        end
+    end
+    return nothing
+end
+
+function _scatter_fused_analog_inputs!(
+    model::CanonicalModel,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+)
+    @inbounds for node in 1:CORE_NODE_COUNT
+        record = Int(worker.tape.latest_record[node])
+        while record != 0
+            for channel in 1:Cell.INPUT_DIM
+                learner.scratch.dinput[channel] =
+                    learner.signals.config.analog_multiplier *
+                    learner.receiver_input_cotangent[channel, record]
+            end
+            _scatter_local_input_parameters!(
+                model,
+                worker,
+                learner,
+                record,
+                learner.scratch.dinput,
+            )
+            record = Int(worker.tape.previous_record[record])
+        end
+    end
+    return nothing
+end
+
+
+function _scatter_hard_source_input_parameters!(
+    model::CanonicalModel,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    record::Int,
+)
+    provenance = worker.provenance
+    phase = TransitionPhase(@inbounds worker.tape.phase[record])
+    if phase == EVENT_WAVE
+        delivery = record_event_delivery_head(provenance, record)
+        while delivery != 0
+            @inbounds begin
+                channel = Int(provenance.event_resolved_channel[delivery])
+                scale = provenance.event_scale[delivery]
+                raw_index = Int(provenance.event_contact_parameter[delivery])
+                kind_index = Int(provenance.event_kind_parameter[delivery])
+            end
+            local_bar = Local.fused_event_input_cotangent(
+                learner.fused_scratch,
+                channel,
+            ) * learner.signals.config.hard_event_multiplier * scale
+            if !iszero(local_bar)
+                contact_weight = @inbounds model.cache.event_weight[raw_index]
+                kind_weight = @inbounds model.cache.event_weight[kind_index]
+                @inbounds learner.hard_gradient.event_raw[raw_index] +=
+                    local_bar * kind_weight *
+                    _softplus_derivative(model.parameters.event_raw[raw_index])
+                @inbounds learner.hard_gradient.event_raw[kind_index] +=
+                    local_bar * contact_weight *
+                    _softplus_derivative(model.parameters.event_raw[kind_index])
+                learner.counters.event_control_event_parameter_updates += 1
+            end
+            delivery = next_event_delivery_record(provenance, delivery)
+        end
+        return nothing
+    end
+
+    first, count = record_analog_deposit_range(provenance, record)
+    count == 0 && return nothing
+    @inbounds for deposit in first:(first + count - 1)
+        AnalogDepositKind(provenance.analog_kind[deposit]) ==
+            SEMANTIC_PACKET_DEPOSIT || continue
+        branch = Int(provenance.analog_branch[deposit])
+        role = Int(provenance.analog_semantic_role[deposit])
+        semantic_class = Int(provenance.analog_semantic_class[deposit])
+        changed = false
+        for receptor in 1:Cell.INPUT_CHANNELS
+            local_bar = Local.fused_event_input_cotangent(
+                learner.fused_scratch,
+                Cell.input_index(branch, receptor),
+            ) * learner.signals.config.hard_event_multiplier
+            iszero(local_bar) && continue
+            for group in 1:Axon.GROUP_COUNT
+                lane = Axon.packet_lane(group, receptor)
+                learner.hard_gradient.semantic_projection_raw[
+                    group,
+                    receptor,
+                    role,
+                    semantic_class,
+                ] += local_bar * provenance.analog_packet[lane, deposit] *
+                     model.cache.semantic_projection_derivative[
+                         group,
+                         receptor,
+                         role,
+                         semantic_class,
+                     ]
+            end
+            changed = true
+        end
+        changed && (learner.counters.event_control_semantic_updates += 1)
+    end
+    return nothing
+end
+
+function _contract_fused_local_records!(
+    model::CanonicalModel,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    raw_delta::AbstractVector{Float32};
+    write_analog::Bool,
+    allow_common_source::Bool,
+    consume_common_source::Bool,
+    hard_state_id::Int,
+    hard_candidate_ordinal::Int,
+)
+    length(raw_delta) == Output.OUTPUT_DIM || throw(DimensionMismatch(
+        "local raw derivative must have length 22",
+    ))
+    all(isfinite, raw_delta) || throw(ArgumentError(
+        "local raw derivative must be finite",
+    ))
+    config = learner.signals.config
+    config.hard_event_multiplier > 0.0f0 || error(
+        "fused hard-event replay requires a positive multiplier",
+    )
+    Local.reset_adjoint_arena!(learner.fused_arena)
+    fill!(learner.source_event_advantage, 0.0f0)
+    @views fill!(
+        learner.receiver_input_cotangent[:, 1:worker.tape.count],
+        0.0f0,
+    )
+    _mark_logical_local_records!(worker, learner)
+    _prepare_hard_event_source_fanout!(
+        worker,
+        learner,
+        allow_common_source,
+    )
+    visited_before = learner.counters.visited_transitions
+    pullbacks_before = learner.counters.conditional_pullbacks
+    @inbounds for node in 1:CORE_NODE_COUNT
+        terminal_record = Int(worker.tape.latest_record[node])
+        terminal_record == 0 && continue
+        continuous = @view learner.continuous_signal_by_node[:, node]
+        packet = @view learner.packet_signal_by_node[:, node]
+        Local.project_learning_signal!(
+            continuous,
+            learner.signals.continuous[node],
+            raw_delta,
+        )
+        Local.project_learning_signal!(
+            packet,
+            learner.signals.packet[node],
+            raw_delta,
+        )
+        (_has_nonzero(continuous) || _has_nonzero(packet)) &&
+            (learner.counters.signal_nonzero += 1)
+        Local.begin_fused_local_adjoint!(
+            learner.fused_arena,
+            node,
+            terminal_record,
+        )
+    end
+    consume_common_source && _seed_common_source_advantages!(worker, learner)
+
+    @inbounds for record in worker.tape.count:-1:1
+        learner.logical_record[record] || continue
+        _gather_hard_event_source_advantages!(worker, learner, record)
+        node = Int(worker.tape.node[record])
+        predecessor = Int(worker.tape.previous_record[record])
+        mask = worker.tape.event_mask[record]
+        advantages = _event_control_advantages(learner, record)
+        has_advantage = any(!iszero, advantages)
+        control = Local.CausalEventControl(
+            mask,
+            advantages;
+            connected=!iszero(mask),
+        )
+        Local.contract_replayed_transition_fused!(
+            learner.fused_arena,
+            node,
+            learner.fused_scratch,
+            Local.ChronologicalTransitionLink(record, predecessor, record),
+            @view(worker.tape.previous_state[:, record]),
+            @view(worker.tape.input[:, record]),
+            model.cache.core_cell[node],
+            model.cache.core_derivative[node],
+            @view(worker.tape.next_state[:, record]),
+            @view(learner.continuous_signal_by_node[:, node]),
+            @view(learner.packet_signal_by_node[:, node]);
+            touched=true,
+            # The receiver lane is the unscaled local objective. Its dinput
+            # defines a_e independently of the analog optimizer multiplier.
+            analog_scale=1.0f0,
+            # The event lane is the unscaled source eligibility. Its own
+            # optimizer multiplier is applied only when scattering the three
+            # hard-gradient parameter groups.
+            event_scale=1.0f0,
+            event_control=control,
+        )
+        for parameter in 1:Cell.PARAM_DIM
+            write_analog && (@inbounds worker.gradient.core_cell_raw[
+                parameter,
+                node,
+            ] += config.analog_multiplier * Local.fused_analog_raw_cotangent(
+                learner.fused_scratch,
+                parameter,
+            ))
+            @inbounds learner.hard_gradient.core_cell_raw[
+                parameter,
+                node,
+            ] += config.hard_event_multiplier * Local.fused_event_raw_cotangent(
+                learner.fused_scratch,
+                parameter,
+            )
+        end
+        _scatter_hard_source_input_parameters!(
+            model,
+            worker,
+            learner,
+            record,
+        )
+        for channel in 1:Cell.INPUT_DIM
+            @inbounds learner.receiver_input_cotangent[channel, record] =
+                Local.fused_analog_input_cotangent(
+                    learner.fused_scratch,
+                    channel,
+                )
+        end
+        phase = TransitionPhase(worker.tape.phase[record])
+        phase == EVENT_WAVE && _return_event_source_advantages!(
+            model,
+            worker,
+            learner,
+            record,
+            allow_common_source,
+        )
+        if has_advantage
+            learner.counters.event_control_source_transitions += 1
+            !iszero(advantages[Axon.SOMA_EVENT]) &&
+                (learner.counters.event_control_soma_sources += 1)
+            for lane in Axon.PLATEAU_EVENT_FIRST:Axon.EVENT_DIM
+                !iszero(advantages[lane]) &&
+                    (learner.counters.event_control_plateau_sources += 1)
+            end
+        end
+        learner.counters.visited_transitions += 1
+        learner.counters.conditional_pullbacks += 1
+        iszero(mask & UInt8(0x01)) &&
+            (learner.counters.nonspiking_transitions += 1)
+    end
+    @inbounds for delivery in 1:worker.provenance.event_count
+        destination_record = Int(
+            worker.provenance.event_destination_record[delivery],
+        )
+        learner.logical_record[destination_record] || continue
+        learner.event_delivery_ready[delivery] || error(
+            "logical hard-event delivery was not evaluated exactly once",
+        )
+    end
+    allow_common_source && _publish_candidate_common_source_deliveries!(
+        worker,
+        learner,
+        hard_state_id,
+        hard_candidate_ordinal,
+    )
+    write_analog && _scatter_fused_analog_inputs!(model, worker, learner)
+    @inbounds for node in 1:CORE_NODE_COUNT
+        Int(worker.tape.latest_record[node]) == 0 && continue
+        Local.finish_fused_local_adjoint!(learner.fused_arena, node, 0)
+    end
+    learner.counters.visited_transitions - visited_before ==
+        learner.counters.conditional_pullbacks - pullbacks_before || error(
+            "fused replay must execute one conditional pullback per transition",
+        )
+    if consume_common_source
+        fill!(learner.common_source_event_advantage, 0.0f0)
+        learner.common_source_seed_loaded = false
+        learner.common_source_seed_consumed = true
+        learner.common_source_seed_in_progress = false
+    end
+    return nothing
+end
+
+function _contract_due_local_records!(
+    model::CanonicalModel,
+    worker::ModelWorker,
+    learner::ModelLocalLearner,
+    raw_delta::AbstractVector{Float32},
+    due::Local.DuePlasticityClocks;
+    allow_common_source::Bool,
+    consume_common_source::Bool=false,
+    hard_state_id::Int=0,
+    hard_candidate_ordinal::Int=0,
+)
+    hard_due = due.hard_event &&
+        learner.signals.config.hard_event_multiplier > 0.0f0
+    if hard_due
+        _contract_fused_local_records!(
+            model,
+            worker,
+            learner,
+            raw_delta;
+            write_analog=due.analog,
+            allow_common_source,
+            consume_common_source,
+            hard_state_id,
+            hard_candidate_ordinal,
+        )
+    elseif due.analog
+        _contract_analog_local_records!(model, worker, learner, raw_delta)
+    end
+    return nothing
+end
+
 @inline function _local_report(
     signature::TrajectorySignature,
     counters::LocalReplayCounters,
-    before::NTuple{8,Int},
+    before::NTuple{15,Int},
 )
     return LocalReplayReport(
         signature,
@@ -3892,6 +5204,13 @@ end
         counters.event_receiver_updates - before[6],
         counters.utility_updates - before[7],
         counters.output_replays - before[8],
+        counters.event_control_deliveries - before[9],
+        counters.event_control_source_transitions - before[10],
+        counters.event_control_soma_sources - before[11],
+        counters.event_control_plateau_sources - before[12],
+        counters.event_control_common_seeds - before[13],
+        counters.event_control_semantic_updates - before[14],
+        counters.event_control_event_parameter_updates - before[15],
     )
 end
 
@@ -3905,6 +5224,13 @@ end
         counters.event_receiver_updates,
         counters.utility_updates,
         counters.output_replays,
+        counters.event_control_deliveries,
+        counters.event_control_source_transitions,
+        counters.event_control_soma_sources,
+        counters.event_control_plateau_sources,
+        counters.event_control_common_seeds,
+        counters.event_control_semantic_updates,
+        counters.event_control_event_parameter_updates,
     )
 end
 
@@ -4089,6 +5415,8 @@ function local_replay_candidate!(
     due::Local.DuePlasticityClocks;
     expected_signature::TrajectorySignature,
     mode::Symbol=:cow,
+    hard_state_id::Integer=0,
+    hard_candidate_ordinal::Integer=0,
 )
     length(raw_delta) == Output.OUTPUT_DIM || throw(DimensionMismatch(
         "candidate local raw derivative must have length 22",
@@ -4099,6 +5427,28 @@ function local_replay_candidate!(
     iszero(component_bar.value) || throw(ArgumentError(
         "candidate local replay cannot credit shared V(s)",
     ))
+    hard_due = due.hard_event &&
+        learner.signals.config.hard_event_multiplier > 0.0f0
+    state_identity = Int(hard_state_id)
+    candidate_identity = Int(hard_candidate_ordinal)
+    if hard_due
+        1 <= state_identity <= typemax(UInt16) || throw(ArgumentError(
+            "hard-event candidate state identity must fit positive UInt16",
+        ))
+        1 <= candidate_identity <= typemax(Int32) || throw(ArgumentError(
+            "hard-event candidate ordinal must fit positive Int32",
+        ))
+        previous_candidate = Int(learner.last_hard_candidate_ordinal)
+        (previous_candidate == 0 || candidate_identity == previous_candidate + 1) ||
+            throw(ArgumentError(
+                "hard-event candidates must replay in contiguous logical order",
+            ))
+    end
+    (learner.common_source_seed_loaded ||
+     learner.common_source_seed_consumed ||
+     learner.common_source_seed_in_progress) && error(
+        "candidate replay requires a fresh learner without common hard-event seeds",
+    )
     before = _local_counter_snapshot(learner.counters)
     signature = _replay_candidate_world!(
         model,
@@ -4108,6 +5458,13 @@ function local_replay_candidate!(
         expected_signature,
         mode,
     )
+    if hard_due
+        _bind_hard_parameter_digest!(
+            learner,
+            worker.provenance.parameter_digest,
+        )
+        _preflight_candidate_hard_seed_capacity!(worker, learner)
+    end
     _collect_local_plasticity!(
         model,
         worker,
@@ -4133,7 +5490,21 @@ function local_replay_candidate!(
         model.cache.output,
     )
     learner.counters.output_replays += 1
-    due.analog && _contract_local_records!(model, worker, learner, raw_delta)
+    _contract_due_local_records!(
+        model,
+        worker,
+        learner,
+        raw_delta,
+        due;
+        allow_common_source=true,
+        hard_state_id=state_identity,
+        hard_candidate_ordinal=candidate_identity,
+    )
+    if hard_due
+        learner.first_hard_candidate_ordinal == 0 &&
+            (learner.first_hard_candidate_ordinal = Int32(candidate_identity))
+        learner.last_hard_candidate_ordinal = Int32(candidate_identity)
+    end
     learner.counters.candidate_replays += 1
     return _local_report(signature, learner.counters, before)
 end
@@ -4338,6 +5709,7 @@ function local_replay_state_common!(
     shared_value_bar::Float32,
     due::Local.DuePlasticityClocks;
     expected_signature::TrajectorySignature,
+    hard_state_id::Integer=0,
 )
     length(aggregate_raw_delta) == Output.OUTPUT_DIM || throw(DimensionMismatch(
         "common local raw derivative must have length 22",
@@ -4348,6 +5720,32 @@ function local_replay_state_common!(
     isfinite(shared_value_bar) || throw(ArgumentError(
         "shared value cotangent must be finite",
     ))
+    hard_due = due.hard_event &&
+        learner.signals.config.hard_event_multiplier > 0.0f0
+    state_identity = Int(hard_state_id)
+    if hard_due
+        1 <= state_identity <= typemax(UInt16) || throw(ArgumentError(
+            "common hard-event replay state identity must fit positive UInt16",
+        ))
+        learner.common_source_seed_loaded || error(
+            "common hard-event replay requires a loaded state seed slab",
+        )
+        learner.common_source_seed_consumed && error(
+            "common hard-event replay seed slab was already consumed",
+        )
+        learner.common_source_seed_in_progress && error(
+            "failed common hard-event replay must be reset before retry",
+        )
+        Int(learner.common_source_seed_state_id) == state_identity || throw(
+            ArgumentError(
+                "loaded common hard-event seed slab belongs to another state",
+            ),
+        )
+    elseif learner.common_source_seed_loaded ||
+           learner.common_source_seed_in_progress
+        error("common hard-event seeds were staged on a non-hard replay clock")
+    end
+    hard_due && (learner.common_source_seed_in_progress = true)
     before = _local_counter_snapshot(learner.counters)
     signature = replay_state_common!(
         model,
@@ -4355,6 +5753,10 @@ function local_replay_state_common!(
         worker,
         input;
         expected_signature,
+    )
+    hard_due && _bind_hard_parameter_digest!(
+        learner,
+        worker.provenance.parameter_digest,
     )
     replay = worker.common_replay_state
     _collect_local_plasticity!(
@@ -4385,11 +5787,15 @@ function local_replay_state_common!(
         model.cache.output,
     )
     learner.counters.output_replays += 1
-    due.analog && _contract_local_records!(
+    _contract_due_local_records!(
         model,
         worker,
         learner,
         aggregate_raw_delta,
+        due;
+        allow_common_source=false,
+        consume_common_source=true,
+        hard_state_id=state_identity,
     )
     learner.counters.common_replays += 1
     return _local_report(signature, learner.counters, before)

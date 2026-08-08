@@ -575,6 +575,137 @@ end
     @test abs(bap_raw[threshold_index]) < 1.0e-14
 end
 
+@testset "mixed conditional pullback equals two scalar lanes bitwise" begin
+    raw = Cell.default_raw_parameters()
+    cache, derivative_cache = Cell.parameter_caches(raw)
+    state = Cell.initial_state(cache)
+    state[Cell.SOMA_INDEX] = cache.soma_threshold
+    state[Cell.ADAPTATION_INDEX] = 0.3f0
+    state[Cell.SPIKE_INDEX] = 1.0f0
+    input = seeded_input()
+    next_state = similar(state)
+    Cell.cell_step!(next_state, state, input, cache)
+    margin = Cell.spike_margin_from_transition(state, next_state, cache)
+    @test abs(margin) < Cell.SPIKE_SURROGATE_WIDTH
+
+    real_dnext = [Float32(mod(7 * index, 17) - 8) / 16.0f0
+                  for index in 1:Cell.STATE_DIM]
+    event_dnext = [Float32(mod(11 * index, 19) - 9) / 32.0f0
+                   for index in 1:Cell.STATE_DIM]
+    real_event_cotangent = 0.625f0
+    event_event_cotangent = -0.375f0
+    real_direct_margin = -0.25f0
+    event_direct_margin = 0.1875f0
+
+    real_dstate = zeros(Float32, Cell.STATE_DIM)
+    real_dinput = zeros(Float32, Cell.INPUT_DIM)
+    real_draw = zeros(Float32, Cell.PARAM_DIM)
+    Cell.cell_step_conditional_pullback!(
+        real_dstate,
+        real_dinput,
+        real_draw,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        real_dnext,
+        real_event_cotangent,
+        0.0f0,
+        real_direct_margin,
+    )
+
+    event_dstate = zeros(Float32, Cell.STATE_DIM)
+    event_dinput = zeros(Float32, Cell.INPUT_DIM)
+    event_draw = zeros(Float32, Cell.PARAM_DIM)
+    Cell.cell_step_conditional_pullback!(
+        event_dstate,
+        event_dinput,
+        event_draw,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        event_dnext,
+        event_event_cotangent,
+        0.0f0,
+        event_direct_margin,
+    )
+
+    mixed_dnext = ComplexF32.(real_dnext, event_dnext)
+    mixed_dstate = zeros(ComplexF32, Cell.STATE_DIM)
+    mixed_dinput = zeros(ComplexF32, Cell.INPUT_DIM)
+    mixed_draw = zeros(ComplexF32, Cell.PARAM_DIM)
+    mixed_result = Cell.cell_step_conditional_pullback_mixed!(
+        mixed_dstate,
+        mixed_dinput,
+        mixed_draw,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        mixed_dnext,
+        ComplexF32(real_event_cotangent, event_event_cotangent),
+        0.0f0,
+        ComplexF32(real_direct_margin, event_direct_margin),
+    )
+    @test mixed_result[1] === mixed_dstate
+    @test mixed_result[2] === mixed_dinput
+    @test mixed_result[3] === mixed_draw
+    @test any(!iszero, real_dstate)
+    @test any(!iszero, event_dstate)
+    @test any(!iszero, real_dinput)
+    @test any(!iszero, event_dinput)
+    @test any(!iszero, real_draw)
+    @test any(!iszero, event_draw)
+
+    for (mixed, real_lane, event_lane) in (
+        (mixed_dstate, real_dstate, event_dstate),
+        (mixed_dinput, real_dinput, event_dinput),
+        (mixed_draw, real_draw, event_draw),
+    )
+        @test length(mixed) == length(real_lane) == length(event_lane)
+        @inbounds for index in eachindex(mixed, real_lane, event_lane)
+            @test reinterpret(UInt32, real(mixed[index])) ==
+                  reinterpret(UInt32, real_lane[index])
+            @test reinterpret(UInt32, imag(mixed[index])) ==
+                  reinterpret(UInt32, event_lane[index])
+        end
+    end
+
+    # Warmed execution must keep the fused two-lane traversal allocation-free.
+    Cell.cell_step_conditional_pullback_mixed!(
+        mixed_dstate,
+        mixed_dinput,
+        mixed_draw,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        mixed_dnext,
+        ComplexF32(real_event_cotangent, event_event_cotangent),
+        0.0f0,
+        ComplexF32(real_direct_margin, event_direct_margin),
+    )
+    @test @allocated(Cell.cell_step_conditional_pullback_mixed!(
+        mixed_dstate,
+        mixed_dinput,
+        mixed_draw,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        mixed_dnext,
+        ComplexF32(real_event_cotangent, event_event_cotangent),
+        0.0f0,
+        ComplexF32(real_direct_margin, event_direct_margin),
+    )) == 0
+end
+
 @testset "analytic local reverse against Zygote and finite differences" begin
     rng = MersenneTwister(0xA57A1)
     raw = Float64.(raw_for_value(

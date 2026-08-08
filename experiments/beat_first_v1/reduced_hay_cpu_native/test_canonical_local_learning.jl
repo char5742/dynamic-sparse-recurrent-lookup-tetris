@@ -614,6 +614,284 @@ end
     )
 end
 
+@testset "fused analog and hard-source control remain exactly separated" begin
+    raw, state, input, next_state = nonspiking_transition()
+    cache, derivative_cache = Cell.parameter_caches(raw)
+    continuous = collect(range(
+        -0.2f0,
+        0.3f0;
+        length=Local.LOCAL_OBSERVATION_DIM,
+    ))
+    packet = collect(range(0.15f0, -0.1f0; length=Axon.PACKET_DIM))
+    link = Local.ChronologicalTransitionLink(1, 0, 81)
+
+    analog_arena = Local.ContractedAdjointArena(1)
+    analog_scratch = Local.ContractedAdjointScratch()
+    Local.begin_local_adjoint!(analog_arena, 1, 1)
+    Local.contract_replayed_transition!(
+        analog_arena,
+        1,
+        analog_scratch,
+        link,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        continuous,
+        packet;
+        touched=true,
+        eligibility_scale=0.7f0,
+    )
+
+    fused_arena = Local.FusedContractedAdjointArena(1)
+    fused_scratch = Local.FusedContractedAdjointScratch()
+    Local.begin_fused_local_adjoint!(fused_arena, 1, 1)
+    Local.contract_replayed_transition_fused!(
+        fused_arena,
+        1,
+        fused_scratch,
+        link,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        continuous,
+        packet;
+        touched=true,
+        analog_scale=0.7f0,
+        event_scale=0.4f0,
+    )
+    @test reinterpret(UInt32, analog_scratch.draw) == reinterpret(
+        UInt32,
+        Float32[
+            Local.fused_analog_raw_cotangent(fused_scratch, parameter)
+            for parameter in 1:Cell.PARAM_DIM
+        ],
+    )
+    @test reinterpret(UInt32, analog_scratch.dinput) == reinterpret(
+        UInt32,
+        Float32[
+            Local.fused_analog_input_cotangent(fused_scratch, channel)
+            for channel in 1:Cell.INPUT_DIM
+        ],
+    )
+    @test reinterpret(UInt32, analog_arena.state_bar[:, 1]) == reinterpret(
+        UInt32,
+        fused_arena.analog_state_bar[:, 1],
+    )
+    @test all(iszero, fused_arena.event_state_bar)
+    @test all(
+        parameter -> iszero(Local.fused_event_raw_cotangent(
+            fused_scratch,
+            parameter,
+        )),
+        1:Cell.PARAM_DIM,
+    )
+    @test fused_arena.conditional_pullback_count[1] == 1
+    Local.finish_fused_local_adjoint!(fused_arena, 1, 0)
+
+    # A threshold-near soma event receives a bounded source surrogate in the
+    # event lane without changing the zero analog lane.
+    soma_next = copy(next_state)
+    soma_next[Cell.SPIKE_INDEX] = 1.0f0
+    soma_mask_vector = zeros(UInt8, Axon.EVENT_DIM)
+    Axon.hard_events!(soma_mask_vector, state, soma_next)
+    soma_mask = foldl(
+        (mask, lane) -> iszero(soma_mask_vector[lane]) ? mask :
+            mask | (UInt8(1) << (lane - 1)),
+        1:Axon.EVENT_DIM;
+        init=UInt8(0),
+    )
+    soma_advantages = ntuple(
+        lane -> lane == Axon.SOMA_EVENT ? 0.25f0 : 0.0f0,
+        Val(Axon.EVENT_DIM),
+    )
+    Local.reset_adjoint_arena!(fused_arena)
+    Local.begin_fused_local_adjoint!(fused_arena, 1, 1)
+    Local.contract_replayed_transition_fused!(
+        fused_arena,
+        1,
+        fused_scratch,
+        link,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        soma_next,
+        zeros(Float32, Local.LOCAL_OBSERVATION_DIM),
+        zeros(Float32, Axon.PACKET_DIM);
+        touched=true,
+        analog_scale=0.0f0,
+        event_scale=0.4f0,
+        event_control=Local.CausalEventControl(
+            soma_mask,
+            soma_advantages,
+        ),
+    )
+    soma_event_gradient = Float32[
+        Local.fused_event_raw_cotangent(fused_scratch, parameter)
+        for parameter in 1:Cell.PARAM_DIM
+    ]
+    @test all(
+        parameter -> iszero(Local.fused_analog_raw_cotangent(
+            fused_scratch,
+            parameter,
+        )),
+        1:Cell.PARAM_DIM,
+    )
+    @test sum(abs, soma_event_gradient) > 0.0f0
+    threshold_parameter = findfirst(
+        ==(:soma_threshold_gap),
+        Cell.PARAMETER_NAMES,
+    )
+    @test soma_event_gradient[threshold_parameter] < 0.0f0
+    before_energy = Cell.spike_surrogate_value(
+        Cell.spike_margin_from_transition(state, next_state, cache),
+    )
+    stepped_raw = copy(raw)
+    stepped_raw[threshold_parameter] -=
+        0.01f0 * soma_event_gradient[threshold_parameter]
+    stepped_cache = Cell.transform_parameters(stepped_raw)
+    stepped_next = Cell.cell_step_cached_functional(
+        state,
+        input,
+        stepped_cache,
+    )
+    after_energy = Cell.spike_surrogate_value(
+        Cell.spike_margin_from_transition(
+            state,
+            stepped_next,
+            stepped_cache,
+        ),
+    )
+    @test after_energy < before_energy
+
+    # Each plateau group owns its crossing surrogate. A group-1 onset near
+    # threshold is credited; moving the same crossing outside the compact
+    # support makes its event eligibility exactly zero.
+    plateau_previous = copy(state)
+    plateau_next = copy(next_state)
+    plateau_previous[Cell.SPIKE_INDEX] = 0.0f0
+    plateau_next[Cell.SPIKE_INDEX] = 0.0f0
+    for compartment in 1:Cell.N_COMPARTMENTS
+        plateau_previous[Cell.state_index(
+            compartment,
+            Cell.FIELD_PLATEAU,
+        )] = 0.0f0
+        plateau_next[Cell.state_index(
+            compartment,
+            Cell.FIELD_PLATEAU,
+        )] = 0.0f0
+    end
+    plateau_index = Cell.state_index(1, Cell.FIELD_PLATEAU)
+    plateau_next[plateau_index] = Float32(Axon.PLATEAU_EVENT_THRESHOLD)
+    plateau_mask = UInt8(1) << (Axon.PLATEAU_EVENT_FIRST - 1)
+    plateau_advantages = ntuple(
+        lane -> lane == Axon.PLATEAU_EVENT_FIRST ? 0.3f0 : 0.0f0,
+        Val(Axon.EVENT_DIM),
+    )
+    Local.reset_adjoint_arena!(fused_arena)
+    Local.begin_fused_local_adjoint!(fused_arena, 1, 1)
+    Local.contract_replayed_transition_fused!(
+        fused_arena,
+        1,
+        fused_scratch,
+        link,
+        plateau_previous,
+        input,
+        cache,
+        derivative_cache,
+        plateau_next,
+        zeros(Float32, Local.LOCAL_OBSERVATION_DIM),
+        zeros(Float32, Axon.PACKET_DIM);
+        touched=true,
+        analog_scale=0.0f0,
+        event_scale=0.4f0,
+        event_control=Local.CausalEventControl(
+            plateau_mask,
+            plateau_advantages,
+        ),
+    )
+    @test any(
+        parameter -> !iszero(Local.fused_event_raw_cotangent(
+            fused_scratch,
+            parameter,
+        )),
+        1:Cell.PARAM_DIM,
+    )
+    plateau_next[plateau_index] =
+        3.0f0 * Float32(Axon.PLATEAU_EVENT_THRESHOLD)
+    Local.reset_adjoint_arena!(fused_arena)
+    Local.begin_fused_local_adjoint!(fused_arena, 1, 1)
+    Local.contract_replayed_transition_fused!(
+        fused_arena,
+        1,
+        fused_scratch,
+        link,
+        plateau_previous,
+        input,
+        cache,
+        derivative_cache,
+        plateau_next,
+        zeros(Float32, Local.LOCAL_OBSERVATION_DIM),
+        zeros(Float32, Axon.PACKET_DIM);
+        touched=true,
+        analog_scale=0.0f0,
+        event_scale=0.4f0,
+        event_control=Local.CausalEventControl(
+            plateau_mask,
+            plateau_advantages,
+        ),
+    )
+    @test all(
+        parameter -> iszero(Local.fused_event_raw_cotangent(
+            fused_scratch,
+            parameter,
+        )),
+        1:Cell.PARAM_DIM,
+    )
+
+    Local.reset_adjoint_arena!(fused_arena)
+    Local.begin_fused_local_adjoint!(fused_arena, 1, 1)
+    Local.contract_replayed_transition_fused!(
+        fused_arena,
+        1,
+        fused_scratch,
+        link,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        continuous,
+        packet;
+        touched=true,
+        analog_scale=0.7f0,
+        event_scale=0.4f0,
+    )
+    Local.reset_adjoint_arena!(fused_arena)
+    Local.begin_fused_local_adjoint!(fused_arena, 1, 1)
+    allocated = @allocated Local.contract_replayed_transition_fused!(
+        fused_arena,
+        1,
+        fused_scratch,
+        link,
+        state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        continuous,
+        packet;
+        touched=true,
+        analog_scale=0.7f0,
+        event_scale=0.4f0,
+    )
+    @test allocated == 0
+end
+
 @testset "linearity and generic seeded-adjoint duality" begin
     raw, states, inputs, continuous_a, packet_a = make_local_trajectory(2)
     continuous_b = [0.37 .* signal for signal in continuous_a]

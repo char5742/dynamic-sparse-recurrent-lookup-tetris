@@ -13,6 +13,8 @@ export LOCAL_OBSERVATION_DIM,
        ContractedLocalAdjoint,
        ContractedAdjointArena,
        ContractedAdjointScratch,
+       FusedContractedAdjointArena,
+       FusedContractedAdjointScratch,
        CausalEventControl,
        StructuralUtilityState,
        FixedLocalSignalMap,
@@ -25,8 +27,10 @@ export LOCAL_OBSERVATION_DIM,
        TwoPassListNetReplay,
        reset_replay!,
        begin_local_adjoint!,
+       begin_fused_local_adjoint!,
        add_terminal_seed!,
        finish_local_adjoint!,
+       finish_fused_local_adjoint!,
        reset_adjoint_arena!,
        preview_clocks,
        commit_clocks!,
@@ -37,8 +41,13 @@ export LOCAL_OBSERVATION_DIM,
        finish_replay!,
        project_learning_signal!,
        contract_replayed_transition!,
+       contract_replayed_transition_fused!,
        raw_parameter_cotangent,
        input_cotangent,
+       fused_analog_raw_cotangent,
+       fused_event_raw_cotangent,
+       fused_analog_input_cotangent,
+       fused_event_input_cotangent,
        update_structural_utility!,
        config_summary,
        config_fingerprint,
@@ -214,6 +223,92 @@ struct ContractedAdjointScratch{T<:AbstractFloat}
     packet_dnext::Vector{T}
 end
 
+"""
+Two independent local-adjoint lanes sharing one conditional cell reverse.
+
+The analog lane carries the ordinary factorized ListNet/local-prediction
+third factor.  The event lane carries only source hard-control credit.  Both
+slabs are `48 x node_count`, never parameter-width eligibility matrices.
+"""
+mutable struct FusedContractedAdjointArena{T<:AbstractFloat}
+    analog_state_bar::Matrix{T}
+    event_state_bar::Matrix{T}
+    expected_record::Vector{Int}
+    active::Vector{Bool}
+    touched::Vector{Bool}
+    visited_transition_count::Vector{Int}
+    conditional_pullback_count::Vector{Int}
+    generation::Vector{UInt32}
+    current_generation::UInt32
+end
+
+function FusedContractedAdjointArena(
+    node_count::Integer;
+    T::Type{<:AbstractFloat}=Float32,
+)
+    count = _require_positive("fused adjoint arena node_count", node_count)
+    return FusedContractedAdjointArena{T}(
+        zeros(T, Cell.STATE_DIM, count),
+        zeros(T, Cell.STATE_DIM, count),
+        zeros(Int, count),
+        fill(false, count),
+        fill(false, count),
+        zeros(Int, count),
+        zeros(Int, count),
+        zeros(UInt32, count),
+        UInt32(1),
+    )
+end
+
+"""Fixed scratch for the fused analog/event conditional pullback."""
+struct FusedContractedAdjointScratch{T<:AbstractFloat}
+    dstate::Vector{Complex{T}}
+    dinput::Vector{Complex{T}}
+    draw::Vector{Complex{T}}
+    dnext::Vector{Complex{T}}
+    packet_bar::Vector{T}
+    packet_dnext::Vector{T}
+end
+
+function FusedContractedAdjointScratch(
+    ; T::Type{<:AbstractFloat}=Float32,
+)
+    return FusedContractedAdjointScratch{T}(
+        zeros(Complex{T}, Cell.STATE_DIM),
+        zeros(Complex{T}, Cell.INPUT_DIM),
+        zeros(Complex{T}, Cell.PARAM_DIM),
+        zeros(Complex{T}, Cell.STATE_DIM),
+        zeros(T, Axon.PACKET_DIM),
+        zeros(T, Cell.STATE_DIM),
+    )
+end
+
+function reset_adjoint_arena!(arena::FusedContractedAdjointArena)
+    if arena.current_generation == typemax(UInt32)
+        fill!(arena.generation, UInt32(0))
+        arena.current_generation = UInt32(1)
+    else
+        arena.current_generation += UInt32(1)
+    end
+    return arena
+end
+
+@inline function _check_arena_node(
+    arena::FusedContractedAdjointArena,
+    node::Integer,
+)
+    selected = Int(node)
+    checkbounds(arena.expected_record, selected)
+    return selected
+end
+
+@inline function _arena_is_current(
+    arena::FusedContractedAdjointArena,
+    node::Int,
+)
+    return arena.generation[node] == arena.current_generation
+end
+
 function ContractedAdjointScratch(; T::Type{<:AbstractFloat}=Float32)
     return ContractedAdjointScratch{T}(
         zeros(T, Cell.STATE_DIM),
@@ -226,21 +321,25 @@ function ContractedAdjointScratch(; T::Type{<:AbstractFloat}=Float32)
 end
 
 """
-Explicit hard-event control boundary.
+Explicit source hard-event control boundary.
 
-The initial canonical model has no causal continuation/energy estimator, so
-only `CausalEventControl()` is accepted by the contracted kernel. A nonzero or
-connected control fails closed instead of silently reusing the analog ListNet
-signal. Once a fused two-lane cell VJP exists, a connected estimator can be
-implemented without merging the analog and hard-event clocks.
+Lane 1 is the soma event and lanes 2:5 are the four plateau-group crossings.
+Only lanes present in `source_mask` may carry a nonzero advantage. The
+ordinary Float32 contracted kernel remains analog-only and rejects connected
+control; `contract_replayed_transition_fused!` consumes the connected form in
+its independent event lane.
 """
 struct CausalEventControl{T<:AbstractFloat}
     advantage::T
+    plateau_advantage::NTuple{4,T}
+    source_mask::UInt8
     connected::Bool
 end
 
 CausalEventControl(; T::Type{<:AbstractFloat}=Float32) =
-    CausalEventControl{T}(zero(T), false)
+    CausalEventControl{T}(
+        zero(T), (zero(T), zero(T), zero(T), zero(T)), UInt8(0), false,
+    )
 
 function CausalEventControl(
     advantage::T;
@@ -249,7 +348,45 @@ function CausalEventControl(
     isfinite(advantage) || throw(ArgumentError(
         "hard-event advantage must be finite",
     ))
-    return CausalEventControl{T}(advantage, connected)
+    return CausalEventControl{T}(
+        advantage,
+        (zero(T), zero(T), zero(T), zero(T)),
+        iszero(advantage) ? UInt8(0) : UInt8(1),
+        connected,
+    )
+end
+
+function CausalEventControl(
+    source_mask::Integer,
+    advantages::NTuple{5,T};
+    connected::Bool=true,
+) where {T<:AbstractFloat}
+    mask = UInt8(source_mask)
+    source_mask == mask && iszero(mask & ~UInt8(0x1f)) || throw(
+        ArgumentError("hard-event source mask must use only five event lanes"),
+    )
+    all(isfinite, advantages) || throw(ArgumentError(
+        "hard-event advantages must be finite",
+    ))
+    @inbounds for lane in 1:Axon.EVENT_DIM
+        !iszero(advantages[lane]) && iszero(mask & (UInt8(1) << (lane - 1))) &&
+            throw(ArgumentError(
+                "a non-emitted hard-event lane cannot carry source advantage",
+            ))
+    end
+    return CausalEventControl{T}(
+        advantages[1],
+        (advantages[2], advantages[3], advantages[4], advantages[5]),
+        mask,
+        connected,
+    )
+end
+
+@inline function _event_advantage(control::CausalEventControl, lane::Int)
+    lane == Axon.SOMA_EVENT && return control.advantage
+    return @inbounds control.plateau_advantage[
+        lane - Axon.PLATEAU_EVENT_FIRST + 1
+    ]
 end
 
 """Slow utility state. It never aliases analog or hard-event gradients."""
@@ -524,6 +661,7 @@ struct LocalLearningConfig
     eligibility_decay::Float32
     analog_multiplier::Float32
     hard_event_multiplier::Float32
+    hard_event_energy_cost::Float32
     utility_mode::Symbol
     plasticity::PlasticityConfig
 end
@@ -537,9 +675,8 @@ function LocalLearningConfig(;
     predictor_dim::Integer=0,
     eligibility_decay::Real=0.0,
     analog_multiplier::Real=1.0,
-    # Fail closed until a causal continuation/energy estimator and fused
-    # analog/event cell VJP are connected.
     hard_event_multiplier::Real=0.0,
+    hard_event_energy_cost::Real=0.0,
     utility_mode::Symbol=:combined,
     plasticity::PlasticityConfig=PlasticityConfig(),
 )
@@ -551,6 +688,7 @@ function LocalLearningConfig(;
     decay = Float32(eligibility_decay)
     analog = Float32(analog_multiplier)
     hard_event = Float32(hard_event_multiplier)
+    hard_event_cost = Float32(hard_event_energy_cost)
     predictor_dim >= 0 || throw(ArgumentError(
         "predictor dimension must be nonnegative",
     ))
@@ -569,6 +707,11 @@ function LocalLearningConfig(;
     isfinite(hard_event) && hard_event >= 0.0f0 || throw(ArgumentError(
         "hard-event multiplier must be finite and nonnegative",
     ))
+    isfinite(hard_event_cost) && hard_event_cost >= 0.0f0 || throw(
+        ArgumentError(
+            "hard-event energy cost must be finite and nonnegative",
+        ),
+    )
     utility_mode in (:combined, :none) || throw(ArgumentError(
         "utility mode must be :combined or :none",
     ))
@@ -581,6 +724,7 @@ function LocalLearningConfig(;
         decay,
         analog,
         hard_event,
+        hard_event_cost,
         utility_mode,
         plasticity,
     )
@@ -622,6 +766,7 @@ function config_summary(config::LocalLearningConfig)
         "eligibility_decay=$(config.eligibility_decay)",
         "analog_multiplier=$(config.analog_multiplier)",
         "hard_event_multiplier=$(config.hard_event_multiplier)",
+        "hard_event_energy_cost=$(config.hard_event_energy_cost)",
         "utility_mode=$(config.utility_mode)",
         "firing_ema_decay=$(plasticity.firing_ema_decay)",
         "target_rate_min=$(plasticity.target_rate_min)",
@@ -969,6 +1114,29 @@ function begin_local_adjoint!(
     return selected
 end
 
+function begin_fused_local_adjoint!(
+    arena::FusedContractedAdjointArena{T},
+    node::Integer,
+    terminal_record::Integer,
+) where {T<:AbstractFloat}
+    selected = _check_arena_node(arena, node)
+    terminal = Int(terminal_record)
+    terminal >= 0 || throw(ArgumentError(
+        "terminal record must be nonnegative",
+    ))
+    @inbounds for index in 1:Cell.STATE_DIM
+        arena.analog_state_bar[index, selected] = zero(T)
+        arena.event_state_bar[index, selected] = zero(T)
+    end
+    arena.expected_record[selected] = terminal
+    arena.active[selected] = true
+    arena.touched[selected] = false
+    arena.visited_transition_count[selected] = 0
+    arena.conditional_pullback_count[selected] = 0
+    arena.generation[selected] = arena.current_generation
+    return selected
+end
+
 """Add a generic/oracle terminal cotangent to an active adjoint seed."""
 function add_terminal_seed!(
     state::ContractedLocalAdjoint{T},
@@ -1077,6 +1245,28 @@ function finish_local_adjoint!(
     return selected
 end
 
+function finish_fused_local_adjoint!(
+    arena::FusedContractedAdjointArena,
+    node::Integer,
+    root_record::Integer=0,
+)
+    selected = _check_arena_node(arena, node)
+    _arena_is_current(arena, selected) && arena.active[selected] ||
+        throw(ArgumentError("fused local-adjoint column is not active"))
+    root = Int(root_record)
+    root >= 0 || throw(ArgumentError("root record must be nonnegative"))
+    arena.expected_record[selected] == root || throw(ArgumentError(
+        "fused local replay stopped at record " *
+        "$(arena.expected_record[selected]), expected $root",
+    ))
+    arena.conditional_pullback_count[selected] ==
+        arena.visited_transition_count[selected] || error(
+            "each visited transition must execute exactly one fused cell pullback",
+        )
+    arena.active[selected] = false
+    return selected
+end
+
 """Write the local 47D continuous observation; teacher state is not an input."""
 function continuous_observation!(
     destination::AbstractVector{T},
@@ -1133,14 +1323,250 @@ end
 end
 
 @inline function _check_event_control(control::CausalEventControl)
-    if control.connected || !iszero(control.advantage)
+    if control.connected || !iszero(control.source_mask) ||
+       !iszero(control.advantage) || any(!iszero, control.plateau_advantage)
         throw(ArgumentError(
-            "hard-event control is disconnected: a causal continuation/energy " *
-            "estimator and fused two-lane cell VJP are required",
+            "connected hard-event control requires the fused two-lane kernel",
         ))
     end
     return nothing
 end
+
+@inline function _plateau_group_active(
+    state::AbstractVector{T},
+    group::Int,
+) where {T<:AbstractFloat}
+    first_branch = 2 * group - 1
+    second_branch = first_branch + 1
+    threshold = T(Axon.PLATEAU_EVENT_THRESHOLD)
+    return @inbounds(
+        state[Cell.state_index(first_branch, Cell.FIELD_PLATEAU)] >= threshold ||
+        state[Cell.state_index(second_branch, Cell.FIELD_PLATEAU)] >= threshold
+    )
+end
+
+@inline function _recorded_event_mask(
+    previous_state::AbstractVector{T},
+    next_state::AbstractVector{T},
+) where {T<:AbstractFloat}
+    mask = next_state[Cell.SPIKE_INDEX] >= T(0.5) ? UInt8(0x01) : UInt8(0)
+    @inbounds for group in 1:Axon.GROUP_COUNT
+        if _plateau_group_active(previous_state, group) !=
+           _plateau_group_active(next_state, group)
+            lane = Axon.plateau_event_lane(group)
+            mask |= UInt8(1) << (lane - 1)
+        end
+    end
+    return mask
+end
+
+@inline function _seed_plateau_event_control!(
+    dnext::AbstractVector{Complex{T}},
+    previous_state::AbstractVector{T},
+    next_state::AbstractVector{T},
+    control::CausalEventControl{T},
+    event_scale::T,
+) where {T<:AbstractFloat}
+    threshold = T(Axon.PLATEAU_EVENT_THRESHOLD)
+    width = threshold
+    @inbounds for group in 1:Axon.GROUP_COUNT
+        lane = Axon.plateau_event_lane(group)
+        bit = UInt8(1) << (lane - 1)
+        iszero(control.source_mask & bit) && continue
+        advantage = _event_advantage(control, lane)
+        iszero(advantage) && continue
+        first_branch = 2 * group - 1
+        second_branch = first_branch + 1
+        first_index = Cell.state_index(first_branch, Cell.FIELD_PLATEAU)
+        second_index = Cell.state_index(second_branch, Cell.FIELD_PLATEAU)
+        first_value = next_state[first_index]
+        second_value = next_state[second_index]
+        selected_index = first_value >= second_value ? first_index : second_index
+        selected_value = max(first_value, second_value)
+        next_active = _plateau_group_active(next_state, group)
+        direction = next_active ? one(T) : -one(T)
+        surrogate = Cell.spike_surrogate_derivative(
+            selected_value - threshold,
+            width,
+        )
+        dnext[selected_index] += Complex{T}(
+            zero(T),
+            event_scale * advantage * direction * surrogate,
+        )
+    end
+    return nothing
+end
+
+"""
+    contract_replayed_transition_fused!(...)
+
+Contract one chronological transition with two exactly separated cotangent
+lanes and one conditional cell reverse.  The real lane is the existing analog
+local estimator.  The imaginary lane is seeded only by actually returned
+source-event advantages.  Plateau groups use their own threshold-crossing
+surrogate; soma credit uses the canonical pre-reset-margin surrogate inside
+the cell pullback.
+"""
+function contract_replayed_transition_fused!(
+    arena::FusedContractedAdjointArena{T},
+    node::Integer,
+    scratch::FusedContractedAdjointScratch{T},
+    link::ChronologicalTransitionLink,
+    previous_state::AbstractVector{T},
+    input::AbstractVector{T},
+    cache::Cell.CellParameterCache{T},
+    derivative_cache::Cell.CellParameterDerivativeCache{T},
+    next_state::AbstractVector{T},
+    continuous_signal::AbstractVector{T},
+    packet_signal::AbstractVector{T};
+    touched::Bool,
+    analog_scale::T=one(T),
+    event_scale::T=one(T),
+    event_control::CausalEventControl{T}=CausalEventControl(; T=T),
+) where {T<:AbstractFloat}
+    length(previous_state) == Cell.STATE_DIM || throw(DimensionMismatch(
+        "previous state has the wrong length",
+    ))
+    length(input) == Cell.INPUT_DIM || throw(DimensionMismatch(
+        "cell input has the wrong length",
+    ))
+    length(next_state) == Cell.STATE_DIM || throw(DimensionMismatch(
+        "next state has the wrong length",
+    ))
+    length(continuous_signal) == LOCAL_OBSERVATION_DIM || throw(
+        DimensionMismatch("continuous learning signal has the wrong length"),
+    )
+    length(packet_signal) == Axon.PACKET_DIM || throw(
+        DimensionMismatch("packet learning signal has the wrong length"),
+    )
+    isfinite(analog_scale) && analog_scale >= zero(T) || throw(ArgumentError(
+        "analog eligibility scale must be finite and nonnegative",
+    ))
+    isfinite(event_scale) && event_scale >= zero(T) || throw(ArgumentError(
+        "event eligibility scale must be finite and nonnegative",
+    ))
+    touched || return false
+    selected = _check_arena_node(arena, node)
+    _arena_is_current(arena, selected) && arena.active[selected] ||
+        throw(ArgumentError(
+            "begin_fused_local_adjoint! must activate the arena column",
+        ))
+    arena.expected_record[selected] == link.record || throw(ArgumentError(
+        "out-of-order fused replay: expected record " *
+        "$(arena.expected_record[selected]), received $(link.record)",
+    ))
+    all(isfinite, previous_state) && all(isfinite, input) &&
+        all(isfinite, next_state) && all(isfinite, continuous_signal) &&
+        all(isfinite, packet_signal) || throw(ArgumentError(
+            "fused local replay inputs must be finite",
+        ))
+    if event_control.connected
+        event_control.source_mask == _recorded_event_mask(
+            previous_state,
+            next_state,
+        ) || throw(ArgumentError(
+            "hard-event control mask differs from the recorded transition",
+        ))
+    elseif !iszero(event_control.source_mask) ||
+           !iszero(event_control.advantage) ||
+           any(!iszero, event_control.plateau_advantage)
+        throw(ArgumentError(
+            "hard-event advantages require a connected source transition",
+        ))
+    end
+
+    @inbounds for index in 1:Cell.STATE_DIM
+        scratch.dnext[index] = Complex{T}(
+            arena.analog_state_bar[index, selected],
+            arena.event_state_bar[index, selected],
+        )
+    end
+    continuous_count = Cell.N_COMPARTMENTS * Cell.COMPARTMENT_STATE_DIM
+    @inbounds for index in 1:continuous_count
+        scratch.dnext[index] += Complex{T}(
+            analog_scale * continuous_signal[index],
+            zero(T),
+        )
+    end
+    scratch.dnext[Cell.ADAPTATION_INDEX] += Complex{T}(
+        analog_scale * continuous_signal[ADAPTATION_OBSERVATION],
+        zero(T),
+    )
+    @inbounds for lane in 1:Axon.PACKET_DIM
+        scratch.packet_bar[lane] = analog_scale * packet_signal[lane]
+    end
+    margin_cotangent = analog_scale *
+        continuous_signal[MARGIN_OBSERVATION]
+    margin_cotangent += Axon.axon_packet_pullback!(
+        scratch.packet_dnext,
+        scratch.packet_bar,
+        previous_state,
+        next_state,
+        cache,
+    )
+    @inbounds for index in 1:(Cell.STATE_DIM - 1)
+        scratch.dnext[index] += Complex{T}(
+            scratch.packet_dnext[index],
+            zero(T),
+        )
+    end
+    event_control.connected && _seed_plateau_event_control!(
+        scratch.dnext,
+        previous_state,
+        next_state,
+        event_control,
+        event_scale,
+    )
+    soma_event = event_control.connected &&
+        !iszero(event_control.source_mask & UInt8(0x01)) ?
+        Complex{T}(zero(T), event_scale * event_control.advantage) :
+        zero(Complex{T})
+
+    Cell.cell_step_conditional_pullback_mixed!(
+        scratch.dstate,
+        scratch.dinput,
+        scratch.draw,
+        previous_state,
+        input,
+        cache,
+        derivative_cache,
+        next_state,
+        scratch.dnext,
+        soma_event,
+        zero(T),
+        Complex{T}(margin_cotangent, zero(T)),
+    )
+    @inbounds for index in 1:Cell.STATE_DIM
+        value = scratch.dstate[index]
+        arena.analog_state_bar[index, selected] = real(value)
+        arena.event_state_bar[index, selected] = imag(value)
+    end
+    arena.expected_record[selected] = link.predecessor
+    arena.touched[selected] = true
+    arena.visited_transition_count[selected] += 1
+    arena.conditional_pullback_count[selected] += 1
+    return true
+end
+
+@inline fused_analog_raw_cotangent(
+    scratch::FusedContractedAdjointScratch,
+    parameter::Integer,
+) = real(@inbounds scratch.draw[Int(parameter)])
+
+@inline fused_event_raw_cotangent(
+    scratch::FusedContractedAdjointScratch,
+    parameter::Integer,
+) = imag(@inbounds scratch.draw[Int(parameter)])
+
+@inline fused_analog_input_cotangent(
+    scratch::FusedContractedAdjointScratch,
+    channel::Integer,
+) = real(@inbounds scratch.dinput[Int(channel)])
+
+@inline fused_event_input_cotangent(
+    scratch::FusedContractedAdjointScratch,
+    channel::Integer,
+) = imag(@inbounds scratch.dinput[Int(channel)])
 
 @inline function _contract_seeded_transition!(
     scratch::ContractedAdjointScratch{T},

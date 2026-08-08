@@ -385,6 +385,8 @@ function cdg_hot_local_candidate!(
         due;
         expected_signature=signature,
         mode=:cow,
+        hard_state_id=1,
+        hard_candidate_ordinal=1,
     )
     return nothing
 end
@@ -399,9 +401,15 @@ function cdg_hot_local_common!(
     value_bar,
     due,
     signature,
+    common_seed=nothing,
 )
     CDGGraph.clear_gradient!(worker)
     CDGGraph.begin_local_microbatch!(learner)
+    common_seed === nothing || CDGGraph.load_common_hard_event_seeds!(
+        learner,
+        common_seed,
+        1,
+    )
     CDGGraph.local_replay_state_common!(
         model,
         state,
@@ -412,6 +420,7 @@ function cdg_hot_local_common!(
         value_bar,
         due;
         expected_signature=signature,
+        hard_state_id=common_seed === nothing ? 0 : 1,
     )
     return nothing
 end
@@ -1455,10 +1464,15 @@ end
         model,
         CDGLocal.LocalLearningConfig(predictor_dim=1),
     )
-    @test_throws ArgumentError CDGGraph.initialize_local_signal_maps(
+    hard_signals = CDGGraph.initialize_local_signal_maps(
         model,
-        CDGLocal.LocalLearningConfig(hard_event_multiplier=0.1),
+        CDGLocal.LocalLearningConfig(
+            hard_event_multiplier=0.1,
+            hard_event_energy_cost=0.01,
+        ),
     )
+    @test hard_signals.config.hard_event_multiplier == 0.1f0
+    @test hard_signals.config.hard_event_energy_cost == 0.01f0
 
     raw_delta = fill(0.01f0, CDGOutput.OUTPUT_DIM)
     component_bar = cdg_component_bar(1.0f0)
@@ -1867,6 +1881,984 @@ end
     @test all(!iszero, observation.task_utility_sum[
         [family2_branch2, family2_branch3]
     ])
+end
+
+@testset "hard-event source credit is causal, split, and clock-independent" begin
+    model = CDGGraph.initialize_model(
+        MersenneTwister(0xe7c0de),
+        CDGGraph.GraphConfig(2, 7, 12_288, :error),
+    )
+    source_limit = CDGTopology.SPATIAL_COUNT +
+        CDGTopology.ROW_INTERNAL_COUNT + CDGTopology.COLUMN_INTERNAL_COUNT
+    cdg_configure_high_plateau!(model; node_limit=source_limit)
+    input = cdg_dynamic_contact_coverage_input()
+    state = CDGGraph.initialize_state(model)
+    forward_worker = CDGGraph.initialize_worker(model)
+    CDGGraph.prepare_state_common!(model, state, forward_worker, input)
+    _, signature = CDGGraph.forward_candidate!(
+        model,
+        state,
+        forward_worker,
+        input;
+        mode=:cow,
+    )
+    raw_delta = fill(0.02f0, CDGOutput.OUTPUT_DIM)
+    zero_bar = CDGOutput.OutputComponentGradient(Float32)
+    analog_due = CDGLocal.DuePlasticityClocks(true, false, false, false)
+    both_due = CDGLocal.DuePlasticityClocks(true, true, false, false)
+    hard_due = CDGLocal.DuePlasticityClocks(false, true, false, false)
+
+    function run_candidate(
+        mode::Symbol,
+        config::CDGLocal.LocalLearningConfig,
+        due,
+        delta=raw_delta;
+        state_id::Int=1,
+        candidate_ordinal::Int=1,
+    )
+        worker = CDGGraph.initialize_worker(model)
+        learner = CDGGraph.initialize_local_learner(
+            model,
+            CDGGraph.initialize_local_signal_maps(model, config),
+        )
+        CDGGraph.begin_local_microbatch!(learner)
+        CDGGraph.clear_gradient!(worker)
+        report = CDGGraph.local_replay_candidate!(
+            model,
+            state,
+            worker,
+            learner,
+            input,
+            delta,
+            zero_bar,
+            due;
+            expected_signature=signature,
+            mode,
+            hard_state_id=state_id,
+            hard_candidate_ordinal=candidate_ordinal,
+        )
+        hard = CDGGraph.hard_event_gradient(learner)
+        published = if due.hard_event && config.hard_event_multiplier > 0.0f0
+            slot = CDGGraph.initialize_hard_event_delta(model)
+            CDGGraph.publish_hard_event_delta!(
+                slot,
+                learner,
+                model,
+                candidate_ordinal,
+                candidate_ordinal,
+            )
+        else
+            nothing
+        end
+        return (
+            report,
+            worker,
+            learner,
+            cdg_gradient_snapshot(worker.gradient),
+            (
+                core_cell_raw=copy(hard.core_cell_raw),
+                semantic_projection_raw=copy(hard.semantic_projection_raw),
+                event_raw=copy(hard.event_raw),
+            ),
+            published,
+            copy(CDGGraph.hard_event_delivery_gradient(learner)),
+        )
+    end
+
+    analog_config = CDGLocal.LocalLearningConfig(
+        feedback_seed=0xe7c0de,
+        feedback_scale=0.4,
+    )
+    hard_config = CDGLocal.LocalLearningConfig(
+        feedback_seed=0xe7c0de,
+        feedback_scale=0.4,
+        hard_event_multiplier=0.2,
+        hard_event_energy_cost=0.0,
+    )
+    analog = run_candidate(:cow, analog_config, analog_due)
+    fused_cow = run_candidate(:cow, hard_config, both_due)
+    fused_full = run_candidate(:full, hard_config, both_due)
+
+    # The real lane is the pre-existing analog estimator. Enabling the event
+    # lane neither changes its bits nor adds a second cell pullback.
+    @test cdg_same_gradient_bits(analog[4], fused_cow[4])
+    @test fused_cow[1].visited_transitions ==
+          fused_cow[1].conditional_pullbacks > 0
+    @test fused_cow[1].event_control_deliveries ==
+          fused_cow[2].provenance.event_count > 0
+    @test fused_cow[1].event_control_source_transitions > 0
+    @test fused_cow[1].event_control_soma_sources > 0
+    @test fused_cow[1].event_control_plateau_sources > 0
+    @test fused_cow[1].event_control_semantic_updates > 0
+    @test fused_cow[1].event_control_event_parameter_updates > 0
+    @test all(
+        group -> sum(abs, getproperty(fused_cow[5], group)) > 0.0f0,
+        propertynames(fused_cow[5]),
+    )
+
+    # Work-only full-mode records are not logical eligibility records.
+    @test fused_cow[1] == fused_full[1]
+    @test cdg_same_gradient_bits(fused_cow[4], fused_full[4])
+    @test cdg_same_gradient_bits(fused_cow[5], fused_full[5])
+    @test CDGGraph.hard_event_delta_sealed(fused_cow[6])
+    @test cdg_same_gradient_bits(
+        fused_cow[5],
+        CDGGraph.hard_event_gradient(fused_cow[6]),
+    )
+    @test CDGGraph.hard_event_delta_candidate_range(fused_cow[6]) == (1, 1)
+    @test CDGGraph.hard_event_seed_count(fused_cow[6]) ==
+          CDGGraph.hard_event_seed_count(fused_full[6])
+    @test fused_cow[6].seed_state_id[1:fused_cow[6].seed_count] ==
+          fused_full[6].seed_state_id[1:fused_full[6].seed_count]
+    @test fused_cow[6].seed_candidate_ordinal[1:fused_cow[6].seed_count] ==
+          fused_full[6].seed_candidate_ordinal[1:fused_full[6].seed_count]
+    @test fused_cow[6].seed_delivery_ordinal[1:fused_cow[6].seed_count] ==
+          fused_full[6].seed_delivery_ordinal[1:fused_full[6].seed_count]
+    @test fused_cow[6].seed_source_node[1:fused_cow[6].seed_count] ==
+          fused_full[6].seed_source_node[1:fused_full[6].seed_count]
+    @test fused_cow[6].seed_lane[1:fused_cow[6].seed_count] ==
+          fused_full[6].seed_lane[1:fused_full[6].seed_count]
+    @test fused_cow[6].seed_identity_digest ==
+          fused_full[6].seed_identity_digest
+    @test fused_cow[6].hard_gradient_digest ==
+          fused_full[6].hard_gradient_digest
+    @test reinterpret(UInt32,
+                      fused_cow[6].seed_advantage[1:fused_cow[6].seed_count]) ==
+          reinterpret(UInt32,
+                      fused_full[6].seed_advantage[1:fused_full[6].seed_count])
+
+    provenance = fused_cow[2].provenance
+    positive_source_nodes = Set{Int}()
+    common_deliveries = Int[]
+    common_delivery_count = 0
+    static_delivery_count = 0
+    dynamic_delivery_count = 0
+    delivered_kind = falses(CDGPacket.EVENT_DIM)
+    @inbounds for delivery in 1:provenance.event_count
+        record = CDGGraph.event_delivery_record(provenance, delivery)
+        raw_index = Int(record.contact_parameter)
+        lane = Int(record.lane)
+        delivered_kind[lane] = true
+        raw_index <= 2_040 ?
+            (static_delivery_count += 1) :
+            (dynamic_delivery_count += 1)
+        if CDGGraph.is_common_source_record(record)
+            common_delivery_count += 1
+            push!(common_deliveries, delivery)
+        else
+            push!(positive_source_nodes, Int(record.source_node))
+            @test Int(record.source_record) < Int(record.destination_record)
+        end
+    end
+    @test static_delivery_count > 0
+    @test dynamic_delivery_count > 0
+    @test common_delivery_count > 0
+    @test all(delivered_kind)
+    expected_positive_advantage = zeros(
+        Float32,
+        CDGPacket.EVENT_DIM,
+        fused_cow[2].tape.count,
+    )
+    @inbounds for delivery in 1:provenance.event_count
+        record = CDGGraph.event_delivery_record(provenance, delivery)
+        CDGGraph.is_common_source_record(record) && continue
+        expected_positive_advantage[
+            Int(record.lane),
+            Int(record.source_record),
+        ] += fused_cow[3].event_delivery_advantage[delivery]
+    end
+    @test reinterpret(UInt32, vec(expected_positive_advantage)) ==
+          reinterpret(UInt32, vec(@view(
+              fused_cow[3].source_event_advantage[:, 1:fused_cow[2].tape.count],
+          )))
+    @test all(@view(
+        fused_cow[3].event_delivery_ready[1:provenance.event_count],
+    ))
+    @test any(
+        node -> sum(abs, @view(fused_cow[5].core_cell_raw[:, node])) > 0.0f0,
+        positive_source_nodes,
+    )
+    @test CDGGraph.hard_event_seed_count(fused_cow[6]) ==
+          common_delivery_count > 0
+    @inbounds for index in 1:CDGGraph.hard_event_seed_count(fused_cow[6])
+        seed = CDGGraph.hard_event_seed_record(fused_cow[6], index)
+        expected_delivery = common_deliveries[index]
+        expected = CDGGraph.event_delivery_record(provenance, expected_delivery)
+        @test seed.state_id == UInt16(1)
+        @test seed.candidate_ordinal == Int32(1)
+        @test seed.delivery_ordinal == UInt32(expected_delivery)
+        @test seed.source_node == expected.source_node
+        @test seed.lane == expected.lane
+        @test reinterpret(UInt32, seed.advantage) == reinterpret(
+            UInt32,
+            fused_cow[3].event_delivery_advantage[expected_delivery],
+        )
+    end
+    @test all(iszero, fused_cow[3].common_source_event_advantage)
+    @test sum(abs, fused_cow[5].event_raw[1:2_040]) > 0.0f0
+    @test sum(abs, fused_cow[5].event_raw[2_041:2_120]) > 0.0f0
+    @test sum(abs, fused_cow[5].event_raw[2_121:2_125]) > 0.0f0
+
+    # Every evaluated outgoing delivery owns a separate hard continuation
+    # derivative for its contact raw and shared kind raw. Kappa is deliberately
+    # absent from this direct receiver formula.
+    expected_direct = zeros(Float32, length(model.parameters.event_raw))
+    expected_delivery_advantage = zeros(Float32, provenance.event_count)
+    logical_record = falses(fused_cow[2].tape.count)
+    @inbounds for node in 1:CDGGraph.CORE_NODE_COUNT
+        record = Int(fused_cow[2].tape.latest_record[node])
+        while record != 0
+            logical_record[record] = true
+            record = Int(fused_cow[2].tape.previous_record[record])
+        end
+    end
+    @inbounds for destination_record in fused_cow[2].tape.count:-1:1
+        logical_record[destination_record] || continue
+        delivery = CDGGraph.record_event_delivery_head(
+            provenance,
+            destination_record,
+        )
+        while delivery != 0
+            record = CDGGraph.event_delivery_record(provenance, delivery)
+            channel = Int(record.resolved_channel)
+            raw_index = Int(record.contact_parameter)
+            kind_index = Int(record.kind_parameter)
+            input_bar = fused_cow[3].receiver_input_cotangent[
+                channel,
+                destination_record,
+            ]
+            amplitude = record.scale * model.cache.event_weight[raw_index] *
+                model.cache.event_weight[kind_index]
+            expected_delivery_advantage[delivery] = muladd(
+                input_bar,
+                amplitude,
+                hard_config.hard_event_energy_cost,
+            )
+            direct_bar = input_bar * record.scale *
+                hard_config.hard_event_multiplier
+            raw_value = model.parameters.event_raw[raw_index]
+            raw_derivative = raw_value >= 0.0f0 ?
+                inv(1.0f0 + exp(-raw_value)) :
+                exp(raw_value) / (1.0f0 + exp(raw_value))
+            kind_value = model.parameters.event_raw[kind_index]
+            kind_derivative = kind_value >= 0.0f0 ?
+                inv(1.0f0 + exp(-kind_value)) :
+                exp(kind_value) / (1.0f0 + exp(kind_value))
+            expected_direct[raw_index] += direct_bar *
+                model.cache.event_weight[kind_index] * raw_derivative
+            expected_direct[kind_index] += direct_bar *
+                model.cache.event_weight[raw_index] * kind_derivative
+            delivery = CDGGraph.next_event_delivery_record(provenance, delivery)
+        end
+    end
+    @test reinterpret(UInt32, expected_direct) ==
+          reinterpret(UInt32, fused_cow[7])
+    @test reinterpret(UInt32, expected_delivery_advantage) == reinterpret(
+        UInt32,
+        fused_cow[3].event_delivery_advantage[1:provenance.event_count],
+    )
+    @test sum(abs, expected_direct) > 0.0f0
+
+    # With one event wave, every credited source transition is mandatory and
+    # therefore has no incoming event deposit. The hard event-parameter buffer
+    # must then equal the independently observed direct-delivery derivative.
+    # State-common must drain with the canonical wave budget. Reuse that exact
+    # prepared parameter/cache snapshot through a candidate-only one-wave view,
+    # which isolates delivered wave-one contact/kind derivatives without
+    # changing the finalized common baseline.
+    direct_only_model = typeof(model)(
+        CDGGraph.GraphConfig(2, 1, 12_288, :error),
+        model.topology,
+        model.parameters,
+        model.cache,
+    )
+    direct_only_state = state
+    direct_only_forward = CDGGraph.initialize_worker(direct_only_model)
+    _, direct_only_signature = CDGGraph.forward_candidate!(
+        direct_only_model,
+        direct_only_state,
+        direct_only_forward,
+        input;
+        mode=:cow,
+    )
+    direct_only_worker = CDGGraph.initialize_worker(direct_only_model)
+    direct_only_learner = CDGGraph.initialize_local_learner(
+        direct_only_model,
+        CDGGraph.initialize_local_signal_maps(direct_only_model, hard_config),
+    )
+    CDGGraph.begin_local_microbatch!(direct_only_learner)
+    CDGGraph.clear_gradient!(direct_only_worker)
+    direct_only_report = CDGGraph.local_replay_candidate!(
+        direct_only_model,
+        direct_only_state,
+        direct_only_worker,
+        direct_only_learner,
+        input,
+        raw_delta,
+        zero_bar,
+        hard_due;
+        expected_signature=direct_only_signature,
+        mode=:cow,
+        hard_state_id=1,
+        hard_candidate_ordinal=1,
+    )
+    direct_only_delivery_gradient =
+        CDGGraph.hard_event_delivery_gradient(direct_only_learner)
+    @test direct_only_report.event_control_deliveries ==
+          direct_only_worker.provenance.event_count > 0
+    @test sum(abs, direct_only_delivery_gradient) > 0.0f0
+    @test reinterpret(UInt32, direct_only_delivery_gradient) == reinterpret(
+        UInt32,
+        CDGGraph.hard_event_gradient(direct_only_learner).event_raw,
+    )
+
+    # Receiver benefit is independent of analog optimizer scaling. M=0 with
+    # kappa=0 is strict zero; positive kappa alone is a source energy cost.
+    hard_only_config = CDGLocal.LocalLearningConfig(
+        feedback_seed=0xe7c0de,
+        feedback_scale=0.4,
+        analog_multiplier=0.0,
+        hard_event_multiplier=0.2,
+        hard_event_energy_cost=0.0,
+    )
+    benefit_only = run_candidate(:cow, hard_only_config, hard_due)
+    @test all(
+        group -> all(iszero, getproperty(benefit_only[4], group)),
+        propertynames(benefit_only[4]),
+    )
+    @test all(
+        group -> sum(abs, getproperty(benefit_only[5], group)) > 0.0f0,
+        propertynames(benefit_only[5]),
+    )
+    @test all(iszero, benefit_only[2].core_state_bar)
+    @test all(iszero, benefit_only[2].record_state_bar)
+    @test all(iszero, benefit_only[2].core_packet_bar)
+    @test all(iszero, benefit_only[2].record_packet_bar)
+    zero_control = run_candidate(
+        :cow,
+        hard_only_config,
+        hard_due,
+        zeros(Float32, CDGOutput.OUTPUT_DIM),
+    )
+    @test zero_control[1].signal_nonzero == 0
+    @test all(
+        group -> all(iszero, getproperty(zero_control[5], group)),
+        propertynames(zero_control[5]),
+    )
+    @test all(iszero, @view(zero_control[3].event_delivery_advantage[
+        1:zero_control[2].provenance.event_count
+    ]))
+    @test all(iszero, zero_control[3].source_event_advantage)
+    @test CDGGraph.hard_event_seed_count(zero_control[6]) ==
+          common_delivery_count
+    @test all(iszero,
+              zero_control[6].seed_advantage[1:zero_control[6].seed_count])
+    energy_config = CDGLocal.LocalLearningConfig(
+        feedback_seed=0xe7c0de,
+        feedback_scale=0.4,
+        analog_multiplier=0.0,
+        hard_event_multiplier=0.2,
+        hard_event_energy_cost=0.01,
+    )
+    energy_only = run_candidate(
+        :cow,
+        energy_config,
+        hard_due,
+        zeros(Float32, CDGOutput.OUTPUT_DIM),
+    )
+    @test energy_only[1].signal_nonzero == 0
+    @test sum(abs, energy_only[5].core_cell_raw) > 0.0f0
+    @test all(
+        ==(energy_config.hard_event_energy_cost),
+        @view(energy_only[3].event_delivery_advantage[
+            1:energy_only[2].provenance.event_count
+        ]),
+    )
+    @test all(
+        advantage -> advantage == energy_config.hard_event_energy_cost,
+        energy_only[6].seed_advantage[1:energy_only[6].seed_count],
+    )
+    disabled = run_candidate(
+        :cow,
+        CDGLocal.LocalLearningConfig(
+            feedback_seed=0xe7c0de,
+            hard_event_multiplier=0.0,
+            hard_event_energy_cost=0.01,
+        ),
+        hard_due,
+        zeros(Float32, CDGOutput.OUTPUT_DIM),
+    )
+    @test disabled[1].visited_transitions == 0
+    @test all(
+        group -> all(iszero, getproperty(disabled[5], group)),
+        propertynames(disabled[5]),
+    )
+
+    # Candidate sentinel deliveries cross the worker boundary only through a
+    # sealed state-tagged delta. Slot/range reduction is deterministic and a
+    # fresh common learner consumes exactly one state slice.
+    second_state_delta = run_candidate(
+        :cow,
+        hard_config,
+        hard_due,
+        raw_delta;
+        state_id=2,
+        candidate_ordinal=2,
+    )[6]
+    chunk_worker = CDGGraph.initialize_worker(model)
+    chunk_learner = CDGGraph.initialize_local_learner(
+        model,
+        CDGGraph.initialize_local_signal_maps(model, hard_config);
+        hard_event_seed_capacity=
+            2 * CDGGraph.MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE,
+    )
+    CDGGraph.begin_local_microbatch!(chunk_learner)
+    CDGGraph.clear_gradient!(chunk_worker)
+    for (state_id, candidate_ordinal) in ((1, 1), (2, 2))
+        CDGGraph.local_replay_candidate!(
+            model,
+            state,
+            chunk_worker,
+            chunk_learner,
+            input,
+            raw_delta,
+            zero_bar,
+            hard_due;
+            expected_signature=signature,
+            mode=:cow,
+            hard_state_id=state_id,
+            hard_candidate_ordinal=candidate_ordinal,
+        )
+    end
+    chunk_delta = CDGGraph.initialize_hard_event_delta(
+        model,
+        2 * CDGGraph.MAX_COMMON_HARD_EVENT_SEEDS_PER_CANDIDATE,
+    )
+    CDGGraph.publish_hard_event_delta!(
+        chunk_delta,
+        chunk_learner,
+        model,
+        1,
+        2,
+    )
+    @test cdg_same_gradient_bits(
+        CDGGraph.hard_event_gradient(chunk_learner),
+        CDGGraph.hard_event_gradient(chunk_delta),
+    )
+    @test CDGGraph.hard_event_seed_count(chunk_delta) ==
+          2 * common_delivery_count
+    @test CDGGraph.hard_event_delta_candidate_range(chunk_delta) == (1, 2)
+    @test all(==(UInt16(1)),
+              chunk_delta.seed_state_id[1:common_delivery_count])
+    @test all(==(Int32(1)),
+              chunk_delta.seed_candidate_ordinal[1:common_delivery_count])
+    @test all(==(UInt16(2)), chunk_delta.seed_state_id[
+        (common_delivery_count + 1):(2 * common_delivery_count)
+    ])
+    @test all(==(Int32(2)), chunk_delta.seed_candidate_ordinal[
+        (common_delivery_count + 1):(2 * common_delivery_count)
+    ])
+    @test chunk_delta.seed_delivery_ordinal[1:common_delivery_count] ==
+          chunk_delta.seed_delivery_ordinal[
+              (common_delivery_count + 1):(2 * common_delivery_count)
+          ]
+    common_seed_by_state = zeros(
+        Float32,
+        CDGPacket.EVENT_DIM,
+        CDGGraph.CORE_NODE_COUNT,
+        2,
+    )
+    CDGGraph.accumulate_common_hard_event_seeds!(
+        common_seed_by_state,
+        fused_cow[6],
+        model;
+        expected_first_candidate=1,
+        expected_last_candidate=1,
+    )
+    state_one_bits = copy(reinterpret(UInt32, vec(
+        @view(common_seed_by_state[:, :, 1]),
+    )))
+    @test sum(abs, @view(common_seed_by_state[:, :, 1])) > 0.0f0
+    @test all(iszero, @view(common_seed_by_state[:, :, 2]))
+    CDGGraph.accumulate_common_hard_event_seeds!(
+        common_seed_by_state,
+        second_state_delta,
+        model;
+        expected_first_candidate=2,
+        expected_last_candidate=2,
+    )
+    @test state_one_bits == reinterpret(
+        UInt32,
+        vec(@view(common_seed_by_state[:, :, 1])),
+    )
+    @test sum(abs, @view(common_seed_by_state[:, :, 2])) > 0.0f0
+    chunk_seed_by_state = zeros(Float32, size(common_seed_by_state))
+    CDGGraph.accumulate_common_hard_event_seeds!(
+        chunk_seed_by_state,
+        chunk_delta,
+        model;
+        expected_first_candidate=1,
+        expected_last_candidate=2,
+    )
+    @test reinterpret(UInt32, vec(chunk_seed_by_state)) ==
+          reinterpret(UInt32, vec(common_seed_by_state))
+
+    common_worker = CDGGraph.initialize_worker(model)
+    common_learner = CDGGraph.initialize_local_learner(
+        model,
+        CDGGraph.initialize_local_signal_maps(model, hard_config),
+    )
+    CDGGraph.begin_local_microbatch!(common_learner)
+    CDGGraph.clear_gradient!(common_worker)
+    CDGGraph.load_common_hard_event_seeds!(
+        common_learner,
+        @view(common_seed_by_state[:, :, 1]),
+        1,
+    )
+    @test CDGGraph.common_hard_event_seed_loaded(common_learner)
+    common_report = CDGGraph.local_replay_state_common!(
+        model,
+        state,
+        common_worker,
+        common_learner,
+        input,
+        zeros(Float32, CDGOutput.OUTPUT_DIM),
+        0.0f0,
+        hard_due;
+        expected_signature=state.common_signature,
+        hard_state_id=1,
+    )
+    @test common_report.event_control_source_transitions > 0
+    @test sum(abs,
+              CDGGraph.hard_event_gradient(common_learner).core_cell_raw) > 0.0f0
+    @test !CDGGraph.common_hard_event_seed_loaded(common_learner)
+    @test CDGGraph.common_hard_event_seed_consumed(common_learner)
+    @test all(iszero, common_learner.common_source_event_advantage)
+
+    CDGGraph.clear_gradient!(common_worker)
+    CDGGraph.clear_hard_event_gradient!(
+        CDGGraph.hard_event_gradient(common_learner),
+    )
+    @test_throws ErrorException CDGGraph.local_replay_state_common!(
+        model,
+        state,
+        common_worker,
+        common_learner,
+        input,
+        zeros(Float32, CDGOutput.OUTPUT_DIM),
+        0.0f0,
+        hard_due;
+        expected_signature=state.common_signature,
+        hard_state_id=1,
+    )
+    @test all(iszero,
+              CDGGraph.hard_event_gradient(common_learner).core_cell_raw)
+    @test all(iszero, common_worker.gradient.core_cell_raw)
+
+    zero_common_worker = CDGGraph.initialize_worker(model)
+    zero_common_learner = CDGGraph.initialize_local_learner(
+        model,
+        CDGGraph.initialize_local_signal_maps(model, hard_config),
+    )
+    zero_common_seed = zeros(
+        Float32,
+        CDGPacket.EVENT_DIM,
+        CDGGraph.CORE_NODE_COUNT,
+    )
+    CDGGraph.begin_local_microbatch!(zero_common_learner)
+    CDGGraph.load_common_hard_event_seeds!(
+        zero_common_learner,
+        zero_common_seed,
+        2,
+    )
+    @test_throws ArgumentError CDGGraph.local_replay_state_common!(
+        model,
+        state,
+        zero_common_worker,
+        zero_common_learner,
+        input,
+        zeros(Float32, CDGOutput.OUTPUT_DIM),
+        0.0f0,
+        hard_due;
+        expected_signature=state.common_signature,
+        hard_state_id=1,
+    )
+    @test CDGGraph.common_hard_event_seed_loaded(zero_common_learner)
+    @test !CDGGraph.common_hard_event_seed_poisoned(zero_common_learner)
+    @test_throws ErrorException CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        zero_common_worker,
+        zero_common_learner,
+        input,
+        raw_delta,
+        zero_bar,
+        hard_due;
+        expected_signature=signature,
+        mode=:cow,
+        hard_state_id=1,
+        hard_candidate_ordinal=1,
+    )
+    @test CDGGraph.common_hard_event_seed_loaded(zero_common_learner)
+    @test all(
+        group -> all(iszero, getproperty(
+            cdg_gradient_snapshot(zero_common_worker.gradient),
+            group,
+        )),
+        propertynames(cdg_gradient_snapshot(zero_common_worker.gradient)),
+    )
+    @test all(
+        group -> all(iszero, getproperty(
+            CDGGraph.hard_event_gradient(zero_common_learner),
+            group,
+        )),
+        propertynames(CDGGraph.hard_event_gradient(zero_common_learner)),
+    )
+    zero_common_report = CDGGraph.local_replay_state_common!(
+        model,
+        state,
+        zero_common_worker,
+        zero_common_learner,
+        input,
+        zeros(Float32, CDGOutput.OUTPUT_DIM),
+        0.0f0,
+        hard_due;
+        expected_signature=state.common_signature,
+        hard_state_id=2,
+    )
+    @test zero_common_report.event_control_source_transitions == 0
+    @test all(iszero,
+              CDGGraph.hard_event_gradient(zero_common_learner).core_cell_raw)
+    @test CDGGraph.common_hard_event_seed_consumed(zero_common_learner)
+
+    # A failure after entering common replay poisons the staged slab. Retrying
+    # cannot duplicate a partially written prefix; reset is the only recovery.
+    CDGGraph.begin_local_microbatch!(zero_common_learner)
+    CDGGraph.clear_gradient!(zero_common_worker)
+    @test_throws ArgumentError CDGGraph.load_common_hard_event_seeds!(
+        zero_common_learner,
+        zero_common_seed,
+        Int(typemax(UInt16)) + 1,
+    )
+    CDGGraph.load_common_hard_event_seeds!(
+        zero_common_learner,
+        zero_common_seed,
+        1,
+    )
+    @test_throws ArgumentError CDGGraph.local_replay_state_common!(
+        model,
+        state,
+        zero_common_worker,
+        zero_common_learner,
+        input,
+        zeros(Float32, CDGOutput.OUTPUT_DIM),
+        0.0f0,
+        hard_due;
+        expected_signature=CDGGraph.TrajectorySignature(),
+        hard_state_id=1,
+    )
+    @test CDGGraph.common_hard_event_seed_loaded(zero_common_learner)
+    @test !CDGGraph.common_hard_event_seed_consumed(zero_common_learner)
+    @test CDGGraph.common_hard_event_seed_poisoned(zero_common_learner)
+    poisoned_analog = cdg_gradient_snapshot(zero_common_worker.gradient)
+    poisoned_hard = (
+        core_cell_raw=copy(CDGGraph.hard_event_gradient(
+            zero_common_learner,
+        ).core_cell_raw),
+        semantic_projection_raw=copy(CDGGraph.hard_event_gradient(
+            zero_common_learner,
+        ).semantic_projection_raw),
+        event_raw=copy(CDGGraph.hard_event_gradient(
+            zero_common_learner,
+        ).event_raw),
+    )
+    @test_throws ErrorException CDGGraph.local_replay_state_common!(
+        model,
+        state,
+        zero_common_worker,
+        zero_common_learner,
+        input,
+        zeros(Float32, CDGOutput.OUTPUT_DIM),
+        0.0f0,
+        hard_due;
+        expected_signature=state.common_signature,
+        hard_state_id=1,
+    )
+    @test cdg_same_gradient_bits(
+        poisoned_analog,
+        cdg_gradient_snapshot(zero_common_worker.gradient),
+    )
+    @test cdg_same_gradient_bits(
+        poisoned_hard,
+        CDGGraph.hard_event_gradient(zero_common_learner),
+    )
+    poisoned_delta = CDGGraph.initialize_hard_event_delta(model)
+    @test_throws ErrorException CDGGraph.publish_hard_event_delta!(
+        poisoned_delta,
+        zero_common_learner,
+        model,
+        0,
+        0,
+    )
+    @test !CDGGraph.hard_event_delta_sealed(poisoned_delta)
+    CDGGraph.begin_local_microbatch!(zero_common_learner)
+    @test !CDGGraph.common_hard_event_seed_loaded(zero_common_learner)
+    @test !CDGGraph.common_hard_event_seed_consumed(zero_common_learner)
+    @test !CDGGraph.common_hard_event_seed_poisoned(zero_common_learner)
+
+    # Publication/reduction failures are checked before target mutation.
+    unsealed = CDGGraph.initialize_hard_event_delta(model)
+    reduction_before = copy(common_seed_by_state)
+    @test_throws ErrorException CDGGraph.accumulate_common_hard_event_seeds!(
+        common_seed_by_state,
+        unsealed,
+        model,
+    )
+    @test reinterpret(UInt32, vec(common_seed_by_state)) ==
+          reinterpret(UInt32, vec(reduction_before))
+    reduction_before .= common_seed_by_state
+    @test_throws ErrorException CDGGraph.accumulate_common_hard_event_seeds!(
+        common_seed_by_state,
+        fused_cow[6],
+        model,
+    )
+    @test reinterpret(UInt32, vec(common_seed_by_state)) ==
+          reinterpret(UInt32, vec(reduction_before))
+
+    stale = run_candidate(
+        :cow,
+        hard_config,
+        hard_due,
+        raw_delta;
+        state_id=1,
+        candidate_ordinal=3,
+    )[6]
+    stale.parameter_digest = xor(stale.parameter_digest, UInt64(1))
+    @test_throws ArgumentError CDGGraph.accumulate_common_hard_event_seeds!(
+        common_seed_by_state,
+        stale,
+        model,
+    )
+    @test reinterpret(UInt32, vec(common_seed_by_state)) ==
+          reinterpret(UInt32, vec(reduction_before))
+
+    malformed = run_candidate(
+        :cow,
+        hard_config,
+        hard_due,
+        raw_delta;
+        state_id=1,
+        candidate_ordinal=4,
+    )[6]
+    malformed.seed_delivery_ordinal[1] += UInt32(1)
+    @test_throws ErrorException CDGGraph.accumulate_common_hard_event_seeds!(
+        common_seed_by_state,
+        malformed,
+        model,
+    )
+    @test reinterpret(UInt32, vec(common_seed_by_state)) ==
+          reinterpret(UInt32, vec(reduction_before))
+
+    mutated_advantage = run_candidate(
+        :cow,
+        hard_config,
+        hard_due,
+        raw_delta;
+        state_id=1,
+        candidate_ordinal=5,
+    )[6]
+    mutated_advantage.seed_advantage[1] += 0.125f0
+    @test_throws ErrorException CDGGraph.accumulate_common_hard_event_seeds!(
+        common_seed_by_state,
+        mutated_advantage,
+        model,
+    )
+    @test reinterpret(UInt32, vec(common_seed_by_state)) ==
+          reinterpret(UInt32, vec(reduction_before))
+    @test !mutated_advantage.reduced
+
+    mutated_gradient = run_candidate(
+        :cow,
+        hard_config,
+        hard_due,
+        raw_delta;
+        state_id=1,
+        candidate_ordinal=6,
+    )[6]
+    mutated_gradient.gradient.core_cell_raw[1] += 1.0f0
+    @test_throws ErrorException CDGGraph.accumulate_common_hard_event_seeds!(
+        common_seed_by_state,
+        mutated_gradient,
+        model,
+    )
+    @test reinterpret(UInt32, vec(common_seed_by_state)) ==
+          reinterpret(UInt32, vec(reduction_before))
+    @test !mutated_gradient.reduced
+
+    overflow_delta = run_candidate(
+        :cow,
+        hard_config,
+        hard_due,
+        raw_delta;
+        state_id=1,
+        candidate_ordinal=7,
+    )[6]
+    overflow_reduction = zeros(
+        Float32,
+        CDGPacket.EVENT_DIM,
+        CDGGraph.CORE_NODE_COUNT,
+        1,
+    )
+    first_overflow_seed = CDGGraph.hard_event_seed_record(overflow_delta, 1)
+    overflow_reduction[
+        Int(first_overflow_seed.lane),
+        Int(first_overflow_seed.source_node),
+        1,
+    ] = floatmax(Float32)
+    overflow_reduction_before = copy(overflow_reduction)
+    @test_throws OverflowError CDGGraph.accumulate_common_hard_event_seeds!(
+        overflow_reduction,
+        overflow_delta,
+        model,
+    )
+    @test reinterpret(UInt32, vec(overflow_reduction)) ==
+          reinterpret(UInt32, vec(overflow_reduction_before))
+    @test !overflow_delta.reduced
+
+    undersized = CDGGraph.initialize_hard_event_delta(model, 1)
+    @test fused_cow[3].hard_seed_count > 1
+    @test_throws OverflowError CDGGraph.publish_hard_event_delta!(
+        undersized,
+        fused_cow[3],
+        model,
+        1,
+        1,
+    )
+    @test !CDGGraph.hard_event_delta_sealed(undersized)
+    @test all(iszero, undersized.gradient.core_cell_raw)
+
+    overflow_worker = CDGGraph.initialize_worker(model)
+    overflow_learner = CDGGraph.initialize_local_learner(
+        model,
+        CDGGraph.initialize_local_signal_maps(model, hard_config);
+        hard_event_seed_capacity=1,
+    )
+    CDGGraph.begin_local_microbatch!(overflow_learner)
+    CDGGraph.clear_gradient!(overflow_worker)
+    @test_throws OverflowError CDGGraph.local_replay_candidate!(
+        model,
+        state,
+        overflow_worker,
+        overflow_learner,
+        input,
+        raw_delta,
+        zero_bar,
+        hard_due;
+        expected_signature=signature,
+        mode=:cow,
+        hard_state_id=1,
+        hard_candidate_ordinal=1,
+    )
+    @test all(iszero, overflow_worker.gradient.core_cell_raw)
+    @test all(iszero,
+              CDGGraph.hard_event_gradient(overflow_learner).core_cell_raw)
+
+    hot_worker = CDGGraph.initialize_worker(model)
+    hot_learner = CDGGraph.initialize_local_learner(
+        model,
+        CDGGraph.initialize_local_signal_maps(model, hard_config),
+    )
+    cdg_hot_local_candidate!(
+        model,
+        state,
+        hot_worker,
+        hot_learner,
+        input,
+        raw_delta,
+        zero_bar,
+        both_due,
+        signature,
+    )
+    @test @allocated(cdg_hot_local_candidate!(
+        model,
+        state,
+        hot_worker,
+        hot_learner,
+        input,
+        raw_delta,
+        zero_bar,
+        both_due,
+        signature,
+    )) == 0
+    hot_delta = CDGGraph.initialize_hard_event_delta(model)
+    CDGGraph.publish_hard_event_delta!(
+        hot_delta,
+        fused_cow[3],
+        model,
+        1,
+        1,
+    )
+    @test @allocated(CDGGraph.clear_hard_event_delta!(hot_delta)) == 0
+    @test @allocated(CDGGraph.publish_hard_event_delta!(
+        hot_delta,
+        fused_cow[3],
+        model,
+        1,
+        1,
+    )) == 0
+    hot_reduction = zeros(
+        Float32,
+        CDGPacket.EVENT_DIM,
+        CDGGraph.CORE_NODE_COUNT,
+        1,
+    )
+    CDGGraph.accumulate_common_hard_event_seeds!(hot_reduction, hot_delta, model)
+    CDGGraph.clear_hard_event_delta!(hot_delta)
+    CDGGraph.publish_hard_event_delta!(hot_delta, fused_cow[3], model, 1, 1)
+    fill!(hot_reduction, 0.0f0)
+    @test @allocated(CDGGraph.accumulate_common_hard_event_seeds!(
+        hot_reduction,
+        hot_delta,
+        model,
+    )) == 0
+    hot_load_learner = CDGGraph.initialize_local_learner(
+        model,
+        CDGGraph.initialize_local_signal_maps(model, hard_config),
+    )
+    hot_load_source = @view(hot_reduction[:, :, 1])
+    CDGGraph.begin_local_microbatch!(hot_load_learner)
+    CDGGraph.load_common_hard_event_seeds!(hot_load_learner, hot_load_source, 1)
+    CDGGraph.begin_local_microbatch!(hot_load_learner)
+    @test @allocated(CDGGraph.load_common_hard_event_seeds!(
+        hot_load_learner,
+        hot_load_source,
+        1,
+    )) == 0
+    hot_common_seed = @view(common_seed_by_state[:, :, 1])
+    cdg_hot_local_common!(
+        model,
+        state,
+        hot_worker,
+        hot_learner,
+        input,
+        raw_delta,
+        0.0f0,
+        both_due,
+        state.common_signature,
+        hot_common_seed,
+    )
+    @test @allocated(cdg_hot_local_common!(
+        model,
+        state,
+        hot_worker,
+        hot_learner,
+        input,
+        raw_delta,
+        0.0f0,
+        both_due,
+        state.common_signature,
+        hot_common_seed,
+    )) == 0
 end
 
 @testset "contracted local COW/full and hot replay are exact" begin
