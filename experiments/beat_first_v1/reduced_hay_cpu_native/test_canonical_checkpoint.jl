@@ -1,11 +1,27 @@
 using Test
 using Serialization
+using Random
 
 module CanonicalCheckpointTestHarness
+include(joinpath(@__DIR__, "ActiveApicalCell.jl"))
+include(joinpath(@__DIR__, "DendriticAxonPacket.jl"))
+include(joinpath(@__DIR__, "OrderedMultiscaleTopology.jl"))
+include(joinpath(@__DIR__, "CanonicalTetrisInput.jl"))
+include(joinpath(@__DIR__, "DendriticOutputPopulation.jl"))
+include(joinpath(@__DIR__, "CanonicalEventArena.jl"))
+include(joinpath(@__DIR__, "CanonicalSpatialDrive.jl"))
+include(joinpath(@__DIR__, "CanonicalLocalLearning.jl"))
+include(joinpath(@__DIR__, "CanonicalOptimizer.jl"))
+include(joinpath(@__DIR__, "CanonicalDendriticGraph.jl"))
 include(joinpath(@__DIR__, "CanonicalCheckpoint.jl"))
 end
 
 const CP = CanonicalCheckpointTestHarness.CanonicalCheckpoint
+const Local = CanonicalCheckpointTestHarness.CanonicalLocalLearning
+const Opt = CanonicalCheckpointTestHarness.CanonicalOptimizer
+const Topology = CanonicalCheckpointTestHarness.OrderedMultiscaleTopology
+const Input = CanonicalCheckpointTestHarness.CanonicalTetrisInput
+const Graph = CanonicalCheckpointTestHarness.CanonicalDendriticGraph
 
 struct TestParameters
     cell::Matrix{Float32}
@@ -13,9 +29,10 @@ struct TestParameters
 end
 
 struct TestConfig
-    count::Int
-    scale::Float32
-    labels::Tuple{Symbol,Symbol}
+    max_candidates::Int
+    max_event_waves::Int
+    tape_capacity::Int
+    event_overflow::Symbol
 end
 
 mutable struct TestCounters
@@ -25,39 +42,8 @@ mutable struct TestCounters
     rewires::Int
 end
 
-@enum TestTransformKind::UInt8 TEST_SIGNED=1 TEST_CONDUCTANCE=2
-
-struct TestGroup
-    name::Symbol
-    parameter::Array{Float32}
-    gradient::Array{Float32}
-    transform_kind::TestTransformKind
-    multiplier::Float32
-    lower_bound::Float32
-    upper_bound::Float32
-end
-
-struct TestRegistry
-    groups::Tuple{TestGroup,TestGroup}
-end
-
-struct TestGroupMoments
-    name::Symbol
-    transform_kind::TestTransformKind
-    multiplier::Float32
-    lower_bound::Float32
-    upper_bound::Float32
-    first::Array{Float32}
-    second::Array{Float32}
-end
-
-mutable struct TestOptimizerState
-    moments::Tuple{TestGroupMoments,TestGroupMoments}
-    group_steps::Vector{UInt64}
-    total_step::UInt64
-end
-
 function fixture()
+    model = Graph.initialize_model(MersenneTwister(0x5eed))
     parameters = TestParameters(
         reshape(Float32.(1:12) ./ 10.0f0, 3, 4),
         Float32[0.25, -0.5, 0.75],
@@ -71,62 +57,157 @@ function fixture()
         fill(0.75f0, size(parameters.packet)),
     )
     configs = (;
-        architecture=TestConfig(1_458, 12.0f0, (:analog, :event)),
-        input=(rows=24, columns=10, raw_placement=true, ren_encoding=:exact),
-        topology=(
-            packet_width=12,
-            maximum_waves=4,
-            fanout=4,
-            source=UInt16[1, 2, 3],
-            destination=UInt16[4, 5, 6],
-            branch=UInt8[1, 2, 3],
-            receptor=UInt8[1, 2, 3],
+        architecture=model.config,
+        input=CP.canonical_input_contract(Input),
+        topology=model,
+        learning=Local.LocalLearningConfig(
+            schedule=Local.LearningSchedule(
+                analog_interval=1,
+                hard_event_interval=4,
+                homeostasis_interval=128,
+                structure_interval=4096,
+            ),
+            feedback_seed=UInt64(0xdec011e),
+            plasticity=Local.PlasticityConfig(
+                utility_decay=0.997,
+                connection_cost=2.0e-6,
+            ),
         ),
-        learning=(eligibility_decay=0.8f0, feedback_seed=UInt64(0xdec011e)),
-        optimizer=(learning_rate=0.002f0, beta1=0.9f0, beta2=0.999f0),
+        optimizer=Opt.AdamWConfig(
+            learning_rate=0.002f0,
+            beta1=0.9f0,
+            beta2=0.999f0,
+            epsilon=1.0f-8,
+            clip_norm=5.0f0,
+            weight_decay=1.0f-4,
+        ),
     )
     counters = TestCounters(37, 31, 19, 2)
     return parameters, first, second, configs, counters
 end
 
-function optimizer_fixture()
-    left = reshape(Float32.(1:6), 2, 3)
-    right = Float32[-1, 2, -3]
+function optimizer_fixture(model::Graph.CanonicalModel)
+    parameters = Graph.parameter_components(model.parameters)
+    gradient = Graph.initialize_gradient(model)
+    gradients = Graph.gradient_components(gradient)
     groups = (
-        TestGroup(
-            :cell_raw,
-            left,
-            zeros(Float32, size(left)),
-            TEST_CONDUCTANCE,
-            0.5f0,
-            0.01f0,
-            4.0f0,
+        Opt.ParameterGroup(
+            :core_cell_raw,
+            parameters.core_cell_raw,
+            gradients.core_cell_raw,
+            Opt.CELL_RAW;
+            multiplier=0.5f0,
         ),
-        TestGroup(
-            :signed_output,
-            right,
-            zeros(Float32, size(right)),
-            TEST_SIGNED,
-            1.0f0,
-            -Inf32,
-            Inf32,
+        Opt.ParameterGroup(
+            :semantic_projection_raw,
+            parameters.semantic_projection_raw,
+            gradients.semantic_projection_raw,
+            Opt.INVERSE_SOFTPLUS_CONDUCTANCE;
+            multiplier=0.75f0,
+            lower_bound=1.0f-4,
+            upper_bound=4.0f0,
+        ),
+        Opt.ParameterGroup(
+            :event_raw,
+            parameters.event_raw,
+            gradients.event_raw,
+            Opt.INVERSE_SOFTPLUS_CONDUCTANCE;
+            multiplier=0.5f0,
+            lower_bound=1.0f-4,
+            upper_bound=4.0f0,
+        ),
+        Opt.ParameterGroup(
+            :output_cell_raw,
+            parameters.output_cell_raw,
+            gradients.output_cell_raw,
+            Opt.CELL_RAW;
+            multiplier=1.0f0,
+        ),
+        Opt.ParameterGroup(
+            :output_projection_raw,
+            parameters.output_projection_raw,
+            gradients.output_projection_raw,
+            Opt.INVERSE_SOFTPLUS_CONDUCTANCE;
+            multiplier=1.0f0,
+            lower_bound=1.0f-4,
+            upper_bound=4.0f0,
         ),
     )
-    moments = map(groups) do group
-        TestGroupMoments(
-            group.name,
-            group.transform_kind,
-            group.multiplier,
-            group.lower_bound,
-            group.upper_bound,
-            fill(0.1f0, size(group.parameter)),
-            fill(0.2f0, size(group.parameter)),
-        )
+    registry = Opt.ParameterRegistry(groups...)
+    state = Opt.AdamWState(registry)
+    @inbounds for (index, moment) in enumerate(state.moments)
+        fill!(moment.first, 0.025f0 * index)
+        fill!(moment.second, 0.05f0 * index)
     end
-    return TestRegistry(groups), TestOptimizerState(
-        moments,
-        UInt64[5, 7],
-        UInt64(7),
+    state.group_steps .= UInt64[5, 6, 5, 7, 7]
+    state.total_step = UInt64(7)
+    return registry, state
+end
+
+function registry_with_event_length(registry, event_count::Int)
+    original = registry.groups[3]
+    event_group = Opt.ParameterGroup(
+        :event_raw,
+        zeros(Float32, event_count),
+        zeros(Float32, event_count),
+        original.transform_kind;
+        multiplier=original.multiplier,
+        lower_bound=original.lower_bound,
+        upper_bound=original.upper_bound,
+    )
+    return Opt.ParameterRegistry(
+        Base.setindex(registry.groups, event_group, 3),
+    )
+end
+
+function training_counters(config, update::Int)
+    clock = Local.LearningClockState()
+    for _ in 1:update
+        Local.advance_clocks!(clock, config.learning.schedule)
+    end
+    mechanisms = (;
+        decolle_signal_nonzero=Int64(31),
+        subthreshold_updates=Int64(19),
+        nonspiking_updates=Int64(11),
+        homeostasis_events=Int64(0),
+        synaptic_scaling_events=Int64(0),
+        utility_updates=Int64(7),
+        rewires=Int64(0),
+    )
+    return (;
+        learning_clock=clock,
+        mechanisms,
+        training_updates=UInt64(update),
+    )
+end
+
+function with_utility_decay(config::Local.LocalLearningConfig, decay::Real)
+    original = config.plasticity
+    plasticity = Local.PlasticityConfig(
+        firing_ema_decay=original.firing_ema_decay,
+        target_rate_min=original.target_rate_min,
+        target_rate_max=original.target_rate_max,
+        threshold_homeostasis_step=original.threshold_homeostasis_step,
+        adaptation_homeostasis_step=original.adaptation_homeostasis_step,
+        synaptic_scaling_rate=original.synaptic_scaling_rate,
+        conductance_floor=original.conductance_floor,
+        conductance_ceiling=original.conductance_ceiling,
+        structure_enabled=original.structure_enabled,
+        utility_decay=decay,
+        connection_cost=original.connection_cost,
+        max_swaps_per_node=original.max_swaps_per_node,
+    )
+    return Local.LocalLearningConfig(
+        schedule=config.schedule,
+        feedback_seed=config.feedback_seed,
+        feedback_scale=config.feedback_scale,
+        predictor_scale=config.predictor_scale,
+        predictor_dim=config.predictor_dim,
+        eligibility_decay=config.eligibility_decay,
+        analog_multiplier=config.analog_multiplier,
+        hard_event_multiplier=config.hard_event_multiplier,
+        utility_mode=config.utility_mode,
+        plasticity=plasticity,
     )
 end
 
@@ -149,11 +230,13 @@ end
 
 @testset "canonical optimizer registry roundtrip" begin
     mktempdir() do directory
-        _, _, _, configs, counters = fixture()
-        registry, state = optimizer_fixture()
+        _, _, _, configs, _ = fixture()
+        counters = training_counters(configs, 7)
+        registry, state = optimizer_fixture(configs.topology)
         expected_parameters = map(group -> copy(group.parameter), registry.groups)
         expected_first = map(moment -> copy(moment.first), state.moments)
         expected_second = map(moment -> copy(moment.second), state.moments)
+        expected_event_weight = copy(configs.topology.cache.event_weight)
         path = CP.save_checkpoint(
             joinpath(directory, "optimizer.jls"),
             registry,
@@ -166,12 +249,18 @@ end
             optimizer_config=configs.optimizer,
         )
         snapshot = CP.load_checkpoint(path)
+        @test Opt.parameter_group_names(registry) == CP.CANONICAL_PARAMETER_GROUPS
+        @test length(registry.groups[3].parameter) == 2_125
+        @test Graph.stored_parameter_count(configs.topology) == 69_445
         @test snapshot.optimizer_step == 7
-        @test snapshot.counters.optimizer_group_steps == (UInt64(5), UInt64(7))
+        @test snapshot.counters.optimizer_group_steps ==
+            (UInt64(5), UInt64(6), UInt64(5), UInt64(7), UInt64(7))
 
         for group in registry.groups
             fill!(group.parameter, 0.0f0)
         end
+        Graph.refresh_cache!(configs.topology)
+        @test configs.topology.cache.event_weight != expected_event_weight
         for moment in state.moments
             fill!(moment.first, 0.0f0)
             fill!(moment.second, 0.0f0)
@@ -191,23 +280,107 @@ end
         @test map(group -> group.parameter, registry.groups) == expected_parameters
         @test map(moment -> moment.first, state.moments) == expected_first
         @test map(moment -> moment.second, state.moments) == expected_second
-        @test state.group_steps == UInt64[5, 7]
+        @test configs.topology.cache.event_weight == expected_event_weight
+        @test state.group_steps == UInt64[5, 6, 5, 7, 7]
         @test state.total_step == 7
         @test resume.optimizer_step == 7
-        @test resume.counters.update == counters.update
+        @test resume.counters.learning_clock.update == 7
+        @test resume.counters.learning_clock.analog_ticks == 7
+        @test resume.counters.learning_clock.hard_event_ticks == 1
+        @test resume.counters.mechanisms.decolle_signal_nonzero == 31
+        learning_contract = CP.canonical_learning_contract(configs.learning)
+        @test learning_contract.fixed_local_signal_map.output_dim == 22
+        @test learning_contract.fixed_local_signal_map.continuous_observation_dim == 47
+        @test learning_contract.fixed_local_signal_map.packet_observation_dim == 12
+        @test learning_contract.fixed_local_signal_map.cell_count == 1_436
+
+        bad_clock_counters = deepcopy(counters)
+        bad_clock_counters.learning_clock.hard_event_ticks += 1
+        @test_throws ArgumentError CP.save_checkpoint(
+            joinpath(directory, "bad-clock.jls"),
+            registry,
+            state;
+            counters=bad_clock_counters,
+            architecture_config=configs.architecture,
+            input_config=configs.input,
+            topology_config=configs.topology,
+            learning_config=configs.learning,
+            optimizer_config=configs.optimizer,
+        )
+
+        wrong_core = Opt.ParameterGroup(
+            :core_cell_raw,
+            zeros(Float32, 45, 1_436),
+            zeros(Float32, 45, 1_436),
+            Opt.CELL_RAW;
+            multiplier=registry.groups[1].multiplier,
+        )
+        wrong_shape_registry = Opt.ParameterRegistry(
+            Base.setindex(registry.groups, wrong_core, 1),
+        )
+        wrong_shape_state = Opt.AdamWState(wrong_shape_registry)
+        @test_throws DimensionMismatch CP.save_checkpoint(
+            joinpath(directory, "wrong-shape.jls"),
+            wrong_shape_registry,
+            wrong_shape_state;
+            counters=training_counters(configs, 0),
+            architecture_config=configs.architecture,
+            input_config=configs.input,
+            topology_config=configs.topology,
+            learning_config=configs.learning,
+            optimizer_config=configs.optimizer,
+        )
+
+        short_registry = Opt.ParameterRegistry(registry.groups[1:4])
+        short_state = Opt.AdamWState(short_registry)
+        @test_throws ArgumentError CP.save_checkpoint(
+            joinpath(directory, "missing-group.jls"),
+            short_registry,
+            short_state;
+            counters=training_counters(configs, 0),
+            architecture_config=configs.architecture,
+            input_config=configs.input,
+            topology_config=configs.topology,
+            learning_config=configs.learning,
+            optimizer_config=configs.optimizer,
+        )
+
+        # Historical event layouts are semantically incompatible even when
+        # their static source-major prefix matches the canonical graph.
+        for legacy_event_count in (2_040, 2_296, 2_301)
+            legacy_registry = registry_with_event_length(
+                registry,
+                legacy_event_count,
+            )
+            legacy_state = Opt.AdamWState(legacy_registry)
+            @test_throws DimensionMismatch CP.save_checkpoint(
+                joinpath(directory, "legacy-event-$legacy_event_count.jls"),
+                legacy_registry,
+                legacy_state;
+                counters=training_counters(configs, 0),
+                architecture_config=configs.architecture,
+                input_config=configs.input,
+                topology_config=configs.topology,
+                learning_config=configs.learning,
+                optimizer_config=configs.optimizer,
+            )
+        end
 
         # Metadata is part of the optimizer fingerprint, not mutable payload.
         changed = deepcopy(registry)
-        changed_group = TestGroup(
+        original = changed.groups[1]
+        changed_group = Opt.ParameterGroup(
             changed.groups[1].name,
             changed.groups[1].parameter,
             changed.groups[1].gradient,
-            changed.groups[1].transform_kind,
-            0.25f0,
-            changed.groups[1].lower_bound,
-            changed.groups[1].upper_bound,
+            changed.groups[1].transform_kind;
+            multiplier=0.25f0,
+            lower_bound=original.lower_bound,
+            upper_bound=original.upper_bound,
         )
-        changed_registry = TestRegistry((changed_group, changed.groups[2]))
+        changed_registry = Opt.ParameterRegistry(
+            Base.setindex(changed.groups, changed_group, 1),
+        )
         @test_throws ArgumentError CP.restore_checkpoint!(
             changed_registry,
             state,
@@ -263,14 +436,47 @@ end
             CP.learning_fingerprint(configs.learning)
         @test snapshot.optimizer_fingerprint ==
             CP.optimizer_fingerprint(configs.optimizer)
-        swapped_topology = merge(configs.topology, (;
-            source=reverse(configs.topology.source),
-        ))
+        @test configs.input.board.empty != configs.input.board.occupied
+        @test keys(configs.input.pieces) ==
+            (:none, :i, :o, :t, :s, :z, :j, :l)
+        swapped_topology = deepcopy(configs.topology)
+        swapped_topology.topology.edge_sources[1] = UInt16(
+            Int(swapped_topology.topology.edge_sources[1]) + 1,
+        )
         @test CP.topology_fingerprint(swapped_topology) !=
             CP.topology_fingerprint(configs.topology)
-        changed_adam = merge(configs.optimizer, (; beta2=0.995f0))
+        changed_event_semantics = deepcopy(configs.topology)
+        changed_event_semantics.cache.event_graph.destination[1] += UInt16(1)
+        @test CP.topology_fingerprint(changed_event_semantics) !=
+            CP.topology_fingerprint(configs.topology)
+        @test_throws ArgumentError CP.topology_fingerprint(
+            configs.topology.topology,
+        )
+        changed_adam = Opt.AdamWConfig(
+            learning_rate=configs.optimizer.learning_rate,
+            beta1=configs.optimizer.beta1,
+            beta2=0.995f0,
+            epsilon=configs.optimizer.epsilon,
+            clip_norm=configs.optimizer.clip_norm,
+            weight_decay=configs.optimizer.weight_decay,
+        )
         @test CP.optimizer_fingerprint(changed_adam) !=
             CP.optimizer_fingerprint(configs.optimizer)
+        changed_learning = with_utility_decay(configs.learning, 0.996f0)
+        @test CP.learning_fingerprint(changed_learning) !=
+            CP.learning_fingerprint(configs.learning)
+        @test CP.architecture_fingerprint(
+            TestConfig(128, 7, 11_488, :error),
+        ) isa String
+        @test_throws ArgumentError CP.architecture_fingerprint(
+            TestConfig(128, 7, 11_487, :error),
+        )
+        @test_throws ArgumentError CP.architecture_fingerprint(
+            TestConfig(128, 8, 13_000, :error),
+        )
+        @test_throws ArgumentError CP.architecture_fingerprint(
+            TestConfig(128, 4, 1_436, :error),
+        )
 
         fill!(parameters.cell, 0.0f0)
         fill!(parameters.packet, 0.0f0)
@@ -308,9 +514,12 @@ end
         snapshot = CP.load_checkpoint(path)
 
         before = copy(parameters.cell)
-        wrong_configs = merge(configs, (;
-            topology=merge(configs.topology, (; packet_width=11)),
-        ))
+        wrong_topology = deepcopy(configs.topology)
+        wrong_topology.topology.edge_roles[1] = xor(
+            wrong_topology.topology.edge_roles[1],
+            0x01,
+        )
+        wrong_configs = merge(configs, (; topology=wrong_topology))
         @test_throws ArgumentError restore_fixture!(
             parameters,
             first,

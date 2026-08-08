@@ -2,12 +2,66 @@ module CanonicalCheckpoint
 
 using Serialization
 using SHA
+using ..CanonicalDendriticGraph
+
+const Graph = CanonicalDendriticGraph
 
 const CHECKPOINT_MAGIC = UInt64(0x43414e4f4e484447) # "CANONHDG"
 const CHECKPOINT_SCHEMA = UInt32(1)
 const CHECKPOINT_FORMAT =
     "route-free-ordered-multiscale-dendritic-event-graph-v1"
 const FINGERPRINT_ALGORITHM = "sha256-canonical-binary-contract-v1"
+const CANONICAL_PARAMETER_GROUPS = (
+    :core_cell_raw,
+    :semantic_projection_raw,
+    :event_raw,
+    :output_cell_raw,
+    :output_projection_raw,
+)
+const CANONICAL_MECHANISM_COUNTERS = (
+    :decolle_signal_nonzero,
+    :subthreshold_updates,
+    :nonspiking_updates,
+    :homeostasis_events,
+    :synaptic_scaling_events,
+    :utility_updates,
+    :rewires,
+)
+const _TOPOLOGY_FIELDS = (
+    :child_offsets,
+    :child_edges,
+    :parent_offsets,
+    :parent_edges,
+    :edge_sources,
+    :edge_destinations,
+    :edge_kinds,
+    :edge_slots,
+    :edge_roles,
+    :node_classes,
+    :node_planes,
+    :node_slots,
+    :interval_firsts,
+    :interval_lasts,
+)
+const _CANONICAL_NODE_COUNT = 1_458
+const _CANONICAL_EDGE_COUNT = 2_216
+const _CANONICAL_CORE_COUNT = 1_436
+const _CANONICAL_OUTPUT_DIM = 22
+const _CANONICAL_CONTINUOUS_OBSERVATION_DIM = 47
+const _CANONICAL_PACKET_DIM = 12
+const _CANONICAL_CELL_STATE_DIM = 48
+const _CANONICAL_CELL_INPUT_DIM = 27
+const _CANONICAL_CELL_PARAMETER_DIM = 46
+const _CANONICAL_EVENT_DIM = 5
+const _CANONICAL_STATIC_EVENT_COUNT = 2_040
+const _CANONICAL_DYNAMIC_EVENT_COUNT = 80
+const _CANONICAL_EVENT_PARAMETER_COUNT = 2_125
+const _GRAPH_CONFIG_FIELDS = (
+    :max_candidates,
+    :max_event_waves,
+    :tape_capacity,
+    :event_overflow,
+)
 
 const _REGISTRY_KEYS = (:path, :element_type, :dimensions, :length)
 const _SNAPSHOT_KEYS = (
@@ -31,8 +85,13 @@ const _SNAPSHOT_KEYS = (
 export CHECKPOINT_FORMAT,
        CHECKPOINT_MAGIC,
        CHECKPOINT_SCHEMA,
+       CANONICAL_PARAMETER_GROUPS,
+       CANONICAL_MECHANISM_COUNTERS,
        ResumeState,
        architecture_fingerprint,
+       canonical_architecture_contract,
+       canonical_input_contract,
+       canonical_learning_contract,
        input_fingerprint,
        learning_fingerprint,
        load_checkpoint,
@@ -142,11 +201,286 @@ function _contract_fingerprint(label::AbstractString, value)
     return bytes2hex(SHA.sha256(take!(io)))
 end
 
-architecture_fingerprint(config) =
-    _contract_fingerprint("architecture", config)
+function canonical_architecture_contract(config)
+    fieldnames(typeof(config)) == _GRAPH_CONFIG_FIELDS || throw(ArgumentError(
+        "graph config fields are missing, extra, or reordered",
+    ))
+    config.max_candidates isa Int && config.max_candidates > 0 || throw(
+        ArgumentError("graph max_candidates must be a positive Int"),
+    )
+    maximum_waves = Graph.Events.CANONICAL_MAX_WAVES
+    config.max_event_waves isa Int &&
+        0 <= config.max_event_waves <= maximum_waves || throw(
+            ArgumentError(
+                "graph max_event_waves must be in 0:$maximum_waves",
+            ),
+        )
+    required_tape_capacity = _CANONICAL_CORE_COUNT *
+        (1 + config.max_event_waves)
+    config.tape_capacity isa Int &&
+        config.tape_capacity >= required_tape_capacity || throw(ArgumentError(
+            "graph tape capacity cannot hold all canonical transitions",
+        ))
+    config.event_overflow in (:error, :fallback) || throw(ArgumentError(
+        "graph event overflow policy is unsupported",
+    ))
+    return (;
+        config,
+        node_count=_CANONICAL_NODE_COUNT,
+        core_node_count=_CANONICAL_CORE_COUNT,
+        output_count=_CANONICAL_OUTPUT_DIM,
+        cell_state_dim=_CANONICAL_CELL_STATE_DIM,
+        cell_input_dim=_CANONICAL_CELL_INPUT_DIM,
+        cell_parameter_dim=_CANONICAL_CELL_PARAMETER_DIM,
+        packet_dim=_CANONICAL_PACKET_DIM,
+        event_dim=_CANONICAL_EVENT_DIM,
+        information_spine=:ordered_binary_full_packet,
+        semantic_receiver=:typed_receptor_diagonal,
+    )
+end
+
+architecture_fingerprint(config) = _contract_fingerprint(
+    "architecture",
+    canonical_architecture_contract(config),
+)
+
+@inline function _module_binding(owner::Module, name::Symbol)
+    isdefined(owner, name) || throw(ArgumentError(
+        "canonical input module has no $(String(name)) binding",
+    ))
+    return getfield(owner, name)
+end
+
+"""Plain, exhaustive semantic ABI of `CanonicalTetrisInput`."""
+function canonical_input_contract(input::Module)
+    code(name) = UInt8(_module_binding(input, name))
+    rows = _module_binding(input, :BOARD_ROWS)
+    columns = _module_binding(input, :BOARD_COLUMNS)
+    placement_capacity = _module_binding(input, :PLACEMENT_CAPACITY)
+    next_count = _module_binding(input, :NEXT_COUNT)
+    rows == 24 && columns == 10 || throw(ArgumentError(
+        "canonical input board must be 24 x 10",
+    ))
+    placement_capacity == 4 && next_count == 5 || throw(ArgumentError(
+        "canonical placement/queue dimensions differ",
+    ))
+    return (;
+        board_rows=rows,
+        board_columns=columns,
+        placement_capacity,
+        queue_roles=(:hold, :next1, :next2, :next3, :next4, :next5),
+        ren_storage=:Int32_exact_nonnegative,
+        board=(empty=code(:EMPTY), occupied=code(:OCCUPIED)),
+        placement=(absent=code(:ABSENT), present=code(:PRESENT)),
+        pieces=(
+            none=code(:NONE), i=code(:PIECE_I), o=code(:PIECE_O),
+            t=code(:PIECE_T), s=code(:PIECE_S), z=code(:PIECE_Z),
+            j=code(:PIECE_J), l=code(:PIECE_L),
+        ),
+        truth=(false_value=code(:FALSE_VALUE), true_value=code(:TRUE_VALUE)),
+        event=(no_event=code(:NO_EVENT), present=code(:EVENT_PRESENT)),
+        site=(
+            empty=code(:SITE_EMPTY), occupied=code(:SITE_OCCUPIED),
+            placed=code(:SITE_PLACED), outside=code(:OUTSIDE),
+        ),
+        candidate_path=(
+            uninitialized=code(:UNINITIALIZED),
+            no_clear_cow=code(:NO_CLEAR_COW),
+            clear_slow_path=code(:CLEAR_SLOW_PATH),
+        ),
+        teacher_fields_absent=true,
+    )
+end
+
 input_fingerprint(config) = _contract_fingerprint("input", config)
-topology_fingerprint(config) = _contract_fingerprint("topology", config)
-learning_fingerprint(config) = _contract_fingerprint("learning", config)
+
+function _validate_topology_contract(config)
+    fieldnames(typeof(config)) == _TOPOLOGY_FIELDS || throw(ArgumentError(
+        "topology contract fields are missing, extra, or reordered",
+    ))
+    length(config.child_offsets) == _CANONICAL_NODE_COUNT + 1 || throw(
+        DimensionMismatch("topology child offsets have the wrong length"),
+    )
+    length(config.parent_offsets) == _CANONICAL_NODE_COUNT + 1 || throw(
+        DimensionMismatch("topology parent offsets have the wrong length"),
+    )
+    length(config.child_edges) == _CANONICAL_EDGE_COUNT || throw(
+        DimensionMismatch("topology child edge order has the wrong length"),
+    )
+    length(config.parent_edges) == _CANONICAL_EDGE_COUNT || throw(
+        DimensionMismatch("topology parent edge order has the wrong length"),
+    )
+    for name in (
+        :edge_sources, :edge_destinations, :edge_kinds, :edge_slots, :edge_roles,
+    )
+        length(getproperty(config, name)) == _CANONICAL_EDGE_COUNT || throw(
+            DimensionMismatch("topology $name has the wrong length"),
+        )
+    end
+    for name in (
+        :node_classes, :node_planes, :node_slots, :interval_firsts,
+        :interval_lasts,
+    )
+        length(getproperty(config, name)) == _CANONICAL_NODE_COUNT || throw(
+            DimensionMismatch("topology $name has the wrong length"),
+        )
+    end
+    config.child_offsets[1] == 1 &&
+        config.child_offsets[end] == _CANONICAL_EDGE_COUNT + 1 || throw(
+            ArgumentError("topology child offsets are not canonical CSR"),
+        )
+    config.parent_offsets[1] == 1 &&
+        config.parent_offsets[end] == _CANONICAL_EDGE_COUNT + 1 || throw(
+            ArgumentError("topology parent offsets are not canonical CSR"),
+        )
+    @inbounds for edge in 1:_CANONICAL_EDGE_COUNT
+        source = Int(config.edge_sources[edge])
+        destination = Int(config.edge_destinations[edge])
+        1 <= source < destination <= _CANONICAL_NODE_COUNT || throw(
+            ArgumentError("topology edge $edge violates ordered DAG anatomy"),
+        )
+    end
+    return config
+end
+
+function _canonical_event_parameter_order(model::Graph.CanonicalModel)
+    _validate_topology_contract(model.topology)
+    parameter_count = Graph.event_parameter_count(model)
+    parameter_count == _CANONICAL_EVENT_PARAMETER_COUNT || throw(
+        DimensionMismatch("canonical event parameter count differs"),
+    )
+    length(model.parameters.event_raw) == parameter_count || throw(
+        DimensionMismatch(
+            "model event_raw does not match static, dynamic, and kind order",
+        ),
+    )
+    kind = Vector{UInt8}(undef, parameter_count)
+    source = Vector{UInt16}(undef, parameter_count)
+    destination = Vector{UInt16}(undef, parameter_count)
+    channel = Vector{UInt8}(undef, parameter_count)
+    family = Vector{UInt8}(undef, parameter_count)
+    slot = Vector{UInt8}(undef, parameter_count)
+    branch = Vector{UInt8}(undef, parameter_count)
+    lane = Vector{UInt8}(undef, parameter_count)
+    @inbounds for index in 1:parameter_count
+        descriptor = Graph.event_parameter_descriptor(model, index)
+        kind[index] = UInt8(descriptor.kind)
+        source[index] = descriptor.source
+        destination[index] = descriptor.destination
+        channel[index] = descriptor.channel
+        family[index] = descriptor.family
+        slot[index] = descriptor.slot
+        branch[index] = descriptor.branch
+        lane[index] = descriptor.lane
+    end
+
+    static_kind = UInt8(Graph.STATIC_EVENT_CONTACT)
+    dynamic_kind = UInt8(Graph.DYNAMIC_EVENT_CONTACT)
+    shared_kind = UInt8(Graph.SHARED_EVENT_KIND_GAIN)
+    all(==(static_kind), @view(kind[1:_CANONICAL_STATIC_EVENT_COUNT])) ||
+        throw(ArgumentError("static event parameter prefix changed"))
+    dynamic_first = _CANONICAL_STATIC_EVENT_COUNT + 1
+    dynamic_last = _CANONICAL_STATIC_EVENT_COUNT +
+        _CANONICAL_DYNAMIC_EVENT_COUNT
+    all(==(dynamic_kind), @view(kind[dynamic_first:dynamic_last])) ||
+        throw(ArgumentError("dynamic event parameter segment changed"))
+    all(==(shared_kind), @view(kind[(dynamic_last + 1):end])) ||
+        throw(ArgumentError("shared event-kind parameter suffix changed"))
+    lane[(dynamic_last + 1):end] == UInt8.(1:_CANONICAL_EVENT_DIM) ||
+        throw(ArgumentError("shared event-kind lane order changed"))
+
+    # Only this descriptor stream defines optimizer-coordinate semantics.
+    return (;
+        parameter_count,
+        kind,
+        source,
+        destination,
+        channel,
+        family,
+        slot,
+        branch,
+        lane,
+    )
+end
+
+function _canonical_event_parameter_order(value)
+    throw(ArgumentError(
+        "canonical topology contract requires the live CanonicalModel; " *
+        "topology alone cannot identify event parameter semantics",
+    ))
+end
+
+function _canonical_topology_contract(model::Graph.CanonicalModel)
+    return (;
+        topology=_validate_topology_contract(model.topology),
+        event_parameter_order=_canonical_event_parameter_order(model),
+    )
+end
+
+function _canonical_topology_contract(value)
+    throw(ArgumentError(
+        "canonical topology fingerprint requires CanonicalDendriticGraph.CanonicalModel",
+    ))
+end
+
+topology_fingerprint(config) = _contract_fingerprint(
+    "topology",
+    _canonical_topology_contract(config),
+)
+
+@inline function _local_learning_config(config)
+    hasproperty(config, :schedule) && hasproperty(config, :plasticity) &&
+        return config
+    hasproperty(config, :local) && return getproperty(config, :local)
+    hasproperty(config, :local_learning) &&
+        return getproperty(config, :local_learning)
+    throw(ArgumentError(
+        "learning config must be LocalLearningConfig or own one explicitly",
+    ))
+end
+
+"""Include local/plasticity controls and fixed-map dimensional identity."""
+function canonical_learning_contract(config)
+    local_config = _local_learning_config(config)
+    schedule = local_config.schedule
+    plasticity = local_config.plasticity
+    for name in (
+        :analog_interval, :hard_event_interval, :homeostasis_interval,
+        :structure_interval,
+    )
+        hasproperty(schedule, name) || throw(ArgumentError(
+            "learning schedule is missing $(String(name))",
+        ))
+    end
+    for name in (
+        :firing_ema_decay, :target_rate_min, :target_rate_max,
+        :threshold_homeostasis_step, :adaptation_homeostasis_step,
+        :synaptic_scaling_rate, :conductance_floor, :conductance_ceiling,
+        :structure_enabled, :utility_decay, :connection_cost,
+        :max_swaps_per_node,
+    )
+        hasproperty(plasticity, name) || throw(ArgumentError(
+            "plasticity config is missing $(String(name))",
+        ))
+    end
+    return (;
+        config,
+        fixed_local_signal_map=(
+            output_dim=_CANONICAL_OUTPUT_DIM,
+            continuous_observation_dim=_CANONICAL_CONTINUOUS_OBSERVATION_DIM,
+            packet_observation_dim=_CANONICAL_PACKET_DIM,
+            cell_count=_CANONICAL_CORE_COUNT,
+            seed_source=:feedback_seed,
+            family_source=:ordered_node_class,
+            cell_source=:ordered_node_id,
+        ),
+    )
+end
+
+learning_fingerprint(config) = _contract_fingerprint(
+    "learning",
+    canonical_learning_contract(config),
+)
 optimizer_fingerprint(config) = _contract_fingerprint("optimizer", config)
 
 @inline function _is_parameter_container(value)
@@ -726,6 +1060,10 @@ function _optimizer_registry_contract(registry)
     length(unique(names)) == length(names) || throw(ArgumentError(
         "optimizer registry contains duplicate group names",
     ))
+    names == CANONICAL_PARAMETER_GROUPS || throw(ArgumentError(
+        "optimizer registry must contain the five canonical graph groups " *
+        "in canonical order",
+    ))
     return contracts
 end
 
@@ -789,6 +1127,94 @@ function _optimizer_components(registry, state)
     return parameters, first, second, contracts, group_steps, Int(total_step)
 end
 
+@inline function _counter_fields(value)
+    value isa NamedTuple && return keys(value)
+    return fieldnames(typeof(value))
+end
+
+function _validate_training_counters(counters, learning_config, total_step::Int)
+    _counter_fields(counters) ==
+        (:learning_clock, :mechanisms, :training_updates) || throw(
+            ArgumentError(
+                "training counters must contain learning_clock, mechanisms, " *
+                "training_updates in canonical order",
+            ),
+        )
+    clock = getproperty(counters, :learning_clock)
+    mechanisms = getproperty(counters, :mechanisms)
+    updates = getproperty(counters, :training_updates)
+    _counter_fields(clock) == (
+        :update,
+        :analog_ticks,
+        :hard_event_ticks,
+        :homeostasis_ticks,
+        :structure_ticks,
+    ) || throw(ArgumentError(
+        "learning clock fields are missing, extra, or reordered",
+    ))
+    _counter_fields(mechanisms) == CANONICAL_MECHANISM_COUNTERS || throw(
+        ArgumentError(
+            "mechanism counter fields are missing, extra, or reordered",
+        ),
+    )
+    updates isa UInt64 && updates == UInt64(total_step) || throw(ArgumentError(
+        "training update counter differs from optimizer total step",
+    ))
+    clock.update isa Int && clock.update == total_step || throw(ArgumentError(
+        "learning clock update differs from optimizer total step",
+    ))
+    local_config = _local_learning_config(learning_config)
+    schedule = local_config.schedule
+    expected = (
+        fld(total_step, schedule.analog_interval),
+        fld(total_step, schedule.hard_event_interval),
+        fld(total_step, schedule.homeostasis_interval),
+        fld(total_step, schedule.structure_interval),
+    )
+    actual = (
+        clock.analog_ticks,
+        clock.hard_event_ticks,
+        clock.homeostasis_ticks,
+        clock.structure_ticks,
+    )
+    actual == expected || throw(ArgumentError(
+        "learning clock ticks disagree with the checkpointed schedule",
+    ))
+    _validate_counter_value(counters)
+    return counters
+end
+
+function _validate_canonical_group_shapes(parameters, topology_config)
+    keys(parameters) == CANONICAL_PARAMETER_GROUPS || throw(ArgumentError(
+        "canonical parameter components are missing, extra, or reordered",
+    ))
+    size(parameters.core_cell_raw) ==
+        (_CANONICAL_CELL_PARAMETER_DIM, _CANONICAL_CORE_COUNT) || throw(
+            DimensionMismatch("core_cell_raw has the wrong canonical shape"),
+        )
+    size(parameters.semantic_projection_raw) == (4, 3, 8, 2) || throw(
+        DimensionMismatch(
+            "semantic_projection_raw has the wrong canonical shape",
+        ),
+    )
+    event_order = _canonical_event_parameter_order(topology_config)
+    length(parameters.event_raw) == event_order.parameter_count || throw(
+        DimensionMismatch(
+            "event_raw length differs from canonical static/dynamic/kind order",
+        ),
+    )
+    size(parameters.output_cell_raw) ==
+        (_CANONICAL_CELL_PARAMETER_DIM, _CANONICAL_OUTPUT_DIM) || throw(
+            DimensionMismatch("output_cell_raw has the wrong canonical shape"),
+        )
+    size(parameters.output_projection_raw) == (4, 3, 5) || throw(
+        DimensionMismatch(
+            "output_projection_raw has the wrong canonical shape",
+        ),
+    )
+    return parameters
+end
+
 """Save directly from `CanonicalOptimizer.ParameterRegistry`/`AdamWState`."""
 function save_checkpoint(
     path::AbstractString,
@@ -803,6 +1229,8 @@ function save_checkpoint(
 )
     parameters, first, second, group_contract, group_steps, total_step =
         _optimizer_components(registry, optimizer_state)
+    _validate_canonical_group_shapes(parameters, topology_config)
+    _validate_training_counters(counters, learning_config, total_step)
     optimizer_contract = (;
         adam=optimizer_config,
         parameter_groups=group_contract,
@@ -840,6 +1268,7 @@ function restore_checkpoint!(
     _validate_snapshot(snapshot)
     parameters, first, second, group_contract, _, _ =
         _optimizer_components(registry, optimizer_state)
+    _validate_canonical_group_shapes(parameters, topology_config)
     optimizer_contract = (;
         adam=optimizer_config,
         parameter_groups=group_contract,
@@ -853,6 +1282,11 @@ function restore_checkpoint!(
         throw(ArgumentError("checkpoint optimizer group-step count differs"))
     all(step -> step isa UInt64 && step <= UInt64(snapshot.optimizer_step), group_steps) ||
         throw(ArgumentError("checkpoint optimizer group steps are invalid"))
+    _validate_training_counters(
+        counters.learner,
+        learning_config,
+        snapshot.optimizer_step,
+    )
 
     resume = restore_checkpoint!(
         parameters,
@@ -867,6 +1301,10 @@ function restore_checkpoint!(
     )
     optimizer_state.group_steps .= group_steps
     optimizer_state.total_step = UInt64(resume.optimizer_step)
+    # `event_raw`, cell dynamics, and output projections all have derived
+    # caches.  A resumed optimizer must never observe the constructor cache
+    # paired with restored raw coordinates.
+    Graph.refresh_cache!(topology_config)
     return ResumeState(resume.optimizer_step, deepcopy(counters.learner))
 end
 
