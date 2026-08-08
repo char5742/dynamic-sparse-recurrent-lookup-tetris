@@ -473,10 +473,10 @@ reusable monoids.
 Continuous analog credit, hard-event control credit, homeostasis, and
 structural plasticity are different estimators on different clocks.
 
-### 8.1 Teacher-free eligibility
+### 8.1 Teacher-free eligibility and its production contraction
 
-Eligibility is generated during forward or forward replay without teacher
-access:
+For one cell-local trajectory, the reference e-prop eligibility is generated
+during forward or forward replay without teacher access:
 
 ```math
 E_{i,p}^{t+1}=A_i^tE_{i,p}^{t}+\frac{\partial F_i^t}{\partial p}.
@@ -486,6 +486,74 @@ Multi-compartment traces cover voltage, AMPA, NMDA, GABA, plateau, apical,
 soma, adaptation, packet projection, and synaptic parameters. A cell touched
 by the mandatory analog sweep may learn even if its hard spike is zero. A truly
 unvisited cell receives zero task update.
+
+The reference matrix above is a mathematical definition and an exact oracle;
+it is **not** the production storage format.  A dense `state x parameter`
+matrix for every cell and native worker is incompatible with the CPU cache and
+the `>=20 updates/s` gate.
+
+Let one chronological transition be
+
+```math
+z_{t+1}=F_t(z_t,u_t;p),\qquad
+\chi_t=O_t(z_t,z_{t+1};p),
+```
+
+and let `m_t` be the local third factor applied to the continuous observation
+`chi_t`.  Define
+
+```math
+A_t=\frac{\partial F_t}{\partial z_t},\quad
+D_t=\frac{\partial F_t}{\partial p},\quad
+C_t=\frac{\partial \chi_t}{\partial z_{t+1}},\quad
+K_t=\frac{\partial \chi_t}{\partial p}.
+```
+
+The materialized e-prop gradient
+
+```math
+g_p=\sum_t m_t^T\left(C_tE_{t+1,p}+K_t\right)
+```
+
+has the exactly equivalent reverse contraction
+
+```math
+r_t=C_t^Tm_t+\lambda_{t+1},\qquad
+g_p\mathrel{+}=D_t^Tr_t+K_t^Tm_t,\qquad
+\lambda_t=A_t^Tr_t.
+```
+
+Production therefore replays the already teacher-free tape and executes one
+cell conditional VJP per visited transition in reverse chronological order.
+It carries only one 48-dimensional local adjoint per active cell plus fixed
+scratch.  It never materializes `E`, never sends a cotangent across a cell-to-
+cell edge, and is algebraically identical to contracting the reference e-prop
+eligibility with the same local third factors.  This is **replay-contracted
+e-prop**, not full graph BPTT and not a low-rank approximation.
+
+Chronology is explicit.  Every tape record stores its predecessor record and
+the exact packet version consumed by downstream work.  A mandatory consumer
+credits the mandatory packet version; a final output credits the latest event-
+refined version.  Candidate COW transitions are alternative worlds starting
+from their declared initial state, not temporal successors of the state-common
+transition.  No state-common sensitivity is copied into such an alternative
+candidate trajectory.  State-common local credit is contracted once with the
+state-aggregated candidate signal; candidate-local contraction follows only
+the records that candidate actually visited.
+
+This changes production complexity from
+
+```math
+O(N_{visited}\,d_z\,d_p)
+```
+
+stored eligibility state per worker to
+
+```math
+O(N_{active}\,d_z)+O(N_{tape})
+```
+
+storage and one cell VJP plus active-contact work per transition.
 
 ### 8.2 Two-pass ListNet learning
 
@@ -526,9 +594,25 @@ T_{i,p}=\widetilde H'(m_i)\frac{\partial m_i}{\partial p}.
 ```
 
 Its learning signal contains causal continuation benefit and an explicit event
-energy cost. It is measured and clipped separately from analog credit. The
-canonical ListNet analog gradient does not silently include event surrogate
-terms.
+energy cost.  During reverse local contraction, a destination input cotangent
+gives each actually delivered event contact the conditional loss derivative
+
+```math
+a_e=\left\langle \bar u_{dst},\Delta u_e\right\rangle+\kappa_{event}.
+```
+
+That scalar is returned only on the event-control path to the source record.
+The soma event uses a bounded pre-reset-margin surrogate; each plateau group
+uses its own threshold-crossing surrogate.  Event control may cross the one
+event edge whose causal contribution it evaluates, but the continuous analog
+local adjoint never crosses graph edges.  Onset is delivered as NMDA-like
+excitation and offset as GABA-like inhibition; source group and destination
+branch remain explicit.
+
+Analog and event gradients have separate buffers, norms, clipping and clocks,
+and must satisfy `g_total == g_analog + g_event` when measured together.  The
+canonical ListNet analog gradient does not silently include event-surrogate or
+energy terms.
 
 ### 8.4 Exact oracle
 
