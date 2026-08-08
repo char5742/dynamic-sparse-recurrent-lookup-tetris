@@ -1444,9 +1444,11 @@ end
     other isa Optimizer.ParameterGroup || throw(ArgumentError(
         "plasticity segments must be ParameterGroups",
     ))
-    group.name != other.name && group.parameter !== other.parameter || throw(
+    group.name != other.name &&
+        !Base.mightalias(group.parameter, other.parameter) || throw(
         ArgumentError(
-            "plasticity segments must identify distinct parameter groups",
+            "plasticity segments must identify distinct, non-aliased " *
+            "parameter groups",
         ),
     )
     return _preflight_group_distinct_from(group, Base.tail(others))
@@ -2272,8 +2274,11 @@ Replace at most one optional contact of `source_node` on a due structure tick.
 The graph supplies deterministic proposals and a graph-specific validator for
 branch/receptor invariants.  Fanout is preserved by replacement, duplicate
 destinations and self-loops are rejected here, and receptor identity is never
-changed.  The new contact starts at the physical conductance floor.  Both a
-targeted optimizer-moment reset and eligibility reset are mandatory callbacks.
+changed.  The new contact starts at the physical conductance floor.  The
+optimizer reset must be an `OptimizerMomentReset`; arbitrary reset callbacks
+fail before any graph-owned state changes.  Eligibility is reset before the
+first graph-owned write, so an eligibility callback failure also leaves the
+destination, conductance, optimizer moment, utility, and counter unchanged.
 """
 function rewire_one_optional_contact!(
     state::PlasticityState,
@@ -2344,17 +2349,29 @@ function rewire_one_optional_contact!(
     selected == 0 && return 0
 
     proposal = Int(proposed_destination[selected])
-    destination[selected] = convert(eltype(destination), proposal)
+    converted_proposal = convert(eltype(destination), proposal)
     lower = max(config.conductance_floor, conductance_group.lower_bound)
     upper = min(config.conductance_ceiling, conductance_group.upper_bound)
     lower < upper || throw(ArgumentError(
         "plasticity and optimizer conductance bounds do not overlap",
     ))
-    conductance_group.parameter[selected] =
-        Optimizer.inverse_softplus(lower)
-    reset_moment!(conductance_group.name, selected)
+    _assert_group_scalar_metadata(conductance_group)
+    _preflight_group_raw_parameters(conductance_group)
+    _preflight_moment_reset(reset_moment!, (conductance_group,))
+    state.rewires < typemax(UInt64) || throw(OverflowError(
+        "rewires counter overflow",
+    ))
+    replacement_raw = Optimizer.inverse_softplus(lower)
+
+    # An arbitrary eligibility callback cannot be proven non-throwing.  Invoke
+    # it while every graph-owned value is still at its pre-transaction value.
+    # The canonical moment reset has been completely preflighted above and is
+    # therefore safe to place immediately before the non-throwing array writes.
     reset_eligibility!(selected)
-    state.utility[selected] = zero(eltype(state.utility))
+    reset_moment!(conductance_group.name, selected)
+    @inbounds destination[selected] = converted_proposal
+    @inbounds conductance_group.parameter[selected] = replacement_raw
+    @inbounds state.utility[selected] = zero(eltype(state.utility))
     state.rewires += UInt64(1)
     return 1
 end

@@ -141,6 +141,17 @@ end
     return nothing
 end
 
+mutable struct ThrowingReset
+    count::Int
+    throw_after::Int
+end
+
+@inline function (reset::ThrowingReset)(::Symbol, index)
+    reset.count += 1
+    reset.count >= reset.throw_after && error("injected moment-reset failure")
+    return nothing
+end
+
 mutable struct EligibilityResetCounter
     count::Int
     last::Int
@@ -150,6 +161,15 @@ end
     counter.count += 1
     counter.last = Int(index)
     return nothing
+end
+
+mutable struct ThrowingEligibilityReset
+    count::Int
+end
+
+@inline function (reset::ThrowingEligibilityReset)(index::Integer)
+    reset.count += 1
+    error("injected eligibility-reset failure at $(Int(index))")
 end
 
 struct AcceptEveryValidSwap end
@@ -661,7 +681,7 @@ end
         optimizer.moments,
     )
 
-    arbitrary = ResetCounter(0, 0)
+    arbitrary = ThrowingReset(0, 1)
     @test_throws ArgumentError Plasticity.apply_intrinsic_homeostasis!(
         state, config, true, groups, (1:2, 3:4), arbitrary,
     )
@@ -679,7 +699,9 @@ end
         for index in eachindex(groups)
     )
 
-    state.homeostasis_events = typemax(UInt64)
+    # Two logical cells would change, so even a counter with one remaining
+    # value must fail before either segment is touched.
+    state.homeostasis_events = typemax(UInt64) - UInt64(1)
     @test_throws OverflowError Plasticity.apply_intrinsic_homeostasis!(
         state, config, true, groups, (1:2, 3:4), reset,
     )
@@ -692,7 +714,43 @@ end
             optimizer.moments[index].second == moments_before[index][2]
         for index in eachindex(optimizer.moments)
     )
-    @test state.homeostasis_events == typemax(UInt64)
+    @test state.homeostasis_events == typemax(UInt64) - UInt64(1)
+
+    # Distinct ParameterGroup wrappers over overlapping views are aliases even
+    # though neither the group nor the parameter object is `===`.
+    default = Cell.default_raw_parameters()
+    aliased_cell_storage = repeat(default, 1, 3)
+    left_cell_view = @view aliased_cell_storage[:, 1:2]
+    right_cell_view = @view aliased_cell_storage[:, 2:3]
+    aliased_cell_groups = (
+        Optimizer.ParameterGroup(
+            :left_cell_raw,
+            left_cell_view,
+            zeros(Float32, size(left_cell_view)),
+            Optimizer.CELL_RAW,
+        ),
+        Optimizer.ParameterGroup(
+            :right_cell_raw,
+            right_cell_view,
+            zeros(Float32, size(right_cell_view)),
+            Optimizer.CELL_RAW,
+        ),
+    )
+    aliased_cell_before = copy(aliased_cell_storage)
+    @test Base.mightalias(
+        aliased_cell_groups[1].parameter,
+        aliased_cell_groups[2].parameter,
+    )
+    @test_throws ArgumentError Plasticity.apply_intrinsic_homeostasis!(
+        state,
+        config,
+        true,
+        aliased_cell_groups,
+        (1:2, 3:4),
+        arbitrary,
+    )
+    @test aliased_cell_storage == aliased_cell_before
+    @test arbitrary.count == 0
 
     invalid_rate = Plasticity.PlasticityState(config, 4, 0)
     invalid_rate.firing_rate[1] = -0.01f0
@@ -700,6 +758,10 @@ end
         invalid_rate, config, false, groups, (1:2, 3:4), reset,
     )
     invalid_rate.firing_rate[1] = 1.01f0
+    @test_throws DomainError Plasticity.apply_intrinsic_homeostasis!(
+        invalid_rate, config, false, groups, (1:2, 3:4), reset,
+    )
+    invalid_rate.firing_rate[1] = NaN32
     @test_throws DomainError Plasticity.apply_intrinsic_homeostasis!(
         invalid_rate, config, false, groups, (1:2, 3:4), reset,
     )
@@ -720,7 +782,7 @@ end
         moment -> (copy(moment.first), copy(moment.second)),
         conductance_optimizer.moments,
     )
-    arbitrary = ResetCounter(0, 0)
+    arbitrary = ThrowingReset(0, 1)
     @test_throws ArgumentError Plasticity.apply_synaptic_scaling!(
         conductance_state,
         config,
@@ -742,7 +804,10 @@ end
         (destinations[1], destinations[1]),
         conductance_reset,
     )
-    conductance_state.synaptic_scaling_events = typemax(UInt64)
+    # Five contacts would change, so four remaining counter values are not
+    # enough; the preflight must precede every conductance and moment write.
+    conductance_state.synaptic_scaling_events =
+        typemax(UInt64) - UInt64(4)
     @test_throws OverflowError Plasticity.apply_synaptic_scaling!(
         conductance_state,
         config,
@@ -762,7 +827,53 @@ end
             conductance_moments_before[index][2]
         for index in eachindex(conductance_optimizer.moments)
     )
-    @test conductance_state.synaptic_scaling_events == typemax(UInt64)
+    @test conductance_state.synaptic_scaling_events ==
+        typemax(UInt64) - UInt64(4)
+
+    aliased_conductance_storage = fill(
+        Optimizer.inverse_softplus(0.5f0),
+        3,
+    )
+    left_conductance_view = @view aliased_conductance_storage[1:2]
+    right_conductance_view = @view aliased_conductance_storage[2:3]
+    make_aliased_conductance(name, parameter) = Optimizer.ParameterGroup(
+        name,
+        parameter,
+        zeros(Float32, size(parameter)),
+        Optimizer.INVERSE_SOFTPLUS_CONDUCTANCE;
+        lower_bound=1.0f-4,
+        upper_bound=4.0f0,
+    )
+    aliased_conductance_groups = (
+        make_aliased_conductance(:left_contact_raw, left_conductance_view),
+        make_aliased_conductance(:right_contact_raw, right_conductance_view),
+    )
+    aliased_conductance_before = copy(aliased_conductance_storage)
+    @test Base.mightalias(
+        aliased_conductance_groups[1].parameter,
+        aliased_conductance_groups[2].parameter,
+    )
+    @test_throws ArgumentError Plasticity.apply_synaptic_scaling!(
+        conductance_state,
+        config,
+        true,
+        aliased_conductance_groups,
+        (UInt16[1, 2], UInt16[2, 3]),
+        arbitrary,
+    )
+    @test aliased_conductance_storage == aliased_conductance_before
+    @test arbitrary.count == 0
+
+    invalid_conductance_rate = Plasticity.PlasticityState(config, 3, 0)
+    invalid_conductance_rate.firing_rate[2] = Inf32
+    @test_throws DomainError Plasticity.apply_synaptic_scaling!(
+        invalid_conductance_rate,
+        config,
+        false,
+        conductance_groups,
+        destinations,
+        conductance_reset,
+    )
 end
 
 @testset "group multiplier zero is a strict plasticity freeze" begin
@@ -875,6 +986,159 @@ end
     @test eligibility_reset.last == 1
     @test state.utility[1] == 0.0f0
     @test state.rewires == 1
+end
+
+@testset "rewire reset, bounds, and counter failures are atomic" begin
+    source = Int[1, 1, 2, 2]
+    receptor = UInt8[1, 2, 1, 2]
+    optional = Bool[true, true, true, false]
+    proposal = Int[4, 2, 4, 4]
+    enabled = Local.PlasticityConfig(
+        structure_enabled=true,
+        max_swaps_per_node=1,
+    )
+
+    function fixture(config=enabled)
+        fixture_destination = UInt16[2, 3, 1, 3]
+        fixture_registry, fixture_optimizer = parameter_fixture(
+            4,
+            fixture_destination,
+        )
+        fixture_state = Plasticity.PlasticityState(config, 4, 4)
+        fixture_state.utility .= Float32[0.1, 0.01, 0.2, 0.0]
+        return (
+            fixture_destination,
+            fixture_registry,
+            fixture_optimizer,
+            fixture_state,
+        )
+    end
+
+    function snapshot(destination, registry, optimizer, state)
+        return (
+            destination=copy(destination),
+            parameter=copy(registry.groups[2].parameter),
+            first=copy(optimizer.moments[2].first),
+            second=copy(optimizer.moments[2].second),
+            utility=copy(state.utility),
+            rewires=state.rewires,
+        )
+    end
+
+    function attempt!(
+        state,
+        config,
+        destination,
+        group,
+        moment_reset,
+        eligibility_reset,
+    )
+        return Plasticity.rewire_one_optional_contact!(
+            state,
+            config,
+            true,
+            1,
+            source,
+            destination,
+            receptor,
+            optional,
+            proposal,
+            group,
+            AcceptEveryValidSwap(),
+            moment_reset,
+            eligibility_reset,
+        )
+    end
+
+    destination, registry, optimizer, state = fixture()
+    before = snapshot(destination, registry, optimizer, state)
+    throwing_reset = ThrowingReset(0, 1)
+    eligibility_reset = EligibilityResetCounter(0, 0)
+    @test_throws ArgumentError attempt!(
+        state,
+        enabled,
+        destination,
+        registry.groups[2],
+        throwing_reset,
+        eligibility_reset,
+    )
+    @test throwing_reset.count == 0
+    @test eligibility_reset.count == 0
+    @test snapshot(destination, registry, optimizer, state) == before
+
+    destination, registry, optimizer, state = fixture()
+    foreign_destination,
+    foreign_registry,
+    foreign_optimizer,
+    foreign_state = fixture()
+    @test foreign_destination !== destination
+    @test foreign_registry !== registry
+    @test foreign_optimizer !== optimizer
+    @test foreign_state !== state
+    before = snapshot(destination, registry, optimizer, state)
+    eligibility_reset = EligibilityResetCounter(0, 0)
+    @test_throws ArgumentError attempt!(
+        state,
+        enabled,
+        destination,
+        registry.groups[2],
+        Plasticity.OptimizerMomentReset(
+            foreign_optimizer,
+            foreign_registry,
+        ),
+        eligibility_reset,
+    )
+    @test eligibility_reset.count == 0
+    @test snapshot(destination, registry, optimizer, state) == before
+
+    disjoint = Local.PlasticityConfig(
+        structure_enabled=true,
+        max_swaps_per_node=1,
+        conductance_floor=5.0f0,
+        conductance_ceiling=6.0f0,
+    )
+    destination, registry, optimizer, state = fixture(disjoint)
+    before = snapshot(destination, registry, optimizer, state)
+    eligibility_reset = EligibilityResetCounter(0, 0)
+    @test_throws ArgumentError attempt!(
+        state,
+        disjoint,
+        destination,
+        registry.groups[2],
+        Plasticity.OptimizerMomentReset(optimizer, registry),
+        eligibility_reset,
+    )
+    @test eligibility_reset.count == 0
+    @test snapshot(destination, registry, optimizer, state) == before
+
+    destination, registry, optimizer, state = fixture()
+    state.rewires = typemax(UInt64)
+    before = snapshot(destination, registry, optimizer, state)
+    eligibility_reset = EligibilityResetCounter(0, 0)
+    @test_throws OverflowError attempt!(
+        state,
+        enabled,
+        destination,
+        registry.groups[2],
+        Plasticity.OptimizerMomentReset(optimizer, registry),
+        eligibility_reset,
+    )
+    @test eligibility_reset.count == 0
+    @test snapshot(destination, registry, optimizer, state) == before
+
+    destination, registry, optimizer, state = fixture()
+    before = snapshot(destination, registry, optimizer, state)
+    throwing_eligibility = ThrowingEligibilityReset(0)
+    @test_throws ErrorException attempt!(
+        state,
+        enabled,
+        destination,
+        registry.groups[2],
+        Plasticity.OptimizerMomentReset(optimizer, registry),
+        throwing_eligibility,
+    )
+    @test throwing_eligibility.count == 1
+    @test snapshot(destination, registry, optimizer, state) == before
 end
 
 function publish_duplicate_invariant_fixture!(batch, candidates, order)
