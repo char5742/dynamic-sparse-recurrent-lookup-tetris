@@ -8,17 +8,22 @@ export AbstractCanonicalGraphAdapter,
        CanonicalExecutor,
        CanonicalSession,
        FORWARD_PASS,
+       PREPARE_COMMON_PASS,
        REPLAY_PASS,
+       REPLAY_COMMON_PASS,
        apply_update!,
        begin_microbatch!,
        candidate_count,
        create_worker_arena,
        deterministic_reduce!,
        finalize_listnet!,
+       finish_state_common_phase!,
        finish_forward_microbatch!,
        prepare_batch!,
+       prepare_state_common!,
        reduce_worker!,
        replay_candidate!,
+       replay_state_common!,
        run_candidate!,
        run_executor_team!,
        scheduler_report,
@@ -27,11 +32,15 @@ export AbstractCanonicalGraphAdapter,
        state_count,
        train_update!
 
-const FORWARD_PASS = UInt8(1)
-const REPLAY_PASS = UInt8(2)
+const PREPARE_COMMON_PASS = UInt8(1)
+const FORWARD_PASS = UInt8(2)
+const REPLAY_PASS = UInt8(3)
+const REPLAY_COMMON_PASS = UInt8(4)
 
-const _FORWARD_CANDIDATES = UInt16(1)
-const _REPLAY_CANDIDATES = UInt16(2)
+const _PREPARE_COMMON_STATES = UInt16(1)
+const _FORWARD_CANDIDATES = UInt16(2)
+const _REPLAY_CANDIDATES = UInt16(3)
+const _REPLAY_COMMON_STATES = UInt16(4)
 
 """
 Adapter boundary between the persistent MPMC team and `CanonicalDendriticGraph`.
@@ -46,6 +55,8 @@ abstract type AbstractCanonicalGraphAdapter end
 
 function create_worker_arena end
 function prepare_batch! end
+function prepare_state_common! end
+function finish_state_common_phase! end
 function state_count end
 function candidate_count end
 function state_candidate_bounds end
@@ -54,6 +65,7 @@ function run_candidate! end
 function finish_forward_microbatch! end
 function finalize_listnet! end
 function replay_candidate! end
+function replay_state_common! end
 function reduce_worker! end
 function deterministic_reduce! end
 function apply_update! end
@@ -71,6 +83,7 @@ mutable struct CanonicalExecutor{A<:AbstractCanonicalGraphAdapter,B,W}
     batch::B
     workers::Vector{W}
     candidate_chunk_size::Int
+    state_total::Int
     candidate_total::Int
     microbatch_total::Int
     update_active::Bool
@@ -100,6 +113,7 @@ function CanonicalExecutor(
         batch,
         workers,
         chunk,
+        0,
         0,
         0,
         false,
@@ -137,8 +151,23 @@ function _validate_candidate_partition!(executor::CanonicalExecutor)
         "state candidate ranges do not cover candidate_count",
     ))
 
+    executor.state_total = states
     executor.candidate_total = candidates
     executor.microbatch_total = cld(candidates, executor.candidate_chunk_size)
+    return nothing
+end
+
+@inline function _prepare_common_state!(
+    executor::CanonicalExecutor,
+    worker_slot::Int,
+    first::Int,
+    last::Int,
+)
+    first == last || error("state-common preparation jobs must be indivisible")
+    worker = @inbounds executor.workers[worker_slot]
+    prepare_state_common!(
+        executor.adapter, worker, executor.batch, first,
+    )
     return nothing
 end
 
@@ -156,6 +185,26 @@ end
         "scheduler emitted a noncanonical microbatch end",
     )
     return slot
+end
+
+@inline function _replay_common_state!(
+    executor::CanonicalExecutor,
+    worker_slot::Int,
+    first::Int,
+    last::Int,
+)
+    first == last || error("state-common replay jobs must be indivisible")
+    state_slot = first
+    reduction_slot = executor.microbatch_total + state_slot
+    worker = @inbounds executor.workers[worker_slot]
+    replay_state_common!(
+        executor.adapter,
+        worker,
+        executor.batch,
+        state_slot,
+        reduction_slot,
+    )
+    return nothing
 end
 
 @inline function _forward_microbatch!(
@@ -210,10 +259,14 @@ function SchedulerCore.dispatch_work!(
 )
     first = Int(item.first)
     last = Int(item.last)
-    if item.phase == _FORWARD_CANDIDATES
+    if item.phase == _PREPARE_COMMON_STATES
+        _prepare_common_state!(executor, worker_slot, first, last)
+    elseif item.phase == _FORWARD_CANDIDATES
         _forward_microbatch!(executor, worker_slot, first, last)
     elseif item.phase == _REPLAY_CANDIDATES
         _replay_microbatch!(executor, worker_slot, first, last)
+    elseif item.phase == _REPLAY_COMMON_STATES
+        _replay_common_state!(executor, worker_slot, first, last)
     else
         throw(ArgumentError(
             "unknown canonical barrierless phase $(item.phase)",
@@ -258,8 +311,9 @@ Run one complete canonical update in the persistent team.
 
 The two global mathematical boundaries are explicit:
 
-1. every candidate forward is complete before `finalize_listnet!`; and
-2. every replay microbatch is committed before ascending-slot
+1. every state-common prefix is complete before candidate forward;
+2. every candidate forward is complete before `finalize_listnet!`; and
+3. every candidate and state-common replay is committed before ascending-slot
    `deterministic_reduce!` and `apply_update!`.
 
 `finalize_listnet!` must use `state_candidate_bounds` and finalize each state
@@ -280,6 +334,16 @@ function train_update!(session::CanonicalSession)
         _validate_candidate_partition!(executor)
         SchedulerCore.run_phase!(
             session.scheduler,
+            _PREPARE_COMMON_STATES,
+            1,
+            executor.state_total;
+            chunk_size=1,
+        )
+        finish_state_common_phase!(
+            executor.adapter, executor.batch, executor.state_total,
+        )
+        SchedulerCore.run_phase!(
+            session.scheduler,
             _FORWARD_CANDIDATES,
             1,
             executor.candidate_total;
@@ -296,6 +360,13 @@ function train_update!(session::CanonicalSession)
             1,
             executor.candidate_total;
             chunk_size=executor.candidate_chunk_size,
+        )
+        SchedulerCore.run_phase!(
+            session.scheduler,
+            _REPLAY_COMMON_STATES,
+            1,
+            executor.state_total;
+            chunk_size=1,
         )
 
         deterministic_reduce!(
@@ -322,6 +393,12 @@ function serial_reference_update!(executor::CanonicalExecutor)
     try
         prepare_batch!(executor.adapter, executor.batch)
         _validate_candidate_partition!(executor)
+        @inbounds for state_slot in 1:executor.state_total
+            _prepare_common_state!(executor, 1, state_slot, state_slot)
+        end
+        finish_state_common_phase!(
+            executor.adapter, executor.batch, executor.state_total,
+        )
         candidates = executor.candidate_total
         chunk = executor.candidate_chunk_size
         first = 1
@@ -336,6 +413,9 @@ function serial_reference_update!(executor::CanonicalExecutor)
             last = min(first + chunk - 1, candidates)
             _replay_microbatch!(executor, 1, first, last)
             first = last + 1
+        end
+        @inbounds for state_slot in 1:executor.state_total
+            _replay_common_state!(executor, 1, state_slot, state_slot)
         end
         deterministic_reduce!(
             executor.adapter,

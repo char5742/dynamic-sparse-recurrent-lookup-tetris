@@ -42,6 +42,8 @@ mutable struct FakeAdapter <: Parallel.AbstractCanonicalGraphAdapter
     forward_seen::Vector{Int}
     replay_seen::Vector{Int}
     candidate_worker::Vector{Int}
+    state_prepare_seen::Vector{Int}
+    state_replay_seen::Vector{Int}
     partials::Vector{Int64}
     reduced::Int64
     parameter::Int64
@@ -52,12 +54,19 @@ mutable struct FakeAdapter <: Parallel.AbstractCanonicalGraphAdapter
     fail_ordinal::Int
 end
 
-function FakeAdapter(candidates::Int, max_microbatches::Int; fail_ordinal::Int=0)
+function FakeAdapter(
+    candidates::Int,
+    states::Int,
+    max_microbatches::Int;
+    fail_ordinal::Int=0,
+)
     return FakeAdapter(
         zeros(Int, candidates),
         zeros(Int, candidates),
         zeros(Int, candidates),
-        zeros(Int64, max_microbatches),
+        zeros(Int, states),
+        zeros(Int, states),
+        zeros(Int64, max_microbatches + states),
         0,
         100_000,
         0,
@@ -90,6 +99,8 @@ function Parallel.prepare_batch!(adapter::FakeAdapter, batch::FakeBatch)
     fill!(adapter.forward_seen, 0)
     fill!(adapter.replay_seen, 0)
     fill!(adapter.candidate_worker, 0)
+    fill!(adapter.state_prepare_seen, 0)
+    fill!(adapter.state_replay_seen, 0)
     fill!(adapter.partials, 0)
     fill!(batch.raw, 0)
     fill!(batch.raw_gradient, 0)
@@ -97,6 +108,27 @@ function Parallel.prepare_batch!(adapter::FakeAdapter, batch::FakeBatch)
     adapter.listnet_states = 0
     adapter.listnet_ready = false
     adapter.replay_before_listnet = 0
+    return nothing
+end
+
+function Parallel.prepare_state_common!(
+    adapter::FakeAdapter,
+    ::FakeArena,
+    ::FakeBatch,
+    state::Int,
+)
+    @inbounds adapter.state_prepare_seen[state] += 1
+    return nothing
+end
+
+function Parallel.finish_state_common_phase!(
+    adapter::FakeAdapter,
+    ::FakeBatch,
+    state_total::Int,
+)
+    all(==(1), @view(adapter.state_prepare_seen[1:state_total])) || error(
+        "state-common preparation phase was incomplete",
+    )
     return nothing
 end
 
@@ -201,13 +233,26 @@ function Parallel.reduce_worker!(
     return nothing
 end
 
+function Parallel.replay_state_common!(
+    adapter::FakeAdapter,
+    ::FakeArena,
+    ::FakeBatch,
+    state::Int,
+    reduction_slot::Int,
+)
+    @inbounds adapter.state_replay_seen[state] += 1
+    @inbounds adapter.partials[reduction_slot] = Int64(10_000 * state)
+    return nothing
+end
+
 function Parallel.deterministic_reduce!(
     adapter::FakeAdapter,
-    ::FakeBatch,
+    batch::FakeBatch,
     microbatch_count::Int,
 )
     total = Int64(0)
-    @inbounds for slot in 1:microbatch_count
+    total_slots = microbatch_count + length(batch.state_counts)
+    @inbounds for slot in 1:total_slots
         total += adapter.partials[slot]
     end
     adapter.reduced = total
@@ -229,6 +274,7 @@ function run_parallel(
     batch = FakeBatch(counts)
     adapter = FakeAdapter(
         length(batch.raw),
+        length(batch.state_counts),
         cld(length(batch.raw), chunk);
         fail_ordinal,
     )
@@ -258,6 +304,8 @@ end
     @test result == adapter.parameter
     @test adapter.forward_seen == ones(Int, 9)
     @test adapter.replay_seen == ones(Int, 9)
+    @test adapter.state_prepare_seen == ones(Int, 3)
+    @test adapter.state_replay_seen == ones(Int, 3)
     @test all(!iszero, adapter.candidate_worker)
     @test adapter.listnet_states == 3
     @test adapter.replay_before_listnet == 0
@@ -278,7 +326,7 @@ end
     workers = min(4, Threads.nthreads(:default))
 
     serial_batch = FakeBatch(counts)
-    serial_adapter = FakeAdapter(length(serial_batch.raw), 5)
+    serial_adapter = FakeAdapter(length(serial_batch.raw), length(counts), 5)
     serial_executor = Parallel.CanonicalExecutor(
         serial_adapter,
         serial_batch;
@@ -311,7 +359,7 @@ end
     counts = Int[3, 2, 4]
     workers = min(4, Threads.nthreads(:default))
     batch = FakeBatch(counts)
-    adapter = FakeAdapter(length(batch.raw), 5)
+    adapter = FakeAdapter(length(batch.raw), length(counts), 5)
     executor = Parallel.CanonicalExecutor(
         adapter,
         batch;
@@ -336,7 +384,9 @@ end
     counts = Int[3, 2, 4]
     workers = min(4, Threads.nthreads(:default))
     batch = FakeBatch(counts)
-    adapter = FakeAdapter(length(batch.raw), 5; fail_ordinal=4)
+    adapter = FakeAdapter(
+        length(batch.raw), length(counts), 5; fail_ordinal=4,
+    )
     executor = Parallel.CanonicalExecutor(
         adapter,
         batch;
@@ -370,7 +420,7 @@ end
 @testset "state candidate partition fails closed" begin
     batch = FakeBatch(Int[2, 2])
     batch.state_offsets[2] = 5
-    adapter = FakeAdapter(4, 2)
+    adapter = FakeAdapter(4, 2, 2)
     executor = Parallel.CanonicalExecutor(
         adapter,
         batch;

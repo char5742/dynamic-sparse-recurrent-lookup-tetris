@@ -185,7 +185,11 @@ end
     @test reinterpret(UInt32, adapter.plasticity_state.utility) != utility_before
     @test adapter.plasticity_state.utility_updates > utility_updates_before
     @test adapter.plasticity_state.reduced_batches == 2
-    @test adapter.common_local.counters.common_replays == 1
+    common_slot = cld(batch.input.valid_count, adapter.candidate_chunk_size) + 1
+    @test adapter.slot_generation[common_slot] == adapter.active_generation
+    @test adapter.slot_kind[common_slot] == 0x02
+    @test adapter.slot_logical_first[common_slot] == 1
+    @test adapter.slot_logical_last[common_slot] == 1
     @test all(==(adapter.plasticity_batch.generation),
               adapter.plasticity_batch.common.stamp[1:1])
     @test all(==(adapter.plasticity_batch.generation),

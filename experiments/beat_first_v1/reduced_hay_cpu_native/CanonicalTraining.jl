@@ -41,6 +41,8 @@ const QUANTILE_RANGE = Output.QUANTILE_RANGE
 const GEOMETRY_RANGE = Output.GEOMETRY_RANGE
 const QUANTILE_COUNT = length(QUANTILE_RANGE)
 const GEOMETRY_COUNT = length(GEOMETRY_RANGE)
+const _CANDIDATE_REDUCTION_SLOT = UInt8(1)
+const _STATE_COMMON_REDUCTION_SLOT = UInt8(2)
 
 const _MECHANISM_KEYS = (
     :decolle_signal_nonzero,
@@ -328,17 +330,18 @@ mutable struct DendriticTrainingWorker{G,L}
     local_learner::L
     delta22::Vector{Float32}
     counters::MechanismCounterState
+    worker_slot::UInt16
 end
 
-mutable struct DendriticTrainingAdapter{R,A,S,L,PB,PS} <:
+mutable struct DendriticTrainingAdapter{C,R,A,S,PB,PS} <:
                Barrierless.AbstractCanonicalGraphAdapter
     model::Graph.CanonicalModel
-    config::CanonicalTrainingConfig
+    config::C
     local_signals::S
     common_states::Vector{Graph.ModelState}
-    common_worker::Graph.ModelWorker
-    common_local::L
     common_signature::Vector{Graph.TrajectorySignature}
+    common_prepare_generation::Vector{UInt64}
+    common_prepare_owner::Vector{UInt16}
     components::Vector{Output.OutputComponents{Float32}}
     component_bars::Vector{Output.OutputComponentGradient{Float32}}
     forward_signature::Vector{Graph.TrajectorySignature}
@@ -366,6 +369,11 @@ mutable struct DendriticTrainingAdapter{R,A,S,L,PB,PS} <:
     event_destination::Vector{UInt16}
     zero_based_state_offsets::Vector{Int32}
     mechanism_slots::Vector{MechanismCounters}
+    slot_generation::Vector{UInt64}
+    slot_kind::Vector{UInt8}
+    slot_logical_first::Vector{Int32}
+    slot_logical_last::Vector{Int32}
+    slot_owner::Vector{UInt16}
     mechanisms::MechanismCounters
     expected::MechanismActivation
     clocks::Local.LearningClockState
@@ -373,7 +381,9 @@ mutable struct DendriticTrainingAdapter{R,A,S,L,PB,PS} <:
     registry::R
     optimizer_state::A
     candidate_chunk_size::Int
+    candidate_slot_capacity::Int
     slot_capacity::Int
+    active_generation::UInt64
     optimizer_boundaries::Int
     updates::UInt64
 end
@@ -466,13 +476,12 @@ function DendriticTrainingAdapter(
     config.local_learning.plasticity.structure_enabled && throw(ArgumentError(
         "canonical fixed-spine training requires structure_enabled=false",
     ))
-    slot_capacity = cld(capacity, chunk)
+    candidate_slot_capacity = cld(capacity, chunk)
+    slot_capacity = candidate_slot_capacity + states
     local_signals = Graph.initialize_local_signal_maps(
         model, config.local_learning,
     )
     common_states = [Graph.initialize_state(model) for _ in 1:states]
-    common_worker = Graph.initialize_worker(model)
-    common_local = Graph.initialize_local_learner(model, local_signals)
     reduced_gradient = Graph.initialize_gradient(model)
     gradient_slots = [
         Graph.initialize_gradient(model) for _ in 1:slot_capacity
@@ -514,9 +523,9 @@ function DendriticTrainingAdapter(
         config,
         local_signals,
         common_states,
-        common_worker,
-        common_local,
         fill(Graph.TrajectorySignature(), states),
+        zeros(UInt64, states),
+        zeros(UInt16, states),
         [Output.OutputComponents(Float32) for _ in 1:capacity],
         [Output.OutputComponentGradient(Float32) for _ in 1:capacity],
         fill(Graph.TrajectorySignature(), capacity),
@@ -544,6 +553,11 @@ function DendriticTrainingAdapter(
         event_destination,
         zeros(Int32, states + 1),
         fill(MechanismCounters(), slot_capacity),
+        zeros(UInt64, slot_capacity),
+        zeros(UInt8, slot_capacity),
+        zeros(Int32, slot_capacity),
+        zeros(Int32, slot_capacity),
+        zeros(UInt16, slot_capacity),
         MechanismCounters(),
         MechanismActivation(),
         Local.LearningClockState(),
@@ -551,7 +565,9 @@ function DendriticTrainingAdapter(
         registry,
         optimizer_state,
         chunk,
+        candidate_slot_capacity,
         slot_capacity,
+        UInt64(0),
         0,
         UInt64(0),
     )
@@ -569,6 +585,7 @@ function Barrierless.create_worker_arena(
         learner,
         zeros(Float32, OUTPUT_DIM),
         MechanismCounterState(),
+        UInt16(worker_slot),
     )
 end
 
@@ -618,11 +635,23 @@ function _validate_batch_shape!(
     return nothing
 end
 
+@inline _clear_gradient_groups!(::Tuple{}) = nothing
+
+@inline function _clear_gradient_groups!(groups::Tuple)
+    fill!(first(groups).gradient, 0.0f0)
+    _clear_gradient_groups!(Base.tail(groups))
+    return nothing
+end
+
 function Barrierless.prepare_batch!(
     adapter::DendriticTrainingAdapter,
     batch::Data.CanonicalBatch,
 )
     _validate_batch_shape!(adapter, batch)
+    adapter.active_generation != typemax(UInt64) || throw(OverflowError(
+        "canonical barrierless attempt generation overflow",
+    ))
+    adapter.active_generation += UInt64(1)
     input = batch.input
     valid = input.valid_count
     fill!(adapter.forward_seen, 0x00)
@@ -633,7 +662,7 @@ function Barrierless.prepare_batch!(
     fill!(adapter.q_gradient, 0.0f0)
     fill!(adapter.state_delta22, 0.0f0)
     fill!(adapter.state_value_delta, 0.0f0)
-    Optimizer.clear_gradients!(adapter.registry)
+    _clear_gradient_groups!(adapter.registry.groups)
     Plasticity.begin_plasticity_batch!(adapter.plasticity_batch)
     adapter.optimizer_boundaries = 0
     adapter.mechanisms = MechanismCounters()
@@ -660,22 +689,74 @@ function Barrierless.prepare_batch!(
         end
         adapter.state_offsets[state + 1] = Int32(ordinal)
         adapter.zero_based_state_offsets[state + 1] = Int32(ordinal - 1)
-        Graph.prepare_state_common!(
-            adapter.model,
-            adapter.common_states[state],
-            adapter.common_worker,
-            Data.state_input(input, state),
-        )
-        adapter.state_value[state] = adapter.common_states[state].state_value
-        adapter.common_signature[state] =
-            adapter.common_states[state].common_signature
     end
     ordinal == valid + 1 || error("candidate compact order overflow")
     required_slots = cld(valid, adapter.candidate_chunk_size)
-    required_slots <= adapter.slot_capacity || error(
+    required_slots <= adapter.candidate_slot_capacity || error(
         "microbatch slot storage is smaller than the scheduler partition",
     )
+    required_slots + input.state_batch <= adapter.slot_capacity || error(
+        "state-common slot storage is smaller than the scheduler partition",
+    )
     return adapter
+end
+
+function Barrierless.prepare_state_common!(
+    adapter::DendriticTrainingAdapter,
+    worker::DendriticTrainingWorker,
+    batch::Data.CanonicalBatch,
+    state::Int,
+)
+    1 <= state <= batch.input.state_batch || throw(BoundsError(
+        adapter.common_states, state,
+    ))
+    generation = adapter.active_generation
+    @inbounds adapter.common_prepare_generation[state] != generation || error(
+        "state-common preparation published twice for state $state",
+    )
+    common = @inbounds adapter.common_states[state]
+    Graph.prepare_state_common!(
+        adapter.model,
+        common,
+        worker.graph,
+        Data.state_input(batch.input, state),
+    )
+    @inbounds begin
+        adapter.state_value[state] = common.state_value
+        adapter.common_signature[state] = common.common_signature
+        adapter.common_prepare_owner[state] = worker.worker_slot
+        # Publication stamp is deliberately last.  The scheduler phase barrier
+        # is the acquire boundary for the coordinator and candidate workers.
+        adapter.common_prepare_generation[state] = generation
+    end
+    return nothing
+end
+
+function Barrierless.finish_state_common_phase!(
+    adapter::DendriticTrainingAdapter,
+    batch::Data.CanonicalBatch,
+    state_total::Int,
+)
+    state_total == batch.input.state_batch || throw(DimensionMismatch(
+        "scheduler state count differs from the canonical batch",
+    ))
+    generation = adapter.active_generation
+    @inbounds for state in 1:state_total
+        adapter.common_prepare_generation[state] == generation || error(
+            "state-common preparation slot $state is missing or stale",
+        )
+        !iszero(adapter.common_prepare_owner[state]) || error(
+            "state-common preparation slot $state has no worker owner",
+        )
+        adapter.common_states[state].ready || error(
+            "state-common preparation slot $state is not finalized",
+        )
+        adapter.common_states[state].common_signature ==
+            adapter.common_signature[state] || error(
+                "state-common preparation signature changed before forward",
+            )
+    end
+    return nothing
 end
 
 function Barrierless.begin_microbatch!(
@@ -1007,21 +1088,141 @@ function Barrierless.replay_candidate!(
     return nothing
 end
 
+@inline function _publish_reduction_slot!(
+    adapter::DendriticTrainingAdapter,
+    worker::DendriticTrainingWorker,
+    slot::Int,
+    kind::UInt8,
+    logical_first::Int,
+    logical_last::Int,
+)
+    1 <= slot <= adapter.slot_capacity || throw(BoundsError(
+        adapter.gradient_slots, slot,
+    ))
+    generation = adapter.active_generation
+    @inbounds adapter.slot_generation[slot] != generation || error(
+        "reduction slot $slot was published twice in one attempt",
+    )
+    destination = @inbounds adapter.gradient_slots[slot]
+    Graph.clear_gradient!(destination)
+    Graph.accumulate_gradient!(destination, worker.graph.gradient)
+    @inbounds begin
+        adapter.mechanism_slots[slot] = _snapshot(worker.counters)
+        adapter.slot_kind[slot] = kind
+        adapter.slot_logical_first[slot] = Int32(logical_first)
+        adapter.slot_logical_last[slot] = Int32(logical_last)
+        adapter.slot_owner[slot] = worker.worker_slot
+        # Publish after the complete payload and logical identity.
+        adapter.slot_generation[slot] = generation
+    end
+    return nothing
+end
+
 function Barrierless.reduce_worker!(
     adapter::DendriticTrainingAdapter,
     worker::DendriticTrainingWorker,
     ::Data.CanonicalBatch,
     slot::Int,
-    ::Int,
-    ::Int,
+    first::Int,
+    last::Int,
 )
-    1 <= slot <= adapter.slot_capacity || throw(BoundsError(
+    slot <= adapter.candidate_slot_capacity || throw(BoundsError(
         adapter.gradient_slots, slot,
     ))
-    destination = adapter.gradient_slots[slot]
-    Graph.clear_gradient!(destination)
-    Graph.accumulate_gradient!(destination, worker.graph.gradient)
-    adapter.mechanism_slots[slot] = _snapshot(worker.counters)
+    _publish_reduction_slot!(
+        adapter,
+        worker,
+        slot,
+        _CANDIDATE_REDUCTION_SLOT,
+        first,
+        last,
+    )
+    return nothing
+end
+
+
+function Barrierless.replay_state_common!(
+    adapter::DendriticTrainingAdapter,
+    worker::DendriticTrainingWorker,
+    batch::Data.CanonicalBatch,
+    state::Int,
+    reduction_slot::Int,
+)
+    1 <= state <= batch.input.state_batch || throw(BoundsError(
+        adapter.common_states, state,
+    ))
+    @inbounds adapter.common_prepare_generation[state] ==
+        adapter.active_generation || error(
+            "state-common replay observed an unprepared state $state",
+        )
+    Graph.reset_candidate_set!(worker.graph)
+    Graph.clear_gradient!(worker.graph)
+    Graph.begin_local_microbatch!(worker.local_learner)
+    _reset!(worker.counters)
+    common = @inbounds adapter.common_states[state]
+    value_delta = @inbounds adapter.state_value_delta[state]
+    expected_signature = @inbounds adapter.common_signature[state]
+    report = Graph.local_replay_state_common!(
+        adapter.model,
+        common,
+        worker.graph,
+        worker.local_learner,
+        Data.state_input(batch.input, state),
+        @view(adapter.state_delta22[:, state]),
+        value_delta,
+        adapter.due;
+        expected_signature,
+    )
+    report.signature == expected_signature || error(
+        "state-common replay signature changed after ListNet boundary",
+    )
+    _accumulate_local_report!(worker.counters, report)
+    observation = Graph.local_plasticity_observation(worker.local_learner)
+    Plasticity.record_state_common_plasticity!(
+        adapter.plasticity_batch,
+        state,
+        observation.spike_count,
+        observation.visit_count,
+        observation.activity_sum,
+        observation.incoming_conductance_sum,
+        observation.task_utility_sum,
+        observation.contact_activity_sum,
+    )
+    _publish_reduction_slot!(
+        adapter,
+        worker,
+        reduction_slot,
+        _STATE_COMMON_REDUCTION_SLOT,
+        state,
+        state,
+    )
+    return nothing
+end
+
+@inline function _preflight_reduction_slot!(
+    adapter::DendriticTrainingAdapter,
+    slot::Int,
+    kind::UInt8,
+    logical_first::Int,
+    logical_last::Int,
+)
+    @inbounds begin
+        adapter.slot_generation[slot] == adapter.active_generation || error(
+            "reduction slot $slot is missing or stale",
+        )
+        adapter.slot_kind[slot] == kind || error(
+            "reduction slot $slot has the wrong ownership kind",
+        )
+        adapter.slot_logical_first[slot] == logical_first || error(
+            "reduction slot $slot has the wrong logical start",
+        )
+        adapter.slot_logical_last[slot] == logical_last || error(
+            "reduction slot $slot has the wrong logical end",
+        )
+        !iszero(adapter.slot_owner[slot]) || error(
+            "reduction slot $slot has no worker owner",
+        )
+    end
     return nothing
 end
 
@@ -1034,56 +1235,47 @@ function Barrierless.deterministic_reduce!(
     all(==(0x01), @view(adapter.replay_seen[1:valid])) || error(
         "deterministic reduction observed an incomplete replay set",
     )
-    microbatch_count <= adapter.slot_capacity || throw(BoundsError(
+    microbatch_count <= adapter.candidate_slot_capacity || throw(BoundsError(
         adapter.gradient_slots, microbatch_count,
     ))
+    state_total = batch.input.state_batch
+    total_slots = microbatch_count + state_total
+    total_slots <= adapter.slot_capacity || throw(BoundsError(
+        adapter.gradient_slots, total_slots,
+    ))
+    @inbounds for slot in 1:microbatch_count
+        first = (slot - 1) * adapter.candidate_chunk_size + 1
+        last = min(
+            slot * adapter.candidate_chunk_size,
+            batch.input.valid_count,
+        )
+        _preflight_reduction_slot!(
+            adapter,
+            slot,
+            _CANDIDATE_REDUCTION_SLOT,
+            first,
+            last,
+        )
+    end
+    @inbounds for state in 1:state_total
+        _preflight_reduction_slot!(
+            adapter,
+            microbatch_count + state,
+            _STATE_COMMON_REDUCTION_SLOT,
+            state,
+            state,
+        )
+    end
+
+    # No reduction scratch is touched until every worker publication has been
+    # validated against this attempt generation and its logical owner.
     Graph.clear_gradient!(adapter.reduced_gradient)
     mechanisms = MechanismCounters()
-    @inbounds for slot in 1:microbatch_count
+    @inbounds for slot in 1:total_slots
         Graph.accumulate_gradient!(
             adapter.reduced_gradient, adapter.gradient_slots[slot],
         )
         mechanisms = _add(mechanisms, adapter.mechanism_slots[slot])
-    end
-
-    # Candidate COW worlds stop at `initial_core`.  The state-common chronology
-    # is regenerated and credited exactly once per state, only after every
-    # candidate replay has joined and in fixed state order.
-    @inbounds for state in 1:batch.input.state_batch
-        Graph.reset_candidate_set!(adapter.common_worker)
-        Graph.clear_gradient!(adapter.common_worker)
-        Graph.begin_local_microbatch!(adapter.common_local)
-        report = Graph.local_replay_state_common!(
-            adapter.model,
-            adapter.common_states[state],
-            adapter.common_worker,
-            adapter.common_local,
-            Data.state_input(batch.input, state),
-            @view(adapter.state_delta22[:, state]),
-            adapter.state_value_delta[state],
-            adapter.due;
-            expected_signature=adapter.common_signature[state],
-        )
-        report.signature == adapter.common_signature[state] || error(
-            "state-common replay signature changed after ListNet boundary",
-        )
-        Graph.accumulate_gradient!(
-            adapter.reduced_gradient, adapter.common_worker.gradient,
-        )
-        common_counts = MechanismCounterState()
-        _accumulate_local_report!(common_counts, report)
-        mechanisms = _add(mechanisms, _snapshot(common_counts))
-        observation = Graph.local_plasticity_observation(adapter.common_local)
-        Plasticity.record_state_common_plasticity!(
-            adapter.plasticity_batch,
-            state,
-            observation.spike_count,
-            observation.visit_count,
-            observation.activity_sum,
-            observation.incoming_conductance_sum,
-            observation.task_utility_sum,
-            observation.contact_activity_sum,
-        )
     end
     adapter.mechanisms = mechanisms
     return adapter.reduced_gradient
@@ -1145,12 +1337,57 @@ end
     return (analog, analog, analog || hard, true, true)
 end
 
-@inline function _assert_all_finite(array, label::AbstractString)
+@noinline function _nonfinite_optimizer_state(value, group::Symbol, field::Symbol)
+    throw(DomainError(value, (group=group, field=field)))
+end
+
+@inline function _assert_all_finite(
+    array,
+    group::Symbol,
+    field::Symbol,
+)
     @inbounds for value in array
-        isfinite(value) || throw(DomainError(
-            value, "non-finite value in $label",
-        ))
+        isfinite(value) || _nonfinite_optimizer_state(value, group, field)
     end
+    return nothing
+end
+
+
+@inline function _preflight_optimizer_groups!(
+    ::Tuple{},
+    ::Tuple{},
+    ::Vector{UInt64},
+    ::Tuple{},
+    ::Int,
+)
+    return nothing
+end
+
+@inline function _preflight_optimizer_groups!(
+    groups::Tuple,
+    moments::Tuple,
+    group_steps::Vector{UInt64},
+    due_mask::Tuple,
+    index::Int,
+)
+    group = first(groups)
+    moment = first(moments)
+    _assert_all_finite(group.parameter, group.name, :parameter)
+    _assert_all_finite(moment.first, group.name, :first_moment)
+    _assert_all_finite(moment.second, group.name, :second_moment)
+    group.multiplier > 0.0f0 &&
+        _assert_all_finite(group.gradient, group.name, :gradient)
+    step_at_limit = @inbounds group_steps[index] == typemax(UInt64)
+    first(due_mask) && group.multiplier > 0.0f0 && step_at_limit && throw(
+            OverflowError("optimizer group clock overflow for $(group.name)"),
+        )
+    _preflight_optimizer_groups!(
+        Base.tail(groups),
+        Base.tail(moments),
+        group_steps,
+        Base.tail(due_mask),
+        index + 1,
+    )
     return nothing
 end
 
@@ -1167,19 +1404,13 @@ function _preflight_optimizer_transaction!(
     state.total_step != typemax(UInt64) || throw(OverflowError(
         "total optimizer clock overflow",
     ))
-    @inbounds for index in eachindex(registry.groups)
-        group = registry.groups[index]
-        moments = state.moments[index]
-        _assert_all_finite(group.parameter, "$(group.name) parameters")
-        _assert_all_finite(moments.first, "$(group.name) first moments")
-        _assert_all_finite(moments.second, "$(group.name) second moments")
-        group.multiplier > 0.0f0 &&
-            _assert_all_finite(group.gradient, "$(group.name) gradients")
-        due_mask[index] && group.multiplier > 0.0f0 &&
-            state.group_steps[index] == typemax(UInt64) && throw(
-                OverflowError("optimizer group clock overflow for $(group.name)"),
-            )
-    end
+    _preflight_optimizer_groups!(
+        registry.groups,
+        state.moments,
+        state.group_steps,
+        due_mask,
+        1,
+    )
     Optimizer.gradient_norm(registry; due_mask)
     return nothing
 end
