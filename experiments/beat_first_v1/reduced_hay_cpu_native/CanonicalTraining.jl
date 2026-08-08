@@ -2432,7 +2432,9 @@ function restore_training_checkpoint!(
         map(moment -> moment.second, optimizer.moments),
         snapshot.optimizer.second_moments,
     )
-    copyto!(optimizer.group_steps, snapshot.optimizer.group_steps)
+    @inbounds for index in 1:5
+        optimizer.group_steps[index] = snapshot.optimizer.group_steps[index]
+    end
     optimizer.total_step = snapshot.optimizer.total_step
 
     clock = snapshot.learning_clock

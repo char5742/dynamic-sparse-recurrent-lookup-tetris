@@ -25,6 +25,7 @@ const Root = RootModuleTestHarness.ReducedHayCPU
         :CanonicalDendriticGraph,
         :CanonicalBarrierless,
         :CanonicalValidation,
+        :ReducedHayCPUSampler,
         :CanonicalCheckpoint,
         :CanonicalExactOracle,
         :CanonicalTraining,
@@ -99,6 +100,7 @@ end
         "CanonicalDendriticGraph.jl",
         "CanonicalBarrierless.jl",
         "CanonicalValidation.jl",
+        "Sampler.jl",
         "CanonicalCheckpoint.jl",
         "CanonicalExactOracle.jl",
         "CanonicalTraining.jl",
@@ -132,7 +134,6 @@ end
         :RelationGraphOptimizer,
         :RelationGraphTraining,
         :RelationGraphBarrierless,
-        :ReducedHayCPUSampler,
         :RelationGraphCheckpoint,
 
         # Earlier forest/point/dense-output and routed-workspace roots.

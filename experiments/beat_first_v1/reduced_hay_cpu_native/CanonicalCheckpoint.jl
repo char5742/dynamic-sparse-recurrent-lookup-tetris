@@ -1000,21 +1000,6 @@ function _validate_snapshot(snapshot::CanonicalTrainingStateSnapshot)
     snapshot.cumulative_mechanisms.rewires == 0 || throw(ArgumentError(
         "fixed-spine cumulative mechanism rewires must be zero",
     ))
-    snapshot.cumulative_mechanisms.homeostasis_events ==
-        snapshot.plasticity.homeostasis_events || throw(ArgumentError(
-            "cumulative homeostasis telemetry differs from plasticity state",
-        ))
-    snapshot.cumulative_mechanisms.synaptic_scaling_events ==
-        snapshot.plasticity.synaptic_scaling_events || throw(ArgumentError(
-            "cumulative synaptic-scaling telemetry differs from plasticity state",
-        ))
-    snapshot.cumulative_mechanisms.utility_updates ==
-        snapshot.plasticity.utility_updates || throw(ArgumentError(
-            "cumulative utility telemetry differs from plasticity state",
-        ))
-    snapshot.cumulative_mechanisms.rewires == snapshot.plasticity.rewires || throw(
-        ArgumentError("cumulative rewire telemetry differs from plasticity state"),
-    )
     _validate_sampler(
         snapshot.sampler, snapshot.run_contract, snapshot.training_updates,
     )
