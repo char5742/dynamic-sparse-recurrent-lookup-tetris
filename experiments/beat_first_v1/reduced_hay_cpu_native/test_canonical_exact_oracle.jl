@@ -222,3 +222,442 @@ end
         "bad", "bad", "bad", "bad",
     )
 end
+
+# ---------------------------------------------------------------------------
+# Sound fixed-hard-trajectory oracle fixture.
+#
+# The three primitive layers deliberately implement forward-mode and
+# reverse-mode formulas in separate functions.  BigFloat replay uses the exact
+# stored Float64 values and the recorded mask; it never re-runs a hard
+# comparison.
+
+struct ThreeLayerRecording
+    input::Vector{Float64}
+    weight1::Matrix{Float64}
+    bias1::Vector{Float64}
+    weight2::Matrix{Float64}
+    bias2::Vector{Float64}
+    recorded_mask::Vector{Bool}
+    weight3::Matrix{Float64}
+    bias3::Vector{Float64}
+end
+
+mutable struct ThreeLayerRecordedAdapter <: Oracle.AbstractRecordedFloat64Adapter
+    provenance_fault::Symbol
+    corrupt_vjp::Bool
+    jvp_calls::Int
+    vjp_calls::Int
+end
+
+ThreeLayerRecordedAdapter(; provenance_fault=:none, corrupt_vjp=false) =
+    ThreeLayerRecordedAdapter(provenance_fault, corrupt_vjp, 0, 0)
+
+function three_layer_recording()
+    return ThreeLayerRecording(
+        [0.625, -0.375],
+        [0.75 -0.20; 0.15 0.55],
+        [0.10, -0.05],
+        [0.40 -0.35; 0.60 0.25],
+        [-0.08, 0.12],
+        Bool[true, false],
+        [0.30 -0.45; 0.70 0.20],
+        [0.03, -0.09],
+    )
+end
+
+const THREE_LAYER_NAMES = (
+    :affine_cell,
+    :typed_deposit,
+    :output_readout,
+)
+
+Oracle.recorded_parameter_layout(
+    ::ThreeLayerRecordedAdapter,
+    ::ThreeLayerRecording,
+) = Oracle.RecordedParameterLayout(
+    (:layer1, :layer2, :layer3),
+    (6, 6, 6),
+)
+
+Oracle.recorded_output_dimension(
+    ::ThreeLayerRecordedAdapter,
+    ::ThreeLayerRecording,
+) = 2
+
+Oracle.recorded_layer_names(
+    ::ThreeLayerRecordedAdapter,
+    ::ThreeLayerRecording,
+) = THREE_LAYER_NAMES
+
+function Oracle.recorded_layer_parameter_layout(
+    ::ThreeLayerRecordedAdapter,
+    ::ThreeLayerRecording,
+    layer::Symbol,
+)
+    layer in THREE_LAYER_NAMES || throw(ArgumentError("unknown primitive layer"))
+    return Oracle.RecordedParameterLayout((:input, :parameters), (2, 6))
+end
+
+function Oracle.recorded_layer_output_dimension(
+    ::ThreeLayerRecordedAdapter,
+    ::ThreeLayerRecording,
+    layer::Symbol,
+)
+    layer in THREE_LAYER_NAMES || throw(ArgumentError("unknown primitive layer"))
+    return 2
+end
+
+function _three_layer_signature(recording::ThreeLayerRecording; changed=false)
+    spikes = copy(recording.recorded_mask)
+    changed && (spikes[1] = !spikes[1])
+    return Oracle.conditional_event_signature(
+        spikes,
+        Bool[false, true],
+        ((node=1, phase=1), (node=2, phase=2)),
+        Bool[false, true],
+    )
+end
+
+function Oracle.recorded_payload_digest(
+    ::ThreeLayerRecordedAdapter,
+    recording::ThreeLayerRecording,
+)
+    return Oracle._digest((
+        input=recording.input,
+        weight1=recording.weight1,
+        bias1=recording.bias1,
+        weight2=recording.weight2,
+        bias2=recording.bias2,
+        recorded_mask=recording.recorded_mask,
+        weight3=recording.weight3,
+        bias3=recording.bias3,
+    ))
+end
+
+
+function Oracle.recorded_provenance(
+    adapter::ThreeLayerRecordedAdapter,
+    recording::ThreeLayerRecording,
+)
+    layout = Oracle.recorded_parameter_layout(adapter, recording)
+    layout_digest = Oracle.recorded_layout_digest(layout)
+    primitive_digest = Oracle.recorded_primitive_manifest_digest(
+        adapter, recording,
+    )
+    parameter_digest = Oracle._digest((
+        recording.weight1,
+        recording.bias1,
+        recording.weight2,
+        recording.bias2,
+        recording.weight3,
+        recording.bias3,
+    ))
+    initial_digest = Oracle._digest(recording.input)
+    payload_digest = Oracle.recorded_payload_digest(adapter, recording)
+    source_signature = _three_layer_signature(recording)
+    replay_signature = _three_layer_signature(
+        recording; changed=adapter.provenance_fault === :signature,
+    )
+    expected = Oracle.RecordedCountManifest(3, 2, 1, 2, 4)
+    recorded = adapter.provenance_fault === :counts ?
+        Oracle.RecordedCountManifest(3, 1, 1, 2, 4) : expected
+    bad_digest = repeat("0", 64)
+    return Oracle.RecordedHardProvenance(
+        1,
+        source_signature,
+        replay_signature,
+        expected,
+        recorded,
+        adapter.provenance_fault === :recomputed_decision ? 1 : 0,
+        parameter_digest,
+        adapter.provenance_fault === :parameters ? bad_digest : parameter_digest,
+        initial_digest,
+        adapter.provenance_fault === :initial_state ? bad_digest : initial_digest,
+        adapter.provenance_fault === :layout ? bad_digest : layout_digest,
+        adapter.provenance_fault === :primitive ? bad_digest : primitive_digest,
+        payload_digest,
+        adapter.provenance_fault === :record ? bad_digest : payload_digest,
+        adapter.provenance_fault !== :unsealed,
+    )
+end
+
+@inline _softplus_fixture(value) = log1p(exp(value))
+
+function _three_layer_primals(recording::ThreeLayerRecording, ::Type{T}) where {T}
+    input = T.(recording.input)
+    weight1 = T.(recording.weight1)
+    bias1 = T.(recording.bias1)
+    pre1 = weight1 * input + bias1
+    hidden1 = tanh.(pre1)
+    weight2 = T.(recording.weight2)
+    bias2 = T.(recording.bias2)
+    pre2 = weight2 * hidden1 + bias2
+    mask = T.(recording.recorded_mask)
+    hidden2 = mask .* _softplus_fixture.(pre2)
+    weight3 = T.(recording.weight3)
+    bias3 = T.(recording.bias3)
+    pre3 = weight3 * hidden2 + bias3
+    output = tanh.(pre3)
+    return (
+        input=input,
+        weight1=weight1,
+        pre1=pre1,
+        hidden1=hidden1,
+        weight2=weight2,
+        pre2=pre2,
+        mask=mask,
+        hidden2=hidden2,
+        weight3=weight3,
+        pre3=pre3,
+        output=output,
+    )
+end
+
+function Oracle.recorded_jvp!(
+    adapter::ThreeLayerRecordedAdapter,
+    recording::ThreeLayerRecording,
+    direction,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    adapter.jvp_calls += 1
+    primal = _three_layer_primals(recording, T)
+    direction1 = direction[:layer1]
+    direction2 = direction[:layer2]
+    direction3 = direction[:layer3]
+    delta_weight1 = reshape(direction1[1:4], 2, 2)
+    delta_bias1 = direction1[5:6]
+    delta_pre1 = delta_weight1 * primal.input + delta_bias1
+    delta_hidden1 = (one(T) .- primal.hidden1 .* primal.hidden1) .* delta_pre1
+    delta_weight2 = reshape(direction2[1:4], 2, 2)
+    delta_bias2 = direction2[5:6]
+    delta_pre2 = delta_weight2 * primal.hidden1 +
+                 primal.weight2 * delta_hidden1 + delta_bias2
+    jvp_plateau_slope = inv.(one(T) .+ exp.(-primal.pre2))
+    delta_hidden2 = primal.mask .* jvp_plateau_slope .* delta_pre2
+    delta_weight3 = reshape(direction3[1:4], 2, 2)
+    delta_bias3 = direction3[5:6]
+    delta_pre3 = delta_weight3 * primal.hidden2 +
+                 primal.weight3 * delta_hidden2 + delta_bias3
+    return (one(T) .- primal.output .* primal.output) .* delta_pre3
+end
+
+function Oracle.recorded_vjp!(
+    adapter::ThreeLayerRecordedAdapter,
+    recording::ThreeLayerRecording,
+    cotangent,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    adapter.vjp_calls += 1
+    primal = _three_layer_primals(recording, T)
+    bar_pre3 = cotangent .* (one(T) .- primal.output .* primal.output)
+    bar_weight3 = bar_pre3 * transpose(primal.hidden2)
+    bar_bias3 = copy(bar_pre3)
+    bar_hidden2 = transpose(primal.weight3) * bar_pre3
+    reverse_plateau_slope = inv.(one(T) .+ exp.(-primal.pre2))
+    bar_pre2 = bar_hidden2 .* primal.mask .* reverse_plateau_slope
+    bar_weight2 = bar_pre2 * transpose(primal.hidden1)
+    bar_bias2 = copy(bar_pre2)
+    bar_hidden1 = transpose(primal.weight2) * bar_pre2
+    bar_pre1 = bar_hidden1 .* (one(T) .- primal.hidden1 .* primal.hidden1)
+    bar_weight1 = bar_pre1 * transpose(primal.input)
+    bar_bias1 = copy(bar_pre1)
+    result = Dict(
+        :layer1 => vcat(vec(bar_weight1), bar_bias1),
+        :layer2 => vcat(vec(bar_weight2), bar_bias2),
+        :layer3 => vcat(vec(bar_weight3), bar_bias3),
+    )
+    if adapter.corrupt_vjp
+        result[:layer2][1] += T(1) / T(32)
+    end
+    return result
+end
+
+function _layer_input_and_parameters(
+    recording::ThreeLayerRecording,
+    layer::Symbol,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    primal = _three_layer_primals(recording, T)
+    if layer === :affine_cell
+        return primal.input, T.(recording.weight1), T.(recording.bias1), nothing
+    elseif layer === :typed_deposit
+        return primal.hidden1, T.(recording.weight2), T.(recording.bias2), primal.mask
+    elseif layer === :output_readout
+        return primal.hidden2, T.(recording.weight3), T.(recording.bias3), nothing
+    end
+    throw(ArgumentError("unknown primitive layer"))
+end
+
+function Oracle.recorded_layer_jvp!(
+    adapter::ThreeLayerRecordedAdapter,
+    recording::ThreeLayerRecording,
+    layer::Symbol,
+    direction,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    adapter.jvp_calls += 1
+    input, weight, bias, mask = _layer_input_and_parameters(recording, layer, T)
+    delta_input = direction[:input]
+    parameter_direction = direction[:parameters]
+    delta_weight = reshape(parameter_direction[1:4], 2, 2)
+    delta_bias = parameter_direction[5:6]
+    pre = weight * input + bias
+    delta_pre = delta_weight * input + weight * delta_input + delta_bias
+    if layer === :typed_deposit
+        jvp_plateau_slope = inv.(one(T) .+ exp.(-pre))
+        return mask .* jvp_plateau_slope .* delta_pre
+    end
+    output = tanh.(pre)
+    return (one(T) .- output .* output) .* delta_pre
+end
+
+function Oracle.recorded_layer_vjp!(
+    adapter::ThreeLayerRecordedAdapter,
+    recording::ThreeLayerRecording,
+    layer::Symbol,
+    cotangent,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    adapter.vjp_calls += 1
+    input, weight, bias, mask = _layer_input_and_parameters(recording, layer, T)
+    pre = weight * input + bias
+    if layer === :typed_deposit
+        reverse_plateau_slope = inv.(one(T) .+ exp.(-pre))
+        bar_pre = cotangent .* mask .* reverse_plateau_slope
+    else
+        output = tanh.(pre)
+        bar_pre = cotangent .* (one(T) .- output .* output)
+    end
+    bar_input = transpose(weight) * bar_pre
+    bar_weight = bar_pre * transpose(input)
+    bar_bias = copy(bar_pre)
+    parameters = vcat(vec(bar_weight), bar_bias)
+    if adapter.corrupt_vjp && layer === :typed_deposit
+        parameters[1] += T(1) / T(32)
+    end
+    return Dict(:input => bar_input, :parameters => parameters)
+end
+
+function global_recorded_probe()
+    return Oracle.RecordedTransposeProbe(
+        Dict(
+            :layer1 => [0.08, -0.03, 0.05, 0.11, -0.07, 0.04],
+            :layer2 => [-0.06, 0.09, 0.02, -0.05, 0.10, -0.08],
+            :layer3 => [0.07, 0.03, -0.04, 0.06, -0.02, 0.12],
+        ),
+        [0.65, -0.35],
+    )
+end
+
+function primitive_recorded_probes()
+    return Dict(
+        :affine_cell => Oracle.RecordedTransposeProbe(
+            Dict(
+                :input => [0.09, -0.04],
+                :parameters => [0.03, -0.05, 0.07, 0.02, -0.06, 0.08],
+            ),
+            [0.55, -0.25],
+        ),
+        :typed_deposit => Oracle.RecordedTransposeProbe(
+            Dict(
+                :input => [-0.03, 0.10],
+                :parameters => [0.08, 0.04, -0.02, 0.07, 0.05, -0.09],
+            ),
+            [0.70, -0.20],
+        ),
+        :output_readout => Oracle.RecordedTransposeProbe(
+            Dict(
+                :input => [0.06, -0.08],
+                :parameters => [-0.04, 0.09, 0.03, 0.05, 0.07, -0.02],
+            ),
+            [-0.45, 0.75],
+        ),
+    )
+end
+
+@testset "recorded Float64 and BigFloat transpose certificate" begin
+    recording = three_layer_recording()
+    adapter = ThreeLayerRecordedAdapter()
+    certificate = Oracle.recorded_transpose_certificate!(
+        adapter, recording, global_recorded_probe(),
+    )
+    @test certificate.scope === :whole_recording
+    @test certificate.informative
+    @test certificate.precision_stable
+    @test certificate.transpose_equal
+    @test certificate.passed
+    @test certificate.jvp_rounded_bits[1] == certificate.jvp_rounded_bits[2]
+    @test certificate.vjp_rounded_bits[1] == certificate.vjp_rounded_bits[2]
+    @test adapter.jvp_calls == 3
+    @test adapter.vjp_calls == 3
+end
+
+@testset "every primitive layer has an independent transpose certificate" begin
+    recording = three_layer_recording()
+    adapter = ThreeLayerRecordedAdapter()
+    certificates = Oracle.primitive_layerwise_certificates!(
+        adapter, recording, primitive_recorded_probes(),
+    )
+    @test getfield.(certificates, :scope) == collect(THREE_LAYER_NAMES)
+    @test all(certificate -> certificate.informative, certificates)
+    @test all(certificate -> certificate.precision_stable, certificates)
+    @test all(certificate -> certificate.transpose_equal, certificates)
+    @test all(certificate -> certificate.passed, certificates)
+    @test adapter.jvp_calls == 9
+    @test adapter.vjp_calls == 9
+
+    @test_throws ArgumentError Oracle.primitive_layerwise_certificates!(
+        adapter,
+        recording,
+        Dict(:affine_cell => primitive_recorded_probes()[:affine_cell]),
+    )
+end
+
+@testset "a broken reverse fails whole and primitive certificates" begin
+    recording = three_layer_recording()
+    adapter = ThreeLayerRecordedAdapter(corrupt_vjp=true)
+    whole = Oracle.recorded_transpose_certificate!(
+        adapter, recording, global_recorded_probe(),
+    )
+    @test whole.informative
+    @test whole.precision_stable
+    @test !whole.transpose_equal
+    @test !whole.passed
+
+    layers = Oracle.primitive_layerwise_certificates!(
+        adapter, recording, primitive_recorded_probes(),
+    )
+    by_name = Dict(certificate.scope => certificate for certificate in layers)
+    @test by_name[:affine_cell].passed
+    @test !by_name[:typed_deposit].passed
+    @test by_name[:output_readout].passed
+end
+
+@testset "recorded provenance fails before derivative hooks" begin
+    recording = three_layer_recording()
+    for fault in (
+        :unsealed,
+        :counts,
+        :signature,
+        :layout,
+        :primitive,
+        :record,
+        :parameters,
+        :initial_state,
+        :recomputed_decision,
+    )
+        adapter = ThreeLayerRecordedAdapter(provenance_fault=fault)
+        @test_throws ErrorException Oracle.recorded_transpose_certificate!(
+            adapter, recording, global_recorded_probe(),
+        )
+        @test adapter.jvp_calls == 0
+        @test adapter.vjp_calls == 0
+    end
+
+    @test_throws ArgumentError Oracle.RecordedTransposeProbe(
+        Dict(:zero => zeros(2)), [1.0],
+    )
+    @test_throws ArgumentError Oracle.RecordedTransposeProbe(
+        Dict(:nonzero => ones(2)), [0.0],
+    )
+end

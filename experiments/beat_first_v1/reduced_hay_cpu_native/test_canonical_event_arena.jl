@@ -56,6 +56,22 @@ end
 end
 
 @inline function deliver_event_edge!(
+    ::ThresholdAdapter{T},
+    arena::EventArena{T},
+    overlay::DynamicSourceMajorOverlay,
+    source::Int,
+    source_mask::UInt8,
+    edge::Int,
+    destination::Int,
+    slot::Int,
+    wave::Int,
+) where {T<:AbstractFloat}
+    input = Int(overlay.channel[edge])
+    arena.inbox[slot, input] += T(overlay.raw_index[edge])
+    return nothing
+end
+
+@inline function deliver_event_edge!(
     adapter::TypedDeliveryAdapter{T},
     arena::EventArena{T},
     overlay::DynamicSourceMajorOverlay,
@@ -299,6 +315,164 @@ end
     # The complete builder + mixed delivery hot path is allocation-free.
     run_typed_overlay!(arena, fixed, overlay, adapter)
     @test @allocated(run_typed_overlay!(arena, fixed, overlay, adapter)) == 0
+end
+
+function prepare_overlay_only_merge!(overlay)
+    begin_dynamic_overlay!(overlay)
+    push_dynamic_edge!(overlay, 1, 3, 1, 0x02, 1)
+    push_dynamic_edge!(overlay, 2, 3, 1, 0x02, 2)
+    seal_dynamic_overlay!(overlay)
+    return overlay
+end
+
+function run_overlay_only_merge!(arena, fixed, overlay, adapter)
+    prepare_overlay_only_merge!(overlay)
+    begin_candidate!(arena)
+    # Source one appears in both ledgers. The overlay mask is a subset of the
+    # normal mask, so normal delivery owns static+dynamic exactly once.
+    seed_overlay_only_event!(arena, 1, 0x02)
+    seed_event!(arena, 1, 0x03)
+    seed_overlay_only_event!(arena, 2, 0x02)
+    return run_event_waves!(arena, fixed, overlay, adapter; max_waves=1)
+end
+
+@testset "wave-one overlay-only sources merge without static duplication" begin
+    fixed = graph(
+        3,
+        UInt32[1, 2, 3, 3],
+        UInt16[3, 3];
+        channel=UInt8[1, 1],
+        trigger=UInt8[0x01, 0x02],
+        weight=Float32[0.5, 100.0],
+        inbox_dim=3,
+    )
+    overlay = DynamicSourceMajorOverlay(3, 3, 2)
+    arena = EventArena(3, 3, 3, Float32)
+    arena.base_state[1, 1] = 2.0f0
+    arena.base_state[2, 1] = 9.0f0
+    arena.base_state[2, 3] = 1.0f0
+    adapter = TypedDeliveryAdapter{Float32,NTuple{2,Float32}}((3.0f0, 4.0f0))
+
+    report = run_overlay_only_merge!(arena, fixed, overlay, adapter)
+    # Source one contributes static AMPA and dynamic plateau-off GABA. Source
+    # two is overlay-only and contributes plateau-on NMDA without static 100x.
+    @test candidate_state(arena, 3, 1) == 1.0f0
+    @test candidate_state(arena, 3, 2) == 4.0f0
+    @test candidate_state(arena, 3, 3) == 3.0f0
+    @test report.visited_sources == 2
+    @test report.scanned_edges == 3
+    @test report.delivered_edges == 3
+    @test report.destination_updates == 1
+    @test overlay_only_seed_count(arena) == 1
+    @test overlay_only_seed_source(arena, 1) == 2
+    @test overlay_only_seed_mask(arena, 1) == 0x02
+    @test_throws BoundsError overlay_only_seed_source(arena, 2)
+    overlay_only_seed_count(arena)
+    overlay_only_seed_source(arena, 1)
+    overlay_only_seed_mask(arena, 1)
+    @test @allocated(overlay_only_seed_count(arena)) == 0
+    @test @allocated(overlay_only_seed_source(arena, 1)) == 0
+    @test @allocated(overlay_only_seed_mask(arena, 1)) == 0
+
+    # Reverse call order yields the same compacted effective ledger.
+    begin_candidate!(arena)
+    @test seed_event!(arena, 1, 0x03)
+    @test seed_overlay_only_event!(arena, 1, 0x02)
+    @test_throws ArgumentError overlay_only_seed_count(arena)
+    run_event_waves!(arena, fixed, overlay, adapter; max_waves=1)
+    @test overlay_only_seed_count(arena) == 0
+
+    # Duplicate overlay-only masks merge by OR.
+    begin_candidate!(arena)
+    @test seed_overlay_only_event!(arena, 2, 0x01)
+    @test seed_overlay_only_event!(arena, 2, 0x02)
+    @test arena.overlay_only_count == 1
+    @test arena.overlay_only_masks[1] == 0x03
+
+    # Overlay-only work cannot silently run against the static-only API.
+    @test_throws ArgumentError run_event_waves!(arena, fixed, adapter)
+
+    # A bit absent from the normal seed may not be silently discarded.
+    begin_candidate!(arena)
+    seed_overlay_only_event!(arena, 1, 0x02)
+    seed_event!(arena, 1, 0x01)
+    @test_throws ArgumentError run_event_waves!(
+        arena, fixed, overlay, adapter; max_waves=1,
+    )
+    begin_candidate!(arena)
+    seed_event!(arena, 1, 0x01)
+    seed_overlay_only_event!(arena, 1, 0x02)
+    @test_throws ArgumentError run_event_waves!(
+        arena, fixed, overlay, adapter; max_waves=1,
+    )
+
+    fallback_conflict = EventArena(3, 3, 3, Float32; overflow=:fallback)
+    begin_candidate!(fallback_conflict)
+    seed_overlay_only_event!(fallback_conflict, 1, 0x02)
+    seed_event!(fallback_conflict, 1, 0x01)
+    conflict_report = run_event_waves!(
+        fallback_conflict, fixed, overlay, adapter; max_waves=1,
+    )
+    @test conflict_report.fallback_requested
+    @test conflict_report.overflow_kind == OVERFLOW_SEED_MASK_CONFLICT
+    @test_throws ArgumentError overlay_only_seed_count(fallback_conflict)
+
+    run_overlay_only_merge!(arena, fixed, overlay, adapter)
+    @test @allocated(run_overlay_only_merge!(arena, fixed, overlay, adapter)) == 0
+end
+
+function run_overlay_only_chain!(arena, fixed, overlay, waves)
+    begin_dynamic_overlay!(overlay)
+    push_dynamic_edge!(overlay, 2, 3, 1, 0x01, 1)
+    seal_dynamic_overlay!(overlay)
+    begin_candidate!(arena)
+    seed_overlay_only_event!(arena, 2, 0x01)
+    return run_event_waves!(
+        arena,
+        fixed,
+        overlay,
+        ThresholdAdapter(0.5f0);
+        max_waves=waves,
+    )
+end
+
+
+@testset "overlay-only source preserves next-wave causality and overflow" begin
+    # Dynamic wave one: 2 -> 3. Normal wave two: static 3 -> 4.
+    fixed = graph(
+        4,
+        UInt32[1, 1, 1, 2, 2],
+        UInt16[4],
+    )
+    overlay = DynamicSourceMajorOverlay(4, 1, 1)
+    arena = EventArena(4, 2, 1, Float32)
+    one = run_overlay_only_chain!(arena, fixed, overlay, 1)
+    @test candidate_state(arena, 3, 1) == 1.0f0
+    @test candidate_state(arena, 4, 1) == 0.0f0
+    @test one.hit_wave_limit
+    two = run_overlay_only_chain!(arena, fixed, overlay, 2)
+    @test candidate_state(arena, 4, 1) == 1.0f0
+    @test two.waves_executed == 2
+
+    failing = EventArena(
+        3, 2, 1, Float32;
+        frontier_capacity=1,
+        overflow=:error,
+    )
+    begin_candidate!(failing)
+    seed_overlay_only_event!(failing, 1, 0x01)
+    @test_throws ArenaOverflowError seed_overlay_only_event!(failing, 2, 0x01)
+
+    fallback = EventArena(
+        3, 2, 1, Float32;
+        frontier_capacity=1,
+        overflow=:fallback,
+    )
+    begin_candidate!(fallback)
+    @test seed_overlay_only_event!(fallback, 1, 0x01)
+    @test !seed_overlay_only_event!(fallback, 2, 0x01)
+    @test fallback.fallback_requested
+    @test fallback.overflow_kind == OVERFLOW_FRONTIER_CAPACITY
 end
 
 @testset "generation-stamped COW state" begin

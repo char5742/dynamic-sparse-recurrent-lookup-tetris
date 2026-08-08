@@ -18,6 +18,7 @@ export CANONICAL_MAX_WAVES,
        OVERFLOW_ACTIVE_CAPACITY,
        OVERFLOW_FRONTIER_CAPACITY,
        OVERFLOW_DYNAMIC_CAPACITY,
+       OVERFLOW_SEED_MASK_CONFLICT,
        SourceMajorAdjacency,
        DynamicSourceMajorOverlay,
        EventArena,
@@ -33,6 +34,10 @@ export CANONICAL_MAX_WAVES,
        begin_candidate!,
        touch_node!,
        seed_event!,
+       seed_overlay_only_event!,
+       overlay_only_seed_count,
+       overlay_only_seed_source,
+       overlay_only_seed_mask,
        deliver_event_edge!,
        advance_event_cell!,
        run_event_waves!
@@ -47,6 +52,7 @@ const OVERFLOW_NONE = UInt8(0)
 const OVERFLOW_ACTIVE_CAPACITY = UInt8(1)
 const OVERFLOW_FRONTIER_CAPACITY = UInt8(2)
 const OVERFLOW_DYNAMIC_CAPACITY = UInt8(3)
+const OVERFLOW_SEED_MASK_CONFLICT = UInt8(4)
 
 """Immutable source-major hot adjacency copied out of construction buffers."""
 struct SourceMajorAdjacency{T<:AbstractFloat}
@@ -291,6 +297,7 @@ function Base.showerror(io::IO, error::ArenaOverflowError)
     label = error.kind == OVERFLOW_ACTIVE_CAPACITY ? "active COW" :
             error.kind == OVERFLOW_FRONTIER_CAPACITY ? "frontier" :
             error.kind == OVERFLOW_DYNAMIC_CAPACITY ? "dynamic overlay" :
+            error.kind == OVERFLOW_SEED_MASK_CONFLICT ? "seed mask conflict" :
             "unknown"
     print(
         io,
@@ -351,6 +358,12 @@ mutable struct EventArena{T<:AbstractFloat}
     seed_stamp::Vector{UInt32}
     seed_index::Vector{Int32}
     seed_epoch::UInt32
+    overlay_only_nodes::Vector{UInt16}
+    overlay_only_masks::Vector{UInt8}
+    overlay_only_count::Int
+    overlay_only_stamp::Vector{UInt32}
+    overlay_only_index::Vector{Int32}
+    overlay_only_epoch::UInt32
     accepting_seeds::Bool
     fallback_requested::Bool
     overflow_kind::UInt8
@@ -413,6 +426,12 @@ function EventArena(
         zeros(UInt32, nodes),
         zeros(Int32, nodes),
         UInt32(0),
+        zeros(UInt16, frontier),
+        zeros(UInt8, frontier),
+        0,
+        zeros(UInt32, nodes),
+        zeros(Int32, nodes),
+        UInt32(0),
         false,
         false,
         OVERFLOW_NONE,
@@ -446,10 +465,15 @@ function begin_candidate!(arena::EventArena)
         arena.node_generation,
     )
     arena.seed_epoch = _advance_epoch(arena.seed_epoch, arena.seed_stamp)
+    arena.overlay_only_epoch = _advance_epoch(
+        arena.overlay_only_epoch,
+        arena.overlay_only_stamp,
+    )
     arena.active_count = 0
     arena.destination_count = 0
     arena.current_count = 0
     arena.next_count = 0
+    arena.overlay_only_count = 0
     arena.accepting_seeds = true
     arena.fallback_requested = false
     arena.overflow_kind = OVERFLOW_NONE
@@ -558,6 +582,91 @@ function seed_event!(arena::EventArena, node::Integer, event_mask::Integer)
     end
     arena.current_count = requested
     return true
+end
+
+"""
+Seed a source for wave-one dynamic-overlay delivery only.
+
+This is for candidate-incidence sources whose current packet/state is valid but
+which were not re-evaluated in the candidate mandatory closure. Static edges
+must not be scanned for such a source. Duplicate overlay-only seeds merge by
+OR. If the same source is also a normal seed, normal delivery wins regardless
+of call order and this ledger entry is excluded from wave one.
+"""
+function seed_overlay_only_event!(
+    arena::EventArena,
+    node::Integer,
+    event_mask::Integer,
+)
+    arena.accepting_seeds || throw(ArgumentError(
+        "events may only be seeded after begin_candidate! and before run_event_waves!",
+    ))
+    arena.fallback_requested && return false
+    physical = _check_node(arena, node)
+    mask = UInt8(event_mask)
+    !iszero(mask) || throw(ArgumentError(
+        "overlay-only seed event mask must be nonzero",
+    ))
+    if @inbounds(arena.overlay_only_stamp[physical]) == arena.overlay_only_epoch
+        index = Int(@inbounds arena.overlay_only_index[physical])
+        @inbounds arena.overlay_only_masks[index] |= mask
+        return true
+    end
+    requested = arena.overlay_only_count + 1
+    requested <= arena.frontier_capacity || begin
+        _overflow!(
+            arena,
+            OVERFLOW_FRONTIER_CAPACITY,
+            arena.frontier_capacity,
+            requested,
+        )
+        return false
+    end
+    @inbounds begin
+        arena.overlay_only_nodes[requested] = UInt16(physical)
+        arena.overlay_only_masks[requested] = mask
+        arena.overlay_only_stamp[physical] = arena.overlay_only_epoch
+        arena.overlay_only_index[physical] = Int32(requested)
+    end
+    arena.overlay_only_count = requested
+    return true
+end
+
+@inline function _require_sealed_overlay_only(arena::EventArena)
+    arena.accepting_seeds && throw(ArgumentError(
+        "overlay-only seed order is available only after event execution seals it",
+    ))
+    arena.fallback_requested && throw(ArgumentError(
+        "overlay-only seed order is unavailable after a fallback request",
+    ))
+    return nothing
+end
+
+
+"""Number of effective wave-one overlay-only sources in sealed source order."""
+@inline function overlay_only_seed_count(arena::EventArena)
+    _require_sealed_overlay_only(arena)
+    return arena.overlay_only_count
+end
+
+"""Effective overlay-only source at `index` after deterministic sealing."""
+@inline function overlay_only_seed_source(arena::EventArena, index::Integer)
+    _require_sealed_overlay_only(arena)
+    physical = Int(index)
+    1 <= physical <= arena.overlay_only_count || throw(BoundsError(
+        1:arena.overlay_only_count, physical,
+    ))
+    return Int(@inbounds arena.overlay_only_nodes[physical])
+end
+
+"""Effective overlay-only source mask at `index` after deterministic sealing."""
+@inline function overlay_only_seed_mask(arena::EventArena, index::Integer)
+    _require_sealed_overlay_only(arena)
+    physical = Int(index)
+    1 <= physical <= arena.overlay_only_count || throw(BoundsError(
+        1:arena.overlay_only_count, physical,
+    ))
+    return @inbounds arena.overlay_only_masks[physical]
 end
 
 @inline function _swap!(values, left::Int, right::Int)
@@ -751,6 +860,51 @@ end
     )
 end
 
+function _validate_overlay_only_masks!(arena::EventArena)
+    @inbounds for index in 1:arena.overlay_only_count
+        source = Int(arena.overlay_only_nodes[index])
+        arena.seed_stamp[source] == arena.seed_epoch || continue
+        normal_index = Int(arena.seed_index[source])
+        normal_mask = arena.current_masks[normal_index]
+        overlay_mask = arena.overlay_only_masks[index]
+        extra = overlay_mask & ~normal_mask
+        iszero(extra) && continue
+        if arena.overflow_policy == OVERFLOW_ERROR
+            throw(ArgumentError(
+                "overlay-only seed mask contains bits absent from the normal seed",
+            ))
+        end
+        arena.fallback_requested = true
+        arena.overflow_kind = OVERFLOW_SEED_MASK_CONFLICT
+        return false
+    end
+    return true
+end
+
+function _sort_and_compact_overlay_only!(arena::EventArena)
+    _sort_prefix!(
+        arena.overlay_only_nodes,
+        arena.overlay_only_masks,
+        arena.overlay_only_count,
+    )
+    destination = 0
+    @inbounds for source_index in 1:arena.overlay_only_count
+        source = Int(arena.overlay_only_nodes[source_index])
+        # Valid same-source overlap is wholly covered by normal delivery and
+        # therefore is not part of the effective overlay-only ledger.
+        arena.seed_stamp[source] == arena.seed_epoch && continue
+        destination += 1
+        if destination != source_index
+            arena.overlay_only_nodes[destination] =
+                arena.overlay_only_nodes[source_index]
+            arena.overlay_only_masks[destination] =
+                arena.overlay_only_masks[source_index]
+        end
+    end
+    arena.overlay_only_count = destination
+    return arena
+end
+
 @inline function _dynamic_precedes_static(
     overlay::DynamicSourceMajorOverlay,
     dynamic_edge::Int,
@@ -822,6 +976,9 @@ function run_event_waves!(
     adapter;
     max_waves::Integer=CANONICAL_MAX_WAVES,
 ) where {T<:AbstractFloat}
+    arena.overlay_only_count == 0 || throw(ArgumentError(
+        "overlay-only seeds require a sealed dynamic overlay",
+    ))
     return _run_event_waves!(
         arena,
         graph,
@@ -876,10 +1033,19 @@ function _run_event_waves!(
     arena.accepting_seeds || throw(ArgumentError(
         "begin_candidate! must be called exactly once before each event run",
     ))
+    if arena.fallback_requested
+        arena.accepting_seeds = false
+        return _empty_report(arena)
+    end
+    if !_validate_overlay_only_masks!(arena)
+        arena.accepting_seeds = false
+        return _empty_report(arena)
+    end
     arena.accepting_seeds = false
-    arena.fallback_requested && return _empty_report(arena)
-    arena.current_count == 0 && return _empty_report(arena)
+    arena.current_count == 0 && arena.overlay_only_count == 0 &&
+        return _empty_report(arena)
     _sort_prefix!(arena.current_nodes, arena.current_masks, arena.current_count)
+    _sort_and_compact_overlay_only!(arena)
 
     visited_sources = 0
     scanned_edges = 0
@@ -893,12 +1059,33 @@ function _run_event_waves!(
         arena.destination_count = 0
         arena.next_count = 0
 
-        for source_index in 1:arena.current_count
-            source = Int(arena.current_nodes[source_index])
-            source_mask = arena.current_masks[source_index]
+        normal_index = 1
+        overlay_only_index = wave == 1 ? 1 : arena.overlay_only_count + 1
+        while normal_index <= arena.current_count ||
+              overlay_only_index <= arena.overlay_only_count
+            normal_available = normal_index <= arena.current_count
+            overlay_only_available = overlay_only_index <= arena.overlay_only_count
+            normal_source = normal_available ?
+                Int(@inbounds arena.current_nodes[normal_index]) : typemax(Int)
+            overlay_only_source = overlay_only_available ?
+                Int(@inbounds arena.overlay_only_nodes[overlay_only_index]) :
+                typemax(Int)
+            use_overlay_only = overlay_only_source < normal_source
+            if normal_available && overlay_only_available &&
+               normal_source == overlay_only_source
+                # Normal wins: it scans static+dynamic exactly once. The
+                # overlay-only mask is deliberately not merged.
+                overlay_only_index += 1
+            end
+            source = use_overlay_only ? overlay_only_source : normal_source
+            source_mask = use_overlay_only ?
+                @inbounds(arena.overlay_only_masks[overlay_only_index]) :
+                @inbounds(arena.current_masks[normal_index])
+            use_overlay_only ? (overlay_only_index += 1) : (normal_index += 1)
             visited_sources += 1
-            static_edge = Int(graph.offsets[source])
-            static_limit = Int(graph.offsets[source + 1]) - 1
+            static_edge = use_overlay_only ? 1 : Int(graph.offsets[source])
+            static_limit = use_overlay_only ? 0 :
+                Int(graph.offsets[source + 1]) - 1
             dynamic_edge = overlay === nothing ? 1 : Int(overlay.offsets[source])
             dynamic_limit = overlay === nothing ? 0 :
                 Int(overlay.offsets[source + 1]) - 1

@@ -6,6 +6,7 @@ using ..CanonicalValidation
 const Validation = CanonicalValidation
 
 export AbstractExactOracleAdapter,
+       AbstractRecordedFloat64Adapter,
        OracleExecutionMode,
        CANONICAL_EXECUTION,
        FULL_STATE_EXECUTION,
@@ -18,6 +19,27 @@ export AbstractExactOracleAdapter,
        EventStableFiniteDifference,
        ExecutionEquivalence,
        ExactLocalAlignment,
+       RecordedParameterLayout,
+       RecordedCountManifest,
+       RecordedHardProvenance,
+       RecordedTransposeProbe,
+       TransposeObservation,
+       RoundedBitTransposeCertificate,
+       recorded_layout_digest,
+       recorded_primitive_manifest_digest,
+       recorded_provenance,
+       recorded_payload_digest,
+       recorded_parameter_layout,
+       recorded_output_dimension,
+       recorded_jvp!,
+       recorded_vjp!,
+       recorded_layer_names,
+       recorded_layer_parameter_layout,
+       recorded_layer_output_dimension,
+       recorded_layer_jvp!,
+       recorded_layer_vjp!,
+       recorded_transpose_certificate!,
+       primitive_layerwise_certificates!,
        oracle_parameter_groups,
        oracle_parameter_values,
        oracle_parameters_changed!,
@@ -43,6 +65,36 @@ two gradient computations which are to be compared.  In particular,
 returns.
 """
 abstract type AbstractExactOracleAdapter end
+
+"""
+Diagnostics-only adapter for a *recorded* hard trajectory.
+
+This protocol is deliberately separate from `AbstractExactOracleAdapter` and
+its Float32 finite-difference diagnostics.  Implementations must lift recorded
+continuous primals to the requested scalar type while replaying the recorded
+spike, plateau, frontier, delivery, and halt decisions verbatim.  They must not
+re-run hard comparisons at Float64 or BigFloat precision.
+
+`recorded_jvp!` and `recorded_vjp!` are independent implementations of the
+same conditional map.  Neither hook may update parameters or own a production
+optimizer.
+"""
+abstract type AbstractRecordedFloat64Adapter end
+
+# Required recorded-replay protocol.  There are intentionally no fallback
+# methods: an incompletely wired real-graph recorder must fail before it can be
+# mistaken for a certificate.
+function recorded_provenance end
+function recorded_payload_digest end
+function recorded_parameter_layout end
+function recorded_output_dimension end
+function recorded_jvp! end
+function recorded_vjp! end
+function recorded_layer_names end
+function recorded_layer_parameter_layout end
+function recorded_layer_output_dimension end
+function recorded_layer_jvp! end
+function recorded_layer_vjp! end
 
 """Execution variants used only to prove canonical-path equivalence."""
 @enum OracleExecutionMode::UInt8 begin
@@ -181,6 +233,581 @@ conditional_event_signature(spikes, plateaus, frontiers, halts) =
         _digest(frontiers),
         _digest(halts),
     )
+
+"""Ordered parameter groups covered by one recorded transpose probe."""
+struct RecordedParameterLayout
+    groups::Vector{Symbol}
+    lengths::Vector{Int}
+
+    function RecordedParameterLayout(groups, lengths)
+        names = Symbol.(collect(groups))
+        sizes = Int.(collect(lengths))
+        isempty(names) && throw(ArgumentError(
+            "a recorded parameter layout must contain at least one group",
+        ))
+        length(names) == length(sizes) || throw(DimensionMismatch(
+            "recorded layout groups and lengths differ",
+        ))
+        length(unique(names)) == length(names) || throw(ArgumentError(
+            "recorded layout group names must be unique",
+        ))
+        all(>(0), sizes) || throw(ArgumentError(
+            "recorded layout lengths must be positive",
+        ))
+        return new(names, sizes)
+    end
+end
+
+"""Stable digest binding a probe to its ordered parameter layout."""
+recorded_layout_digest(layout::RecordedParameterLayout) =
+    _digest((groups=Tuple(layout.groups), lengths=Tuple(layout.lengths)))
+
+"""Expected or recorded cardinalities of an immutable replay tape."""
+struct RecordedCountManifest
+    transitions::Int
+    typed_deposits::Int
+    ordered_deliveries::Int
+    output_bindings::Int
+    hard_decisions::Int
+
+    function RecordedCountManifest(
+        transitions::Integer,
+        typed_deposits::Integer,
+        ordered_deliveries::Integer,
+        output_bindings::Integer,
+        hard_decisions::Integer,
+    )
+        counts = Int.((
+            transitions,
+            typed_deposits,
+            ordered_deliveries,
+            output_bindings,
+            hard_decisions,
+        ))
+        all(>=(0), counts) || throw(ArgumentError(
+            "recorded count manifest values must be nonnegative",
+        ))
+        return new(counts...)
+    end
+end
+
+"""
+Provenance required before a recorded replay is differentiable diagnostics.
+
+`record_digest` binds the continuous transition/deposit operands and their
+ordering.  Source/replay pairs bind the parameter snapshot, initial state and
+input, and all discrete decisions.  Expected/recorded count equality is used
+instead of assuming that a nonzero count means a complete recording; zero
+deliveries can be legitimate.  A recorder may construct an unsealed value, but
+certification rejects it before calling either JVP or VJP.
+"""
+struct RecordedHardProvenance
+    schema_version::UInt16
+    source_signature::ConditionalEventSignature
+    replay_signature::ConditionalEventSignature
+    expected_counts::RecordedCountManifest
+    recorded_counts::RecordedCountManifest
+    recomputed_hard_decisions::Int
+    source_parameter_digest::String
+    replay_parameter_digest::String
+    source_initial_state_input_digest::String
+    replay_initial_state_input_digest::String
+    parameter_layout_digest::String
+    primitive_manifest_digest::String
+    record_digest::String
+    recomputed_record_digest::String
+    sealed::Bool
+
+    function RecordedHardProvenance(
+        schema_version::Integer,
+        source_signature::ConditionalEventSignature,
+        replay_signature::ConditionalEventSignature,
+        expected_counts::RecordedCountManifest,
+        recorded_counts::RecordedCountManifest,
+        recomputed_hard_decisions::Integer,
+        source_parameter_digest::AbstractString,
+        replay_parameter_digest::AbstractString,
+        source_initial_state_input_digest::AbstractString,
+        replay_initial_state_input_digest::AbstractString,
+        parameter_layout_digest::AbstractString,
+        primitive_manifest_digest::AbstractString,
+        record_digest::AbstractString,
+        recomputed_record_digest::AbstractString,
+        sealed::Bool,
+    )
+        schema = UInt16(schema_version)
+        recomputed = Int(recomputed_hard_decisions)
+        recomputed >= 0 || throw(ArgumentError(
+            "recomputed hard-decision count must be nonnegative",
+        ))
+        hashes = String.((
+            source_parameter_digest,
+            replay_parameter_digest,
+            source_initial_state_input_digest,
+            replay_initial_state_input_digest,
+            parameter_layout_digest,
+            primitive_manifest_digest,
+            record_digest,
+            recomputed_record_digest,
+        ))
+        @inbounds for (label, hash) in zip((
+            "source parameter",
+            "replay parameter",
+            "source initial-state/input",
+            "replay initial-state/input",
+            "parameter layout",
+            "primitive manifest",
+            "record",
+            "recomputed record",
+        ), hashes)
+            occursin(r"^[0-9a-f]{64}$", hash) || throw(ArgumentError(
+                "$label digest must be a lowercase SHA-256 hex string",
+            ))
+        end
+        return new(
+            schema,
+            source_signature,
+            replay_signature,
+            expected_counts,
+            recorded_counts,
+            recomputed,
+            hashes...,
+            sealed,
+        )
+    end
+end
+
+"""One fixed direction and output cotangent for a transpose identity."""
+struct RecordedTransposeProbe
+    direction::Dict{Symbol,Vector{Float64}}
+    output_cotangent::Vector{Float64}
+
+    function RecordedTransposeProbe(direction, output_cotangent)
+        direction isa AbstractDict || direction isa NamedTuple || throw(
+            ArgumentError("recorded probe direction must be a dictionary or NamedTuple"),
+        )
+        raw_names = Symbol.(collect(keys(direction)))
+        isempty(raw_names) && throw(ArgumentError(
+            "recorded probe direction must contain at least one group",
+        ))
+        length(unique(raw_names)) == length(raw_names) || throw(ArgumentError(
+            "recorded probe direction group names must be unique",
+        ))
+        normalized = Dict{Symbol,Vector{Float64}}()
+        for name in raw_names
+            raw = direction isa NamedTuple ? getproperty(direction, name) : direction[name]
+            raw isa AbstractArray || throw(ArgumentError(
+                "recorded direction group $name must be an AbstractArray",
+            ))
+            values = Float64.(vec(collect(raw)))
+            isempty(values) && throw(ArgumentError(
+                "recorded direction group $name must be nonempty",
+            ))
+            all(isfinite, values) || throw(ArgumentError(
+                "recorded direction group $name must be finite",
+            ))
+            normalized[name] = values
+        end
+        any(group_values -> any(x -> !iszero(x), group_values), values(normalized)) || throw(
+            ArgumentError("recorded probe direction must be nonzero"),
+        )
+        cotangent = Float64.(vec(collect(output_cotangent)))
+        isempty(cotangent) && throw(ArgumentError(
+            "recorded output cotangent must be nonempty",
+        ))
+        all(isfinite, cotangent) || throw(ArgumentError(
+            "recorded output cotangent must be finite",
+        ))
+        any(x -> !iszero(x), cotangent) || throw(ArgumentError(
+            "recorded output cotangent must be nonzero",
+        ))
+        return new(normalized, cotangent)
+    end
+end
+
+"""The two independently evaluated sides of `<u, Jv> = <J'u, v>`."""
+struct TransposeObservation{T<:AbstractFloat}
+    jvp_dot::T
+    vjp_dot::T
+end
+
+"""
+Tolerance-free rounded-bit certificate for a fixed conditional trajectory.
+
+The Float64 observation is diagnostic.  Certification is instead based on
+correctly rounding the independent 256- and 512-bit BigFloat observations to
+Float64.  Both precision levels must independently stabilize on the same bits,
+and the JVP and VJP sides must stabilize on the same bits.  No finite
+difference and no magnitude tolerance enters `passed`.
+"""
+struct RoundedBitTransposeCertificate
+    scope::Symbol
+    provenance::RecordedHardProvenance
+    float64::TransposeObservation{Float64}
+    bigfloat_256::TransposeObservation{BigFloat}
+    bigfloat_512::TransposeObservation{BigFloat}
+    jvp_rounded_bits::NTuple{2,UInt64}
+    vjp_rounded_bits::NTuple{2,UInt64}
+    float64_bits_equal::Bool
+    informative::Bool
+    precision_stable::Bool
+    transpose_equal::Bool
+    passed::Bool
+end
+
+function _recorded_layer_names(
+    adapter::AbstractRecordedFloat64Adapter,
+    recording,
+)
+    names = Symbol.(collect(recorded_layer_names(adapter, recording)))
+    isempty(names) && throw(ArgumentError(
+        "recorded adapter must declare at least one primitive layer",
+    ))
+    length(unique(names)) == length(names) || throw(ArgumentError(
+        "recorded primitive layer names must be unique",
+    ))
+    return names
+end
+
+@inline function _recorded_layout(
+    adapter::AbstractRecordedFloat64Adapter,
+    recording,
+    scope::Union{Nothing,Symbol},
+)
+    raw = scope === nothing ?
+        recorded_parameter_layout(adapter, recording) :
+        recorded_layer_parameter_layout(adapter, recording, scope)
+    raw isa RecordedParameterLayout || throw(ArgumentError(
+        scope === nothing ?
+        "recorded_parameter_layout must return RecordedParameterLayout" :
+        "recorded_layer_parameter_layout must return RecordedParameterLayout",
+    ))
+    return raw
+end
+
+"""Digest of the ordered primitive names, layouts, and output dimensions."""
+function recorded_primitive_manifest_digest(
+    adapter::AbstractRecordedFloat64Adapter,
+    recording,
+)
+    entries = map(_recorded_layer_names(adapter, recording)) do name
+        layout = _recorded_layout(adapter, recording, name)
+        dimension = recorded_layer_output_dimension(adapter, recording, name)
+        dimension isa Integer && dimension > 0 || throw(ArgumentError(
+            "recorded primitive output dimensions must be positive integers",
+        ))
+        return (
+            name=name,
+            groups=Tuple(layout.groups),
+            lengths=Tuple(layout.lengths),
+            output_dimension=Int(dimension),
+        )
+    end
+    return _digest(Tuple(entries))
+end
+
+function _require_recorded_provenance(
+    adapter::AbstractRecordedFloat64Adapter,
+    recording,
+)
+    provenance = recorded_provenance(adapter, recording)
+    provenance isa RecordedHardProvenance || throw(ArgumentError(
+        "recorded_provenance must return RecordedHardProvenance",
+    ))
+    provenance.schema_version == 0x0001 || error(
+        "unsupported recorded provenance schema $(provenance.schema_version)",
+    )
+    provenance.sealed || error(
+        "recorded trajectory provenance is not sealed",
+    )
+    provenance.source_signature == provenance.replay_signature || error(
+        "recorded replay hard signature differs from its source",
+    )
+    provenance.expected_counts == provenance.recorded_counts || error(
+        "recorded trajectory counts differ from their expected manifest",
+    )
+    provenance.expected_counts.transitions > 0 || error(
+        "recorded trajectory has no transitions",
+    )
+    provenance.expected_counts.output_bindings > 0 || error(
+        "recorded trajectory has no output bindings",
+    )
+    provenance.recomputed_hard_decisions == 0 || error(
+        "recorded replay recomputed hard decisions instead of forcing the tape",
+    )
+    provenance.source_parameter_digest == provenance.replay_parameter_digest || error(
+        "recorded replay parameter snapshot differs from its source",
+    )
+    provenance.source_initial_state_input_digest ==
+        provenance.replay_initial_state_input_digest || error(
+        "recorded replay initial state/input differs from its source",
+    )
+    layout = _recorded_layout(adapter, recording, nothing)
+    provenance.parameter_layout_digest == recorded_layout_digest(layout) || error(
+        "recorded parameter layout does not match sealed provenance",
+    )
+    provenance.primitive_manifest_digest ==
+        recorded_primitive_manifest_digest(adapter, recording) || error(
+        "recorded primitive manifest does not match sealed provenance",
+    )
+    provenance.record_digest == provenance.recomputed_record_digest || error(
+        "recorded payload digest differs from its recomputed digest",
+    )
+    provenance.record_digest == recorded_payload_digest(adapter, recording) || error(
+        "recorded payload does not match sealed provenance",
+    )
+    return provenance
+end
+
+function _validate_recorded_probe(
+    adapter::AbstractRecordedFloat64Adapter,
+    recording,
+    probe::RecordedTransposeProbe,
+    scope::Union{Nothing,Symbol},
+)
+    layout = _recorded_layout(adapter, recording, scope)
+    Set(keys(probe.direction)) == Set(layout.groups) || throw(ArgumentError(
+        "recorded probe groups differ from the declared parameter layout",
+    ))
+    @inbounds for index in eachindex(layout.groups)
+        group = layout.groups[index]
+        length(probe.direction[group]) == layout.lengths[index] || throw(
+            DimensionMismatch(
+                "recorded probe length for $group differs from its layout",
+            ),
+        )
+    end
+    output_dimension = scope === nothing ?
+        recorded_output_dimension(adapter, recording) :
+        recorded_layer_output_dimension(adapter, recording, scope)
+    output_dimension isa Integer || throw(ArgumentError(
+        "recorded output dimension must be an integer",
+    ))
+    output_dimension > 0 || throw(ArgumentError(
+        "recorded output dimension must be positive",
+    ))
+    length(probe.output_cotangent) == output_dimension || throw(
+        DimensionMismatch(
+            "recorded output cotangent differs from the declared output dimension",
+        ),
+    )
+    return layout
+end
+
+@inline function _typed_direction(
+    probe::RecordedTransposeProbe,
+    layout::RecordedParameterLayout,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    result = Dict{Symbol,Vector{T}}()
+    for group in layout.groups
+        result[group] = T.(probe.direction[group])
+    end
+    return result
+end
+
+function _normalize_recorded_vjp(
+    raw,
+    layout::RecordedParameterLayout,
+    ::Type{T},
+) where {T<:AbstractFloat}
+    raw isa AbstractDict || raw isa NamedTuple || throw(ArgumentError(
+        "recorded VJP must return an AbstractDict or NamedTuple",
+    ))
+    all(name -> name isa Symbol, keys(raw)) || throw(ArgumentError(
+        "recorded VJP group names must be Symbols",
+    ))
+    Set(Symbol.(collect(keys(raw)))) == Set(layout.groups) || throw(
+        ArgumentError("recorded VJP groups differ from the declared layout"),
+    )
+    result = Dict{Symbol,Vector{T}}()
+    @inbounds for index in eachindex(layout.groups)
+        group = layout.groups[index]
+        value = raw isa NamedTuple ? getproperty(raw, group) : raw[group]
+        value isa AbstractArray || throw(ArgumentError(
+            "recorded VJP group $group must be an AbstractArray",
+        ))
+        eltype(value) === T || throw(ArgumentError(
+            "recorded VJP group $group must have eltype $T",
+        ))
+        values = vec(collect(value))
+        length(values) == layout.lengths[index] || throw(DimensionMismatch(
+            "recorded VJP length for $group differs from its layout",
+        ))
+        all(isfinite, values) || throw(ArgumentError(
+            "recorded VJP group $group must be finite",
+        ))
+        result[group] = values
+    end
+    return result
+end
+
+@inline function _ordered_dot(left, right, ::Type{T}) where {T<:AbstractFloat}
+    length(left) == length(right) || throw(DimensionMismatch(
+        "transpose dot-product operands have different lengths",
+    ))
+    accumulator = zero(T)
+    @inbounds for index in eachindex(left, right)
+        accumulator += left[index] * right[index]
+    end
+    return accumulator
+end
+
+function _recorded_transpose_observation(
+    adapter::AbstractRecordedFloat64Adapter,
+    recording,
+    probe::RecordedTransposeProbe,
+    scope::Union{Nothing,Symbol},
+    ::Type{T},
+) where {T<:AbstractFloat}
+    layout = _validate_recorded_probe(adapter, recording, probe, scope)
+    direction = _typed_direction(probe, layout, T)
+    cotangent = T.(probe.output_cotangent)
+    raw_jvp = scope === nothing ?
+        recorded_jvp!(adapter, recording, direction, T) :
+        recorded_layer_jvp!(adapter, recording, scope, direction, T)
+    raw_jvp isa AbstractArray || throw(ArgumentError(
+        "recorded JVP must return an AbstractArray",
+    ))
+    eltype(raw_jvp) === T || throw(ArgumentError(
+        "recorded JVP must have eltype $T",
+    ))
+    jvp = vec(collect(raw_jvp))
+    length(jvp) == length(cotangent) || throw(DimensionMismatch(
+        "recorded JVP differs from the declared output dimension",
+    ))
+    all(isfinite, jvp) || throw(ArgumentError(
+        "recorded JVP must be finite",
+    ))
+
+    raw_vjp = scope === nothing ?
+        recorded_vjp!(adapter, recording, cotangent, T) :
+        recorded_layer_vjp!(adapter, recording, scope, cotangent, T)
+    vjp = _normalize_recorded_vjp(raw_vjp, layout, T)
+
+    jvp_dot = _ordered_dot(cotangent, jvp, T)
+    vjp_dot = zero(T)
+    for group in layout.groups
+        vjp_dot += _ordered_dot(direction[group], vjp[group], T)
+    end
+    isfinite(jvp_dot) && isfinite(vjp_dot) || throw(ArgumentError(
+        "recorded transpose products must be finite",
+    ))
+    return TransposeObservation{T}(jvp_dot, vjp_dot)
+end
+
+@inline function _rounded_float64_bits(value::BigFloat)
+    rounded = Float64(value, RoundNearest)
+    isfinite(rounded) || throw(ArgumentError(
+        "BigFloat transpose product is not representable as finite Float64",
+    ))
+    return reinterpret(UInt64, rounded)
+end
+
+function _recorded_certificate(
+    adapter::AbstractRecordedFloat64Adapter,
+    recording,
+    probe::RecordedTransposeProbe,
+    scope::Union{Nothing,Symbol},
+)
+    provenance = _require_recorded_provenance(adapter, recording)
+    float64_observation = _recorded_transpose_observation(
+        adapter, recording, probe, scope, Float64,
+    )
+    observation_256 = setprecision(BigFloat, 256) do
+        setrounding(BigFloat, RoundNearest) do
+            _recorded_transpose_observation(
+                adapter, recording, probe, scope, BigFloat,
+            )
+        end
+    end
+    observation_512 = setprecision(BigFloat, 512) do
+        setrounding(BigFloat, RoundNearest) do
+            _recorded_transpose_observation(
+                adapter, recording, probe, scope, BigFloat,
+            )
+        end
+    end
+    jvp_bits = (
+        _rounded_float64_bits(observation_256.jvp_dot),
+        _rounded_float64_bits(observation_512.jvp_dot),
+    )
+    vjp_bits = (
+        _rounded_float64_bits(observation_256.vjp_dot),
+        _rounded_float64_bits(observation_512.vjp_dot),
+    )
+    float64_bits_equal = reinterpret(UInt64, float64_observation.jvp_dot) ==
+                         reinterpret(UInt64, float64_observation.vjp_dot)
+    precision_stable = jvp_bits[1] == jvp_bits[2] &&
+                       vjp_bits[1] == vjp_bits[2]
+    transpose_equal = jvp_bits[2] == vjp_bits[2]
+    positive_zero = reinterpret(UInt64, 0.0)
+    negative_zero = reinterpret(UInt64, -0.0)
+    informative = !(jvp_bits[2] in (positive_zero, negative_zero) &&
+                    vjp_bits[2] in (positive_zero, negative_zero))
+    return RoundedBitTransposeCertificate(
+        scope === nothing ? :whole_recording : scope,
+        provenance,
+        float64_observation,
+        observation_256,
+        observation_512,
+        jvp_bits,
+        vjp_bits,
+        float64_bits_equal,
+        informative,
+        precision_stable,
+        transpose_equal,
+        informative && precision_stable && transpose_equal,
+    )
+end
+
+"""
+    recorded_transpose_certificate!(adapter, recording, probe)
+
+Certify an independently implemented recorded Float64 JVP/VJP pair without
+finite differences or a tolerance.  Hard provenance is checked before either
+derivative hook runs.
+"""
+recorded_transpose_certificate!(
+    adapter::AbstractRecordedFloat64Adapter,
+    recording,
+    probe::RecordedTransposeProbe,
+) = _recorded_certificate(adapter, recording, probe, nothing)
+
+"""
+    primitive_layerwise_certificates!(adapter, recording, probes)
+
+Apply the same rounded-bit transpose certificate to every declared primitive
+layer.  The supplied probes must cover the layer set exactly; missing or stale
+layer diagnostics fail closed.
+"""
+function primitive_layerwise_certificates!(
+    adapter::AbstractRecordedFloat64Adapter,
+    recording,
+    probes,
+)
+    probes isa AbstractDict || probes isa NamedTuple || throw(ArgumentError(
+        "primitive layer probes must be a dictionary or NamedTuple",
+    ))
+    names = _recorded_layer_names(adapter, recording)
+    all(name -> name isa Symbol, keys(probes)) || throw(ArgumentError(
+        "primitive layer probe names must be Symbols",
+    ))
+    Set(Symbol.(collect(keys(probes)))) == Set(names) || throw(ArgumentError(
+        "primitive layer probes do not exactly cover recorded_layer_names",
+    ))
+    certificates = Vector{RoundedBitTransposeCertificate}(undef, length(names))
+    for (index, name) in enumerate(names)
+        probe = probes isa NamedTuple ? getproperty(probes, name) : probes[name]
+        probe isa RecordedTransposeProbe || throw(ArgumentError(
+            "primitive layer probe $name must be RecordedTransposeProbe",
+        ))
+        certificates[index] = _recorded_certificate(
+            adapter, recording, probe, name,
+        )
+    end
+    return certificates
+end
 
 """Scalar diagnostic objective and its unmodified 22-D (or tiny-test) output."""
 struct OracleEvaluation
