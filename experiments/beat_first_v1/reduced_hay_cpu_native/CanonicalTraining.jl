@@ -2,6 +2,7 @@ module CanonicalTraining
 
 using SHA
 using ..CanonicalBarrierless
+using ..CanonicalCheckpoint
 using ..CanonicalDendriticGraph
 using ..CanonicalExperimentData
 using ..CanonicalListNet
@@ -10,8 +11,10 @@ using ..CanonicalOptimizer
 using ..CanonicalPlasticity
 using ..DendriticAxonPacket
 using ..DendriticOutputPopulation
+using ..ReducedHayCPUSampler
 
 const Barrierless = CanonicalBarrierless
+const Checkpoint = CanonicalCheckpoint
 const Data = CanonicalExperimentData
 const Graph = CanonicalDendriticGraph
 const ListNet = CanonicalListNet
@@ -20,6 +23,7 @@ const Optimizer = CanonicalOptimizer
 const Plasticity = CanonicalPlasticity
 const Axon = DendriticAxonPacket
 const Output = DendriticOutputPopulation
+const Sampler = ReducedHayCPUSampler
 
 export AuxiliaryLossConfig,
        OptimizerGroupConfig,
@@ -28,10 +32,14 @@ export AuxiliaryLossConfig,
        MechanismActivation,
        MechanismCounters,
        MechanismCounterState,
+       CumulativeMechanismCounters,
        TrainingUpdateResult,
        DendriticTrainingAdapter,
        CanonicalTrainer,
        mechanism_counts,
+       cumulative_mechanism_counts,
+       checkpoint_components,
+       restore_training_checkpoint!,
        training_config_fingerprint,
        training_config_summary,
        update_count,
@@ -277,6 +285,22 @@ end
 
 MechanismCounterState() = MechanismCounterState(0, 0, 0, 0, 0, 0, 0, 0)
 
+"""Training-owned cumulative telemetry committed once per successful update."""
+mutable struct CumulativeMechanismCounters
+    decolle_signal_nonzero::UInt64
+    subthreshold_updates::UInt64
+    nonspiking_updates::UInt64
+    hard_event_control_updates::UInt64
+    homeostasis_events::UInt64
+    synaptic_scaling_events::UInt64
+    utility_updates::UInt64
+    rewires::UInt64
+end
+
+CumulativeMechanismCounters() = CumulativeMechanismCounters(
+    0, 0, 0, 0, 0, 0, 0, 0,
+)
+
 @inline function _reset!(state::MechanismCounterState)
     @inbounds for name in _MECHANISM_KEYS
         setfield!(state, name, Int64(0))
@@ -393,6 +417,7 @@ mutable struct DendriticTrainingAdapter{C,R,A,S,PB,PS,AF,AO,HR,HZ} <:
     slot_logical_last::Vector{Int32}
     slot_owner::Vector{UInt16}
     mechanisms::MechanismCounters
+    cumulative_mechanisms::CumulativeMechanismCounters
     expected::MechanismActivation
     clocks::Local.LearningClockState
     due::Local.DuePlasticityClocks
@@ -634,6 +659,7 @@ function DendriticTrainingAdapter(
         zeros(Int32, slot_capacity),
         zeros(UInt16, slot_capacity),
         MechanismCounters(),
+        CumulativeMechanismCounters(),
         MechanismActivation(),
         Local.LearningClockState(),
         Local.DuePlasticityClocks(false, false, false, false),
@@ -1619,6 +1645,93 @@ function _assert_mechanisms!(
     return nothing
 end
 
+@inline function _checked_cumulative_add(
+    current::UInt64,
+    increment::Int64,
+    name::Symbol,
+)
+    increment >= 0 || throw(ArgumentError(
+        "per-update mechanism $name cannot be negative",
+    ))
+    amount = UInt64(increment)
+    current <= typemax(UInt64) - amount || throw(OverflowError(
+        "cumulative mechanism $name overflow",
+    ))
+    return current + amount
+end
+
+"""Preflight cumulative telemetry before any optimizer/plasticity mutation."""
+function _preflight_cumulative_mechanisms!(
+    cumulative::CumulativeMechanismCounters,
+    update::MechanismCounters,
+)
+    _checked_cumulative_add(
+        cumulative.decolle_signal_nonzero,
+        update.decolle_signal_nonzero,
+        :decolle_signal_nonzero,
+    )
+    _checked_cumulative_add(
+        cumulative.subthreshold_updates,
+        update.subthreshold_updates,
+        :subthreshold_updates,
+    )
+    _checked_cumulative_add(
+        cumulative.nonspiking_updates,
+        update.nonspiking_updates,
+        :nonspiking_updates,
+    )
+    _checked_cumulative_add(
+        cumulative.hard_event_control_updates,
+        update.hard_event_control_updates,
+        :hard_event_control_updates,
+    )
+    _checked_cumulative_add(
+        cumulative.utility_updates,
+        update.utility_updates,
+        :utility_updates,
+    )
+    _checked_cumulative_add(
+        cumulative.rewires,
+        update.rewires,
+        :rewires,
+    )
+    return nothing
+end
+
+function _preflight_cumulative_slow_mechanisms!(
+    adapter::DendriticTrainingAdapter,
+)
+    cumulative = adapter.cumulative_mechanisms
+    cumulative.homeostasis_events <=
+        typemax(UInt64) - UInt64(Graph.TOTAL_NODE_COUNT) || throw(
+            OverflowError("cumulative mechanism homeostasis_events overflow"),
+        )
+    cumulative.synaptic_scaling_events <=
+        typemax(UInt64) - UInt64(length(adapter.event_destination)) || throw(
+            OverflowError(
+                "cumulative mechanism synaptic_scaling_events overflow",
+            ),
+        )
+    return nothing
+end
+
+function _commit_cumulative_mechanisms!(
+    cumulative::CumulativeMechanismCounters,
+    update::MechanismCounters,
+)
+    cumulative.decolle_signal_nonzero += UInt64(update.decolle_signal_nonzero)
+    cumulative.subthreshold_updates += UInt64(update.subthreshold_updates)
+    cumulative.nonspiking_updates += UInt64(update.nonspiking_updates)
+    cumulative.hard_event_control_updates +=
+        UInt64(update.hard_event_control_updates)
+    cumulative.homeostasis_events += UInt64(update.homeostasis_events)
+    cumulative.synaptic_scaling_events +=
+        UInt64(update.synaptic_scaling_events)
+    cumulative.utility_updates += UInt64(update.utility_updates)
+    cumulative.rewires += UInt64(update.rewires)
+    return cumulative
+end
+
 @inline function _optimizer_due_mask(adapter::DendriticTrainingAdapter)
     local_config = adapter.config.local_learning
     analog = adapter.due.analog && local_config.analog_multiplier > 0.0f0
@@ -1823,6 +1936,11 @@ function Barrierless.apply_update!(
     due_mask = _optimizer_due_mask(adapter)
     _preflight_optimizer_transaction!(adapter, due_mask)
     _preflight_slow_counter_clocks!(adapter)
+    _preflight_cumulative_mechanisms!(
+        adapter.cumulative_mechanisms,
+        adapter.mechanisms,
+    )
+    _preflight_cumulative_slow_mechanisms!(adapter)
     local_config = adapter.config.local_learning
     plasticity_config = adapter.config.local_learning.plasticity
     utility_due = adapter.due.analog &&
@@ -1939,6 +2057,10 @@ function Barrierless.apply_update!(
     _assert_mechanisms!(
         adapter.expected, adapter.mechanisms; include_slow=true,
     )
+    _commit_cumulative_mechanisms!(
+        adapter.cumulative_mechanisms,
+        adapter.mechanisms,
+    )
     Graph.refresh_cache!(adapter.model)
     @inbounds for state in adapter.common_states
         Graph.refresh_state_initial!(adapter.model, state)
@@ -1971,6 +2093,415 @@ end
 
 @inline mechanism_counts(trainer::CanonicalTrainer) =
     trainer.session.executor.adapter.mechanisms
+
+@inline cumulative_mechanism_counts(trainer::CanonicalTrainer) =
+    trainer.session.executor.adapter.cumulative_mechanisms
+
+@inline function _checkpoint_group_contract(group)
+    return Checkpoint.ParameterGroupContract(
+        group.name,
+        group.transform_kind,
+        group.multiplier,
+        group.lower_bound,
+        group.upper_bound,
+        group.projected_lower_raw,
+        group.projected_upper_raw,
+        Tuple(size(group.parameter)),
+    )
+end
+
+function _checkpoint_registry(adapter::DendriticTrainingAdapter)
+    groups = adapter.registry.groups
+    length(groups) == 5 || throw(DimensionMismatch(
+        "canonical checkpoint requires exactly five parameter groups",
+    ))
+    return (
+        _checkpoint_group_contract(groups[1]),
+        _checkpoint_group_contract(groups[2]),
+        _checkpoint_group_contract(groups[3]),
+        _checkpoint_group_contract(groups[4]),
+        _checkpoint_group_contract(groups[5]),
+    )
+end
+
+@inline function _checkpoint_parameter_state(arrays::Tuple)
+    length(arrays) == 5 || throw(DimensionMismatch(
+        "canonical parameter state requires exactly five arrays",
+    ))
+    return Checkpoint.CanonicalParameterState(
+        arrays[1], arrays[2], arrays[3], arrays[4], arrays[5],
+    )
+end
+
+function _checkpoint_optimizer_state(
+    adapter::DendriticTrainingAdapter,
+    registry::NTuple{5,Checkpoint.ParameterGroupContract},
+)
+    state = adapter.optimizer_state
+    Optimizer.assert_registry_match(state, adapter.registry)
+    length(state.group_steps) == 5 || throw(DimensionMismatch(
+        "optimizer group clocks differ from the canonical registry",
+    ))
+    parameters = _checkpoint_parameter_state(
+        map(group -> group.parameter, adapter.registry.groups),
+    )
+    first_moments = _checkpoint_parameter_state(
+        map(moment -> moment.first, state.moments),
+    )
+    second_moments = _checkpoint_parameter_state(
+        map(moment -> moment.second, state.moments),
+    )
+    group_steps = (
+        state.group_steps[1],
+        state.group_steps[2],
+        state.group_steps[3],
+        state.group_steps[4],
+        state.group_steps[5],
+    )
+    return Checkpoint.CanonicalOptimizerStateSnapshot(
+        registry,
+        parameters,
+        first_moments,
+        second_moments,
+        group_steps,
+        state.total_step,
+    )
+end
+
+@inline function _checkpoint_clock(adapter::DendriticTrainingAdapter)
+    clock = adapter.clocks
+    return Checkpoint.LearningClockSnapshot(
+        clock.update,
+        clock.analog_ticks,
+        clock.hard_event_ticks,
+        clock.homeostasis_ticks,
+        clock.structure_ticks,
+    )
+end
+
+@inline function _checkpoint_mechanisms(adapter::DendriticTrainingAdapter)
+    counters = adapter.cumulative_mechanisms
+    return Checkpoint.MechanismCounterSnapshot(
+        counters.decolle_signal_nonzero,
+        counters.subthreshold_updates,
+        counters.nonspiking_updates,
+        counters.hard_event_control_updates,
+        counters.homeostasis_events,
+        counters.synaptic_scaling_events,
+        counters.utility_updates,
+        counters.rewires,
+    )
+end
+
+@inline function _checkpoint_plasticity(adapter::DendriticTrainingAdapter)
+    state = adapter.plasticity_state
+    return Checkpoint.PlasticityStateSnapshot(
+        state.firing_rate,
+        state.activity_ema,
+        state.incoming_conductance_ema,
+        state.utility,
+        state.reduced_batches,
+        state.homeostasis_events,
+        state.synaptic_scaling_events,
+        state.utility_updates,
+        state.rewires,
+    )
+end
+
+function _validate_checkpoint_run_boundary!(
+    trainer::CanonicalTrainer,
+    sampler::Sampler.DeterministicEpochSampler,
+    contract::Checkpoint.CanonicalRunContract,
+)
+    Checkpoint.run_contract_fingerprint(contract)
+    session = trainer.session
+    executor = session.executor
+    adapter = executor.adapter
+    input = executor.batch.input
+    input.state_batch == contract.state_batch || throw(DimensionMismatch(
+        "live state batch differs from the run contract",
+    ))
+    input.width == contract.candidate_width || throw(DimensionMismatch(
+        "live candidate width differs from the run contract",
+    ))
+    executor.candidate_chunk_size == contract.chunk_size || throw(
+        ArgumentError("live executor chunk differs from the run contract"),
+    )
+    adapter.candidate_chunk_size == contract.chunk_size || throw(
+        ArgumentError("live adapter chunk differs from the run contract"),
+    )
+    session.scheduler.worker_count == contract.workers || throw(ArgumentError(
+        "live worker count differs from the run contract",
+    ))
+    Barrierless.SchedulerCore.Queue.capacity(session.scheduler.queue) ==
+        contract.queue_capacity || throw(ArgumentError(
+            "live queue capacity differs from the run contract",
+        ))
+    session.scheduler.binding_mode === contract.binding || throw(ArgumentError(
+        "live scheduler binding differs from the run contract",
+    ))
+    training_config_fingerprint(adapter.config) ==
+        contract.training_config_fingerprint || throw(ArgumentError(
+            "live training configuration differs from the run contract",
+        ))
+    Checkpoint.architecture_fingerprint(adapter.model.config) ==
+        contract.architecture_fingerprint || throw(ArgumentError(
+            "live architecture differs from the run contract",
+        ))
+    Checkpoint.topology_fingerprint(adapter.model) ==
+        contract.topology_fingerprint || throw(ArgumentError(
+            "live topology/order differs from the run contract",
+        ))
+    sampler.seed == contract.sampler_seed || throw(ArgumentError(
+        "live sampler seed differs from the run contract",
+    ))
+    length(sampler.source_rows) == contract.training_state_count || throw(
+        DimensionMismatch("live sampler source count differs from the dataset"),
+    )
+    adapter.updates <= UInt64(contract.planned_max_updates) || throw(
+        ArgumentError("live updates exceed the run plan"),
+    )
+    return nothing
+end
+
+"""Extract one complete schema2 snapshot from an idle production trainer."""
+function checkpoint_components(
+    trainer::CanonicalTrainer,
+    sampler::Sampler.DeterministicEpochSampler,
+    contract::Checkpoint.CanonicalRunContract,
+)
+    trainer.active && error("cannot checkpoint an active train_update!")
+    executor = trainer.session.executor
+    executor.update_active && error("cannot checkpoint an active executor update")
+    _validate_checkpoint_run_boundary!(trainer, sampler, contract)
+    registry = _checkpoint_registry(executor.adapter)
+    return Checkpoint.build_training_snapshot(
+        executor.adapter.model,
+        executor.adapter.config.local_learning,
+        executor.adapter.config.optimizer,
+        _checkpoint_optimizer_state(executor.adapter, registry),
+        _checkpoint_clock(executor.adapter),
+        _checkpoint_mechanisms(executor.adapter),
+        executor.adapter.updates,
+        _checkpoint_plasticity(executor.adapter),
+        Checkpoint.SamplerStateSnapshot(Sampler.sampler_snapshot(sampler)),
+        contract,
+    )
+end
+
+@inline _all_zero(values) = all(iszero, values)
+
+@inline function _mechanisms_are_zero(counters)
+    return all(name -> iszero(getfield(counters, name)), _MECHANISM_KEYS)
+end
+
+function _assert_virgin_restore_target!(
+    trainer::CanonicalTrainer,
+    sampler::Sampler.DeterministicEpochSampler,
+)
+    trainer.active && error("checkpoint restore requires an inactive trainer")
+    session = trainer.session
+    executor = session.executor
+    adapter = executor.adapter
+    executor.update_active && error(
+        "checkpoint restore requires an inactive executor",
+    )
+    executor.state_total == 0 && executor.candidate_total == 0 &&
+        executor.microbatch_total == 0 || throw(ArgumentError(
+            "checkpoint restore target has executed an update attempt",
+        ))
+    adapter.updates == 0 && adapter.active_generation == 0 &&
+        adapter.optimizer_boundaries == 0 || throw(ArgumentError(
+            "checkpoint restore target is not virgin",
+        ))
+    Optimizer.assert_registry_match(adapter.optimizer_state, adapter.registry)
+    adapter.optimizer_state.total_step == 0 &&
+        all(iszero, adapter.optimizer_state.group_steps) || throw(ArgumentError(
+            "checkpoint restore target has optimizer progress",
+        ))
+    @inbounds for moments in adapter.optimizer_state.moments
+        _all_zero(moments.first) && _all_zero(moments.second) || throw(
+            ArgumentError("checkpoint restore target has optimizer moments"),
+        )
+    end
+    clock = adapter.clocks
+    clock.update == 0 && clock.analog_ticks == 0 &&
+        clock.hard_event_ticks == 0 && clock.homeostasis_ticks == 0 &&
+        clock.structure_ticks == 0 || throw(ArgumentError(
+            "checkpoint restore target has learning-clock progress",
+        ))
+    adapter.due == Local.DuePlasticityClocks(false, false, false, false) ||
+        throw(ArgumentError("checkpoint restore target has a due-clock token"))
+    adapter.expected == MechanismActivation() || throw(ArgumentError(
+        "checkpoint restore target has mechanism activation state",
+    ))
+    _mechanisms_are_zero(adapter.mechanisms) &&
+        _mechanisms_are_zero(adapter.cumulative_mechanisms) || throw(
+            ArgumentError("checkpoint restore target has mechanism telemetry"),
+        )
+    plasticity = adapter.plasticity_state
+    plasticity_config = adapter.config.local_learning.plasticity
+    initial_rate = Float32(
+        (plasticity_config.target_rate_min +
+         plasticity_config.target_rate_max) / 2,
+    )
+    all(==(initial_rate), plasticity.firing_rate) &&
+        _all_zero(plasticity.activity_ema) &&
+        _all_zero(plasticity.incoming_conductance_ema) &&
+        _all_zero(plasticity.utility) || throw(ArgumentError(
+            "checkpoint restore target has non-constructor plasticity state",
+        ))
+    plasticity.reduced_batches == 0 && plasticity.homeostasis_events == 0 &&
+        plasticity.synaptic_scaling_events == 0 &&
+        plasticity.utility_updates == 0 && plasticity.rewires == 0 || throw(
+            ArgumentError("checkpoint restore target has plasticity progress"),
+        )
+    adapter.listnet_result === nothing || throw(ArgumentError(
+        "checkpoint restore target has a published ListNet result",
+    ))
+    adapter.hard_event_deliveries == 0 &&
+        _all_zero(adapter.common_prepare_generation) &&
+        _all_zero(adapter.common_hard_seed_generation) &&
+        _all_zero(adapter.slot_generation) || throw(ArgumentError(
+            "checkpoint restore target has replay/publication state",
+        ))
+    Sampler.sampler_consumed_rows(sampler) == 0 || throw(ArgumentError(
+        "checkpoint restore requires a virgin sampler",
+    ))
+    return nothing
+end
+
+function _validate_prepared_against_live!(
+    trainer::CanonicalTrainer,
+    sampler::Sampler.DeterministicEpochSampler,
+    prepared::Checkpoint.PreparedTrainingCheckpoint,
+)
+    snapshot = Checkpoint.validate_prepared_checkpoint(prepared)
+    adapter = trainer.session.executor.adapter
+    isequal(snapshot.learning_config, adapter.config.local_learning) || throw(
+        ArgumentError("prepared learning configuration differs from the trainer"),
+    )
+    isequal(snapshot.optimizer_config, adapter.config.optimizer) || throw(
+        ArgumentError("prepared optimizer configuration differs from the trainer"),
+    )
+    snapshot.optimizer.registry == _checkpoint_registry(adapter) || throw(
+        ArgumentError("prepared parameter registry differs from the trainer"),
+    )
+    _validate_checkpoint_run_boundary!(trainer, sampler, snapshot.run_contract)
+    sampler.seed == prepared.sampler.seed &&
+        sampler.source_sha256 == prepared.sampler.source_sha256 &&
+        sampler.source_rows == prepared.sampler.source_rows || throw(
+            ArgumentError("prepared sampler source differs from the live sampler"),
+        )
+    _assert_virgin_restore_target!(trainer, sampler)
+    return snapshot
+end
+
+@inline function _restore_parameter_state!(arrays::Tuple, state)
+    saved = (
+        state.core_cell_raw,
+        state.semantic_projection_raw,
+        state.event_raw,
+        state.output_cell_raw,
+        state.output_projection_raw,
+    )
+    @inbounds for index in 1:5
+        copyto!(arrays[index], saved[index])
+    end
+    return nothing
+end
+
+"""Commit a fully prepared schema2 payload into a virgin inactive trainer."""
+function restore_training_checkpoint!(
+    trainer::CanonicalTrainer,
+    sampler::Sampler.DeterministicEpochSampler,
+    prepared::Checkpoint.PreparedTrainingCheckpoint,
+)
+    snapshot = _validate_prepared_against_live!(trainer, sampler, prepared)
+    adapter = trainer.session.executor.adapter
+    optimizer = adapter.optimizer_state
+    _restore_parameter_state!(
+        map(group -> group.parameter, adapter.registry.groups),
+        snapshot.optimizer.parameters,
+    )
+    _restore_parameter_state!(
+        map(moment -> moment.first, optimizer.moments),
+        snapshot.optimizer.first_moments,
+    )
+    _restore_parameter_state!(
+        map(moment -> moment.second, optimizer.moments),
+        snapshot.optimizer.second_moments,
+    )
+    copyto!(optimizer.group_steps, snapshot.optimizer.group_steps)
+    optimizer.total_step = snapshot.optimizer.total_step
+
+    clock = snapshot.learning_clock
+    adapter.clocks.update = clock.update
+    adapter.clocks.analog_ticks = clock.analog_ticks
+    adapter.clocks.hard_event_ticks = clock.hard_event_ticks
+    adapter.clocks.homeostasis_ticks = clock.homeostasis_ticks
+    adapter.clocks.structure_ticks = clock.structure_ticks
+
+    mechanisms = snapshot.cumulative_mechanisms
+    cumulative = adapter.cumulative_mechanisms
+    @inbounds for name in _MECHANISM_KEYS
+        setfield!(cumulative, name, getfield(mechanisms, name))
+    end
+
+    saved_plasticity = snapshot.plasticity
+    plasticity = adapter.plasticity_state
+    copyto!(plasticity.firing_rate, saved_plasticity.firing_rate)
+    copyto!(plasticity.activity_ema, saved_plasticity.activity_ema)
+    copyto!(
+        plasticity.incoming_conductance_ema,
+        saved_plasticity.incoming_conductance_ema,
+    )
+    copyto!(plasticity.utility, saved_plasticity.utility)
+    plasticity.reduced_batches = saved_plasticity.reduced_batches
+    plasticity.homeostasis_events = saved_plasticity.homeostasis_events
+    plasticity.synaptic_scaling_events =
+        saved_plasticity.synaptic_scaling_events
+    plasticity.utility_updates = saved_plasticity.utility_updates
+    plasticity.rewires = saved_plasticity.rewires
+
+    restored_sampler = prepared.sampler
+    copyto!(sampler.permutation, restored_sampler.permutation)
+    sampler.position.epoch = restored_sampler.position.epoch
+    sampler.position.cursor = restored_sampler.position.cursor
+    adapter.updates = snapshot.training_updates
+
+    # Scratch and latest per-update telemetry are deliberately not serialized.
+    adapter.mechanisms = MechanismCounters()
+    adapter.expected = MechanismActivation()
+    adapter.due = Local.DuePlasticityClocks(false, false, false, false)
+    adapter.listnet_result = nothing
+    adapter.hard_event_deliveries = 0
+    Graph.refresh_cache!(adapter.model)
+    @inbounds for state in adapter.common_states
+        Graph.refresh_state_initial!(adapter.model, state)
+    end
+    return trainer
+end
+
+"""Prepare and restore one loaded typed snapshot without exposing registry internals."""
+function restore_training_checkpoint!(
+    trainer::CanonicalTrainer,
+    sampler::Sampler.DeterministicEpochSampler,
+    snapshot::Checkpoint.CanonicalTrainingStateSnapshot,
+    contract::Checkpoint.CanonicalRunContract,
+)
+    adapter = trainer.session.executor.adapter
+    prepared = Checkpoint.prepare_training_checkpoint(
+        snapshot,
+        adapter.model,
+        _checkpoint_registry(adapter),
+        adapter.config.local_learning,
+        adapter.config.optimizer,
+        contract,
+        sampler.source_rows,
+    )
+    return restore_training_checkpoint!(trainer, sampler, prepared)
+end
 
 """
 The sole production learning operation. There is deliberately no exact-oracle

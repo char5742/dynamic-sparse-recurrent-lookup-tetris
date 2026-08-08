@@ -32,6 +32,7 @@ include(joinpath(@__DIR__, "CanonicalPlasticity.jl"))
 include(joinpath(@__DIR__, "CanonicalDendriticGraph.jl"))
 include(joinpath(@__DIR__, "CanonicalBarrierless.jl"))
 include(joinpath(@__DIR__, "CanonicalValidation.jl"))
+include(joinpath(@__DIR__, "Sampler.jl"))
 include(joinpath(@__DIR__, "CanonicalCheckpoint.jl"))
 include(joinpath(@__DIR__, "CanonicalExactOracle.jl"))
 include(joinpath(@__DIR__, "CanonicalTraining.jl"))
@@ -71,6 +72,7 @@ export ActiveApicalCell,
     CanonicalDendriticGraph,
     CanonicalBarrierless,
     CanonicalValidation,
+    ReducedHayCPUSampler,
     CanonicalCheckpoint,
     CanonicalExactOracle,
     CanonicalTraining,

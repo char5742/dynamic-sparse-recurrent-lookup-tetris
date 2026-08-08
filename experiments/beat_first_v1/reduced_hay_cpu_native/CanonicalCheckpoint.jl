@@ -3,14 +3,24 @@ module CanonicalCheckpoint
 using Serialization
 using SHA
 using ..CanonicalDendriticGraph
+using ..CanonicalLocalLearning
+using ..CanonicalOptimizer
+using ..CanonicalTetrisInput
+using ..ReducedHayCPUSampler
 
 const Graph = CanonicalDendriticGraph
+const Local = CanonicalLocalLearning
+const Optimizer = CanonicalOptimizer
+const Input = CanonicalTetrisInput
+const Sampler = ReducedHayCPUSampler
 
 const CHECKPOINT_MAGIC = UInt64(0x43414e4f4e484447) # "CANONHDG"
-const CHECKPOINT_SCHEMA = UInt32(1)
+const CHECKPOINT_SCHEMA = UInt32(2)
 const CHECKPOINT_FORMAT =
-    "route-free-ordered-multiscale-dendritic-event-graph-v1"
-const FINGERPRINT_ALGORITHM = "sha256-canonical-binary-contract-v1"
+    "route-free-ordered-multiscale-dendritic-event-graph-v2"
+const RUN_CONTRACT_SCHEMA = UInt32(1)
+const FINGERPRINT_ALGORITHM = "sha256-canonical-binary-contract-v2"
+
 const CANONICAL_PARAMETER_GROUPS = (
     :core_cell_raw,
     :semantic_projection_raw,
@@ -22,73 +32,45 @@ const CANONICAL_MECHANISM_COUNTERS = (
     :decolle_signal_nonzero,
     :subthreshold_updates,
     :nonspiking_updates,
+    :hard_event_control_updates,
     :homeostasis_events,
     :synaptic_scaling_events,
     :utility_updates,
     :rewires,
 )
-const _TOPOLOGY_FIELDS = (
-    :child_offsets,
-    :child_edges,
-    :parent_offsets,
-    :parent_edges,
-    :edge_sources,
-    :edge_destinations,
-    :edge_kinds,
-    :edge_slots,
-    :edge_roles,
-    :node_classes,
-    :node_planes,
-    :node_slots,
-    :interval_firsts,
-    :interval_lasts,
-)
+
 const _CANONICAL_NODE_COUNT = 1_458
 const _CANONICAL_EDGE_COUNT = 2_216
 const _CANONICAL_CORE_COUNT = 1_436
 const _CANONICAL_OUTPUT_DIM = 22
-const _CANONICAL_CONTINUOUS_OBSERVATION_DIM = 47
-const _CANONICAL_PACKET_DIM = 12
-const _CANONICAL_CELL_STATE_DIM = 48
-const _CANONICAL_CELL_INPUT_DIM = 27
 const _CANONICAL_CELL_PARAMETER_DIM = 46
-const _CANONICAL_EVENT_DIM = 5
-const _CANONICAL_STATIC_EVENT_COUNT = 2_040
-const _CANONICAL_DYNAMIC_EVENT_COUNT = 80
 const _CANONICAL_EVENT_PARAMETER_COUNT = 2_125
-const _GRAPH_CONFIG_FIELDS = (
-    :max_candidates,
-    :max_event_waves,
-    :tape_capacity,
-    :event_overflow,
-)
-
-const _REGISTRY_KEYS = (:path, :element_type, :dimensions, :length)
-const _SNAPSHOT_KEYS = (
-    :magic,
-    :schema,
-    :format,
-    :architecture_fingerprint,
-    :input_fingerprint,
-    :topology_fingerprint,
-    :learning_fingerprint,
-    :optimizer_fingerprint,
-    :parameter_registry,
-    :parameter_values,
-    :first_moments,
-    :second_moments,
-    :optimizer_step,
-    :counters,
-    :state_fingerprint,
-)
+const _CANONICAL_EVENT_CONTACT_COUNT = 2_120
+const _CANONICAL_STATE_BATCH = 8
+const _CANONICAL_CANDIDATE_WIDTH = 80
+const _CANONICAL_WORKERS = 20
+const _CANONICAL_QUEUE_CAPACITY = 64
+const _CANONICAL_CHUNK_SIZE = 4
+const _CANONICAL_MAX_UPDATES = 100_000
 
 export CHECKPOINT_FORMAT,
        CHECKPOINT_MAGIC,
        CHECKPOINT_SCHEMA,
+       RUN_CONTRACT_SCHEMA,
        CANONICAL_PARAMETER_GROUPS,
        CANONICAL_MECHANISM_COUNTERS,
-       ResumeState,
+       CanonicalRunContract,
+       ParameterGroupContract,
+       CanonicalParameterState,
+       CanonicalOptimizerStateSnapshot,
+       LearningClockSnapshot,
+       MechanismCounterSnapshot,
+       PlasticityStateSnapshot,
+       SamplerStateSnapshot,
+       CanonicalTrainingStateSnapshot,
+       PreparedTrainingCheckpoint,
        architecture_fingerprint,
+       build_training_snapshot,
        canonical_architecture_contract,
        canonical_input_contract,
        canonical_learning_contract,
@@ -96,16 +78,11 @@ export CHECKPOINT_FORMAT,
        learning_fingerprint,
        load_checkpoint,
        optimizer_fingerprint,
-       parameter_registry,
-       restore_checkpoint!,
+       prepare_training_checkpoint,
+       run_contract_fingerprint,
        save_checkpoint,
-       topology_fingerprint
-
-"""Mutable training clocks returned after arrays have been restored."""
-struct ResumeState{T}
-    optimizer_step::Int
-    counters::T
-end
+       topology_fingerprint,
+       validate_prepared_checkpoint
 
 @inline function _write_u64(io::IO, value::UInt64)
     @inbounds for shift in 56:-8:0
@@ -121,10 +98,6 @@ function _write_string(io::IO, value::AbstractString)
     return io
 end
 
-@inline function _type_label(type::Type)
-    return string(type)
-end
-
 function _write_float(io::IO, value::T) where {T<:AbstractFloat}
     isfinite(value) || throw(DomainError(value, "contract float is not finite"))
     if T === Float16
@@ -134,14 +107,14 @@ function _write_float(io::IO, value::T) where {T<:AbstractFloat}
     elseif T === Float64
         _write_u64(io, reinterpret(UInt64, value))
     else
-        throw(ArgumentError("unsupported floating contract type $T"))
+        throw(ArgumentError("unsupported contract float type $T"))
     end
     return io
 end
 
-"""Stable structural encoding used by every configuration fingerprint."""
+"""Stable encoding for immutable contracts and copied checkpoint state."""
 function _write_contract(io::IO, value)
-    _write_string(io, _type_label(typeof(value)))
+    _write_string(io, string(typeof(value)))
     if value === nothing
         return io
     elseif value isa Bool
@@ -169,15 +142,13 @@ function _write_contract(io::IO, value)
         end
     elseif value isa AbstractArray
         isbitstype(eltype(value)) || throw(ArgumentError(
-            "contract array element type $(eltype(value)) is not bits-compatible",
+            "checkpoint array element type $(eltype(value)) is unsupported",
         ))
         _write_u64(io, UInt64(ndims(value)))
         @inbounds for dimension in size(value)
             _write_u64(io, UInt64(dimension))
         end
-        @inbounds for item in value
-            _write_contract(io, item)
-        end
+        _write_string(io, bytes2hex(SHA.sha256(reinterpret(UInt8, vec(value)))))
     elseif isstructtype(typeof(value))
         names = fieldnames(typeof(value))
         _write_u64(io, UInt64(length(names)))
@@ -186,9 +157,7 @@ function _write_contract(io::IO, value)
             _write_contract(io, getfield(value, name))
         end
     else
-        throw(ArgumentError(
-            "unsupported unordered contract value $(typeof(value))",
-        ))
+        throw(ArgumentError("unsupported checkpoint value $(typeof(value))"))
     end
     return io
 end
@@ -201,704 +170,948 @@ function _contract_fingerprint(label::AbstractString, value)
     return bytes2hex(SHA.sha256(take!(io)))
 end
 
-function canonical_architecture_contract(config)
-    fieldnames(typeof(config)) == _GRAPH_CONFIG_FIELDS || throw(ArgumentError(
-        "graph config fields are missing, extra, or reordered",
+@inline function _require_sha256(value::String, label::AbstractString)
+    occursin(r"^[0-9a-f]{64}$", value) || throw(ArgumentError(
+        "$label must be lowercase 64-hex SHA-256",
     ))
-    config.max_candidates isa Int && config.max_candidates > 0 || throw(
-        ArgumentError("graph max_candidates must be a positive Int"),
+    return value
+end
+
+@inline function _require_commit(value::String)
+    occursin(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$", value) || throw(
+        ArgumentError("source_commit must be a full lowercase 40/64-hex ID"),
     )
-    maximum_waves = Graph.Events.CANONICAL_MAX_WAVES
-    config.max_event_waves isa Int &&
-        0 <= config.max_event_waves <= maximum_waves || throw(
-            ArgumentError(
-                "graph max_event_waves must be in 0:$maximum_waves",
-            ),
-        )
-    required_tape_capacity = _CANONICAL_CORE_COUNT *
-        (1 + config.max_event_waves)
-    config.tape_capacity isa Int &&
-        config.tape_capacity >= required_tape_capacity || throw(ArgumentError(
-            "graph tape capacity cannot hold all canonical transitions",
+    return value
+end
+
+@inline function _require_positive(value::Int, label::AbstractString)
+    value > 0 || throw(ArgumentError("$label must be positive"))
+    return value
+end
+
+"""Immutable operational and dataset identity contract for the 100k run."""
+struct CanonicalRunContract
+    schema::UInt32
+    dataset_format_version::Int
+    dataset_manifest_sha256::String
+    ordered_training_rows_sha256::String
+    portable_dataset_sha256::String
+    dataset_state_count::Int
+    training_state_count::Int
+    validation_state_count::Int
+    dataset_candidate_count::Int
+    dataset_part_count::Int
+    dataset_schema_fingerprint::String
+    teacher_target_transform_fingerprint::String
+    split_identity::String
+    source_commit::String
+    source_tree_clean::Bool
+    model_seed::UInt64
+    sampler_seed::UInt64
+    state_batch::Int
+    candidate_width::Int
+    workers::Int
+    queue_capacity::Int
+    chunk_size::Int
+    binding::Symbol
+    training_config_fingerprint::String
+    architecture_fingerprint::String
+    topology_fingerprint::String
+    promotion_plan_fingerprint::String
+    planned_max_updates::Int
+    log_interval::Int
+    evaluation_interval::Int
+    checkpoint_interval::Int
+    update_semantics::Symbol
+end
+
+function _validate_run_contract(contract::CanonicalRunContract)
+    contract.schema == RUN_CONTRACT_SCHEMA || throw(ArgumentError(
+        "run-contract schema is unsupported",
+    ))
+    _require_positive(contract.dataset_format_version, "dataset format version")
+    for (label, value) in (
+        ("dataset manifest SHA-256", contract.dataset_manifest_sha256),
+        ("ordered training rows SHA-256", contract.ordered_training_rows_sha256),
+        ("portable dataset SHA-256", contract.portable_dataset_sha256),
+        ("dataset schema fingerprint", contract.dataset_schema_fingerprint),
+        ("teacher target transform fingerprint",
+            contract.teacher_target_transform_fingerprint),
+        ("training configuration fingerprint",
+            contract.training_config_fingerprint),
+        ("architecture fingerprint", contract.architecture_fingerprint),
+        ("topology fingerprint", contract.topology_fingerprint),
+        ("promotion plan fingerprint", contract.promotion_plan_fingerprint),
+    )
+        _require_sha256(value, label)
+    end
+    _require_commit(contract.source_commit)
+    contract.source_tree_clean || throw(ArgumentError(
+        "run contract requires a clean source-tree attestation",
+    ))
+    isempty(contract.split_identity) && throw(ArgumentError(
+        "split_identity cannot be empty",
+    ))
+    contract.update_semantics === Symbol("") && throw(ArgumentError(
+        "update_semantics cannot be empty",
+    ))
+    _require_positive(contract.dataset_state_count, "dataset state count")
+    _require_positive(contract.training_state_count, "training state count")
+    _require_positive(contract.validation_state_count, "validation state count")
+    _require_positive(contract.dataset_candidate_count, "dataset candidate count")
+    _require_positive(contract.dataset_part_count, "dataset part count")
+    contract.training_state_count + contract.validation_state_count <=
+        contract.dataset_state_count || throw(ArgumentError(
+            "training/validation states exceed dataset state count",
         ))
+    contract.state_batch == _CANONICAL_STATE_BATCH || throw(ArgumentError(
+        "canonical state_batch must be $_CANONICAL_STATE_BATCH",
+    ))
+    contract.candidate_width == _CANONICAL_CANDIDATE_WIDTH || throw(
+        ArgumentError("canonical candidate_width must be $_CANONICAL_CANDIDATE_WIDTH"),
+    )
+    contract.dataset_candidate_count >= contract.dataset_state_count || throw(
+        ArgumentError("dataset has fewer candidates than states"),
+    )
+    UInt128(contract.dataset_candidate_count) <=
+        UInt128(contract.dataset_state_count) * UInt128(contract.candidate_width) ||
+        throw(ArgumentError("dataset candidates exceed the width-80 bound"))
+    contract.workers == _CANONICAL_WORKERS || throw(ArgumentError(
+        "canonical workers must be $_CANONICAL_WORKERS",
+    ))
+    contract.queue_capacity == _CANONICAL_QUEUE_CAPACITY || throw(ArgumentError(
+        "canonical queue capacity must be $_CANONICAL_QUEUE_CAPACITY",
+    ))
+    contract.chunk_size == _CANONICAL_CHUNK_SIZE || throw(ArgumentError(
+        "canonical chunk size must be $_CANONICAL_CHUNK_SIZE",
+    ))
+    contract.binding === :none || throw(ArgumentError(
+        "canonical binding must be :none",
+    ))
+    contract.planned_max_updates == _CANONICAL_MAX_UPDATES || throw(
+        ArgumentError("canonical planned_max_updates must be $_CANONICAL_MAX_UPDATES"),
+    )
+    for (label, cadence) in (
+        ("log interval", contract.log_interval),
+        ("evaluation interval", contract.evaluation_interval),
+        ("checkpoint interval", contract.checkpoint_interval),
+    )
+        _require_positive(cadence, label)
+        cadence <= contract.planned_max_updates || throw(ArgumentError(
+            "$label exceeds planned_max_updates",
+        ))
+    end
+    return contract
+end
+
+run_contract_fingerprint(contract::CanonicalRunContract) =
+    _contract_fingerprint("run-contract", _validate_run_contract(contract))
+
+struct ParameterGroupContract
+    name::Symbol
+    transform_kind::Optimizer.ParameterTransformKind
+    multiplier_bits::UInt32
+    lower_bound_bits::UInt32
+    upper_bound_bits::UInt32
+    projected_lower_raw_bits::UInt32
+    projected_upper_raw_bits::UInt32
+    dimensions::Tuple
+end
+
+function ParameterGroupContract(
+    name::Symbol,
+    transform_kind::Optimizer.ParameterTransformKind,
+    multiplier::Float32,
+    lower_bound::Float32,
+    upper_bound::Float32,
+    projected_lower_raw::Float32,
+    projected_upper_raw::Float32,
+    dimensions::Tuple,
+)
+    name === Symbol("") && throw(ArgumentError("parameter-group name is empty"))
+    isfinite(multiplier) && multiplier >= 0.0f0 || throw(ArgumentError(
+        "parameter-group multiplier is invalid",
+    ))
+    !isnan(lower_bound) && !isnan(upper_bound) && lower_bound < upper_bound ||
+        throw(ArgumentError("parameter-group physical bounds are invalid"))
+    !isnan(projected_lower_raw) && !isnan(projected_upper_raw) &&
+        projected_lower_raw < projected_upper_raw || throw(ArgumentError(
+            "parameter-group raw bounds are invalid",
+        ))
+    !isempty(dimensions) && all(dimension -> dimension isa Int && dimension > 0,
+        dimensions) || throw(ArgumentError("parameter-group dimensions are invalid"))
+    return ParameterGroupContract(
+        name,
+        transform_kind,
+        reinterpret(UInt32, multiplier),
+        reinterpret(UInt32, lower_bound),
+        reinterpret(UInt32, upper_bound),
+        reinterpret(UInt32, projected_lower_raw),
+        reinterpret(UInt32, projected_upper_raw),
+        dimensions,
+    )
+end
+
+@inline _multiplier(group::ParameterGroupContract) =
+    reinterpret(Float32, group.multiplier_bits)
+@inline _raw_lower(group::ParameterGroupContract) =
+    reinterpret(Float32, group.projected_lower_raw_bits)
+@inline _raw_upper(group::ParameterGroupContract) =
+    reinterpret(Float32, group.projected_upper_raw_bits)
+
+struct CanonicalParameterState
+    core_cell_raw::Matrix{Float32}
+    semantic_projection_raw::Array{Float32,4}
+    event_raw::Vector{Float32}
+    output_cell_raw::Matrix{Float32}
+    output_projection_raw::Array{Float32,3}
+end
+
+function CanonicalParameterState(
+    core_cell_raw::AbstractMatrix{Float32},
+    semantic_projection_raw::AbstractArray{Float32,4},
+    event_raw::AbstractVector{Float32},
+    output_cell_raw::AbstractMatrix{Float32},
+    output_projection_raw::AbstractArray{Float32,3},
+)
+    return CanonicalParameterState(
+        Array(core_cell_raw),
+        Array(semantic_projection_raw),
+        Vector(event_raw),
+        Array(output_cell_raw),
+        Array(output_projection_raw),
+    )
+end
+
+@inline _parameter_arrays(state::CanonicalParameterState) = (
+    state.core_cell_raw,
+    state.semantic_projection_raw,
+    state.event_raw,
+    state.output_cell_raw,
+    state.output_projection_raw,
+)
+
+struct CanonicalOptimizerStateSnapshot
+    registry::NTuple{5,ParameterGroupContract}
+    parameters::CanonicalParameterState
+    first_moments::CanonicalParameterState
+    second_moments::CanonicalParameterState
+    group_steps::NTuple{5,UInt64}
+    total_step::UInt64
+end
+
+struct LearningClockSnapshot
+    update::Int
+    analog_ticks::Int
+    hard_event_ticks::Int
+    homeostasis_ticks::Int
+    structure_ticks::Int
+end
+
+struct MechanismCounterSnapshot
+    decolle_signal_nonzero::UInt64
+    subthreshold_updates::UInt64
+    nonspiking_updates::UInt64
+    hard_event_control_updates::UInt64
+    homeostasis_events::UInt64
+    synaptic_scaling_events::UInt64
+    utility_updates::UInt64
+    rewires::UInt64
+end
+
+struct PlasticityStateSnapshot
+    firing_rate::Vector{Float32}
+    activity_ema::Vector{Float32}
+    incoming_conductance_ema::Vector{Float32}
+    utility::Vector{Float32}
+    reduced_batches::UInt64
+    homeostasis_events::UInt64
+    synaptic_scaling_events::UInt64
+    utility_updates::UInt64
+    rewires::UInt64
+end
+
+function PlasticityStateSnapshot(
+    firing_rate::AbstractVector{Float32},
+    activity_ema::AbstractVector{Float32},
+    incoming_conductance_ema::AbstractVector{Float32},
+    utility::AbstractVector{Float32},
+    reduced_batches::UInt64,
+    homeostasis_events::UInt64,
+    synaptic_scaling_events::UInt64,
+    utility_updates::UInt64,
+    rewires::UInt64,
+)
+    return PlasticityStateSnapshot(
+        Vector(firing_rate),
+        Vector(activity_ema),
+        Vector(incoming_conductance_ema),
+        Vector(utility),
+        reduced_batches,
+        homeostasis_events,
+        synaptic_scaling_events,
+        utility_updates,
+        rewires,
+    )
+end
+
+struct SamplerSourceIdentitySnapshot
+    encoding::String
+    count::Int
+    sha256::String
+end
+
+struct SamplerStateSnapshot
+    schema::Int
+    algorithm::String
+    seed::UInt64
+    epoch::UInt64
+    cursor::Int
+    source_identity::SamplerSourceIdentitySnapshot
+    source_rows::Vector{Int}
+    permutation::Vector{Int}
+end
+
+function SamplerStateSnapshot(snapshot::NamedTuple)
+    keys(snapshot) == (
+        :schema, :algorithm, :seed, :epoch, :cursor, :source_identity,
+        :source_rows, :permutation,
+    ) || throw(ArgumentError("sampler snapshot fields differ"))
+    identity = snapshot.source_identity
+    identity isa NamedTuple && keys(identity) == (:encoding, :count, :sha256) ||
+        throw(ArgumentError("sampler source identity fields differ"))
+    typeof(snapshot.schema) === Int || throw(ArgumentError(
+        "sampler snapshot schema type differs",
+    ))
+    typeof(snapshot.algorithm) === String || throw(ArgumentError(
+        "sampler snapshot algorithm type differs",
+    ))
+    typeof(snapshot.seed) === UInt64 || throw(ArgumentError(
+        "sampler snapshot seed type differs",
+    ))
+    typeof(snapshot.epoch) === UInt64 || throw(ArgumentError(
+        "sampler snapshot epoch type differs",
+    ))
+    typeof(snapshot.cursor) === Int || throw(ArgumentError(
+        "sampler snapshot cursor type differs",
+    ))
+    typeof(identity.encoding) === String || throw(ArgumentError(
+        "sampler source encoding type differs",
+    ))
+    typeof(identity.count) === Int || throw(ArgumentError(
+        "sampler source count type differs",
+    ))
+    typeof(identity.sha256) === String || throw(ArgumentError(
+        "sampler source digest type differs",
+    ))
+    typeof(snapshot.source_rows) === Vector{Int} || throw(ArgumentError(
+        "sampler source rows type differs",
+    ))
+    typeof(snapshot.permutation) === Vector{Int} || throw(ArgumentError(
+        "sampler permutation type differs",
+    ))
+    return SamplerStateSnapshot(
+        snapshot.schema,
+        snapshot.algorithm,
+        snapshot.seed,
+        snapshot.epoch,
+        snapshot.cursor,
+        SamplerSourceIdentitySnapshot(
+            identity.encoding, identity.count, identity.sha256,
+        ),
+        copy(snapshot.source_rows),
+        copy(snapshot.permutation),
+    )
+end
+
+function _sampler_named_tuple(snapshot::SamplerStateSnapshot)
+    identity = snapshot.source_identity
+    return (;
+        schema=snapshot.schema,
+        algorithm=snapshot.algorithm,
+        seed=snapshot.seed,
+        epoch=snapshot.epoch,
+        cursor=snapshot.cursor,
+        source_identity=(;
+            encoding=identity.encoding,
+            count=identity.count,
+            sha256=identity.sha256,
+        ),
+        source_rows=copy(snapshot.source_rows),
+        permutation=copy(snapshot.permutation),
+    )
+end
+
+struct CanonicalTrainingStateSnapshot
+    magic::UInt64
+    schema::UInt32
+    format::String
+    architecture_fingerprint::String
+    input_fingerprint::String
+    topology_fingerprint::String
+    learning_fingerprint::String
+    optimizer_fingerprint::String
+    run_contract_fingerprint::String
+    run_contract::CanonicalRunContract
+    learning_config::Local.LocalLearningConfig
+    optimizer_config::Optimizer.AdamWConfig
+    optimizer::CanonicalOptimizerStateSnapshot
+    learning_clock::LearningClockSnapshot
+    cumulative_mechanisms::MechanismCounterSnapshot
+    training_updates::UInt64
+    plasticity::PlasticityStateSnapshot
+    sampler::SamplerStateSnapshot
+    state_fingerprint::String
+end
+
+struct PreparedTrainingCheckpoint
+    snapshot::CanonicalTrainingStateSnapshot
+    sampler::Sampler.DeterministicEpochSampler
+end
+
+function canonical_architecture_contract(config::Graph.GraphConfig)
+    maximum_waves = Graph.Events.CANONICAL_MAX_WAVES
+    0 <= config.max_event_waves <= maximum_waves || throw(ArgumentError(
+        "graph max_event_waves must be in 0:$maximum_waves",
+    ))
+    required_tape = _CANONICAL_CORE_COUNT * (1 + config.max_event_waves)
+    config.tape_capacity >= required_tape || throw(ArgumentError(
+        "graph tape capacity cannot hold all canonical transitions",
+    ))
     config.event_overflow in (:error, :fallback) || throw(ArgumentError(
         "graph event overflow policy is unsupported",
     ))
     return (;
         config,
         node_count=_CANONICAL_NODE_COUNT,
-        core_node_count=_CANONICAL_CORE_COUNT,
-        output_count=_CANONICAL_OUTPUT_DIM,
-        cell_state_dim=_CANONICAL_CELL_STATE_DIM,
-        cell_input_dim=_CANONICAL_CELL_INPUT_DIM,
-        cell_parameter_dim=_CANONICAL_CELL_PARAMETER_DIM,
-        packet_dim=_CANONICAL_PACKET_DIM,
-        event_dim=_CANONICAL_EVENT_DIM,
-        information_spine=:ordered_binary_full_packet,
-        semantic_receiver=:typed_receptor_diagonal,
+        edge_count=_CANONICAL_EDGE_COUNT,
+        core_count=_CANONICAL_CORE_COUNT,
+        output_dim=_CANONICAL_OUTPUT_DIM,
+        event_parameters=_CANONICAL_EVENT_PARAMETER_COUNT,
     )
 end
 
-architecture_fingerprint(config) = _contract_fingerprint(
-    "architecture",
-    canonical_architecture_contract(config),
-)
+architecture_fingerprint(config::Graph.GraphConfig) =
+    _contract_fingerprint("architecture", canonical_architecture_contract(config))
 
-@inline function _module_binding(owner::Module, name::Symbol)
-    isdefined(owner, name) || throw(ArgumentError(
-        "canonical input module has no $(String(name)) binding",
-    ))
-    return getfield(owner, name)
-end
-
-"""Plain, exhaustive semantic ABI of `CanonicalTetrisInput`."""
-function canonical_input_contract(input::Module)
-    code(name) = UInt8(_module_binding(input, name))
-    rows = _module_binding(input, :BOARD_ROWS)
-    columns = _module_binding(input, :BOARD_COLUMNS)
-    placement_capacity = _module_binding(input, :PLACEMENT_CAPACITY)
-    next_count = _module_binding(input, :NEXT_COUNT)
-    rows == 24 && columns == 10 || throw(ArgumentError(
-        "canonical input board must be 24 x 10",
-    ))
-    placement_capacity == 4 && next_count == 5 || throw(ArgumentError(
-        "canonical placement/queue dimensions differ",
-    ))
+function canonical_input_contract()
     return (;
-        board_rows=rows,
-        board_columns=columns,
-        placement_capacity,
-        queue_roles=(:hold, :next1, :next2, :next3, :next4, :next5),
-        ren_storage=:Int32_exact_nonnegative,
-        board=(empty=code(:EMPTY), occupied=code(:OCCUPIED)),
-        placement=(absent=code(:ABSENT), present=code(:PRESENT)),
+        board_rows=Input.BOARD_ROWS,
+        board_columns=Input.BOARD_COLUMNS,
+        placement_capacity=Input.PLACEMENT_CAPACITY,
+        next_count=Input.NEXT_COUNT,
+        board=(empty=UInt8(Input.EMPTY), occupied=UInt8(Input.OCCUPIED)),
+        placement=(absent=UInt8(Input.ABSENT), present=UInt8(Input.PRESENT)),
         pieces=(
-            none=code(:NONE), i=code(:PIECE_I), o=code(:PIECE_O),
-            t=code(:PIECE_T), s=code(:PIECE_S), z=code(:PIECE_Z),
-            j=code(:PIECE_J), l=code(:PIECE_L),
+            none=UInt8(Input.NONE), i=UInt8(Input.PIECE_I),
+            o=UInt8(Input.PIECE_O), t=UInt8(Input.PIECE_T),
+            s=UInt8(Input.PIECE_S), z=UInt8(Input.PIECE_Z),
+            j=UInt8(Input.PIECE_J), l=UInt8(Input.PIECE_L),
         ),
-        truth=(false_value=code(:FALSE_VALUE), true_value=code(:TRUE_VALUE)),
-        event=(no_event=code(:NO_EVENT), present=code(:EVENT_PRESENT)),
+        truth=(false_value=UInt8(Input.FALSE_VALUE),
+            true_value=UInt8(Input.TRUE_VALUE)),
+        event=(no_event=UInt8(Input.NO_EVENT),
+            present=UInt8(Input.EVENT_PRESENT)),
         site=(
-            empty=code(:SITE_EMPTY), occupied=code(:SITE_OCCUPIED),
-            placed=code(:SITE_PLACED), outside=code(:OUTSIDE),
+            empty=UInt8(Input.SITE_EMPTY), occupied=UInt8(Input.SITE_OCCUPIED),
+            placed=UInt8(Input.SITE_PLACED), outside=UInt8(Input.OUTSIDE),
         ),
         candidate_path=(
-            uninitialized=code(:UNINITIALIZED),
-            no_clear_cow=code(:NO_CLEAR_COW),
-            clear_slow_path=code(:CLEAR_SLOW_PATH),
+            uninitialized=UInt8(Input.UNINITIALIZED),
+            no_clear_cow=UInt8(Input.NO_CLEAR_COW),
+            clear_slow_path=UInt8(Input.CLEAR_SLOW_PATH),
         ),
         teacher_fields_absent=true,
     )
 end
 
-input_fingerprint(config) = _contract_fingerprint("input", config)
+input_fingerprint() = _contract_fingerprint("input", canonical_input_contract())
 
-function _validate_topology_contract(config)
-    fieldnames(typeof(config)) == _TOPOLOGY_FIELDS || throw(ArgumentError(
-        "topology contract fields are missing, extra, or reordered",
-    ))
-    length(config.child_offsets) == _CANONICAL_NODE_COUNT + 1 || throw(
-        DimensionMismatch("topology child offsets have the wrong length"),
+function _topology_contract(model::Graph.CanonicalModel)
+    topology = model.topology
+    length(topology.edge_sources) == _CANONICAL_EDGE_COUNT || throw(
+        DimensionMismatch("canonical topology edge count differs"),
     )
-    length(config.parent_offsets) == _CANONICAL_NODE_COUNT + 1 || throw(
-        DimensionMismatch("topology parent offsets have the wrong length"),
-    )
-    length(config.child_edges) == _CANONICAL_EDGE_COUNT || throw(
-        DimensionMismatch("topology child edge order has the wrong length"),
-    )
-    length(config.parent_edges) == _CANONICAL_EDGE_COUNT || throw(
-        DimensionMismatch("topology parent edge order has the wrong length"),
-    )
-    for name in (
-        :edge_sources, :edge_destinations, :edge_kinds, :edge_slots, :edge_roles,
-    )
-        length(getproperty(config, name)) == _CANONICAL_EDGE_COUNT || throw(
-            DimensionMismatch("topology $name has the wrong length"),
-        )
-    end
-    for name in (
-        :node_classes, :node_planes, :node_slots, :interval_firsts,
-        :interval_lasts,
-    )
-        length(getproperty(config, name)) == _CANONICAL_NODE_COUNT || throw(
-            DimensionMismatch("topology $name has the wrong length"),
-        )
-    end
-    config.child_offsets[1] == 1 &&
-        config.child_offsets[end] == _CANONICAL_EDGE_COUNT + 1 || throw(
-            ArgumentError("topology child offsets are not canonical CSR"),
-        )
-    config.parent_offsets[1] == 1 &&
-        config.parent_offsets[end] == _CANONICAL_EDGE_COUNT + 1 || throw(
-            ArgumentError("topology parent offsets are not canonical CSR"),
-        )
-    @inbounds for edge in 1:_CANONICAL_EDGE_COUNT
-        source = Int(config.edge_sources[edge])
-        destination = Int(config.edge_destinations[edge])
-        1 <= source < destination <= _CANONICAL_NODE_COUNT || throw(
-            ArgumentError("topology edge $edge violates ordered DAG anatomy"),
-        )
-    end
-    return config
-end
-
-function _canonical_event_parameter_order(model::Graph.CanonicalModel)
-    _validate_topology_contract(model.topology)
     parameter_count = Graph.event_parameter_count(model)
     parameter_count == _CANONICAL_EVENT_PARAMETER_COUNT || throw(
         DimensionMismatch("canonical event parameter count differs"),
     )
-    length(model.parameters.event_raw) == parameter_count || throw(
-        DimensionMismatch(
-            "model event_raw does not match static, dynamic, and kind order",
-        ),
-    )
-    kind = Vector{UInt8}(undef, parameter_count)
-    source = Vector{UInt16}(undef, parameter_count)
-    destination = Vector{UInt16}(undef, parameter_count)
-    channel = Vector{UInt8}(undef, parameter_count)
-    family = Vector{UInt8}(undef, parameter_count)
-    slot = Vector{UInt8}(undef, parameter_count)
-    branch = Vector{UInt8}(undef, parameter_count)
-    lane = Vector{UInt8}(undef, parameter_count)
+    kinds = Vector{UInt8}(undef, parameter_count)
+    sources = Vector{UInt16}(undef, parameter_count)
+    destinations = Vector{UInt16}(undef, parameter_count)
+    channels = Vector{UInt8}(undef, parameter_count)
+    families = Vector{UInt8}(undef, parameter_count)
+    slots = Vector{UInt8}(undef, parameter_count)
+    branches = Vector{UInt8}(undef, parameter_count)
+    lanes = Vector{UInt8}(undef, parameter_count)
     @inbounds for index in 1:parameter_count
         descriptor = Graph.event_parameter_descriptor(model, index)
-        kind[index] = UInt8(descriptor.kind)
-        source[index] = descriptor.source
-        destination[index] = descriptor.destination
-        channel[index] = descriptor.channel
-        family[index] = descriptor.family
-        slot[index] = descriptor.slot
-        branch[index] = descriptor.branch
-        lane[index] = descriptor.lane
+        kinds[index] = UInt8(descriptor.kind)
+        sources[index] = descriptor.source
+        destinations[index] = descriptor.destination
+        channels[index] = descriptor.channel
+        families[index] = descriptor.family
+        slots[index] = descriptor.slot
+        branches[index] = descriptor.branch
+        lanes[index] = descriptor.lane
     end
-
-    static_kind = UInt8(Graph.STATIC_EVENT_CONTACT)
-    dynamic_kind = UInt8(Graph.DYNAMIC_EVENT_CONTACT)
-    shared_kind = UInt8(Graph.SHARED_EVENT_KIND_GAIN)
-    all(==(static_kind), @view(kind[1:_CANONICAL_STATIC_EVENT_COUNT])) ||
-        throw(ArgumentError("static event parameter prefix changed"))
-    dynamic_first = _CANONICAL_STATIC_EVENT_COUNT + 1
-    dynamic_last = _CANONICAL_STATIC_EVENT_COUNT +
-        _CANONICAL_DYNAMIC_EVENT_COUNT
-    all(==(dynamic_kind), @view(kind[dynamic_first:dynamic_last])) ||
-        throw(ArgumentError("dynamic event parameter segment changed"))
-    all(==(shared_kind), @view(kind[(dynamic_last + 1):end])) ||
-        throw(ArgumentError("shared event-kind parameter suffix changed"))
-    lane[(dynamic_last + 1):end] == UInt8.(1:_CANONICAL_EVENT_DIM) ||
-        throw(ArgumentError("shared event-kind lane order changed"))
-
-    # Only this descriptor stream defines optimizer-coordinate semantics.
     return (;
-        parameter_count,
-        kind,
-        source,
-        destination,
-        channel,
-        family,
-        slot,
-        branch,
-        lane,
+        topology,
+        event_parameter_order=(;
+            kinds,
+            sources,
+            destinations,
+            channels,
+            families,
+            slots,
+            branches,
+            lanes,
+        ),
     )
 end
 
-function _canonical_event_parameter_order(value)
-    throw(ArgumentError(
-        "canonical topology contract requires the live CanonicalModel; " *
-        "topology alone cannot identify event parameter semantics",
+topology_fingerprint(model::Graph.CanonicalModel) =
+    _contract_fingerprint("topology", _topology_contract(model))
+
+function canonical_learning_contract(config::Local.LocalLearningConfig)
+    config.plasticity.structure_enabled && throw(ArgumentError(
+        "schema2 fixed-spine resume requires structure_enabled=false",
     ))
-end
-
-function _canonical_topology_contract(model::Graph.CanonicalModel)
-    return (;
-        topology=_validate_topology_contract(model.topology),
-        event_parameter_order=_canonical_event_parameter_order(model),
-    )
-end
-
-function _canonical_topology_contract(value)
-    throw(ArgumentError(
-        "canonical topology fingerprint requires CanonicalDendriticGraph.CanonicalModel",
-    ))
-end
-
-topology_fingerprint(config) = _contract_fingerprint(
-    "topology",
-    _canonical_topology_contract(config),
-)
-
-@inline function _local_learning_config(config)
-    hasproperty(config, :schedule) && hasproperty(config, :plasticity) &&
-        return config
-    hasproperty(config, :local) && return getproperty(config, :local)
-    hasproperty(config, :local_learning) &&
-        return getproperty(config, :local_learning)
-    throw(ArgumentError(
-        "learning config must be LocalLearningConfig or own one explicitly",
-    ))
-end
-
-"""Include local/plasticity controls and fixed-map dimensional identity."""
-function canonical_learning_contract(config)
-    local_config = _local_learning_config(config)
-    schedule = local_config.schedule
-    plasticity = local_config.plasticity
-    for name in (
-        :analog_interval, :hard_event_interval, :homeostasis_interval,
-        :structure_interval,
-    )
-        hasproperty(schedule, name) || throw(ArgumentError(
-            "learning schedule is missing $(String(name))",
-        ))
-    end
-    for name in (
-        :firing_ema_decay, :target_rate_min, :target_rate_max,
-        :threshold_homeostasis_step, :adaptation_homeostasis_step,
-        :synaptic_scaling_rate, :conductance_floor, :conductance_ceiling,
-        :structure_enabled, :utility_decay, :connection_cost,
-        :max_swaps_per_node,
-    )
-        hasproperty(plasticity, name) || throw(ArgumentError(
-            "plasticity config is missing $(String(name))",
-        ))
-    end
     return (;
         config,
         fixed_local_signal_map=(
             output_dim=_CANONICAL_OUTPUT_DIM,
-            continuous_observation_dim=_CANONICAL_CONTINUOUS_OBSERVATION_DIM,
-            packet_observation_dim=_CANONICAL_PACKET_DIM,
+            observation_dim=47,
+            packet_dim=12,
             cell_count=_CANONICAL_CORE_COUNT,
-            seed_source=:feedback_seed,
-            family_source=:ordered_node_class,
-            cell_source=:ordered_node_id,
         ),
     )
 end
 
-learning_fingerprint(config) = _contract_fingerprint(
-    "learning",
-    canonical_learning_contract(config),
-)
-optimizer_fingerprint(config) = _contract_fingerprint("optimizer", config)
+learning_fingerprint(config::Local.LocalLearningConfig) =
+    _contract_fingerprint("learning", canonical_learning_contract(config))
 
-@inline function _is_parameter_container(value)
-    return value isa NamedTuple || value isa Tuple || (
-        isstructtype(typeof(value)) &&
-        !(value isa Number) &&
-        !(value isa AbstractString) &&
-        !(value isa Symbol) &&
-        !(value isa Enum)
+optimizer_fingerprint(
+    config::Optimizer.AdamWConfig,
+    registry::NTuple{5,ParameterGroupContract},
+) = _contract_fingerprint("optimizer", (; config, registry))
+
+function _validate_group_contracts(
+    registry::NTuple{5,ParameterGroupContract},
+)
+    map(group -> group.name, registry) == CANONICAL_PARAMETER_GROUPS || throw(
+        ArgumentError("parameter groups are missing, extra, or reordered"),
     )
-end
-
-function _collect_parameter_arrays!(
-    paths::Vector{String},
-    arrays::Vector{DenseArray{Float32}},
-    value,
-    path::String,
-)
-    if value isa DenseArray{Float32}
-        isempty(path) && throw(ArgumentError("parameter path cannot be empty"))
-        @inbounds for previous in arrays
-            Base.mightalias(previous, value) && throw(ArgumentError(
-                "parameter array $path aliases another registry entry",
-            ))
-        end
-        push!(paths, path)
-        push!(arrays, value)
-        return nothing
-    elseif value isa AbstractArray
-        throw(ArgumentError(
-            "parameter $path must be a dense Float32 array, got $(typeof(value))",
-        ))
-    elseif value isa NamedTuple
-        isempty(value) && throw(ArgumentError("parameter container $path is empty"))
-        @inbounds for name in keys(value)
-            child = isempty(path) ? String(name) : "$path/$(String(name))"
-            _collect_parameter_arrays!(
-                paths,
-                arrays,
-                getproperty(value, name),
-                child,
-            )
-        end
-        return nothing
-    elseif value isa Tuple
-        isempty(value) && throw(ArgumentError("parameter container $path is empty"))
-        @inbounds for (index, child_value) in enumerate(value)
-            child = isempty(path) ? "[$index]" : "$path/[$index]"
-            _collect_parameter_arrays!(paths, arrays, child_value, child)
-        end
-        return nothing
-    elseif _is_parameter_container(value)
-        names = fieldnames(typeof(value))
-        isempty(names) && throw(ArgumentError("parameter container $path is empty"))
-        @inbounds for name in names
-            child = isempty(path) ? String(name) : "$path/$(String(name))"
-            _collect_parameter_arrays!(
-                paths,
-                arrays,
-                getfield(value, name),
-                child,
-            )
-        end
-        return nothing
-    end
-    throw(ArgumentError(
-        "parameter registry leaf $path must be a dense Float32 array, " *
-        "got $(typeof(value))",
-    ))
-end
-
-function _parameter_arrays(components)
-    paths = String[]
-    arrays = DenseArray{Float32}[]
-    _collect_parameter_arrays!(paths, arrays, components, "")
-    isempty(arrays) && throw(ArgumentError("parameter registry cannot be empty"))
-    length(unique(paths)) == length(paths) || throw(ArgumentError(
-        "parameter registry contains duplicate paths",
-    ))
-    return paths, arrays
-end
-
-function _registry_record(paths, arrays)
-    records = Vector{NamedTuple{_REGISTRY_KEYS,Tuple{
-        String,String,Tuple{Vararg{Int}},Int,
-    }}}(undef, length(arrays))
-    @inbounds for index in eachindex(arrays)
-        array = arrays[index]
-        records[index] = (;
-            path=paths[index],
-            element_type=_type_label(eltype(array)),
-            dimensions=Tuple(size(array)),
-            length=length(array),
+    expected_dimensions = (
+        (_CANONICAL_CELL_PARAMETER_DIM, _CANONICAL_CORE_COUNT),
+        (4, 3, 8, 2),
+        (_CANONICAL_EVENT_PARAMETER_COUNT,),
+        (_CANONICAL_CELL_PARAMETER_DIM, _CANONICAL_OUTPUT_DIM),
+        (4, 3, 5),
+    )
+    @inbounds for index in 1:5
+        registry[index].dimensions == expected_dimensions[index] || throw(
+            DimensionMismatch(
+                "parameter-group $(registry[index].name) shape differs",
+            ),
         )
     end
-    return records
-end
-
-"""Return the exact ordered path/type/shape registry for trainable arrays."""
-function parameter_registry(components)
-    paths, arrays = _parameter_arrays(components)
-    return _registry_record(paths, arrays)
-end
-
-function _validate_numeric_arrays(arrays, label::AbstractString;
-                                  nonnegative::Bool=false)
-    @inbounds for (array_index, array) in enumerate(arrays)
-        for value in array
-            isfinite(value) || throw(DomainError(
-                value,
-                "$label array $array_index contains a non-finite value",
-            ))
-            nonnegative && value < 0.0f0 && throw(DomainError(
-                value,
-                "$label array $array_index contains a negative value",
-            ))
-        end
-    end
-    return arrays
-end
-
-function _validate_counter_value(value, path::String="counters")
-    if value isa Bool
-        throw(ArgumentError("$path cannot be Bool"))
-    elseif value isa Integer
-        value >= 0 || throw(ArgumentError("$path cannot be negative"))
-    elseif value isa NamedTuple
-        isempty(value) && throw(ArgumentError("$path cannot be empty"))
-        @inbounds for name in keys(value)
-            _validate_counter_value(getproperty(value, name), "$path/$(String(name))")
-        end
-    elseif value isa Tuple
-        isempty(value) && throw(ArgumentError("$path cannot be empty"))
-        @inbounds for (index, item) in enumerate(value)
-            _validate_counter_value(item, "$path/[$index]")
-        end
-    elseif isstructtype(typeof(value)) && !(value isa Number)
-        names = fieldnames(typeof(value))
-        isempty(names) && throw(ArgumentError("$path cannot be empty"))
-        @inbounds for name in names
-            _validate_counter_value(getfield(value, name), "$path/$(String(name))")
-        end
-    else
-        throw(ArgumentError(
-            "$path must contain only non-negative integer counters",
-        ))
-    end
-    return value
-end
-
-function _fingerprints(
-    architecture_config,
-    input_config,
-    topology_config,
-    learning_config,
-    optimizer_config,
-)
-    return (;
-        architecture=architecture_fingerprint(architecture_config),
-        input=input_fingerprint(input_config),
-        topology=topology_fingerprint(topology_config),
-        learning=learning_fingerprint(learning_config),
-        optimizer=optimizer_fingerprint(optimizer_config),
-    )
-end
-
-function _write_array_state(io::IO, label::String, records, arrays)
-    _write_string(io, label)
-    _write_u64(io, UInt64(length(arrays)))
-    @inbounds for index in eachindex(arrays)
-        record = records[index]
-        _write_contract(io, record)
-        bytes = reinterpret(UInt8, vec(arrays[index]))
-        _write_string(io, bytes2hex(SHA.sha256(bytes)))
-    end
-    return io
-end
-
-function _state_fingerprint(
-    fingerprints,
-    registry,
-    values,
-    first,
-    second,
-    optimizer_step::Int,
-    counters,
-)
-    io = IOBuffer()
-    _write_string(io, FINGERPRINT_ALGORITHM)
-    _write_string(io, CHECKPOINT_FORMAT)
-    _write_contract(io, fingerprints)
-    _write_array_state(io, "parameters", registry, values)
-    _write_array_state(io, "first_moments", registry, first)
-    _write_array_state(io, "second_moments", registry, second)
-    _write_contract(io, optimizer_step)
-    _write_contract(io, counters)
-    return bytes2hex(SHA.sha256(take!(io)))
-end
-
-function _validate_registry(registry)
-    registry isa Vector || throw(ArgumentError(
-        "checkpoint parameter registry is not a Vector",
-    ))
-    isempty(registry) && throw(ArgumentError(
-        "checkpoint parameter registry cannot be empty",
-    ))
-    paths = String[]
-    @inbounds for record in registry
-        record isa NamedTuple || throw(ArgumentError(
-            "checkpoint registry entry is not a NamedTuple",
-        ))
-        keys(record) == _REGISTRY_KEYS || throw(ArgumentError(
-            "checkpoint registry entry fields are missing or extra",
-        ))
-        record.path isa String && !isempty(record.path) || throw(ArgumentError(
-            "checkpoint registry path is invalid",
-        ))
-        record.element_type == "Float32" || throw(ArgumentError(
-            "checkpoint registry element type is not Float32",
-        ))
-        record.dimensions isa Tuple || throw(ArgumentError(
-            "checkpoint registry dimensions are invalid",
-        ))
-        all(dimension -> dimension >= 0, record.dimensions) || throw(
-            ArgumentError("checkpoint registry has a negative dimension"),
-        )
-        record.length isa Int && record.length >= 0 || throw(ArgumentError(
-            "checkpoint registry length is invalid",
-        ))
-        prod(record.dimensions; init=1) == record.length || throw(ArgumentError(
-            "checkpoint registry length disagrees with dimensions",
-        ))
-        push!(paths, record.path)
-    end
-    length(unique(paths)) == length(paths) || throw(ArgumentError(
-        "checkpoint registry contains duplicate paths",
-    ))
     return registry
 end
 
-function _validate_saved_arrays(arrays, registry, label; nonnegative=false)
-    arrays isa Vector || throw(ArgumentError("checkpoint $label is not a Vector"))
-    length(arrays) == length(registry) || throw(DimensionMismatch(
-        "checkpoint $label count differs from the parameter registry",
-    ))
-    @inbounds for index in eachindex(arrays)
+function _validate_parameter_state(
+    state::CanonicalParameterState,
+    registry::NTuple{5,ParameterGroupContract};
+    label::String,
+    second_moment::Bool=false,
+    enforce_bounds::Bool=false,
+)
+    arrays = _parameter_arrays(state)
+    @inbounds for index in 1:5
         array = arrays[index]
-        array isa Array{Float32} || throw(ArgumentError(
-            "checkpoint $label entry $index is not a dense Float32 Array",
-        ))
         Tuple(size(array)) == registry[index].dimensions || throw(
-            DimensionMismatch("checkpoint $label shape differs at $(registry[index].path)"),
+            DimensionMismatch("$label shape differs for $(registry[index].name)"),
+        )
+        lower = _raw_lower(registry[index])
+        upper = _raw_upper(registry[index])
+        for value in array
+            isfinite(value) || throw(DomainError(value, "$label is non-finite"))
+            second_moment && value < 0.0f0 && throw(DomainError(
+                value, "$label contains a negative value",
+            ))
+            enforce_bounds && !(lower <= value <= upper) && throw(DomainError(
+                value, "$label is outside the registered raw bounds",
+            ))
+        end
+        if _multiplier(registry[index]) == 0.0f0 && label != "parameters"
+            all(iszero, array) || throw(ArgumentError(
+                "frozen group $(registry[index].name) has nonzero $label",
+            ))
+        end
+    end
+    return state
+end
+
+@inline function _due_union_count(updates::UInt64, left::Int, right::Int)
+    l = UInt128(left)
+    r = UInt128(right)
+    greatest = UInt128(gcd(left, right))
+    least = (l ÷ greatest) * r
+    total = UInt128(updates)
+    value = total ÷ l + total ÷ r - total ÷ least
+    value <= UInt128(typemax(UInt64)) || throw(OverflowError(
+        "optimizer due-union count overflow",
+    ))
+    return UInt64(value)
+end
+
+function _expected_group_steps(
+    updates::UInt64,
+    config::Local.LocalLearningConfig,
+    registry::NTuple{5,ParameterGroupContract},
+)
+    schedule = config.schedule
+    analog = config.analog_multiplier > 0.0f0 ?
+        updates ÷ UInt64(schedule.analog_interval) : UInt64(0)
+    hard = config.hard_event_multiplier > 0.0f0 ?
+        updates ÷ UInt64(schedule.hard_event_interval) : UInt64(0)
+    recurrent = if iszero(analog)
+        hard
+    elseif iszero(hard)
+        analog
+    else
+        _due_union_count(
+            updates, schedule.analog_interval, schedule.hard_event_interval,
         )
     end
-    _validate_numeric_arrays(arrays, label; nonnegative=nonnegative)
-    return arrays
-end
-
-function _validate_header(snapshot)
-    snapshot isa NamedTuple || throw(ArgumentError(
-        "checkpoint payload is not the canonical NamedTuple format",
-    ))
-    keys(snapshot) == _SNAPSHOT_KEYS || throw(ArgumentError(
-        "checkpoint fields are missing or extra; legacy checkpoints are unsupported",
-    ))
-    snapshot.magic === CHECKPOINT_MAGIC || throw(ArgumentError(
-        "checkpoint magic is not canonical",
-    ))
-    snapshot.schema === CHECKPOINT_SCHEMA || throw(ArgumentError(
-        "checkpoint schema is unsupported",
-    ))
-    snapshot.format === CHECKPOINT_FORMAT || throw(ArgumentError(
-        "checkpoint format is unsupported; relation/motif checkpoints cannot resume",
-    ))
-    return snapshot
-end
-
-function _validate_snapshot(snapshot)
-    _validate_header(snapshot)
-    fingerprints = (;
-        architecture=snapshot.architecture_fingerprint,
-        input=snapshot.input_fingerprint,
-        topology=snapshot.topology_fingerprint,
-        learning=snapshot.learning_fingerprint,
-        optimizer=snapshot.optimizer_fingerprint,
-    )
-    @inbounds for (name, fingerprint) in pairs(fingerprints)
-        fingerprint isa String && occursin(r"^[0-9a-f]{64}$", fingerprint) ||
-            throw(ArgumentError("checkpoint $name fingerprint is malformed"))
+    # Every recurrent group can receive the hard-event lane, so their group
+    # clocks advance on the union of analog and hard-event due updates.
+    raw = (recurrent, recurrent, recurrent, updates, updates)
+    return ntuple(5) do index
+        _multiplier(registry[index]) > 0.0f0 ? raw[index] : UInt64(0)
     end
-    registry = _validate_registry(snapshot.parameter_registry)
-    _validate_saved_arrays(snapshot.parameter_values, registry, "parameters")
-    _validate_saved_arrays(snapshot.first_moments, registry, "first moments")
-    _validate_saved_arrays(
-        snapshot.second_moments,
-        registry,
-        "second moments";
-        nonnegative=true,
-    )
-    snapshot.optimizer_step isa Int || throw(ArgumentError(
-        "checkpoint optimizer step must be Int",
-    ))
-    snapshot.optimizer_step >= 0 || throw(ArgumentError(
-        "checkpoint optimizer step cannot be negative",
-    ))
-    _validate_counter_value(snapshot.counters)
-    snapshot.state_fingerprint isa String || throw(ArgumentError(
-        "checkpoint state fingerprint is not a String",
-    ))
-    expected = _state_fingerprint(
-        fingerprints,
-        registry,
-        snapshot.parameter_values,
-        snapshot.first_moments,
-        snapshot.second_moments,
-        snapshot.optimizer_step,
-        snapshot.counters,
-    )
-    snapshot.state_fingerprint == expected || throw(ArgumentError(
-        "checkpoint state fingerprint is false",
-    ))
-    return snapshot
 end
 
-"""Load and fully validate the new canonical format. Legacy formats fail closed."""
-function load_checkpoint(path::AbstractString)
-    source = abspath(path)
-    isfile(source) || throw(ArgumentError("checkpoint does not exist: $source"))
-    snapshot = try
-        open(deserialize, source)
-    catch error
-        error isa InterruptException && rethrow()
-        throw(ArgumentError(
-            "checkpoint cannot be decoded as the canonical format: " *
-            sprint(showerror, error),
+function _validate_clock(
+    clock::LearningClockSnapshot,
+    config::Local.LocalLearningConfig,
+    updates::UInt64,
+)
+    updates <= UInt64(typemax(Int)) || throw(ArgumentError(
+        "training update count does not fit LearningClock Int",
+    ))
+    expected_update = Int(updates)
+    clock.update == expected_update || throw(ArgumentError(
+        "learning clock update differs from training updates",
+    ))
+    schedule = config.schedule
+    actual = (
+        clock.analog_ticks,
+        clock.hard_event_ticks,
+        clock.homeostasis_ticks,
+        clock.structure_ticks,
+    )
+    expected = (
+        fld(expected_update, schedule.analog_interval),
+        fld(expected_update, schedule.hard_event_interval),
+        fld(expected_update, schedule.homeostasis_interval),
+        fld(expected_update, schedule.structure_interval),
+    )
+    actual == expected || throw(ArgumentError(
+        "learning clock ticks differ from the configured schedule",
+    ))
+    return clock
+end
+
+function _validate_plasticity(
+    state::PlasticityStateSnapshot,
+    clock::LearningClockSnapshot,
+    config::Local.LocalLearningConfig,
+    updates::UInt64,
+)
+    length(state.firing_rate) == _CANONICAL_NODE_COUNT || throw(
+        DimensionMismatch("plasticity firing-rate shape differs"),
+    )
+    length(state.activity_ema) == _CANONICAL_NODE_COUNT || throw(
+        DimensionMismatch("plasticity activity EMA shape differs"),
+    )
+    length(state.incoming_conductance_ema) == _CANONICAL_NODE_COUNT || throw(
+        DimensionMismatch("plasticity conductance EMA shape differs"),
+    )
+    length(state.utility) == _CANONICAL_EVENT_CONTACT_COUNT || throw(
+        DimensionMismatch("plasticity utility shape differs"),
+    )
+    @inbounds for value in state.firing_rate
+        isfinite(value) && 0.0f0 <= value <= 1.0f0 || throw(DomainError(
+            value, "plasticity firing rate is outside [0,1]",
         ))
     end
+    for (label, values) in (
+        ("activity EMA", state.activity_ema),
+        ("incoming-conductance EMA", state.incoming_conductance_ema),
+        ("utility", state.utility),
+    )
+        @inbounds for value in values
+            isfinite(value) && value >= 0.0f0 || throw(DomainError(
+                value, "plasticity $label is invalid",
+            ))
+        end
+    end
+    state.reduced_batches == updates || throw(ArgumentError(
+        "plasticity reduced_batches differs from training updates",
+    ))
+    analog_active = config.analog_multiplier > 0.0f0 &&
+        config.utility_mode === :combined
+    utility_bound = analog_active ?
+        UInt128(clock.analog_ticks) * UInt128(_CANONICAL_EVENT_CONTACT_COUNT) :
+        UInt128(0)
+    UInt128(state.utility_updates) <= utility_bound || throw(ArgumentError(
+        "plasticity utility counter exceeds its scheduled bound",
+    ))
+    UInt128(state.homeostasis_events) <=
+        UInt128(clock.homeostasis_ticks) * UInt128(_CANONICAL_NODE_COUNT) ||
+        throw(ArgumentError("homeostasis counter exceeds its scheduled bound"))
+    UInt128(state.synaptic_scaling_events) <=
+        UInt128(clock.homeostasis_ticks) *
+            UInt128(_CANONICAL_EVENT_CONTACT_COUNT) || throw(ArgumentError(
+                "synaptic-scaling counter exceeds its scheduled bound",
+            ))
+    !config.plasticity.structure_enabled || throw(ArgumentError(
+        "schema2 does not serialize mutable rewired topology",
+    ))
+    state.rewires == 0 || throw(ArgumentError(
+        "fixed-spine schema2 requires rewires == 0",
+    ))
+    return state
+end
+
+function _validate_sampler(
+    snapshot::SamplerStateSnapshot,
+    contract::CanonicalRunContract,
+    updates::UInt64,
+)
+    snapshot.seed == contract.sampler_seed || throw(ArgumentError(
+        "sampler seed differs from the run contract",
+    ))
+    snapshot.source_identity.count == contract.training_state_count || throw(
+        ArgumentError("sampler source count differs from DatasetIdentity"),
+    )
+    restored = Sampler.restore_sampler(
+        snapshot.source_rows, _sampler_named_tuple(snapshot),
+    )
+    consumed = Sampler.sampler_consumed_rows(restored)
+    expected = UInt128(updates) * UInt128(contract.state_batch)
+    consumed == expected || throw(ArgumentError(
+        "sampler position differs from completed training updates",
+    ))
+    return restored
+end
+
+function _state_fingerprint(snapshot::CanonicalTrainingStateSnapshot)
+    return _contract_fingerprint("training-state", (;
+        magic=snapshot.magic,
+        schema=snapshot.schema,
+        format=snapshot.format,
+        architecture_fingerprint=snapshot.architecture_fingerprint,
+        input_fingerprint=snapshot.input_fingerprint,
+        topology_fingerprint=snapshot.topology_fingerprint,
+        learning_fingerprint=snapshot.learning_fingerprint,
+        optimizer_fingerprint=snapshot.optimizer_fingerprint,
+        run_contract_fingerprint=snapshot.run_contract_fingerprint,
+        run_contract=snapshot.run_contract,
+        learning_config=snapshot.learning_config,
+        optimizer_config=snapshot.optimizer_config,
+        optimizer=snapshot.optimizer,
+        learning_clock=snapshot.learning_clock,
+        cumulative_mechanisms=snapshot.cumulative_mechanisms,
+        training_updates=snapshot.training_updates,
+        plasticity=snapshot.plasticity,
+        sampler=snapshot.sampler,
+    ))
+end
+
+function _validate_snapshot(snapshot::CanonicalTrainingStateSnapshot)
+    snapshot.magic == CHECKPOINT_MAGIC || throw(ArgumentError(
+        "checkpoint magic is not canonical",
+    ))
+    snapshot.schema == CHECKPOINT_SCHEMA || throw(ArgumentError(
+        "checkpoint schema is unsupported; schema1 has no compatibility path",
+    ))
+    snapshot.format == CHECKPOINT_FORMAT || throw(ArgumentError(
+        "checkpoint format is unsupported",
+    ))
+    for (label, value) in (
+        ("architecture", snapshot.architecture_fingerprint),
+        ("input", snapshot.input_fingerprint),
+        ("topology", snapshot.topology_fingerprint),
+        ("learning", snapshot.learning_fingerprint),
+        ("optimizer", snapshot.optimizer_fingerprint),
+        ("run contract", snapshot.run_contract_fingerprint),
+        ("state", snapshot.state_fingerprint),
+    )
+        _require_sha256(value, "$label fingerprint")
+    end
+    _validate_run_contract(snapshot.run_contract)
+    run_contract_fingerprint(snapshot.run_contract) ==
+        snapshot.run_contract_fingerprint || throw(ArgumentError(
+            "run-contract fingerprint is false",
+        ))
+    learning_fingerprint(snapshot.learning_config) ==
+        snapshot.learning_fingerprint || throw(ArgumentError(
+            "learning fingerprint is false",
+        ))
+    registry = _validate_group_contracts(snapshot.optimizer.registry)
+    optimizer_fingerprint(snapshot.optimizer_config, registry) ==
+        snapshot.optimizer_fingerprint || throw(ArgumentError(
+            "optimizer fingerprint is false",
+        ))
+    _validate_parameter_state(
+        snapshot.optimizer.parameters, registry;
+        label="parameters", enforce_bounds=true,
+    )
+    _validate_parameter_state(
+        snapshot.optimizer.first_moments, registry;
+        label="first moments",
+    )
+    _validate_parameter_state(
+        snapshot.optimizer.second_moments, registry;
+        label="second moments", second_moment=true,
+    )
+    snapshot.optimizer.total_step == snapshot.training_updates || throw(
+        ArgumentError("optimizer total step differs from training updates"),
+    )
+    expected_steps = _expected_group_steps(
+        snapshot.training_updates, snapshot.learning_config, registry,
+    )
+    snapshot.optimizer.group_steps == expected_steps || throw(ArgumentError(
+        "optimizer group steps differ from the exact due schedule",
+    ))
+    clock = _validate_clock(
+        snapshot.learning_clock,
+        snapshot.learning_config,
+        snapshot.training_updates,
+    )
+    _validate_plasticity(
+        snapshot.plasticity,
+        clock,
+        snapshot.learning_config,
+        snapshot.training_updates,
+    )
+    snapshot.cumulative_mechanisms.rewires == 0 || throw(ArgumentError(
+        "fixed-spine cumulative mechanism rewires must be zero",
+    ))
+    snapshot.cumulative_mechanisms.homeostasis_events ==
+        snapshot.plasticity.homeostasis_events || throw(ArgumentError(
+            "cumulative homeostasis telemetry differs from plasticity state",
+        ))
+    snapshot.cumulative_mechanisms.synaptic_scaling_events ==
+        snapshot.plasticity.synaptic_scaling_events || throw(ArgumentError(
+            "cumulative synaptic-scaling telemetry differs from plasticity state",
+        ))
+    snapshot.cumulative_mechanisms.utility_updates ==
+        snapshot.plasticity.utility_updates || throw(ArgumentError(
+            "cumulative utility telemetry differs from plasticity state",
+        ))
+    snapshot.cumulative_mechanisms.rewires == snapshot.plasticity.rewires || throw(
+        ArgumentError("cumulative rewire telemetry differs from plasticity state"),
+    )
+    _validate_sampler(
+        snapshot.sampler, snapshot.run_contract, snapshot.training_updates,
+    )
+    _state_fingerprint(snapshot) == snapshot.state_fingerprint || throw(
+        ArgumentError("checkpoint state fingerprint is false"),
+    )
+    return snapshot
+end
+
+function build_training_snapshot(
+    model::Graph.CanonicalModel,
+    learning_config::Local.LocalLearningConfig,
+    optimizer_config::Optimizer.AdamWConfig,
+    optimizer::CanonicalOptimizerStateSnapshot,
+    learning_clock::LearningClockSnapshot,
+    cumulative_mechanisms::MechanismCounterSnapshot,
+    training_updates::UInt64,
+    plasticity::PlasticityStateSnapshot,
+    sampler::SamplerStateSnapshot,
+    run_contract::CanonicalRunContract,
+)
+    architecture = architecture_fingerprint(model.config)
+    input = input_fingerprint()
+    topology = topology_fingerprint(model)
+    learning = learning_fingerprint(learning_config)
+    optimizer_fp = optimizer_fingerprint(optimizer_config, optimizer.registry)
+    architecture == run_contract.architecture_fingerprint || throw(
+        ArgumentError("run-contract architecture fingerprint differs"),
+    )
+    topology == run_contract.topology_fingerprint || throw(ArgumentError(
+        "run-contract topology fingerprint differs",
+    ))
+    model_parameters = Graph.parameter_components(model.parameters)
+    live = (
+        model_parameters.core_cell_raw,
+        model_parameters.semantic_projection_raw,
+        model_parameters.event_raw,
+        model_parameters.output_cell_raw,
+        model_parameters.output_projection_raw,
+    )
+    saved = _parameter_arrays(optimizer.parameters)
+    @inbounds for index in 1:5
+        live[index] == saved[index] || throw(ArgumentError(
+            "optimizer parameter snapshot differs from the live model",
+        ))
+    end
+    provisional = CanonicalTrainingStateSnapshot(
+        CHECKPOINT_MAGIC,
+        CHECKPOINT_SCHEMA,
+        CHECKPOINT_FORMAT,
+        architecture,
+        input,
+        topology,
+        learning,
+        optimizer_fp,
+        run_contract_fingerprint(run_contract),
+        run_contract,
+        learning_config,
+        optimizer_config,
+        optimizer,
+        learning_clock,
+        cumulative_mechanisms,
+        training_updates,
+        plasticity,
+        sampler,
+        repeat("0", 64),
+    )
+    snapshot = CanonicalTrainingStateSnapshot(
+        provisional.magic,
+        provisional.schema,
+        provisional.format,
+        provisional.architecture_fingerprint,
+        provisional.input_fingerprint,
+        provisional.topology_fingerprint,
+        provisional.learning_fingerprint,
+        provisional.optimizer_fingerprint,
+        provisional.run_contract_fingerprint,
+        provisional.run_contract,
+        provisional.learning_config,
+        provisional.optimizer_config,
+        provisional.optimizer,
+        provisional.learning_clock,
+        provisional.cumulative_mechanisms,
+        provisional.training_updates,
+        provisional.plasticity,
+        provisional.sampler,
+        _state_fingerprint(provisional),
+    )
     return _validate_snapshot(snapshot)
 end
 
-"""Atomically save the complete canonical train/AdamW state."""
+"""Atomically serialize schema2. There is no schema1/generic overload."""
 function save_checkpoint(
-    path::AbstractString;
-    parameters,
-    first_moments,
-    second_moments,
-    optimizer_step::Integer,
-    counters,
-    architecture_config,
-    input_config,
-    topology_config,
-    learning_config,
-    optimizer_config,
+    path::AbstractString,
+    snapshot::CanonicalTrainingStateSnapshot,
 )
-    optimizer_step isa Bool && throw(ArgumentError("optimizer step cannot be Bool"))
-    step = try
-        Int(optimizer_step)
-    catch
-        throw(ArgumentError("optimizer step does not fit Int"))
-    end
-    step >= 0 || throw(ArgumentError("optimizer step cannot be negative"))
-    _validate_counter_value(counters)
-
-    parameter_paths, parameter_arrays = _parameter_arrays(parameters)
-    first_paths, first_arrays = _parameter_arrays(first_moments)
-    second_paths, second_arrays = _parameter_arrays(second_moments)
-    registry = _registry_record(parameter_paths, parameter_arrays)
-    first_registry = _registry_record(first_paths, first_arrays)
-    second_registry = _registry_record(second_paths, second_arrays)
-    first_registry == registry || throw(ArgumentError(
-        "first-moment registry does not exactly match parameters",
-    ))
-    second_registry == registry || throw(ArgumentError(
-        "second-moment registry does not exactly match parameters",
-    ))
-    _validate_numeric_arrays(parameter_arrays, "parameters")
-    _validate_numeric_arrays(first_arrays, "first moments")
-    _validate_numeric_arrays(second_arrays, "second moments"; nonnegative=true)
-
-    fingerprints = _fingerprints(
-        architecture_config,
-        input_config,
-        topology_config,
-        learning_config,
-        optimizer_config,
-    )
-    parameter_values = [copy(array) for array in parameter_arrays]
-    first_values = [copy(array) for array in first_arrays]
-    second_values = [copy(array) for array in second_arrays]
-    counter_values = deepcopy(counters)
-    state_fingerprint = _state_fingerprint(
-        fingerprints,
-        registry,
-        parameter_values,
-        first_values,
-        second_values,
-        step,
-        counter_values,
-    )
-    snapshot = (;
-        magic=CHECKPOINT_MAGIC,
-        schema=CHECKPOINT_SCHEMA,
-        format=CHECKPOINT_FORMAT,
-        architecture_fingerprint=fingerprints.architecture,
-        input_fingerprint=fingerprints.input,
-        topology_fingerprint=fingerprints.topology,
-        learning_fingerprint=fingerprints.learning,
-        optimizer_fingerprint=fingerprints.optimizer,
-        parameter_registry=registry,
-        parameter_values=parameter_values,
-        first_moments=first_values,
-        second_moments=second_values,
-        optimizer_step=step,
-        counters=counter_values,
-        state_fingerprint=state_fingerprint,
-    )
     _validate_snapshot(snapshot)
-
     destination = abspath(path)
     mkpath(dirname(destination))
     temporary = tempname(dirname(destination); cleanup=false)
@@ -914,398 +1127,87 @@ function save_checkpoint(
     return destination
 end
 
-function _assert_contract_fingerprints(
-    snapshot,
-    architecture_config,
-    input_config,
-    topology_config,
-    learning_config,
-    optimizer_config,
+"""Load schema2 only. NamedTuple/schema1/relation checkpoints fail closed."""
+function load_checkpoint(path::AbstractString)
+    source = abspath(path)
+    isfile(source) || throw(ArgumentError("checkpoint does not exist: $source"))
+    value = try
+        open(deserialize, source)
+    catch error
+        error isa InterruptException && rethrow()
+        throw(ArgumentError(
+            "checkpoint cannot be decoded as canonical schema2: " *
+            sprint(showerror, error),
+        ))
+    end
+    value isa CanonicalTrainingStateSnapshot || throw(ArgumentError(
+        "legacy/generic checkpoint payload is unsupported",
+    ))
+    return _validate_snapshot(value)
+end
+
+function prepare_training_checkpoint(
+    snapshot::CanonicalTrainingStateSnapshot,
+    model::Graph.CanonicalModel,
+    expected_registry::NTuple{5,ParameterGroupContract},
+    learning_config::Local.LocalLearningConfig,
+    optimizer_config::Optimizer.AdamWConfig,
+    run_contract::CanonicalRunContract,
+    source_rows::AbstractVector{<:Integer},
 )
-    current = _fingerprints(
-        architecture_config,
-        input_config,
-        topology_config,
-        learning_config,
-        optimizer_config,
-    )
-    snapshot.architecture_fingerprint == current.architecture || throw(
-        ArgumentError("checkpoint architecture configuration differs"),
-    )
-    snapshot.input_fingerprint == current.input || throw(
-        ArgumentError("checkpoint input configuration differs"),
-    )
-    snapshot.topology_fingerprint == current.topology || throw(
-        ArgumentError("checkpoint topology configuration differs"),
-    )
-    snapshot.learning_fingerprint == current.learning || throw(
-        ArgumentError("checkpoint learning configuration differs"),
-    )
-    snapshot.optimizer_fingerprint == current.optimizer || throw(
-        ArgumentError("checkpoint optimizer configuration differs"),
-    )
-    return current
-end
-
-"""
-Validate every contract and registry before mutating live arrays, then restore
-parameters and both AdamW moment sets. Step/counters are returned explicitly so
-their owning optimizer/learner can install them without hidden reflection.
-"""
-function restore_checkpoint!(
-    parameters,
-    first_moments,
-    second_moments,
-    snapshot;
-    architecture_config,
-    input_config,
-    topology_config,
-    learning_config,
-    optimizer_config,
-)
-    _validate_snapshot(snapshot)
-    _assert_contract_fingerprints(
-        snapshot,
-        architecture_config,
-        input_config,
-        topology_config,
-        learning_config,
-        optimizer_config,
-    )
-
-    parameter_paths, parameter_arrays = _parameter_arrays(parameters)
-    first_paths, first_arrays = _parameter_arrays(first_moments)
-    second_paths, second_arrays = _parameter_arrays(second_moments)
-    current_registry = _registry_record(parameter_paths, parameter_arrays)
-    current_registry == snapshot.parameter_registry || throw(ArgumentError(
-        "live parameter registry does not exactly match checkpoint",
+    copied = deepcopy(snapshot)
+    _validate_snapshot(copied)
+    copied.architecture_fingerprint == architecture_fingerprint(model.config) ||
+        throw(ArgumentError("checkpoint architecture differs"))
+    copied.input_fingerprint == input_fingerprint() || throw(ArgumentError(
+        "checkpoint input ABI differs",
     ))
-    _registry_record(first_paths, first_arrays) == current_registry || throw(
-        ArgumentError("live first-moment registry does not match parameters"),
+    copied.topology_fingerprint == topology_fingerprint(model) || throw(
+        ArgumentError("checkpoint topology/order differs"),
     )
-    _registry_record(second_paths, second_arrays) == current_registry || throw(
-        ArgumentError("live second-moment registry does not match parameters"),
-    )
-
-    # Mutation starts only after the complete snapshot and live contract pass.
-    @inbounds for index in eachindex(parameter_arrays)
-        copyto!(parameter_arrays[index], snapshot.parameter_values[index])
-        copyto!(first_arrays[index], snapshot.first_moments[index])
-        copyto!(second_arrays[index], snapshot.second_moments[index])
-    end
-    return ResumeState(snapshot.optimizer_step, deepcopy(snapshot.counters))
-end
-
-@inline function _require_property(value, name::Symbol, owner::AbstractString)
-    hasproperty(value, name) || throw(ArgumentError(
-        "$owner has no $(String(name)) field",
+    copied.learning_fingerprint == learning_fingerprint(learning_config) ||
+        throw(ArgumentError("checkpoint learning configuration differs"))
+    _validate_group_contracts(expected_registry)
+    copied.optimizer.registry == expected_registry || throw(ArgumentError(
+        "checkpoint parameter registry differs",
     ))
-    return getproperty(value, name)
-end
-
-function _optimizer_registry_contract(registry)
-    groups = _require_property(registry, :groups, "optimizer registry")
-    groups isa Tuple && !isempty(groups) || throw(ArgumentError(
-        "optimizer registry groups must be a non-empty Tuple",
-    ))
-    contracts = map(groups) do group
-        name = _require_property(group, :name, "parameter group")
-        parameter = _require_property(group, :parameter, "parameter group $name")
-        gradient = _require_property(group, :gradient, "parameter group $name")
-        transform_kind = _require_property(
-            group,
-            :transform_kind,
-            "parameter group $name",
+    copied.optimizer_fingerprint ==
+        optimizer_fingerprint(optimizer_config, expected_registry) || throw(
+            ArgumentError("checkpoint optimizer configuration differs"),
         )
-        multiplier = Float32(_require_property(
-            group,
-            :multiplier,
-            "parameter group $name",
-        ))
-        lower_bound = Float32(_require_property(
-            group,
-            :lower_bound,
-            "parameter group $name",
-        ))
-        upper_bound = Float32(_require_property(
-            group,
-            :upper_bound,
-            "parameter group $name",
-        ))
-        name isa Symbol && name !== Symbol("") || throw(ArgumentError(
-            "parameter-group name must be a non-empty Symbol",
-        ))
-        parameter isa DenseArray{Float32} || throw(ArgumentError(
-            "parameter group $name storage must be a dense Float32 array",
-        ))
-        gradient isa AbstractArray{Float32} && size(gradient) == size(parameter) ||
-            throw(DimensionMismatch(
-                "parameter group $name gradient shape differs",
-            ))
-        isfinite(multiplier) && multiplier >= 0.0f0 || throw(ArgumentError(
-            "parameter group $name multiplier is invalid",
-        ))
-        !isnan(lower_bound) && !isnan(upper_bound) && lower_bound < upper_bound ||
-            throw(ArgumentError("parameter group $name bounds are invalid"))
-        return (;
-            name,
-            transform_kind=string(transform_kind),
-            multiplier_bits=reinterpret(UInt32, multiplier),
-            lower_bound_bits=reinterpret(UInt32, lower_bound),
-            upper_bound_bits=reinterpret(UInt32, upper_bound),
-            dimensions=Tuple(size(parameter)),
-        )
-    end
-    names = map(contract -> contract.name, contracts)
-    length(unique(names)) == length(names) || throw(ArgumentError(
-        "optimizer registry contains duplicate group names",
-    ))
-    names == CANONICAL_PARAMETER_GROUPS || throw(ArgumentError(
-        "optimizer registry must contain the five canonical graph groups " *
-        "in canonical order",
-    ))
-    return contracts
+    isequal(copied.run_contract, _validate_run_contract(run_contract)) || throw(
+        ArgumentError("checkpoint run contract differs"),
+    )
+    restored_sampler = Sampler.restore_sampler(
+        source_rows, _sampler_named_tuple(copied.sampler),
+    )
+    Sampler.sampler_consumed_rows(restored_sampler) ==
+        UInt128(copied.training_updates) * UInt128(run_contract.state_batch) ||
+        throw(ArgumentError("restored sampler progress differs"))
+    return PreparedTrainingCheckpoint(copied, restored_sampler)
 end
 
-function _optimizer_components(registry, state)
-    contracts = _optimizer_registry_contract(registry)
-    groups = getproperty(registry, :groups)
-    moments = _require_property(state, :moments, "optimizer state")
-    moments isa Tuple && length(moments) == length(groups) || throw(ArgumentError(
-        "optimizer moment tuple differs from parameter groups",
-    ))
-    names = Tuple(contract.name for contract in contracts)
-    parameters = NamedTuple{names}(Tuple(group.parameter for group in groups))
-    first = NamedTuple{names}(ntuple(length(groups)) do index
-        group = groups[index]
-        moment = moments[index]
-        moment_name = _require_property(moment, :name, "optimizer moment")
-        moment_name == group.name || throw(ArgumentError(
-            "optimizer moment name differs for group $(group.name)",
-        ))
-        for field in (:transform_kind, :multiplier, :lower_bound, :upper_bound)
-            isequal(getproperty(moment, field), getproperty(group, field)) || throw(
-                ArgumentError(
-                    "optimizer moment metadata $field differs for group $(group.name)",
-                ),
-            )
-        end
-        array = _require_property(moment, :first, "optimizer moment $(group.name)")
-        size(array) == size(group.parameter) || throw(DimensionMismatch(
-            "first-moment shape differs for group $(group.name)",
-        ))
-        array
-    end)
-    second = NamedTuple{names}(ntuple(length(groups)) do index
-        group = groups[index]
-        moment = moments[index]
-        array = _require_property(moment, :second, "optimizer moment $(group.name)")
-        size(array) == size(group.parameter) || throw(DimensionMismatch(
-            "second-moment shape differs for group $(group.name)",
-        ))
-        array
-    end)
-    group_steps = _require_property(state, :group_steps, "optimizer state")
-    total_step = _require_property(state, :total_step, "optimizer state")
-    group_steps isa Vector{UInt64} && length(group_steps) == length(groups) ||
-        throw(ArgumentError("optimizer group-step vector differs from registry"))
-    total_step isa UInt64 || throw(ArgumentError(
-        "optimizer total_step must be UInt64",
-    ))
-    @inbounds for (index, group_step) in enumerate(group_steps)
-        group_step <= total_step || throw(ArgumentError(
-            "optimizer group step $index exceeds total step",
-        ))
-        contracts[index].multiplier_bits == reinterpret(UInt32, 0.0f0) &&
-            group_step != 0 && throw(ArgumentError(
-                "frozen optimizer group $(contracts[index].name) has a nonzero step",
-            ))
-    end
-    total_step <= UInt64(typemax(Int)) || throw(ArgumentError(
-        "optimizer total step does not fit checkpoint Int",
-    ))
-    return parameters, first, second, contracts, group_steps, Int(total_step)
-end
-
-@inline function _counter_fields(value)
-    value isa NamedTuple && return keys(value)
-    return fieldnames(typeof(value))
-end
-
-function _validate_training_counters(counters, learning_config, total_step::Int)
-    _counter_fields(counters) ==
-        (:learning_clock, :mechanisms, :training_updates) || throw(
-            ArgumentError(
-                "training counters must contain learning_clock, mechanisms, " *
-                "training_updates in canonical order",
-            ),
-        )
-    clock = getproperty(counters, :learning_clock)
-    mechanisms = getproperty(counters, :mechanisms)
-    updates = getproperty(counters, :training_updates)
-    _counter_fields(clock) == (
-        :update,
-        :analog_ticks,
-        :hard_event_ticks,
-        :homeostasis_ticks,
-        :structure_ticks,
-    ) || throw(ArgumentError(
-        "learning clock fields are missing, extra, or reordered",
-    ))
-    _counter_fields(mechanisms) == CANONICAL_MECHANISM_COUNTERS || throw(
-        ArgumentError(
-            "mechanism counter fields are missing, extra, or reordered",
-        ),
-    )
-    updates isa UInt64 && updates == UInt64(total_step) || throw(ArgumentError(
-        "training update counter differs from optimizer total step",
-    ))
-    clock.update isa Int && clock.update == total_step || throw(ArgumentError(
-        "learning clock update differs from optimizer total step",
-    ))
-    local_config = _local_learning_config(learning_config)
-    schedule = local_config.schedule
-    expected = (
-        fld(total_step, schedule.analog_interval),
-        fld(total_step, schedule.hard_event_interval),
-        fld(total_step, schedule.homeostasis_interval),
-        fld(total_step, schedule.structure_interval),
-    )
-    actual = (
-        clock.analog_ticks,
-        clock.hard_event_ticks,
-        clock.homeostasis_ticks,
-        clock.structure_ticks,
-    )
-    actual == expected || throw(ArgumentError(
-        "learning clock ticks disagree with the checkpointed schedule",
-    ))
-    _validate_counter_value(counters)
-    return counters
-end
-
-function _validate_canonical_group_shapes(parameters, topology_config)
-    keys(parameters) == CANONICAL_PARAMETER_GROUPS || throw(ArgumentError(
-        "canonical parameter components are missing, extra, or reordered",
-    ))
-    size(parameters.core_cell_raw) ==
-        (_CANONICAL_CELL_PARAMETER_DIM, _CANONICAL_CORE_COUNT) || throw(
-            DimensionMismatch("core_cell_raw has the wrong canonical shape"),
-        )
-    size(parameters.semantic_projection_raw) == (4, 3, 8, 2) || throw(
-        DimensionMismatch(
-            "semantic_projection_raw has the wrong canonical shape",
-        ),
-    )
-    event_order = _canonical_event_parameter_order(topology_config)
-    length(parameters.event_raw) == event_order.parameter_count || throw(
-        DimensionMismatch(
-            "event_raw length differs from canonical static/dynamic/kind order",
-        ),
-    )
-    size(parameters.output_cell_raw) ==
-        (_CANONICAL_CELL_PARAMETER_DIM, _CANONICAL_OUTPUT_DIM) || throw(
-            DimensionMismatch("output_cell_raw has the wrong canonical shape"),
-        )
-    size(parameters.output_projection_raw) == (4, 3, 5) || throw(
-        DimensionMismatch(
-            "output_projection_raw has the wrong canonical shape",
-        ),
-    )
-    return parameters
-end
-
-"""Save directly from `CanonicalOptimizer.ParameterRegistry`/`AdamWState`."""
-function save_checkpoint(
+function prepare_training_checkpoint(
     path::AbstractString,
-    registry,
-    optimizer_state;
-    counters,
-    architecture_config,
-    input_config,
-    topology_config,
-    learning_config,
-    optimizer_config,
+    model::Graph.CanonicalModel,
+    expected_registry::NTuple{5,ParameterGroupContract},
+    learning_config::Local.LocalLearningConfig,
+    optimizer_config::Optimizer.AdamWConfig,
+    run_contract::CanonicalRunContract,
+    source_rows::AbstractVector{<:Integer},
 )
-    parameters, first, second, group_contract, group_steps, total_step =
-        _optimizer_components(registry, optimizer_state)
-    _validate_canonical_group_shapes(parameters, topology_config)
-    _validate_training_counters(counters, learning_config, total_step)
-    optimizer_contract = (;
-        adam=optimizer_config,
-        parameter_groups=group_contract,
-    )
-    stored_counters = (;
-        optimizer_group_steps=Tuple(group_steps),
-        learner=deepcopy(counters),
-    )
-    return save_checkpoint(
-        path;
-        parameters,
-        first_moments=first,
-        second_moments=second,
-        optimizer_step=total_step,
-        counters=stored_counters,
-        architecture_config,
-        input_config,
-        topology_config,
+    return prepare_training_checkpoint(
+        load_checkpoint(path),
+        model,
+        expected_registry,
         learning_config,
-        optimizer_config=optimizer_contract,
+        optimizer_config,
+        run_contract,
+        source_rows,
     )
 end
 
-"""Restore directly into the canonical optimizer after complete validation."""
-function restore_checkpoint!(
-    registry,
-    optimizer_state,
-    snapshot;
-    architecture_config,
-    input_config,
-    topology_config,
-    learning_config,
-    optimizer_config,
-)
-    _validate_snapshot(snapshot)
-    parameters, first, second, group_contract, _, _ =
-        _optimizer_components(registry, optimizer_state)
-    _validate_canonical_group_shapes(parameters, topology_config)
-    optimizer_contract = (;
-        adam=optimizer_config,
-        parameter_groups=group_contract,
-    )
-    counters = snapshot isa NamedTuple && hasproperty(snapshot, :counters) ?
-        snapshot.counters : nothing
-    counters isa NamedTuple && keys(counters) == (:optimizer_group_steps, :learner) ||
-        throw(ArgumentError("checkpoint optimizer counters are missing or extra"))
-    group_steps = counters.optimizer_group_steps
-    group_steps isa Tuple && length(group_steps) == length(group_contract) ||
-        throw(ArgumentError("checkpoint optimizer group-step count differs"))
-    all(step -> step isa UInt64 && step <= UInt64(snapshot.optimizer_step), group_steps) ||
-        throw(ArgumentError("checkpoint optimizer group steps are invalid"))
-    _validate_training_counters(
-        counters.learner,
-        learning_config,
-        snapshot.optimizer_step,
-    )
-
-    resume = restore_checkpoint!(
-        parameters,
-        first,
-        second,
-        snapshot;
-        architecture_config,
-        input_config,
-        topology_config,
-        learning_config,
-        optimizer_config=optimizer_contract,
-    )
-    optimizer_state.group_steps .= group_steps
-    optimizer_state.total_step = UInt64(resume.optimizer_step)
-    # `event_raw`, cell dynamics, and output projections all have derived
-    # caches.  A resumed optimizer must never observe the constructor cache
-    # paired with restored raw coordinates.
-    Graph.refresh_cache!(topology_config)
-    return ResumeState(resume.optimizer_step, deepcopy(counters.learner))
-end
+validate_prepared_checkpoint(prepared::PreparedTrainingCheckpoint) =
+    _validate_snapshot(prepared.snapshot)
 
 end # module CanonicalCheckpoint
