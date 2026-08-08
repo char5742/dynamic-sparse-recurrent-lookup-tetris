@@ -645,6 +645,83 @@ end
     worker = CDGGraph.initialize_worker(model)
     CDGGraph.prepare_state_common!(model, state, worker, input)
 
+    @test CDGGraph.COMMON_SOURCE_RECORD === Int32(0)
+    @test CDGGraph.is_common_source_record(1, Int32(0))
+    @test !CDGGraph.is_common_source_record(0, Int32(0))
+    @test CDGGraph.provenance_sealed(worker.provenance)
+    @test CDGGraph.event_delivery_record_count(worker.provenance) > 0
+    @inbounds for delivery in 1:worker.provenance.event_count
+        record = CDGGraph.event_delivery_record(worker.provenance, delivery)
+        @test !CDGGraph.is_common_source_record(record)
+        @test record.source_record > CDGGraph.COMMON_SOURCE_RECORD
+        @test record.source_record <= worker.tape.count
+        @test worker.tape.node[Int(record.source_record)] == record.source_node
+    end
+
+    # Common replay may never borrow the candidate-only common-source ABI.
+    common_delivery = 1
+    common_source_record = worker.provenance.event_source_record[common_delivery]
+    worker.provenance.sealed = false
+    worker.provenance.event_source_record[common_delivery] =
+        CDGGraph.COMMON_SOURCE_RECORD
+    @test_throws ArgumentError CDGGraph._seal_replay_provenance!(
+        model,
+        state,
+        worker,
+        state.common_signature,
+        true,
+    )
+    @test !worker.provenance.sealed
+    worker.provenance.event_source_record[common_delivery] = common_source_record
+    CDGGraph._seal_replay_provenance!(
+        model,
+        state,
+        worker,
+        state.common_signature,
+        true,
+    )
+
+    function audit_candidate_event_sources!()
+        common_deliveries = Tuple[]
+        common_indices = Int[]
+        positive_indices = Int[]
+        @inbounds for delivery in 1:worker.provenance.event_count
+            record = CDGGraph.event_delivery_record(worker.provenance, delivery)
+            source = Int(record.source_node)
+            expected_common = record.wave == 1 &&
+                iszero(worker.closure.marked[source])
+            @test source > 0
+            @test CDGGraph.is_common_source_record(record) == expected_common
+            if expected_common
+                push!(common_indices, delivery)
+                @test record.source_record == CDGGraph.COMMON_SOURCE_RECORD
+                @test record.source_mask == state.common_event_mask[source]
+                @test 2_041 <= record.contact_parameter <= 2_120
+                push!(common_deliveries, (
+                    record.source_node,
+                    record.source_mask,
+                    record.lane,
+                    record.destination_branch,
+                    record.polarity,
+                    record.resolved_channel,
+                    record.contact_parameter,
+                    record.kind_parameter,
+                    record.scale,
+                    record.wave,
+                    record.ordinal,
+                ))
+            else
+                push!(positive_indices, delivery)
+                @test 1 <= record.source_record <= worker.tape.count
+                @test worker.tape.node[Int(record.source_record)] ==
+                    record.source_node
+            end
+        end
+        @test !isempty(common_indices)
+        @test !isempty(positive_indices)
+        return common_deliveries, common_indices, positive_indices
+    end
+
     # A real candidate forward retains closure-unmarked source provenance in
     # the sealed overlay-only ledger. Those entries must read the finalized
     # state-common mask rather than a work-only full-oracle transition.
@@ -655,6 +732,7 @@ end
         input;
         mode=:cow,
     )
+    cow_common_deliveries, _, _ = audit_candidate_event_sources!()
     overlay_seed_count = CDGEvents.overlay_only_seed_count(worker.arena)
     @test overlay_seed_count > 0
     @test cow_signature.delivery_count > 0
@@ -758,6 +836,120 @@ end
         first(combined_path),
         7,
     )) == 0
+
+    # :full owns extra work records, but overlay-only sources retain the named
+    # state-common sentinel and the exact same physical delivery ledger.
+    CDGGraph.reset_candidate_set!(worker)
+    _, full_signature = CDGGraph.forward_candidate!(
+        model,
+        state,
+        worker,
+        input;
+        mode=:full,
+    )
+    full_common_deliveries, full_common_indices, full_positive_indices =
+        audit_candidate_event_sources!()
+    @test full_signature == cow_signature
+    @test full_common_deliveries == cow_common_deliveries
+
+    function reject_record_mutation!(delivery::Int, replacement::Int32)
+        provenance = worker.provenance
+        original = provenance.event_source_record[delivery]
+        provenance.sealed = false
+        provenance.event_source_record[delivery] = replacement
+        try
+            @test_throws ArgumentError CDGGraph._seal_replay_provenance!(
+                model,
+                state,
+                worker,
+                full_signature,
+                false,
+            )
+            @test !provenance.sealed
+        finally
+            provenance.event_source_record[delivery] = original
+        end
+        CDGGraph._seal_replay_provenance!(
+            model,
+            state,
+            worker,
+            full_signature,
+            false,
+        )
+        return nothing
+    end
+
+    sentinel_delivery = first(full_common_indices)
+    sentinel_source = Int(worker.provenance.event_source_node[sentinel_delivery])
+    same_node_work_record = 0
+    @inbounds for record in 1:worker.tape.count
+        if Int(worker.tape.node[record]) == sentinel_source
+            same_node_work_record = record
+            break
+        end
+    end
+    @test same_node_work_record > 0
+    reject_record_mutation!(sentinel_delivery, Int32(same_node_work_record))
+
+    positive_delivery = first(full_positive_indices)
+    positive_source = Int(worker.provenance.event_source_node[positive_delivery])
+    other_node_record = 0
+    @inbounds for record in 1:worker.tape.count
+        if Int(worker.tape.node[record]) != positive_source
+            other_node_record = record
+            break
+        end
+    end
+    @test other_node_record > 0
+    reject_record_mutation!(positive_delivery, CDGGraph.COMMON_SOURCE_RECORD)
+    reject_record_mutation!(positive_delivery, Int32(other_node_record))
+    reject_record_mutation!(positive_delivery, Int32(worker.tape.count + 1))
+    reject_record_mutation!(positive_delivery, Int32(-1))
+
+    provenance = worker.provenance
+    original_source = provenance.event_source_node[positive_delivery]
+    provenance.sealed = false
+    provenance.event_source_node[positive_delivery] = UInt16(0)
+    try
+        @test_throws ArgumentError CDGGraph._seal_replay_provenance!(
+            model,
+            state,
+            worker,
+            full_signature,
+            false,
+        )
+        @test !provenance.sealed
+    finally
+        provenance.event_source_node[positive_delivery] = original_source
+    end
+    CDGGraph._seal_replay_provenance!(
+        model,
+        state,
+        worker,
+        full_signature,
+        false,
+    )
+
+    # Append validation is atomic: malformed source identities do not start a
+    # wave, increment a count, or publish a destination ledger entry.
+    append_tape = CDGGraph.TransitionTape(4)
+    append_provenance = CDGGraph.ReplayProvenance(4, 4, 4, 4)
+    @test_throws ArgumentError CDGGraph._append_event_delivery!(
+        append_provenance, append_tape, false, false,
+        1, 0, 0, UInt8(1), 1, 1, 1, 1, 1.0f0, 1,
+    )
+    @test_throws ArgumentError CDGGraph._append_event_delivery!(
+        append_provenance, append_tape, false, true,
+        1, 1, -1, UInt8(1), 1, 1, 1, 1, 1.0f0, 1,
+    )
+    @test_throws ArgumentError CDGGraph._append_event_delivery!(
+        append_provenance, append_tape, false, true,
+        1, 1, 0, UInt8(1), 1, 1, 1, 1, 1.0f0, 1,
+    )
+    @test append_provenance.event_count == 0
+    @test append_provenance.active_event_wave == 0
+    @test all(iszero, append_provenance.event_head_by_node)
+    @test all(iszero, append_provenance.event_tail_by_node)
 end
 
 @testset "output ownership and hot candidate allocation are exact" begin

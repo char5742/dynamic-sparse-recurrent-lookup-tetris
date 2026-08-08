@@ -34,6 +34,8 @@ export CORE_NODE_COUNT,
        AnalogDepositKind,
        BINARY_PACKET_DEPOSIT,
        SEMANTIC_PACKET_DEPOSIT,
+       COMMON_SOURCE_RECORD,
+       is_common_source_record,
        AnalogDepositRecord,
        EventDeliveryRecord,
        OutputEvidenceRecord,
@@ -400,6 +402,21 @@ end
     SEMANTIC_PACKET_DEPOSIT = 0x02
 end
 
+"""
+Named event-provenance identity for a finalized state-common source.
+
+The sentinel is valid only for a candidate wave-one dynamic-overlay delivery
+from a source outside the logical candidate closure. Event sources are always
+real core nodes, so `(source_node > 0, source_record == COMMON_SOURCE_RECORD)`
+is distinct from an external analog/output constant `(0, 0)`.
+"""
+const COMMON_SOURCE_RECORD = Int32(0)
+
+@inline is_common_source_record(
+    source_node::Integer,
+    source_record::Integer,
+) = source_node > 0 && source_record == COMMON_SOURCE_RECORD
+
 """One immutable view of an authoritative mandatory-analog deposit."""
 struct AnalogDepositRecord
     kind::AnalogDepositKind
@@ -429,6 +446,9 @@ struct EventDeliveryRecord
     ordinal::UInt32
 end
 
+@inline is_common_source_record(record::EventDeliveryRecord) =
+    is_common_source_record(record.source_node, record.source_record)
+
 """One exact packet binding consumed by a physical output cell."""
 struct OutputEvidenceRecord
     source_node::UInt16
@@ -448,11 +468,13 @@ end
 """
 Fixed-capacity chronological provenance for one reusable replay world.
 
-Packet primals are copied into the analog/output ledgers.  Event records keep
+Packet primals are copied into the analog/output ledgers. Event records keep
 stable raw-parameter indices and the resolved typed channel, so replay never
 has to infer polarity, incidence rank, or parameter order from a later graph
-snapshot.  `source_record == 0` denotes the finalized state-common snapshot;
-positive identities index the accompanying `TransitionTape`.
+snapshot. `COMMON_SOURCE_RECORD` denotes a candidate wave-one dynamic-overlay
+read from the finalized state-common snapshot; positive event identities index
+the accompanying `TransitionTape`. Analog/output `(source_node, source_record)
+== (0, 0)` remains the separate external-constant identity.
 """
 mutable struct ReplayProvenance
     analog_kind::Vector{UInt8}
@@ -1368,8 +1390,56 @@ end
     return nothing
 end
 
+@inline function _validate_event_source_record(
+    tape::TransitionTape,
+    source_node::Int,
+    source_record::Int,
+    common_phase::Bool,
+    candidate_affected::Bool,
+    wave::Int,
+    append_time::Bool,
+)
+    1 <= source_node <= CORE_NODE_COUNT || throw(ArgumentError(
+        "event provenance source_node must identify a core node",
+    ))
+    Int(COMMON_SOURCE_RECORD) <= source_record <= typemax(Int32) || throw(
+        ArgumentError(
+            "event provenance source_record must fit the nonnegative Int32 ABI",
+        ),
+    )
+    expected_common = !common_phase && wave == 1 && !candidate_affected
+    is_common_source_record(source_node, source_record) == expected_common || throw(
+        ArgumentError(
+            expected_common ?
+            "candidate overlay finalized-common source must use COMMON_SOURCE_RECORD" :
+            "COMMON_SOURCE_RECORD is valid only for a candidate wave-one overlay source",
+        ),
+    )
+    if expected_common
+        if append_time
+            Int(@inbounds tape.latest_record[source_node]) ==
+                Int(COMMON_SOURCE_RECORD) || throw(ArgumentError(
+                    "candidate overlay common source already has a logical candidate record",
+                ))
+        end
+    else
+        1 <= source_record <= tape.count || throw(ArgumentError(
+            "event provenance source_record is outside the transition tape",
+        ))
+        Int(@inbounds tape.node[source_record]) == source_node || throw(
+            ArgumentError(
+                "event provenance source_record does not belong to source_node",
+            ),
+        )
+    end
+    return nothing
+end
+
 @inline function _append_event_delivery!(
-    tape::ReplayProvenance,
+    provenance::ReplayProvenance,
+    tape::TransitionTape,
+    common_phase::Bool,
+    candidate_affected::Bool,
     destination::Int,
     source_node::Int,
     source_record::Int,
@@ -1381,39 +1451,48 @@ end
     scale::Float32,
     wave::Int,
 )
-    _begin_event_delivery_wave!(tape, wave)
-    slot = tape.event_count + 1
-    slot <= length(tape.event_source_node) || throw(OverflowError(
+    _validate_event_source_record(
+        tape,
+        source_node,
+        source_record,
+        common_phase,
+        candidate_affected,
+        wave,
+        true,
+    )
+    _begin_event_delivery_wave!(provenance, wave)
+    slot = provenance.event_count + 1
+    slot <= length(provenance.event_source_node) || throw(OverflowError(
         "typed event-delivery provenance capacity exceeded",
     ))
-    tape.event_destination_record[slot] = Int32(0)
-    tape.event_source_node[slot] = UInt16(source_node)
-    tape.event_source_record[slot] = Int32(source_record)
-    tape.event_source_mask[slot] = source_mask
-    tape.event_lane[slot] = UInt8(lane)
-    tape.event_destination_branch[slot] = UInt8(
+    provenance.event_destination_record[slot] = Int32(0)
+    provenance.event_source_node[slot] = UInt16(source_node)
+    provenance.event_source_record[slot] = Int32(source_record)
+    provenance.event_source_mask[slot] = source_mask
+    provenance.event_lane[slot] = UInt8(lane)
+    provenance.event_destination_branch[slot] = UInt8(
         div(resolved_channel - 1, Cell.INPUT_CHANNELS) + 1,
     )
     receptor = mod(resolved_channel - 1, Cell.INPUT_CHANNELS) + 1
-    tape.event_polarity[slot] = UInt8(
+    provenance.event_polarity[slot] = UInt8(
         lane == Axon.SOMA_EVENT ? 0 :
         receptor == Cell.INPUT_NMDA ? 1 : 2,
     )
-    tape.event_resolved_channel[slot] = UInt8(resolved_channel)
-    tape.event_contact_parameter[slot] = UInt16(contact_parameter)
-    tape.event_kind_parameter[slot] = UInt16(kind_parameter)
-    tape.event_scale[slot] = scale
-    tape.event_wave[slot] = UInt8(wave)
-    tape.event_ordinal[slot] = UInt32(slot)
-    tape.event_next[slot] = Int32(0)
-    previous = Int(@inbounds tape.event_tail_by_node[destination])
+    provenance.event_resolved_channel[slot] = UInt8(resolved_channel)
+    provenance.event_contact_parameter[slot] = UInt16(contact_parameter)
+    provenance.event_kind_parameter[slot] = UInt16(kind_parameter)
+    provenance.event_scale[slot] = scale
+    provenance.event_wave[slot] = UInt8(wave)
+    provenance.event_ordinal[slot] = UInt32(slot)
+    provenance.event_next[slot] = Int32(0)
+    previous = Int(@inbounds provenance.event_tail_by_node[destination])
     if previous == 0
-        tape.event_head_by_node[destination] = Int32(slot)
+        provenance.event_head_by_node[destination] = Int32(slot)
     else
-        tape.event_next[previous] = Int32(slot)
+        provenance.event_next[previous] = Int32(slot)
     end
-    tape.event_tail_by_node[destination] = Int32(slot)
-    tape.event_count = slot
+    provenance.event_tail_by_node[destination] = Int32(slot)
+    provenance.event_count = slot
     return slot
 end
 
@@ -2268,8 +2347,13 @@ function _prepare_shared_state_value!(
         model.cache.output,
     )
     state.state_value = state.state_value_components.value
-    worker.provenance.signature = state.common_signature
-    worker.provenance.sealed = true
+    _seal_replay_provenance!(
+        model,
+        state,
+        worker,
+        state.common_signature,
+        true,
+    )
     return state.state_value
 end
 
@@ -2683,6 +2767,73 @@ end
     return !iszero(worker.closure.marked[node])
 end
 
+function _validate_event_delivery_provenance!(
+    model::CanonicalModel,
+    state::ModelState,
+    worker::ModelWorker,
+    common_phase::Bool,
+)
+    provenance = worker.provenance
+    tape = worker.tape
+    first_dynamic = Events.edge_count(model.cache.event_graph) + 1
+    last_dynamic = first_dynamic + dynamic_event_contact_count(model) - 1
+    @inbounds for delivery in 1:provenance.event_count
+        source = Int(provenance.event_source_node[delivery])
+        source_record = Int(provenance.event_source_record[delivery])
+        wave = Int(provenance.event_wave[delivery])
+        1 <= source <= CORE_NODE_COUNT || throw(ArgumentError(
+            "sealed event provenance source_node must identify a core node",
+        ))
+        candidate_affected = common_phase ? true :
+            _logical_candidate_affected(worker, source)
+        _validate_event_source_record(
+            tape,
+            source,
+            source_record,
+            common_phase,
+            candidate_affected,
+            wave,
+            false,
+        )
+        if is_common_source_record(source, source_record)
+            state.ready || throw(ArgumentError(
+                "sealed candidate common-source provenance requires a prepared state",
+            ))
+            provenance.event_source_mask[delivery] ==
+                state.common_event_mask[source] || throw(ArgumentError(
+                    "sealed candidate common-source mask differs from finalized state-common",
+                ))
+            contact = Int(provenance.event_contact_parameter[delivery])
+            first_dynamic <= contact <= last_dynamic || throw(ArgumentError(
+                "COMMON_SOURCE_RECORD is restricted to dynamic-overlay contacts",
+            ))
+        end
+    end
+    return nothing
+end
+
+function _seal_replay_provenance!(
+    model::CanonicalModel,
+    state::ModelState,
+    worker::ModelWorker,
+    signature::TrajectorySignature,
+    common_phase::Bool,
+)
+    provenance = worker.provenance
+    provenance.sealed && throw(ArgumentError(
+        "replay provenance is already sealed",
+    ))
+    _validate_event_delivery_provenance!(
+        model,
+        state,
+        worker,
+        common_phase,
+    )
+    provenance.signature = signature
+    provenance.sealed = true
+    return provenance
+end
+
 """
 Return the hard-event mask that owns a source at the start of candidate wave one.
 
@@ -2702,8 +2853,9 @@ static anatomy again would duplicate state-common work.
         source,
     ))
     record = Int(@inbounds worker.tape.mandatory_record[source])
-    return record == 0 ? @inbounds(state.common_event_mask[source]) :
-                         @inbounds(worker.tape.event_mask[record])
+    return is_common_source_record(source, record) ?
+        @inbounds(state.common_event_mask[source]) :
+        @inbounds(worker.tape.event_mask[record])
 end
 
 """
@@ -2884,6 +3036,8 @@ end
     stepper::_GraphEventStepper,
     arena::Events.EventArena{Float32},
     source_state::AbstractVector{Float32},
+    source_record::Int,
+    candidate_affected::Bool,
     source::Int,
     source_mask::UInt8,
     destination::Int,
@@ -2894,6 +3048,15 @@ end
     raw_index::Int,
     wave::Int,
 )
+    if is_common_source_record(source, source_record)
+        stepper.state.ready || throw(ArgumentError(
+            "candidate overlay common source requires a prepared state",
+        ))
+        source_mask == @inbounds(stepper.state.common_event_mask[source]) ||
+            throw(ArgumentError(
+                "candidate overlay source mask differs from finalized state-common",
+            ))
+    end
     @inbounds for lane in 1:Axon.EVENT_DIM
         bit = UInt8(1 << (lane - 1))
         iszero(source_mask & trigger_mask & bit) && continue
@@ -2909,9 +3072,12 @@ end
         arena.inbox[slot, channel] += weight * kind_weight * scale
         _append_event_delivery!(
             stepper.worker.provenance,
+            stepper.worker.tape,
+            stepper.common_phase,
+            candidate_affected,
             destination,
             source,
-            Int(@inbounds stepper.worker.tape.latest_record[source]),
+            source_record,
             source_mask,
             lane,
             channel,
@@ -2951,19 +3117,24 @@ end
     wave::Int,
 )
     source_slot = Events.state_slot(arena, source)
+    candidate_affected = stepper.common_phase ? true :
+        _logical_candidate_affected(stepper.worker, source)
     # Keep column-major common-state and row-major COW-state views behind
     # separate typed calls. Joining those two SubArray layouts into one local
     # union forces a heap allocation on every typed delivery.
     if stepper.common_phase && iszero(source_slot)
         return _deliver_typed_event_from_state!(
             stepper, arena, @view(stepper.state.common_state[:, source]),
+            Int(@inbounds stepper.worker.tape.latest_record[source]),
+            candidate_affected,
             source, source_mask, destination, slot, encoded_channel,
             trigger_mask, weight, raw_index, wave,
         )
-    elseif !stepper.common_phase && wave == 1 &&
-           !_logical_candidate_affected(stepper.worker, source)
+    elseif !stepper.common_phase && wave == 1 && !candidate_affected
         return _deliver_typed_event_from_state!(
             stepper, arena, @view(stepper.state.common_state[:, source]),
+            Int(COMMON_SOURCE_RECORD),
+            candidate_affected,
             source, source_mask, destination, slot, encoded_channel,
             trigger_mask, weight, raw_index, wave,
         )
@@ -2971,6 +3142,8 @@ end
     iszero(source_slot) && error("event source has no current COW state")
     return _deliver_typed_event_from_state!(
         stepper, arena, @view(arena.state[source_slot, :]),
+        Int(@inbounds stepper.worker.tape.latest_record[source]),
+        candidate_affected,
         source, source_mask, destination, slot, encoded_channel,
         trigger_mask, weight, raw_index, wave,
     )
@@ -3260,8 +3433,7 @@ function forward_candidate!(
         candidate_hash,
         report,
     )
-    worker.provenance.signature = signature
-    worker.provenance.sealed = true
+    _seal_replay_provenance!(model, state, worker, signature, false)
     worker.signatures[candidate_slot] = signature
     worker.advantages[candidate_slot] = component.advantage
     worker.candidate_count = candidate_slot
@@ -3289,8 +3461,9 @@ end
     node::Int,
     record::Int,
 )
-    return record == 0 ? @view(state.common_packet[:, node]) :
-                         @view(worker.tape.packet[:, record])
+    return is_common_source_record(node, record) ?
+        @view(state.common_packet[:, node]) :
+        @view(worker.tape.packet[:, record])
 end
 
 @inline function _packet_bar_at_record(
@@ -3298,8 +3471,9 @@ end
     node::Int,
     record::Int,
 )
-    return record == 0 ? @view(worker.core_packet_bar[:, node]) :
-                         @view(worker.record_packet_bar[:, record])
+    return is_common_source_record(node, record) ?
+        @view(worker.core_packet_bar[:, node]) :
+        @view(worker.record_packet_bar[:, record])
 end
 
 @inline function _mandatory_packet(
